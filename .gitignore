@@ -1,0 +1,28 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+
+# --- Virtual environment ---
+.venv/
+venv/
+env/
+
+# --- Build artifacts ---
+build/
+dist/
+*.spec
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+
+# --- OS ---
+Thumbs.db
+.DS_Store
+
+# --- Data ---
+# Large sample datasets (.fcs etc.) should be kept out of the repository.
+# Add specific patterns here once sample data is introduced.
