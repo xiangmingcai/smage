@@ -5,6 +5,10 @@ numpy
 pandas
 scipy
 
+# Data storage & image import
+pyarrow
+tifffile
+
 # Flow-cytometry data
 flowio
 

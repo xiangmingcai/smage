@@ -1,29 +1,2821 @@
-"""Smage — desktop application entry point.
+"""Smage — desktop application entry point and main window.
 
-This module creates the main application window. It is intentionally minimal
-for now; gating, plotting, and pipeline features are added in later phases.
+Phase 1 UI skeleton: a File/Help menu bar and a single tabbed workspace.
+The first tab is the Workflow (always open); further tabs are modules with
+their own toolbar (Save/Settings/Close) and content. The "+" button on a task
+opens an "Add Module" dialog with placeholder module types. Module
+functionality comes in later phases.
 """
 from __future__ import annotations
 
+import copy
+import shutil
 import sys
+from collections import Counter
+from pathlib import Path
+from uuid import uuid4
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
+# Make the `smage` package importable when this file is run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, QTimer, Qt
+from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QGraphicsProxyWidget,
+    QGraphicsScene,
+    QGraphicsView,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QTabWidget,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from smage.dimensions import parameter_names, read_dimensions
+from smage.importer import import_file
+from smage.project import Project
 
 APP_NAME = "Smage"
 
+# Light-blue "tech" theme, loosely inspired by Positron's blue accents.
+APP_STYLE = """
+QMainWindow { background: #f5f8fb; }
+
+/* menu bar */
+QMenuBar { background: #ffffff; border-bottom: 1px solid #e3e8ef; }
+QMenuBar::item { padding: 0px 10px; }
+QMenuBar::item:selected { background: #e6f0fb; color: #1d4f7a; }
+
+/* status bar */
+QStatusBar { background: #ffffff; border-top: 1px solid #e3e8ef; color: #5a6673; }
+
+/* dropdown menus */
+QMenu { background: #ffffff; border: 1px solid #dbe3ec; padding: 4px 0px; }
+QMenu::item { padding: 5px 24px; color: #2c3a48; }
+QMenu::item:selected { background: #e6f0fb; color: #1d4f7a; }
+
+/* flat tabs — no 3D effect, active tab tinted light blue */
+QTabWidget::pane { border: none; }
+QTabBar::tab {
+    background: #eef1f5;
+    color: #5a6673;
+    border: none;
+    padding: 5px 16px;
+    margin-right: 3px;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+QTabBar::tab:hover:!selected { background: #e4eaf0; }
+QTabBar::tab:selected { background: #e1ecf9; color: #1a4a76; }
+
+/* module toolbar */
+QFrame#moduleBar { background: #e1ecf9; border-bottom: 1px solid #d4e2f1; }
+
+/* buttons — flat, light-blue accent */
+QPushButton {
+    background: #ffffff;
+    border: 1px solid #c9d5e2;
+    border-radius: 4px;
+    padding: 3px 12px;
+    color: #2c3a48;
+}
+QPushButton:hover { background: #f0f7fe; border-color: #5aa0e0; }
+QPushButton:pressed { background: #dbeafa; }
+
+/* workflow tree */
+QTreeWidget { background: #f5f8fb; border: none; }
+
+/* parameter panel inputs */
+QCheckBox { spacing: 6px; color: #2c3a48; }
+QLineEdit {
+    background: #ffffff;
+    border: 1px solid #c9d5e2;
+    border-radius: 4px;
+    padding: 3px 8px;
+    color: #2c3a48;
+}
+QLineEdit:focus { border-color: #5aa0e0; }
+"""
+
+
+def _dot_pixmap(color: str) -> QPixmap:
+    """Build a small colored-dot pixmap (placeholder for an icon)."""
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor(color))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(2, 2, 12, 12)
+    painter.end()
+    return pixmap
+
+
+def _lock_pixmap(color: str = "#b58900", size: int = 14) -> QPixmap:
+    """Build a small padlock pixmap for locked modules."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color))
+    pen.setWidthF(1.6)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    # Shackle (top half arc).
+    painter.drawArc(QRectF(3.5, 1.5, size - 7.0, size - 7.0), 0, 180 * 16)
+    # Body.
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawRoundedRect(QRectF(2.0, 5.0, size - 4.0, size - 5.0), 1.6, 1.6)
+    painter.end()
+    return pixmap
+
+
+# Known task types: type key -> (display name, color).
+# "import" is the fixed first task; ADDABLE_TYPES appear in the Add-Module dialog.
+TASK_TYPES = {
+    "import": ("Data Import", "#9aa0a6"),
+    "gating": ("Gating", "#f4b400"),
+    "figure": ("Figure", "#34a853"),
+    "scale": ("Scale", "#4285f4"),
+    "rename": ("Rename", "#8e9aab"),
+    "unmix": ("Unmix", "#7b61ff"),
+    "segmentation": ("Segmentation", "#00acc1"),
+    "compensation": ("Compensation", "#fb8c00"),
+    "spectrum": ("Spectrum", "#e91e63"),
+}
+
+ADDABLE_TYPES = [
+    "gating",
+    "figure",
+    "scale",
+    "rename",
+    "unmix",
+    "segmentation",
+    "compensation",
+    "spectrum",
+]
+
+ROOT_COLOR = "#5f6368"
+FALLBACK_COLOR = "#a142f4"
+
+# Import status colors (the dot shown before each file in the Input panel).
+IMPORT_STATUS_COLORS = {
+    "pending": "#9aa0a6",    # just selected (default)
+    "peeked": "#4285f4",     # dimensions read (Peek)
+    "processed": "#34a853",  # imported / converted
+    "error": "#e53935",      # Peek or import failed
+}
+
+# Human-readable status descriptions (shown as the status dot's tooltip).
+STATUS_DESCRIPTIONS = {
+    "pending": "Not peeked yet",
+    "peeked": "Peeked — dimensions read",
+    "processed": "Imported successfully",
+    "error": "Error",
+}
+
+# Width of the "Original name" column in the Parameter panel.
+PARAM_ORIG_WIDTH = 150
+
+# Figure module settings: scatter color modes and palette choices.
+FIGURE_COLOR_MODES = [("Density", "density"), ("Parameter", "parameter")]
+FIGURE_PALETTES = [
+    "viridis", "plasma", "magma", "inferno", "cividis",
+    "turbo", "jet", "coolwarm", "grayscale",
+]
+
+
+def _figure_colormap(name: str):
+    """Return a pyqtgraph ColorMap for a named palette, with a fallback."""
+    import pyqtgraph as pg
+    try:
+        return pg.colormap.get(name)
+    except Exception:
+        return pg.ColorMap([0.0, 1.0], [(0, 0, 255), (255, 0, 0)])
+
+
+class _ClickFilter(QObject):
+    """Select a plot card when its widget (or embedded plot) is clicked."""
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._callback = callback
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress:
+            self._callback()
+        return False  # let the event continue (plots still pan/zoom)
+
+
+class _PlotDragHandle(QFrame):
+    """Title bar of a plot card (drag-to-move is handled by the card proxy)."""
+
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self.setObjectName("plotTitle")
+        self.setStyleSheet(
+            "#plotTitle { background: #eef2f7; border: none; border-radius: 3px; }"
+        )
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        tb = QHBoxLayout(self)
+        tb.setContentsMargins(6, 3, 6, 3)
+        tb.setSpacing(4)
+        tb.addWidget(QLabel(f"<b>{title}</b>"))
+        tb.addStretch()
+        hint = QLabel("⋮⋮")
+        hint.setStyleSheet("color: #9aa0a6;")
+        tb.addWidget(hint)
+
+
+class _CardProxy(QGraphicsProxyWidget):
+    """A card proxy that supports dragging the card by its title bar."""
+
+    TITLE_HEIGHT = 30
+
+    def __init__(self, on_select, on_drop) -> None:
+        super().__init__()
+        self._on_select = on_select
+        self._on_drop = on_drop
+        self._dragging = False
+        self._press_scene = None
+        self._start_pos = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and event.pos().y() <= self.TITLE_HEIGHT:
+            self._dragging = True
+            self._press_scene = event.scenePos()
+            self._start_pos = self.pos()
+            self.setZValue(1)
+            self._on_select()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging and event.buttons() & Qt.MouseButton.LeftButton:
+            self.setPos(self._start_pos + (event.scenePos() - self._press_scene))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._dragging:
+            self._dragging = False
+            self.setZValue(0)
+            self._on_drop(event.scenePos())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class _ZoomableGraphicsView(QGraphicsView):
+    """A canvas view that zooms the whole canvas with the mouse wheel."""
+
+    def __init__(self, scene) -> None:
+        super().__init__(scene)
+        self.enter_callback = None
+        self.delete_callback = None
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setBackgroundBrush(QColor("#eef2f7"))
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setRenderHints(QPainter.RenderHint.Antialiasing)
+
+    def wheelEvent(self, event) -> None:
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.enter_callback is not None:
+                self.enter_callback()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self.delete_callback is not None:
+                self.delete_callback()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class _FigureCard(QFrame):
+    """A bordered plot card (click to select)."""
+
+    _BASE = "#plotCard { background: #ffffff; border: 1px solid #c9d5e2; border-radius: 6px; }"
+    _SELECTED = "#plotCard { background: #ffffff; border: 2px solid #4285f4; border-radius: 6px; }"
+
+    def __init__(self, title: str, plot_widget, index: int, select_callback) -> None:
+        super().__init__()
+        self._index = index
+        self._select_callback = select_callback
+        self._plot_widget = plot_widget
+        self._proxy = None
+        self.setObjectName("plotCard")
+        self.setStyleSheet(self._BASE)
+        self.setMinimumSize(200, 200)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 6)
+        lay.setSpacing(4)
+        lay.addWidget(_PlotDragHandle(title))
+        lay.addWidget(plot_widget, 1)
+
+    def index(self) -> int:
+        return self._index
+
+    def set_index(self, index: int) -> None:
+        self._index = index
+
+    def plot_widget(self):
+        return self._plot_widget
+
+    def proxy(self):
+        return self._proxy
+
+    def select(self) -> None:
+        self._select_callback(self._index)
+
+    def set_selected(self, selected: bool) -> None:
+        self.setStyleSheet(self._SELECTED if selected else self._BASE)
+
+
+def _format_number(value) -> str:
+    """Format a number compactly (no trailing zeros) for the range fields."""
+    if value is None:
+        return ""
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:.10g}"
+
+
+class _SelectAllFilter(QObject):
+    """Select all text after a mouse click into the line edit."""
+
+    def __init__(self, line_edit) -> None:
+        super().__init__()
+        self._line_edit = line_edit
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            QTimer.singleShot(0, self._line_edit.selectAll)
+        return False
+
+
+class _SizeField(QWidget):
+    """Integer size field: a plain line edit with ±10 step buttons."""
+
+    def __init__(self, value, on_change, minimum: int = 200, maximum: int = 4000) -> None:
+        super().__init__()
+        self._value = int(value)
+        self._on_change = on_change
+        self._min = minimum
+        self._max = maximum
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(1)
+
+        self.edit = QLineEdit()
+        self.edit.setFixedWidth(56)
+        self.edit.setText(str(self._value))
+        self.edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.edit.editingFinished.connect(self._commit)
+        # Select all after a click so typing replaces the old value.
+        self._filter = _SelectAllFilter(self.edit)
+        self.edit.installEventFilter(self._filter)
+        lay.addWidget(self.edit)
+
+        btns = QVBoxLayout()
+        btns.setContentsMargins(0, 0, 0, 0)
+        btns.setSpacing(0)
+        self._up = QToolButton()
+        self._up.setText("▲")
+        self._up.setFixedSize(16, 12)
+        self._up.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._up.clicked.connect(lambda: self._step(10))
+        self._down = QToolButton()
+        self._down.setText("▼")
+        self._down.setFixedSize(16, 12)
+        self._down.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._down.clicked.connect(lambda: self._step(-10))
+        btns.addWidget(self._up)
+        btns.addWidget(self._down)
+        lay.addLayout(btns)
+
+    def value(self) -> int:
+        return self._value
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.edit.setEnabled(enabled)
+        self._up.setEnabled(enabled)
+        self._down.setEnabled(enabled)
+
+    def _clamp(self, value) -> int:
+        return max(self._min, min(self._max, int(value)))
+
+    def _step(self, delta: int) -> None:
+        self._value = self._clamp(self._value + delta)
+        self.edit.setText(str(self._value))
+        if self._on_change is not None:
+            self._on_change(self._value)
+
+    def _commit(self) -> None:
+        try:
+            self._value = self._clamp(int(self.edit.text().strip()))
+        except (ValueError, TypeError):
+            self.edit.setText(str(self._value))
+            return
+        self.edit.setText(str(self._value))
+        if self._on_change is not None:
+            self._on_change(self._value)
+
+
+class _LogStepSpinBox(QWidget):
+    """Narrow numeric field: text shown as typed; ▲/▼ step ×10 / ÷10."""
+
+    def __init__(self, value, on_change) -> None:
+        super().__init__()
+        self._value = value
+        self._on_change = on_change
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(1)
+
+        self.edit = QLineEdit()
+        self.edit.setFixedWidth(64)
+        self.edit.setText(_format_number(value))
+        self.edit.editingFinished.connect(self._commit_edit)
+        self.edit.returnPressed.connect(self._commit_edit)
+        lay.addWidget(self.edit)
+
+        btns = QVBoxLayout()
+        btns.setContentsMargins(0, 0, 0, 0)
+        btns.setSpacing(0)
+        self._up = QToolButton()
+        self._up.setText("▲")
+        self._up.setFixedSize(16, 12)
+        self._up.setAutoRaise(True)
+        self._up.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._up.clicked.connect(lambda: self._step(10.0))
+        self._down = QToolButton()
+        self._down.setText("▼")
+        self._down.setFixedSize(16, 12)
+        self._down.setAutoRaise(True)
+        self._down.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._down.clicked.connect(lambda: self._step(0.1))
+        btns.addWidget(self._up)
+        btns.addWidget(self._down)
+        lay.addLayout(btns)
+
+    def value(self):
+        return self._value
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.edit.setEnabled(enabled)
+        self._up.setEnabled(enabled)
+        self._down.setEnabled(enabled)
+
+    def set_value(self, value) -> None:
+        self._value = value
+        self.edit.setText(_format_number(value))
+
+    def _current_value(self) -> float:
+        try:
+            return float(self.edit.text().strip())
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _step(self, factor: float) -> None:
+        base = 1.0 if self.edit.text().strip() == "" else self._current_value()
+        self._value = base * factor
+        self.edit.setText(_format_number(self._value))
+        if self._on_change is not None:
+            self._on_change(self._value)
+
+    def _commit_edit(self) -> None:
+        text = self.edit.text().strip()
+        try:
+            self._value = float(text)
+        except (ValueError, TypeError):
+            self.edit.setText(_format_number(self._value))
+            return
+        if self._on_change is not None:
+            self._on_change(self._value)
+
+
+def _task_color(task_type: str) -> str:
+    """Return the color for a task type."""
+    if task_type == "root":
+        return ROOT_COLOR
+    return TASK_TYPES.get(task_type, ("Task", FALLBACK_COLOR))[1]
+
+
+# Module kinds: every non-import task is a map, generate, or visualize module.
+# kind is derived from type (not stored in the manifest), so old projects need
+# no migration.
+MODULE_KINDS = {
+    "gating": "map",
+    "scale": "map",
+    "rename": "map",
+    "compensation": "map",
+    "unmix": "map",
+    "segmentation": "generate",
+    "figure": "visualize",
+    "spectrum": "visualize",
+}
+
+
+def _task_kind(task_type: str) -> str:
+    """Return a task's kind: import / map / generate / visualize."""
+    if task_type == "import":
+        return "import"
+    return MODULE_KINDS.get(task_type, "map")
+
+
+def _task_is_locked(task: dict) -> bool:
+    """True if the task (or any descendant) is a generate module with saved data."""
+    if (
+        _task_kind(task.get("type", "")) == "generate"
+        and task.get("output", {}).get("saved")
+    ):
+        return True
+    return any(_task_is_locked(child) for child in task.get("children", []))
+
 
 class MainWindow(QMainWindow):
-    """The main application window."""
+    """Main window: File/Help menu bar and a single tabbed workspace."""
 
     def __init__(self) -> None:
         super().__init__()
+        self.project = None
+        self._clipboard = None
+        self._import_files = []
+        self._processed_files = []
+        self._updating_checks = False
+        self._updating_sample = False
+        self._current_entry = None
         self.setWindowTitle(APP_NAME)
-        self.resize(1100, 720)
+        self.resize(1280, 800)
+        self._build_menu_bar()
+        self._build_main_area()
+        self.statusBar().showMessage("Ready")
 
-        placeholder = QLabel("Smage — welcome!", self)
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setCentralWidget(placeholder)
+    def closeEvent(self, event) -> None:
+        """Warn before closing the app if any Figure page has unsaved changes."""
+        if self._has_unsaved_figure_changes():
+            reply = QMessageBox.question(
+                self,
+                "Close Smage",
+                "There are unsaved changes.\nReally close? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        event.accept()
+
+    def _has_unsaved_figure_changes(self) -> bool:
+        for index in range(1, self.tabs.count()):  # skip Workflow at index 0
+            if getattr(self.tabs.widget(index), "_fig_dirty", False):
+                return True
+        return False
+
+    # ----- menu bar -------------------------------------------------
+    def _build_menu_bar(self) -> None:
+        bar = self.menuBar()
+
+        file_menu = bar.addMenu("&File")
+
+        new_action = QAction("New Project", self)
+        new_action.triggered.connect(self._new_project)
+        file_menu.addAction(new_action)
+
+        open_action = QAction("Open Project…", self)
+        open_action.triggered.connect(self._open_project)
+        file_menu.addAction(open_action)
+
+        save_as_action = QAction("Save Project As…", self)
+        save_as_action.triggered.connect(self._save_project_as)
+        file_menu.addAction(save_as_action)
+
+        help_menu = bar.addMenu("&Help")
+        help_menu.addAction(QAction("About Smage", self))
+
+    # ----- project actions ------------------------------------------
+    def _new_project(self) -> None:
+        """Create a new project folder (name.smage with project.json + data/)."""
+        parent_dir = QFileDialog.getExistingDirectory(
+            self, "Choose a location for the project"
+        )
+        if not parent_dir:
+            return
+
+        name, ok = QInputDialog.getText(self, "New Project", "Project name:")
+        name = name.strip()
+        if not ok or not name:
+            return
+
+        try:
+            self.project = Project.create(Path(parent_dir), name)
+        except OSError as error:
+            QMessageBox.warning(self, "New Project", f"Could not create project:\n{error}")
+            return
+
+        self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
+        self._reset_module_tabs()
+        self._load_import_files()
+        self._refresh_workflow_tree()
+        self.statusBar().showMessage(f"Project created: {self.project.path}")
+
+    def _open_project(self) -> None:
+        """Open an existing project folder."""
+        folder = QFileDialog.getExistingDirectory(self, "Open Project")
+        if not folder:
+            return
+        try:
+            self.project = Project.load(Path(folder))
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.warning(self, "Open Project", f"Could not open project:\n{error}")
+            return
+
+        self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
+        self._reset_module_tabs()
+        self._load_import_files()
+        self._refresh_workflow_tree()
+        self.statusBar().showMessage(f"Opened: {self.project.path}")
+
+    def _save_project_as(self) -> None:
+        """Save the current project under a new name/location."""
+        if self.project is None:
+            QMessageBox.information(self, "Save Project As", "No project is open yet.")
+            return
+
+        parent_dir = QFileDialog.getExistingDirectory(self, "Choose a location")
+        if not parent_dir:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Save Project As", "Project name:", text=self.project.name
+        )
+        name = name.strip()
+        if not ok or not name:
+            return
+
+        try:
+            new_project = Project.create(Path(parent_dir), name)
+            new_project.samples = copy.deepcopy(self.project.samples)
+            new_project.workflow = copy.deepcopy(self.project.workflow)
+            for item in self.project.data_dir.iterdir():
+                if item.is_file():
+                    shutil.copy2(item, new_project.data_dir / item.name)
+            new_project.save()
+        except OSError as error:
+            QMessageBox.warning(self, "Save Project As", f"Could not save project:\n{error}")
+            return
+
+        self.project = new_project
+        self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
+        self.statusBar().showMessage(f"Saved as: {self.project.path}")
+
+    def _reset_module_tabs(self) -> None:
+        """Close all module tabs, keeping only the Workflow tab."""
+        while self.tabs.count() > 1:
+            self.tabs.removeTab(self.tabs.count() - 1)
+
+    def _import_task(self):
+        """Return the fixed 'import' task, or None."""
+        if self.project is None:
+            return None
+        for task in self.project.workflow.get("tasks", []):
+            if task.get("type") == "import":
+                return task
+        return None
+
+    def _import_locked(self) -> bool:
+        """True if the Data Import task is locked (a downstream generate saved data)."""
+        task = self._import_task()
+        return task is not None and _task_is_locked(task)
+
+    def _find_task_by_id(self, task_id: str | None):
+        """Return the workflow task dict with the given id, or None."""
+        if self.project is None or not task_id:
+            return None
+
+        def walk(tasks):
+            for task in tasks:
+                if task.get("id") == task_id:
+                    return task
+                found = walk(task.get("children", []))
+                if found is not None:
+                    return found
+            return None
+
+        return walk(self.project.workflow.get("tasks", []))
+
+    def _load_import_files(self) -> None:
+        """Load the Data Import file list and processed results from the project."""
+        task = self._import_task()
+        if task is None:
+            self._import_files = []
+            self._processed_files = []
+            return
+        params = task.setdefault("params", {})
+        files = params.get("files")
+        if files is None:
+            files = []
+            params["files"] = files
+        self._import_files = files
+        processed = params.get("processed")
+        if processed is None:
+            processed = []
+            params["processed"] = processed
+        self._processed_files = processed
+
+    def _persist_import_files(self) -> None:
+        """Save the project (the import file list lives in the import task's params)."""
+        if self.project is not None:
+            self.project.save()
+
+    # ----- main area: a single tabbed workspace ---------------------
+    def _build_main_area(self) -> None:
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        self._build_workflow_tab()
+
+    # ----- workflow tree --------------------------------------------
+    def _build_workflow_tab(self) -> None:
+        workflow_panel = QWidget()
+        wl = QVBoxLayout(workflow_panel)
+        wl.setContentsMargins(8, 8, 8, 8)
+
+        self.workflow_tree = QTreeWidget()
+        self.workflow_tree.setHeaderHidden(True)
+        self.workflow_tree.setIndentation(22)
+        wl.addWidget(self.workflow_tree)
+
+        self.tabs.addTab(workflow_panel, "Workflow")
+        self._refresh_workflow_tree()
+
+    def _task_item_widget(
+        self, name: str, color: str, is_root: bool = False,
+        on_add_child=None, on_actions=None, task_type: str | None = None,
+        task_id: str | None = None, locked: bool = False,
+    ) -> QWidget:
+        """Build a card (icon + name + action buttons) for one task."""
+        card = QFrame()
+        card.setObjectName("taskCard")
+        card.setStyleSheet(
+            "QFrame#taskCard { background: #ffffff; "
+            "border: 1px solid #dbe3ec; border-radius: 6px; }"
+        )
+
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(6)
+
+        icon = QLabel()
+        icon.setPixmap(_dot_pixmap(color))
+        icon.setFixedSize(16, 16)
+        lay.addWidget(icon)
+
+        title = QLabel(name)
+        if locked:
+            title.setStyleSheet("color: #9aa0a6;")
+        lay.addWidget(title)
+        lay.addSpacing(12)
+
+        if not is_root:
+            buttons = QHBoxLayout()
+            buttons.setSpacing(2)
+            buttons.setContentsMargins(0, 0, 0, 0)
+
+            open_btn = QPushButton("Open")
+            open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            open_btn.clicked.connect(
+                lambda _=False, tid=task_id, t=task_type, n=name: self._open_module(tid, t, n)
+            )
+            buttons.addWidget(open_btn)
+
+            actions_btn = QPushButton("Actions ▾")
+            actions_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            if on_actions is not None:
+                actions_btn.clicked.connect(on_actions)
+            buttons.addWidget(actions_btn)
+
+            add_btn = QPushButton("+")
+            add_btn.setFixedWidth(36)
+            add_btn.setToolTip("Add child module")
+            add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            add_btn.setEnabled(not locked)
+            if on_add_child is not None:
+                add_btn.clicked.connect(on_add_child)
+            buttons.addWidget(add_btn)
+
+            lay.addLayout(buttons)
+
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            lay.addWidget(lock_icon)
+
+        # Wrap the card so it only takes its content width (left-aligned),
+        # with a little vertical margin so cards don't touch.
+        container = QWidget()
+        wrap = QVBoxLayout(container)
+        wrap.setContentsMargins(0, 2, 0, 2)
+        wrap.addWidget(card, 0, Qt.AlignmentFlag.AlignLeft)
+        return container
+
+    def _show_actions_menu(self, task_def: dict, parent_task_def) -> None:
+        """Show the task actions menu."""
+        locked = _task_is_locked(task_def)
+        menu = QMenu(self)
+
+        copy_action = QAction("Copy", self)
+        copy_action.triggered.connect(lambda: self._copy_task(task_def, False))
+        menu.addAction(copy_action)
+
+        copy_branch_action = QAction("Copy branch", self)
+        copy_branch_action.triggered.connect(lambda: self._copy_task(task_def, True))
+        menu.addAction(copy_branch_action)
+
+        menu.addSeparator()
+
+        paste_action = QAction("Paste", self)
+        paste_action.setEnabled(not locked)
+        paste_action.triggered.connect(lambda: self._paste_task(task_def, False))
+        menu.addAction(paste_action)
+
+        paste_branch_action = QAction("Paste branch", self)
+        paste_branch_action.setEnabled(not locked)
+        paste_branch_action.triggered.connect(lambda: self._paste_task(task_def, True))
+        menu.addAction(paste_branch_action)
+
+        menu.addSeparator()
+
+        rename_action = QAction("Rename", self)
+        rename_action.setEnabled(not locked)
+        rename_action.triggered.connect(lambda: self._rename_task(task_def))
+        menu.addAction(rename_action)
+
+        delete_action = QAction("Delete", self)
+        delete_action.setEnabled(not locked)
+        delete_action.triggered.connect(
+            lambda: self._delete_task(task_def, parent_task_def, False)
+        )
+        menu.addAction(delete_action)
+
+        delete_branch_action = QAction("Delete branch", self)
+        delete_branch_action.setEnabled(not locked)
+        delete_branch_action.triggered.connect(
+            lambda: self._delete_task(task_def, parent_task_def, True)
+        )
+        menu.addAction(delete_branch_action)
+
+        menu.exec(QCursor.pos())
+
+    def _copy_task(self, task_def: dict, with_branch: bool = False) -> None:
+        """Copy a single task (or, with_branch, its whole branch) to the clipboard."""
+        copied = copy.deepcopy(task_def)
+        if not with_branch:
+            copied["children"] = []
+        self._clipboard = copied
+
+    def _paste_task(self, task_def: dict, with_branch: bool = False) -> None:
+        """Paste a single task (or, with_branch, its whole branch) as a child."""
+        if self._clipboard is None:
+            return
+        new_task = copy.deepcopy(self._clipboard)
+        if not with_branch:
+            new_task["children"] = []
+        self._reassign_ids(new_task)
+        task_def.setdefault("children", []).append(new_task)
+        if self.project is not None:
+            self.project.save()
+        self._refresh_workflow_tree()
+
+    def _reassign_ids(self, task: dict) -> None:
+        """Give a task (and its subtree) fresh unique ids."""
+        task["id"] = f"{task.get('type', 'task')}-{uuid4().hex[:8]}"
+        for child in task.get("children", []):
+            self._reassign_ids(child)
+
+    def _rename_task(self, task_def: dict) -> None:
+        """Rename a task."""
+        name, ok = QInputDialog.getText(
+            self, "Rename", "New name:", text=task_def.get("name", "")
+        )
+        name = name.strip()
+        if not ok or not name:
+            return
+        task_def["name"] = name
+        if self.project is not None:
+            self.project.save()
+        self._refresh_workflow_tree()
+
+    def _delete_task(self, task_def: dict, parent_task_def, with_branch: bool = False) -> None:
+        """Delete a single task (or, with_branch, its whole branch)."""
+        name = task_def.get("name", "task")
+        message = (
+            f"Delete branch '{name}' and its sub-modules?"
+            if with_branch
+            else f"Delete '{name}'?"
+        )
+        reply = QMessageBox.question(
+            self,
+            "Delete",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        siblings = (
+            self.project.workflow.get("tasks", [])
+            if parent_task_def is None
+            else parent_task_def.get("children", [])
+        )
+        if task_def not in siblings:
+            return
+
+        index = siblings.index(task_def)
+        if with_branch:
+            del siblings[index]
+        else:
+            # Remove only this task; promote its children into its place.
+            siblings[index:index + 1] = task_def.get("children", [])
+
+        if self.project is not None:
+            self.project.save()
+        self._refresh_workflow_tree()
+
+    def _add_task(self, parent, name: str, color: str, is_root: bool = False,
+                  on_add_child=None, on_actions=None, task_type: str | None = None,
+                  task_id: str | None = None, locked: bool = False):
+        """Add a task card to the tree and return its item."""
+        item = QTreeWidgetItem([""])
+        if parent is None:
+            self.workflow_tree.addTopLevelItem(item)
+        else:
+            parent.addChild(item)
+        self.workflow_tree.setItemWidget(
+            item, 0, self._task_item_widget(
+                name, color, is_root, on_add_child, on_actions, task_type, task_id,
+                locked,
+            )
+        )
+        return item
+
+    def _refresh_workflow_tree(self) -> None:
+        """Rebuild the workflow tree from the current project's workflow."""
+        self.workflow_tree.clear()
+        root = self._add_task(None, "Workflow", ROOT_COLOR, is_root=True)
+        root.setExpanded(True)
+
+        if self.project is None:
+            return
+        for task in self.project.workflow.get("tasks", []):
+            self._add_task_from_definition(root, task, None)
+
+    def _add_task_from_definition(self, parent, task_def: dict, parent_task_def=None):
+        """Add a task card (and its children) from a workflow definition dict."""
+        task_type = task_def.get("type", "")
+        name = task_def.get("name") or TASK_TYPES.get(task_type, ("Task",))[0]
+        color = _task_color(task_type)
+        item = self._add_task(
+            parent,
+            name,
+            color,
+            on_add_child=lambda checked=False, t=task_def: self._show_add_module_dialog(t),
+            on_actions=lambda checked=False, t=task_def, p=parent_task_def: self._show_actions_menu(t, p),
+            task_type=task_type,
+            task_id=task_def.get("id", ""),
+            locked=_task_is_locked(task_def),
+        )
+        item.setExpanded(True)
+        for child in task_def.get("children", []):
+            self._add_task_from_definition(item, child, task_def)
+
+    # ----- add-module dialog ----------------------------------------
+    def _show_add_module_dialog(self, parent_task_def: dict) -> None:
+        """Open the Add-Module dialog; the chosen module becomes a child task."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add Module")
+        grid = QGridLayout(dialog)
+
+        for i, mtype in enumerate(ADDABLE_TYPES):
+            name, color = TASK_TYPES[mtype]
+            btn = QToolButton()
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            btn.setText(name)
+            btn.setIcon(QIcon(_dot_pixmap(color)))
+            btn.setIconSize(QSize(28, 28))
+            btn.setFixedSize(96, 72)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(
+                lambda checked=False, t=mtype: self._add_module(parent_task_def, t, dialog)
+            )
+            grid.addWidget(btn, i // 4, i % 4)
+
+        dialog.exec()
+
+    def _add_module(self, parent_task_def: dict, mtype: str, dialog: QDialog) -> None:
+        """Add a placeholder module of the given type as a child task."""
+        name, _ = TASK_TYPES[mtype]
+        new_task = {
+            "id": f"{mtype}-{uuid4().hex[:8]}",
+            "type": mtype,
+            "name": name,
+            "params": {},
+            "children": [],
+        }
+        if _task_kind(mtype) == "generate":
+            new_task["output"] = {"saved": False}
+        parent_task_def.setdefault("children", []).append(new_task)
+        if self.project is not None:
+            self.project.save()
+        self._refresh_workflow_tree()
+        dialog.accept()
+
+    # ----- module tabs ----------------------------------------------
+    def _build_module_toolbar(self, name: str, page: QWidget, include_save: bool = True,
+                              locked: bool = False) -> QFrame:
+        """Build the module toolbar (title + Save/Settings/Close, plus a lock badge)."""
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{name}</b>"))
+        if locked:
+            lock = QLabel()
+            lock.setPixmap(_lock_pixmap())
+            lock.setFixedSize(14, 14)
+            lock.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        if include_save:
+            save_btn = QPushButton("Save")
+            save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            save_btn.setEnabled(not locked)
+            tl.addWidget(save_btn)
+        settings_btn = QPushButton("Settings")
+        close_btn = QPushButton("Close")
+        for b in (settings_btn, close_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False, p=page: self._close_module_page(p))
+        tl.addWidget(settings_btn)
+        tl.addWidget(close_btn)
+        return bar
+
+    def _build_module_page(self, name: str, locked: bool = False) -> QWidget:
+        """Build a generic (placeholder) module page."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._build_module_toolbar(name, page, locked=locked))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(12, 12, 12, 12)
+        if locked:
+            note = QLabel("Draft (locked) — changes here are temporary and cannot be saved.")
+            note.setStyleSheet("color: #b58900;")
+            cl.addWidget(note)
+        hint = QLabel("Module content goes here (placeholder)")
+        hint.setStyleSheet("color: gray;")
+        cl.addWidget(hint)
+        cl.addStretch()
+        layout.addWidget(content, 1)
+        return page
+
+    def _build_generate_page(self, name: str, task_def: dict) -> QWidget:
+        """Build a generate-module page with Save (params) and Run (params + data)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{name}</b>"))
+        lock_label = QLabel()
+        lock_label.setPixmap(_lock_pixmap())
+        lock_label.setFixedSize(14, 14)
+        lock_label.setToolTip("Locked — generated data has been saved")
+        tl.addWidget(lock_label)
+        draft_label = QLabel("Draft (locked)")
+        draft_label.setStyleSheet("color: #b58900; font-weight: bold;")
+        tl.addWidget(draft_label)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        run_btn = QPushButton("Run")
+        close_btn = QPushButton("Close")
+        for b in (save_btn, run_btn, close_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False, p=page: self._close_module_page(p))
+        tl.addWidget(save_btn)
+        tl.addWidget(run_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(12, 12, 12, 12)
+        status = QLabel()
+        status.setWordWrap(True)
+        cl.addWidget(status)
+        hint = QLabel("Algorithm parameters (placeholder)")
+        hint.setStyleSheet("color: gray;")
+        cl.addWidget(hint)
+        cl.addStretch()
+        layout.addWidget(content, 1)
+
+        def refresh() -> None:
+            locked_now = bool(task_def.get("output", {}).get("saved"))
+            lock_label.setVisible(locked_now)
+            draft_label.setVisible(locked_now)
+            save_btn.setEnabled(not locked_now)
+            run_btn.setEnabled(not locked_now)
+            if locked_now:
+                status.setText("Generated data saved ✓ — module and its upstream are locked.")
+            else:
+                status.setText(
+                    "No generated data yet. Use Save to store parameters, "
+                    "or Run to generate and save data."
+                )
+
+        save_btn.clicked.connect(lambda _=False: self._generate_save(task_def))
+        run_btn.clicked.connect(lambda _=False: self._generate_run(task_def, refresh))
+        refresh()
+        return page
+
+    def _generate_save(self, task_def: dict) -> None:
+        """Save a generate module's parameters without generating data."""
+        task_def.setdefault("output", {"saved": False})
+        if self.project is not None:
+            self.project.save()
+        self.statusBar().showMessage("Parameters saved (no data generated)")
+
+    def _generate_run(self, task_def: dict, refresh) -> None:
+        """Generate data, save it, and lock the module and its upstream."""
+        task_def["output"] = {"saved": True}
+        if self.project is not None:
+            self.project.save()
+        self._refresh_workflow_tree()
+        refresh()
+        self.statusBar().showMessage("Data generated and saved — module locked")
+
+    def _build_data_import_page(self) -> QWidget:
+        """Build the Data Import page: Input | Parameter | Processed."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        locked = self._import_locked()
+        layout.addWidget(self._build_module_toolbar("Data Import", page, include_save=False, locked=locked))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        cl = QHBoxLayout(content)
+        cl.setContentsMargins(12, 12, 12, 12)
+        cl.setSpacing(12)
+        middle_panel = self._build_middle_panel()
+        input_panel = self._build_input_panel()
+        processed_panel = self._build_processed_panel()
+        cl.addWidget(input_panel, 1)
+        cl.addWidget(middle_panel, 1)
+        cl.addWidget(processed_panel, 1)
+        layout.addWidget(content, 1)
+        if locked:
+            self._set_import_controls_enabled(False)
+        return page
+
+    def _build_panel_frame(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("modulePanel")
+        panel.setStyleSheet(
+            "QFrame#modulePanel { background: #ffffff; "
+            "border: 1px solid #dbe3ec; border-radius: 6px; }"
+        )
+        return panel
+
+    def _build_placeholder_panel(self, title: str) -> QFrame:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.addWidget(QLabel(f"<b>{title}</b>"))
+        hint = QLabel("(to be implemented)")
+        hint.setStyleSheet("color: gray;")
+        lay.addWidget(hint)
+        lay.addStretch()
+        return panel
+
+    def _build_middle_panel(self) -> QWidget:
+        """Middle column: Parameter (top, 3) + Sample (bottom, 1)."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        layout.addWidget(self._build_parameter_panel(), 3)
+        layout.addWidget(self._build_sample_panel(), 1)
+        return container
+
+    def _build_sample_panel(self) -> QFrame:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Sample</b>"))
+
+        desc = QLabel("Sampling settings for the selected file.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #5a6673;")
+        lay.addWidget(desc)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.sample_combo = QComboBox()
+        self.sample_combo.addItem("Full sampling", "full")
+        self.sample_combo.addItem("Partial random sampling", "partial")
+        row.addWidget(self.sample_combo)
+
+        self.sample_percent_spin = QSpinBox()
+        self.sample_percent_spin.setRange(1, 100)
+        self.sample_percent_spin.setValue(10)
+        self.sample_percent_spin.setSuffix(" %")
+        self.sample_percent_spin.setVisible(False)
+        self.sample_percent_spin.setMaximumWidth(80)
+        row.addWidget(self.sample_percent_spin)
+
+        row.addStretch()
+
+        self.sample_apply_btn = QPushButton("Apply to")
+        self.sample_apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sample_apply_btn.clicked.connect(self._apply_sampling_to_files)
+        row.addWidget(self.sample_apply_btn)
+        lay.addLayout(row)
+
+        lay.addStretch()
+
+        self.sample_combo.currentIndexChanged.connect(self._on_sampling_changed)
+        self.sample_percent_spin.valueChanged.connect(self._on_sampling_changed)
+        return panel
+
+    def _build_processed_panel(self) -> QFrame:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Processed</b>"))
+        self.processed_list = QListWidget()
+        self.processed_list.setFrameShape(QFrame.Shape.NoFrame)
+        lay.addWidget(self.processed_list)
+        self._refresh_processed_panel()
+        return panel
+
+    def _refresh_processed_panel(self) -> None:
+        self.processed_list.clear()
+        for record in self._processed_files:
+            name = record.get("name", "")
+            rows = record.get("rows", "?")
+            item = QListWidgetItem(f"{name}  —  {rows} rows")
+            item.setToolTip(record.get("parquet", ""))
+            self.processed_list.addItem(item)
+
+    def _set_import_controls_enabled(self, enabled: bool) -> None:
+        """Enable/disable the Data Import controls (used when the task is locked)."""
+        widgets = [
+            self.select_btn, self.select_all_box, self.peek_btn, self.import_btn,
+            self.delete_btn, self.copy_params_btn, self.paste_params_btn,
+            self.apply_params_btn, self.sample_combo, self.sample_percent_spin,
+            self.sample_apply_btn,
+        ]
+        for widget in widgets:
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _build_parameter_panel(self) -> QFrame:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Parameter</b>"))
+
+        self.parameter_summary = QLabel("Select a file to see its parameters.")
+        self.parameter_summary.setWordWrap(True)
+        self.parameter_summary.setStyleSheet("color: #5a6673;")
+        lay.addWidget(self.parameter_summary)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(6)
+        self.copy_params_btn = QPushButton("Copy")
+        self.paste_params_btn = QPushButton("Paste")
+        self.apply_params_btn = QPushButton("Apply to")
+        for b in (self.copy_params_btn, self.paste_params_btn, self.apply_params_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_params_btn.clicked.connect(self._copy_parameters)
+        self.paste_params_btn.clicked.connect(self._paste_parameters)
+        self.apply_params_btn.clicked.connect(self._apply_to_files)
+        button_row.addWidget(self.copy_params_btn)
+        button_row.addWidget(self.paste_params_btn)
+        button_row.addWidget(self.apply_params_btn)
+        button_row.addStretch()
+        lay.addLayout(button_row)
+
+        self.parameter_scroll = QScrollArea()
+        self.parameter_scroll.setWidgetResizable(True)
+        self.parameter_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.parameter_scroll.setStyleSheet("background: transparent;")
+
+        self.parameter_rows = QWidget()
+        self.parameter_rows.setStyleSheet("background: transparent;")
+        self.parameter_rows_layout = QVBoxLayout(self.parameter_rows)
+        self.parameter_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.parameter_rows_layout.setSpacing(2)
+        self.parameter_scroll.setWidget(self.parameter_rows)
+        lay.addWidget(self.parameter_scroll, 1)
+        return panel
+
+    def _build_input_panel(self) -> QFrame:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Input</b>"))
+        header.addStretch()
+        self.select_btn = QPushButton("Select Files…")
+        self.select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_btn.clicked.connect(self._select_import_files)
+        header.addWidget(self.select_btn)
+        lay.addLayout(header)
+
+        self.select_all_box = QCheckBox("Select all")
+        self.select_all_box.setTristate(True)
+        lay.addWidget(self.select_all_box)
+
+        self.import_list = QListWidget()
+        self.import_list.setFrameShape(QFrame.Shape.NoFrame)
+        lay.addWidget(self.import_list)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.peek_btn = QPushButton("Peek")
+        self.peek_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.peek_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.peek_btn.clicked.connect(self._peek_files)
+        btn_row.addWidget(self.peek_btn, 1)
+        self.import_btn = QPushButton("Import")
+        self.import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.import_btn.clicked.connect(self._run_import)
+        btn_row.addWidget(self.import_btn, 1)
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.delete_btn.clicked.connect(self._delete_selected_files)
+        btn_row.addWidget(self.delete_btn, 1)
+        lay.addLayout(btn_row)
+
+        # Reset checkboxes to unchecked each time the module opens, so an
+        # accidental Peek doesn't overwrite carefully edited parameter names.
+        for entry in self._import_files:
+            entry["checked"] = False
+
+        self._refresh_import_list()
+
+        self.select_all_box.stateChanged.connect(self._on_select_all_state_changed)
+        self.import_list.itemChanged.connect(self._on_item_check_changed)
+        self.import_list.itemSelectionChanged.connect(self._on_import_selection_changed)
+        return panel
+
+    def _select_import_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select data files",
+            "",
+            "Data files (*.fcs *.csv *.tif *.tiff *.parquet);;All files (*)",
+        )
+        if not files:
+            return
+        for path in files:
+            self._import_files.append(
+                {
+                    "path": path,
+                    "status": "pending",
+                    "checked": True,
+                    "dimensions": None,
+                    "sampling": "full",
+                    "sampling_percent": 10,
+                }
+            )
+        self._persist_import_files()
+        self._refresh_import_list()
+
+    def _delete_selected_files(self) -> None:
+        """Remove the checked files from Input and their imported files from Processed."""
+        checked = [
+            i for i in range(self.import_list.count())
+            if self.import_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        if not checked:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete",
+            f"Delete {len(checked)} file(s)?\n"
+            "This will also delete their corresponding imported files (in Processed).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        for i in sorted(checked, reverse=True):
+            source = self._import_files[i]["path"]
+            for record in list(self._processed_files):
+                if record.get("source") == source:
+                    parquet = record.get("parquet")
+                    if parquet:
+                        try:
+                            Path(parquet).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            self._processed_files[:] = [
+                r for r in self._processed_files if r.get("source") != source
+            ]
+            del self._import_files[i]
+
+        self._persist_import_files()
+        self._refresh_import_list()
+        self._refresh_processed_panel()
+        self.statusBar().showMessage(f"Deleted {len(checked)} file(s)")
+
+    def _refresh_import_list(self) -> None:
+        self._updating_checks = True
+        self.import_list.clear()
+        name_counts = Counter(Path(e["path"]).name for e in self._import_files)
+        for entry in self._import_files:
+            path = entry["path"]
+            status = entry.get("status", "pending")
+            base = Path(path).name
+            if name_counts[base] > 1:
+                text = f"{base}  —  {Path(path).parent}"
+            else:
+                text = base
+
+            item = QListWidgetItem(text)
+            item.setToolTip(self._status_tooltip(entry))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if entry.get("checked", True)
+                else Qt.CheckState.Unchecked
+            )
+            color = IMPORT_STATUS_COLORS.get(status, IMPORT_STATUS_COLORS["pending"])
+            item.setIcon(QIcon(_dot_pixmap(color)))
+            self.import_list.addItem(item)
+        self._updating_checks = False
+        self._update_select_all_state()
+
+    def _status_tooltip(self, entry) -> str:
+        """Tooltip describing the status dot (and the error, if any)."""
+        status = entry.get("status", "pending")
+        tip = STATUS_DESCRIPTIONS.get(status, status)
+        if status == "error":
+            error = entry.get("error", "")
+            if error:
+                tip += f"\n{error}"
+        return tip
+
+    def _on_select_all_state_changed(self, state: int) -> None:
+        if self._updating_checks:
+            return
+        if state == Qt.CheckState.PartiallyChecked.value:
+            return
+        check_state = (
+            Qt.CheckState.Checked
+            if state == Qt.CheckState.Checked.value
+            else Qt.CheckState.Unchecked
+        )
+        self._updating_checks = True
+        for i in range(self.import_list.count()):
+            self.import_list.item(i).setCheckState(check_state)
+        self._updating_checks = False
+
+    def _on_item_check_changed(self, item) -> None:
+        if self._updating_checks:
+            return
+        index = self.import_list.row(item)
+        if 0 <= index < len(self._import_files):
+            checked = item.checkState() == Qt.CheckState.Checked
+            if self._import_files[index].get("checked", True) != checked:
+                self._import_files[index]["checked"] = checked
+                self._persist_import_files()
+        self._update_select_all_state()
+
+    def _update_select_all_state(self) -> None:
+        total = self.import_list.count()
+        checked = sum(
+            1
+            for i in range(total)
+            if self.import_list.item(i).checkState() == Qt.CheckState.Checked
+        )
+        if total == 0 or checked == 0:
+            state = Qt.CheckState.Unchecked
+        elif checked == total:
+            state = Qt.CheckState.Checked
+        else:
+            state = Qt.CheckState.PartiallyChecked
+        self._updating_checks = True
+        self.select_all_box.setCheckState(state)
+        self._updating_checks = False
+
+    def _peek_files(self) -> None:
+        """Read dimension info for each checked file, with a progress bar."""
+        checked = [
+            i for i in range(self.import_list.count())
+            if self.import_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        if not checked:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Peek",
+            f"Peek will overwrite the parameter name settings of "
+            f"{len(checked)} selected file(s). Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        progress = QProgressDialog("Peeking files...", "Cancel", 0, len(checked), self)
+        progress.setWindowTitle("Peek")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        for step, i in enumerate(checked):
+            if progress.wasCanceled():
+                break
+            entry = self._import_files[i]
+            try:
+                entry["dimensions"] = read_dimensions(entry["path"])
+                entry["parameters"] = [
+                    {"name": n, "extract": True, "rename": n}
+                    for n in parameter_names(entry["dimensions"])
+                ]
+                entry["status"] = "peeked"
+                entry["error"] = None
+            except Exception as exc:
+                entry["status"] = "error"
+                entry["error"] = str(exc)
+            progress.setValue(step + 1)
+            QApplication.processEvents()
+
+        self._persist_import_files()
+        self._refresh_import_list()
+        progress.close()
+
+    def _run_import(self) -> None:
+        """Import each checked file: extract+rename columns, sample, write Parquet."""
+        if self.project is None:
+            return
+        checked = [
+            i for i in range(self.import_list.count())
+            if self.import_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        if not checked:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Import",
+            "Importing will overwrite already-imported files. "
+            "Are you sure you want to import?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Import",
+            f"You have checked {len(checked)} file(s). Are these the correct files?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        not_peeked = [
+            Path(self._import_files[i]["path"]).name
+            for i in checked
+            if not self._import_files[i].get("parameters")
+        ]
+        if not_peeked:
+            QMessageBox.warning(
+                self,
+                "Import",
+                "The following files have not been peeked yet and need to be "
+                "peeked first:\n" + "\n".join(not_peeked),
+            )
+            return
+
+        progress = QProgressDialog("Importing files...", "Cancel", 0, len(checked), self)
+        progress.setWindowTitle("Import")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+
+        for step, i in enumerate(checked):
+            if progress.wasCanceled():
+                break
+            entry = self._import_files[i]
+            try:
+                out_path = self.project.data_dir / f"{Path(entry['path']).stem}.parquet"
+                result = import_file(
+                    entry["path"],
+                    entry.get("parameters") or [],
+                    entry.get("sampling", "full"),
+                    entry.get("sampling_percent", 10),
+                    out_path,
+                )
+                entry["status"] = "processed"
+                entry["error"] = None
+                entry["imported"] = {
+                    "parquet": str(out_path),
+                    "rows": result["rows"],
+                    "columns": result["columns"],
+                }
+                self._processed_files[:] = [
+                    r for r in self._processed_files if r.get("source") != entry["path"]
+                ]
+                self._processed_files.append({
+                    "name": Path(entry["path"]).name,
+                    "source": entry["path"],
+                    "parquet": str(out_path),
+                    "rows": result["rows"],
+                    "columns": result["columns"],
+                })
+            except Exception as exc:
+                entry["status"] = "error"
+                entry["error"] = str(exc)
+                entry["imported"] = None
+            progress.setValue(step + 1)
+            QApplication.processEvents()
+
+        self._persist_import_files()
+        self._refresh_import_list()
+        self._refresh_processed_panel()
+        progress.close()
+
+    def _on_import_selection_changed(self) -> None:
+        item = self.import_list.currentItem()
+        if item is None:
+            self._show_file_parameters(None)
+            return
+        index = self.import_list.row(item)
+        if 0 <= index < len(self._import_files):
+            self._show_file_parameters(self._import_files[index])
+        else:
+            self._show_file_parameters(None)
+
+    def _show_file_parameters(self, entry) -> None:
+        self._current_entry = entry
+        self._show_file_sampling(entry)
+        self._clear_parameter_rows()
+        if entry is None:
+            self.parameter_summary.setText("Select a file to see its parameters.")
+            self.parameter_rows_layout.addStretch()
+            return
+
+        dims = entry.get("dimensions")
+        base = Path(entry["path"]).name
+        if dims is None:
+            if entry.get("status") == "error":
+                self.parameter_summary.setText(f"{base}\nStatus: error (Peek failed)")
+            else:
+                self.parameter_summary.setText(
+                    f"{base}\nStatus: not peeked yet — click Peek first"
+                )
+            self.parameter_rows_layout.addStretch()
+            return
+
+        kind = dims.get("kind")
+        if kind == "fcs":
+            info = (
+                f"FCS  ·  {dims.get('rows')} events  ·  "
+                f"{len(dims.get('columns', []))} channels"
+            )
+        elif kind == "image":
+            info = (
+                f"Image  ·  shape {tuple(dims.get('shape', []))}  ·  "
+                f"{dims.get('channels')} channels"
+            )
+        else:
+            info = (
+                f"Table  ·  {dims.get('rows')} rows  ·  "
+                f"{len(dims.get('columns', []))} columns"
+            )
+        self.parameter_summary.setText(f"{base}\n{info}")
+
+        params = entry.get("parameters")
+        if params is None:
+            params = [
+                {"name": n, "extract": True, "rename": n}
+                for n in parameter_names(dims)
+            ]
+            entry["parameters"] = params
+            self._persist_import_files()
+
+        # Column headers
+        header = QWidget()
+        hh = QHBoxLayout(header)
+        hh.setContentsMargins(0, 2, 0, 4)
+        hh.setSpacing(6)
+        header_style = "font-weight: bold; color: #5a6673;"
+        h_orig = QLabel("Original name")
+        h_orig.setMinimumWidth(PARAM_ORIG_WIDTH)
+        h_orig.setStyleSheet(header_style)
+        hh.addWidget(h_orig)
+        h_inc = QLabel("Extract")
+        h_inc.setStyleSheet(header_style)
+        hh.addWidget(h_inc)
+        h_new = QLabel("Imported name")
+        h_new.setStyleSheet(header_style)
+        hh.addWidget(h_new, 1)
+        self.parameter_rows_layout.addWidget(header)
+
+        locked = self._import_locked()
+        for param in params:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 2, 0, 2)
+            h.setSpacing(6)
+
+            orig_label = QLabel(param.get("name", ""))
+            orig_label.setMinimumWidth(PARAM_ORIG_WIDTH)
+            orig_label.setStyleSheet("color: #2c3a48;")
+            h.addWidget(orig_label)
+
+            check = QCheckBox()
+            check.setChecked(param.get("extract", True))
+            check.setToolTip("Extract this parameter")
+            check.setEnabled(not locked)
+            h.addWidget(check)
+
+            line_edit = QLineEdit(param.get("rename", param.get("name", "")))
+            line_edit.setPlaceholderText("parameter name")
+            line_edit.setEnabled((not locked) and param.get("extract", True))
+            line_edit.setToolTip("Rename this parameter (used after import)")
+            h.addWidget(line_edit, 1)
+
+            check.toggled.connect(
+                lambda checked, pp=param, ll=line_edit:
+                    self._on_param_extract_toggled(pp, ll, checked)
+            )
+            line_edit.editingFinished.connect(
+                lambda pp=param, ll=line_edit: self._on_param_renamed(pp, ll)
+            )
+
+            self.parameter_rows_layout.addWidget(row)
+
+        self.parameter_rows_layout.addStretch()
+
+    def _clear_parameter_rows(self) -> None:
+        while self.parameter_rows_layout.count():
+            item = self.parameter_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()  # avoid a visible top-level window while detaching
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _on_param_extract_toggled(self, param, line_edit, checked) -> None:
+        param["extract"] = checked
+        line_edit.setEnabled(checked)
+        self._persist_import_files()
+
+    def _on_param_renamed(self, param, line_edit) -> None:
+        param["rename"] = line_edit.text().strip() or param.get("name", "")
+        self._persist_import_files()
+
+    def _copy_parameters(self) -> None:
+        self._flash_button(self.copy_params_btn)
+        entry = self._current_entry
+        if entry is None or not entry.get("parameters"):
+            QMessageBox.information(self, "Copy", "No parameters to copy. Peek a file first.")
+            return
+        lines = ["Original name\tExtract\tImported name"]
+        for p in entry["parameters"]:
+            extract = "True" if p.get("extract", True) else "False"
+            lines.append(f"{p.get('name', '')}\t{extract}\t{p.get('rename', '')}")
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Parameters copied to clipboard")
+
+    def _paste_parameters(self) -> None:
+        self._flash_button(self.paste_params_btn)
+        entry = self._current_entry
+        if entry is None or not entry.get("parameters"):
+            QMessageBox.information(self, "Paste", "No parameters to paste into. Peek a file first.")
+            return
+
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            QMessageBox.warning(self, "Paste", "Clipboard is empty.")
+            return
+
+        rows = []
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            fields = line.split("\t")
+            if len(fields) != 3:
+                QMessageBox.warning(
+                    self,
+                    "Paste",
+                    f"Format error on line {line_number}: expected 3 tab-separated "
+                    f"columns (Original name, Extract, Imported name), got {len(fields)}.",
+                )
+                return
+            rows.append(fields)
+
+        # Skip the header row if present (e.g. from a previous Copy).
+        if (
+            rows
+            and rows[0][0].strip().lower() == "original name"
+            and rows[0][1].strip().lower() in ("extract", "include")
+        ):
+            rows = rows[1:]
+
+        params = entry["parameters"]
+        if len(rows) != len(params):
+            QMessageBox.warning(
+                self,
+                "Paste",
+                f"Count mismatch: this file has {len(params)} parameters, "
+                f"but you pasted {len(rows)} rows.",
+            )
+            return
+
+        by_name = {r[0].strip(): r for r in rows}
+        if len(by_name) != len(rows):
+            QMessageBox.warning(self, "Paste", "Duplicate original names in pasted data.")
+            return
+
+        pasted_names = set(by_name)
+        param_names = {p.get("name", "") for p in params}
+        if pasted_names != param_names:
+            missing = sorted(param_names - pasted_names)
+            extra = sorted(pasted_names - param_names)
+            message = "Original names do not match."
+            if missing:
+                message += f"\nMissing from paste: {', '.join(missing)}"
+            if extra:
+                message += f"\nUnexpected in paste: {', '.join(extra)}"
+            QMessageBox.warning(self, "Paste", message)
+            return
+
+        for p in params:
+            name = p.get("name", "")
+            extract_text = by_name[name][1].strip()
+            rename = by_name[name][2].strip()
+            p["extract"] = extract_text.lower() in ("true", "1", "yes", "y", "t")
+            p["rename"] = rename or name
+
+        self._persist_import_files()
+        self._show_file_parameters(entry)
+        self.statusBar().showMessage("Parameters pasted")
+
+    def _flash_button(self, button) -> None:
+        """Briefly highlight a button so the user sees the click registered."""
+        if button is None:
+            return
+        button.setStyleSheet(
+            "QPushButton { background: #dbeafa; border: 1px solid #5aa0e0; color: #1d4f7a; }"
+        )
+        QTimer.singleShot(250, lambda: button.setStyleSheet(""))
+
+    def _apply_to_files(self) -> None:
+        self._flash_button(self.apply_params_btn)
+        entry = self._current_entry
+        if entry is None or not entry.get("parameters"):
+            QMessageBox.information(self, "Apply to", "No parameters to apply. Peek a file first.")
+            return
+
+        candidates = self._find_same_parameter_files(entry)
+        if not candidates:
+            QMessageBox.information(
+                self, "Apply to", "No other files have the same parameter names."
+            )
+            return
+
+        selected = self._show_apply_dialog(candidates)
+        if not selected:
+            return
+
+        self._apply_parameter_settings(entry, selected)
+        self._persist_import_files()
+        self.statusBar().showMessage(f"Applied to {len(selected)} file(s)")
+
+    def _find_same_parameter_files(self, entry):
+        """Return indices of files whose parameter names match the given entry's."""
+        current_names = {p["name"] for p in entry["parameters"]}
+        candidates = []
+        for i, other in enumerate(self._import_files):
+            if other is entry:
+                continue
+            params = other.get("parameters")
+            if params and {p["name"] for p in params} == current_names:
+                candidates.append(i)
+        return candidates
+
+    def _show_apply_dialog(self, candidates):
+        """Show a dialog to choose which files to apply the settings to."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Apply to")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Apply current parameter settings to:"))
+
+        file_list = QListWidget()
+        for idx in candidates:
+            name = Path(self._import_files[idx]["path"]).name
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, idx)
+            file_list.addItem(item)
+        layout.addWidget(file_list)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        confirm_btn = QPushButton("Confirm")
+        cancel_btn = QPushButton("Cancel")
+        confirm_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_row.addWidget(confirm_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        dialog.exec()
+        if dialog.result() != QDialog.DialogCode.Accepted.value:
+            return None
+
+        selected = []
+        for i in range(file_list.count()):
+            item = file_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected.append(item.data(Qt.ItemDataRole.UserRole))
+        return selected
+
+    def _apply_parameter_settings(self, entry, indices) -> None:
+        """Copy the entry's extract/rename settings to the given files by name."""
+        settings = {
+            p["name"]: (p.get("extract", True), p.get("rename", p.get("name", "")))
+            for p in entry["parameters"]
+        }
+        for idx in indices:
+            other = self._import_files[idx]
+            for p in other["parameters"]:
+                name = p["name"]
+                if name in settings:
+                    extract, rename = settings[name]
+                    p["extract"] = extract
+                    p["rename"] = rename
+
+    def _show_file_sampling(self, entry) -> None:
+        self._updating_sample = True
+        if entry is None:
+            self.sample_combo.setCurrentIndex(0)
+            self.sample_percent_spin.setVisible(False)
+        else:
+            sampling = entry.get("sampling", "full")
+            index = self.sample_combo.findData(sampling)
+            if index < 0:
+                index = 0
+            self.sample_combo.setCurrentIndex(index)
+            self.sample_percent_spin.setValue(int(entry.get("sampling_percent", 10)))
+            self.sample_percent_spin.setVisible(sampling == "partial")
+        self._updating_sample = False
+
+    def _on_sampling_changed(self) -> None:
+        if self._updating_sample:
+            return
+        entry = self._current_entry
+        if entry is None:
+            return
+        sampling = self.sample_combo.currentData()
+        entry["sampling"] = sampling
+        entry["sampling_percent"] = self.sample_percent_spin.value()
+        self.sample_percent_spin.setVisible(sampling == "partial")
+        self._persist_import_files()
+
+    def _apply_sampling_to_files(self) -> None:
+        self._flash_button(self.sample_apply_btn)
+        entry = self._current_entry
+        if entry is None:
+            QMessageBox.information(self, "Apply to", "No file selected.")
+            return
+
+        sampling = entry.get("sampling", "full")
+        percent = int(entry.get("sampling_percent", 10))
+
+        candidates = [i for i, other in enumerate(self._import_files) if other is not entry]
+        if not candidates:
+            QMessageBox.information(self, "Apply to", "No other files to apply to.")
+            return
+
+        selected = self._show_apply_dialog(candidates)
+        if not selected:
+            return
+
+        for idx in selected:
+            self._import_files[idx]["sampling"] = sampling
+            self._import_files[idx]["sampling_percent"] = percent
+
+        self._persist_import_files()
+        self.statusBar().showMessage(f"Applied sampling to {len(selected)} file(s)")
+
+    # ----- figure module (visualize) ---------------------------------
+    def _imported_files(self) -> list:
+        """Return the imported (Processed) file records from the import task."""
+        task = self._import_task()
+        if task is None:
+            return []
+        return task.get("params", {}).get("processed", [])
+
+    def _figure_record(self, file_path):
+        """Return the imported-file record matching a parquet path, or None."""
+        for rec in self._imported_files():
+            if rec.get("parquet") == file_path:
+                return rec
+        return None
+
+    def _clear_layout(self, layout) -> None:
+        """Remove and delete every widget/layout inside a layout."""
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()  # avoid a visible top-level window while detaching
+                widget.setParent(None)
+                widget.deleteLater()
+            elif item.layout() is not None:
+                self._clear_layout(item.layout())
+
+    def _build_figure_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Figure page: Figures canvas (3) | Settings (1)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        # Toolbar with a Save button (figure changes are saved only on click).
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{name}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._figure_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        cl = QHBoxLayout(content)
+        cl.setContentsMargins(12, 12, 12, 12)
+        cl.setSpacing(12)
+
+        # Left: zoomable flow canvas (Word-like, auto-wrapping rows).
+        fig_panel = self._build_panel_frame()
+        fl = QVBoxLayout(fig_panel)
+        fl.setContentsMargins(10, 10, 10, 10)
+        fl.setSpacing(6)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Figures</b>"))
+        header.addStretch()
+        add_scatter = QPushButton("Add Scatter")
+        add_hist = QPushButton("Add Histogram")
+        add_scatter.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_hist.setCursor(Qt.CursorShape.PointingHandCursor)
+        header.addWidget(add_scatter)
+        header.addWidget(add_hist)
+        fl.addLayout(header)
+
+        scene = QGraphicsScene()
+        canvas_view = _ZoomableGraphicsView(scene)
+        fl.addWidget(canvas_view, 1)
+
+        # Right: settings panel.
+        settings_panel = self._build_panel_frame()
+        sl = QVBoxLayout(settings_panel)
+        sl.setContentsMargins(10, 10, 10, 10)
+        sl.setSpacing(6)
+        sl.addWidget(QLabel("<b>Settings</b>"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
+        host = QWidget()
+        host.setStyleSheet("background: transparent;")
+        settings_layout = QVBoxLayout(host)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(6)
+        scroll.setWidget(host)
+        sl.addWidget(scroll, 1)
+
+        cl.addWidget(fig_panel, 3)
+        cl.addWidget(settings_panel, 1)
+        layout.addWidget(content, 1)
+
+        # Per-page state (each Figure module instance has its own).
+        page._fig_snapshot = copy.deepcopy(task_def.get("params", {}))
+        page._fig_task_def = task_def
+        page._fig_plots = task_def.setdefault("params", {}).setdefault("plots", [])
+        page._fig_cards = []
+        page._fig_scene = scene
+        page._fig_view = canvas_view
+        page._fig_selected = -1
+        page._fig_settings_layout = settings_layout
+        page._fig_locked = locked
+        page._fig_save_btn = save_btn
+        page._fig_dirty = False
+        save_btn.clicked.connect(lambda _=False: self._figure_save_now(page))
+        self._figure_update_save_btn(page)
+        canvas_view.enter_callback = lambda: self._figure_toggle_break(page, page._fig_selected)
+        canvas_view.delete_callback = lambda: self._figure_delete_selected(page)
+
+        for plot_dict in page._fig_plots:
+            self._figure_new_card(page, plot_dict)
+
+        add_scatter.clicked.connect(lambda _=False: self._figure_add_plot(page, "scatter"))
+        add_hist.clicked.connect(lambda _=False: self._figure_add_plot(page, "histogram"))
+
+        if locked:
+            add_scatter.setEnabled(False)
+            add_hist.setEnabled(False)
+
+        self._figure_relayout(page)
+        if page._fig_plots:
+            self._figure_select(page, 0)
+        else:
+            self._figure_rebuild_settings(page)
+        return page
+
+    def _figure_new_card(self, page, plot_dict) -> int:
+        """Create a plot card for one plot, wrap it in a proxy, and render."""
+        import pyqtgraph as pg
+        plot_widget = pg.PlotWidget()
+        plot_widget.setBackground("w")
+        plot_widget.showGrid(x=True, y=True, alpha=0.2)
+        title = plot_dict.get("title") or plot_dict.get("type", "Plot").title()
+
+        index = len(page._fig_cards)
+        size = plot_dict.get("size")
+        if size is None:
+            size = [440, 340]
+            plot_dict["size"] = list(size)
+        w, h = int(size[0]), int(size[1])
+
+        card = _FigureCard(
+            title, plot_widget, index,
+            select_callback=lambda i: self._figure_select(page, i),
+        )
+        proxy = _CardProxy(
+            on_select=lambda: self._figure_select(page, card.index()),
+            on_drop=lambda pos: self._figure_reorder(page, card.index(), pos),
+        )
+        proxy.setWidget(card)
+        proxy.resize(w, h)
+        page._fig_scene.addItem(proxy)
+        card._proxy = proxy
+
+        # Clicking the plot (not just the title bar) also selects the card.
+        click_filter = _ClickFilter(card.select)
+        card.installEventFilter(click_filter)
+        plot_widget.viewport().installEventFilter(click_filter)
+        page._fig_filters = getattr(page, "_fig_filters", [])
+        page._fig_filters.append(click_filter)
+
+        page._fig_cards.append(card)
+        self._figure_render(plot_dict, plot_widget)
+        self._figure_relayout(page)
+        return index
+
+    def _figure_resize_card(self, page, index: int, w: int, h: int) -> None:
+        if 0 <= index < len(page._fig_plots):
+            page._fig_plots[index]["size"] = [int(w), int(h)]
+            try:
+                page._fig_cards[index].proxy().resize(int(w), int(h))
+            except RuntimeError:
+                return  # proxy already deleted (e.g. during teardown)
+            self._figure_relayout(page)
+
+    def _figure_mark_dirty(self, page) -> None:
+        page._fig_dirty = True
+        self._figure_update_save_btn(page)
+
+    def _figure_save_now(self, page) -> None:
+        if self.project is not None:
+            self.project.save()
+        page._fig_snapshot = copy.deepcopy(page._fig_task_def.get("params", {}))
+        page._fig_dirty = False
+        self._figure_update_save_btn(page)
+        self.statusBar().showMessage("Figure saved")
+
+    def _figure_close(self, page) -> None:
+        """Close the page, prompting first if there are unsaved changes."""
+        if page._fig_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Close Figure",
+                "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._fig_task_def["params"] = page._fig_snapshot
+        self._close_module_page(page)
+
+    def _figure_update_save_btn(self, page) -> None:
+        page._fig_save_btn.setEnabled(page._fig_dirty and not page._fig_locked)
+
+    def _figure_reorder(self, page, index: int, scene_pos) -> None:
+        plots = page._fig_plots
+        cards = page._fig_cards
+        if not (0 <= index < len(plots)):
+            return
+        new_index = self._figure_drop_index(page, index, scene_pos)
+        if new_index == index:
+            self._figure_relayout(page)
+            return
+        plots.insert(new_index, plots.pop(index))
+        cards.insert(new_index, cards.pop(index))
+        for i, card in enumerate(cards):
+            card.set_index(i)
+        page._fig_selected = new_index
+        self._figure_relayout(page)
+        self._figure_mark_dirty(page)
+
+    def _figure_flow_positions(self, cards, plots) -> list:
+        """Compute (x, y, w, h) flow positions, wrapping on explicit line breaks."""
+        margin, gap = 16, 12
+        positions = []
+        x, y, row_h = margin, margin, 0
+        first = True
+        for i, card in enumerate(cards):
+            proxy = card.proxy()
+            w = int(proxy.size().width())
+            h = int(proxy.size().height())
+            if not first and plots[i].get("break_before", False):
+                x = margin
+                y += row_h + gap
+                row_h = 0
+            positions.append((x, y, w, h))
+            x += w + gap
+            row_h = max(row_h, h)
+            first = False
+        return positions
+
+    def _figure_drop_index(self, page, index: int, scene_pos) -> int:
+        """Compute the insertion index for the dragged card at `scene_pos`."""
+        others_cards = [c for i, c in enumerate(page._fig_cards) if i != index]
+        others_plots = [p for i, p in enumerate(page._fig_plots) if i != index]
+        if not others_cards:
+            return 0
+        pos = self._figure_flow_positions(others_cards, others_plots)
+        px, py = scene_pos.x(), scene_pos.y()
+        idx = 0
+        for i, (x0, y0, w, h) in enumerate(pos):
+            cx, cy = x0 + w / 2.0, y0 + h / 2.0
+            if cy + h / 2.0 < py:
+                idx = i + 1
+            elif cy - h / 2.0 <= py:
+                if cx < px:
+                    idx = i + 1
+                else:
+                    break
+            else:
+                break
+        return idx
+
+    def _figure_toggle_break(self, page, index: int) -> None:
+        """Toggle a line break before the selected plot (like pressing Enter)."""
+        if 0 <= index < len(page._fig_plots):
+            p = page._fig_plots[index]
+            p["break_before"] = not p.get("break_before", False)
+            self._figure_relayout(page)
+            self._figure_mark_dirty(page)
+
+    def _figure_delete_selected(self, page) -> None:
+        """Delete the currently selected plot."""
+        index = page._fig_selected
+        if not (0 <= index < len(page._fig_plots)):
+            return
+        page._fig_plots.pop(index)
+        card = page._fig_cards.pop(index)
+        proxy = card.proxy()
+        page._fig_scene.removeItem(proxy)
+        proxy.deleteLater()
+        for i, c in enumerate(page._fig_cards):
+            c.set_index(i)
+        if page._fig_cards:
+            page._fig_selected = min(index, len(page._fig_cards) - 1)
+            self._figure_relayout(page)
+            self._figure_select(page, page._fig_selected)
+        else:
+            page._fig_selected = -1
+            self._figure_relayout(page)
+            self._figure_rebuild_settings(page)
+        self._figure_mark_dirty(page)
+
+    def _figure_relayout(self, page) -> None:
+        """Flow-layout the cards (Word-like): one row, wrapped by line breaks."""
+        positions = self._figure_flow_positions(page._fig_cards, page._fig_plots)
+        for (x, y, w, h), card in zip(positions, page._fig_cards):
+            card.proxy().setPos(x, y)
+        self._figure_update_scene_rect(page)
+
+    def _figure_update_scene_rect(self, page) -> None:
+        if not page._fig_cards:
+            page._fig_scene.setSceneRect(0, 0, 800, 600)
+            return
+        rect = page._fig_scene.itemsBoundingRect()
+        page._fig_scene.setSceneRect(rect.adjusted(-16, -16, 16, 16))
+
+    def _figure_add_plot(self, page, ptype: str) -> None:
+        """Append a new plot (scatter or histogram) and select it."""
+        records = self._imported_files()
+        rec = records[0] if records else None
+        columns = list(rec.get("columns") or []) if rec else []
+        x = columns[0] if columns else None
+        y = columns[1] if len(columns) > 1 else x
+        count = sum(1 for p in page._fig_plots if p.get("type") == ptype)
+        plot_dict = {
+            "type": ptype,
+            "title": f"{ptype.title()} {count + 1}",
+            "file": rec.get("parquet") if rec else None,
+            "file_name": rec.get("name") if rec else None,
+            "x": x,
+            "y": y if ptype == "scatter" else None,
+            "color_mode": "density",
+            "color_param": x,
+            "palette": "viridis",
+            "xmin": None,
+            "xmax": None,
+            "ymin": None,
+            "ymax": None,
+            "break_before": False,
+        }
+        page._fig_plots.append(plot_dict)
+        index = self._figure_new_card(page, plot_dict)
+        self._figure_mark_dirty(page)
+        self._figure_select(page, index)
+
+    def _figure_render(self, plot_dict: dict, plot_widget) -> None:
+        """(Re)draw a plot widget from its plot_dict."""
+        if plot_dict.get("type") == "histogram":
+            self._figure_render_histogram(plot_dict, plot_widget)
+        else:
+            self._figure_render_scatter(plot_dict, plot_widget)
+
+    def _figure_render_scatter(self, plot_dict: dict, plot_widget) -> None:
+        import numpy as np
+        import pandas as pd
+
+        plot_widget.clear()
+        rec = self._figure_record(plot_dict.get("file"))
+        x_name = plot_dict.get("x")
+        y_name = plot_dict.get("y")
+        if not rec or not x_name or not y_name:
+            return
+
+        columns = [x_name, y_name]
+        mode = plot_dict.get("color_mode", "density")
+        color_param = plot_dict.get("color_param") if mode == "parameter" else None
+        if color_param and color_param not in columns:
+            columns.append(color_param)
+
+        try:
+            df = pd.read_parquet(rec["parquet"], columns=columns)
+        except Exception:
+            return
+
+        x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
+        y = pd.to_numeric(df[y_name], errors="coerce").to_numpy(dtype="float64")
+        keep = np.isfinite(x) & np.isfinite(y)
+        x, y = x[keep], y[keep]
+        if x.size == 0:
+            return
+        # Cache the data range so the settings panel can pre-fill Auto values.
+        plot_widget._data_xmin = float(x.min())
+        plot_widget._data_xmax = float(x.max())
+        plot_widget._data_ymin = float(y.min())
+        plot_widget._data_ymax = float(y.max())
+
+        cmap = _figure_colormap(plot_dict.get("palette", "viridis"))
+
+        if mode == "parameter" and color_param:
+            values = pd.to_numeric(df[color_param], errors="coerce").to_numpy(dtype="float64")[keep]
+        else:
+            # Density: color each actual point by its local (binned) density,
+            # without painting empty regions of the plot.
+            hist, xe, ye = np.histogram2d(x, y, bins=200)
+            xi = np.clip(np.digitize(x, xe) - 1, 0, hist.shape[0] - 1)
+            yi = np.clip(np.digitize(y, ye) - 1, 0, hist.shape[1] - 1)
+            values = np.log1p(hist[xi, yi].astype(float))
+
+        self._figure_draw_colored_scatter(plot_widget, x, y, values, cmap)
+        self._figure_apply_ranges(plot_dict, plot_widget)
+
+    def _figure_draw_colored_scatter(self, plot_widget, x, y, values, cmap,
+                                     max_points: int = 50000) -> None:
+        """Draw points colored by `values`, normalized through the colormap."""
+        import numpy as np
+        import pyqtgraph as pg
+
+        lo = float(np.nanmin(values))
+        hi = float(np.nanmax(values))
+        if not np.isfinite(lo):
+            lo = 0.0
+        if not np.isfinite(hi) or hi <= lo:
+            hi = lo + 1.0
+
+        if x.size > max_points:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(x.size, max_points, replace=False)
+            x, y, values = x[idx], y[idx], values[idx]
+
+        norm = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+        rgba = cmap.map(norm, mode="byte")
+        brushes = [pg.mkBrush(int(r), int(g), int(b), 200) for r, g, b, _ in rgba]
+        plot_widget.addItem(
+            pg.ScatterPlotItem(x=x, y=y, symbol="o", size=4, pen=None, brush=brushes)
+        )
+
+    def _figure_render_histogram(self, plot_dict: dict, plot_widget) -> None:
+        import numpy as np
+        import pandas as pd
+        import pyqtgraph as pg
+
+        plot_widget.clear()
+        rec = self._figure_record(plot_dict.get("file"))
+        x_name = plot_dict.get("x")
+        if not rec or not x_name:
+            return
+        try:
+            df = pd.read_parquet(rec["parquet"], columns=[x_name])
+        except Exception:
+            return
+        x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return
+        plot_widget._data_xmin = float(x.min())
+        plot_widget._data_xmax = float(x.max())
+        counts, edges = np.histogram(x, bins=256)
+        plot_widget.addItem(
+            pg.PlotDataItem(
+                edges, counts, stepMode="center", fillLevel=0,
+                brush=(0, 0, 200, 60), pen=(0, 0, 200),
+            )
+        )
+        self._figure_apply_ranges(plot_dict, plot_widget)
+
+    def _figure_apply_ranges(self, plot_dict: dict, plot_widget) -> None:
+        """Apply manual/auto X and Y ranges from the plot settings."""
+        xmin, xmax = plot_dict.get("xmin"), plot_dict.get("xmax")
+        if xmin is not None and xmax is not None and xmax > xmin:
+            plot_widget.setXRange(float(xmin), float(xmax), padding=0)
+        else:
+            plot_widget.enableAutoRange("x", True)
+        ymin, ymax = plot_dict.get("ymin"), plot_dict.get("ymax")
+        if ymin is not None and ymax is not None and ymax > ymin:
+            plot_widget.setYRange(float(ymin), float(ymax), padding=0)
+        else:
+            plot_widget.enableAutoRange("y", True)
+
+    def _figure_apply_change(self, page, index: int, plot_dict: dict) -> None:
+        """Re-render a plot after a settings change (marks the page dirty)."""
+        if 0 <= index < len(page._fig_cards):
+            self._figure_render(plot_dict, page._fig_cards[index].plot_widget())
+        self._figure_mark_dirty(page)
+
+    def _figure_select(self, page, index: int) -> None:
+        """Mark the plot at `index` selected and refresh its settings."""
+        page._fig_selected = index
+        for i, card in enumerate(page._fig_cards):
+            card.set_selected(i == index)
+        self._figure_rebuild_settings(page)
+        page._fig_view.setFocus()
+
+    def _figure_rebuild_settings(self, page) -> None:
+        """Rebuild the right-hand settings panel for the selected plot."""
+        layout = page._fig_settings_layout
+        self._clear_layout(layout)
+        index = page._fig_selected
+        if index < 0 or index >= len(page._fig_plots):
+            hint = QLabel("Add a plot to see its settings.")
+            hint.setStyleSheet("color: gray;")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            layout.addStretch()
+            return
+
+        plot_dict = page._fig_plots[index]
+        locked = page._fig_locked
+        enabled = not locked
+        if locked:
+            note = QLabel("Draft (locked) — settings are read-only.")
+            note.setStyleSheet("color: #b58900;")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+
+        records = self._imported_files()
+        rec = self._figure_record(plot_dict.get("file"))
+        columns = list(rec.get("columns") or []) if rec else []
+
+        # File.
+        layout.addWidget(QLabel("File"))
+        file_combo = QComboBox()
+        for r in records:
+            file_combo.addItem(r.get("name", ""), r.get("parquet", ""))
+        if plot_dict.get("file") is not None:
+            idx = file_combo.findData(plot_dict.get("file"))
+            if idx >= 0:
+                file_combo.setCurrentIndex(idx)
+        file_combo.setEnabled(enabled)
+        layout.addWidget(file_combo)
+
+        # X parameter.
+        layout.addWidget(QLabel("X parameter"))
+        x_combo = self._figure_param_combo(columns, plot_dict.get("x"), enabled)
+        layout.addWidget(x_combo)
+
+        y_combo = None
+        mode_combo = None
+        palette_combo = None
+        cp_combo = None
+
+        if plot_dict.get("type") == "scatter":
+            layout.addWidget(QLabel("Y parameter"))
+            y_combo = self._figure_param_combo(columns, plot_dict.get("y"), enabled)
+            layout.addWidget(y_combo)
+
+            layout.addWidget(QLabel("Color mode"))
+            mode_combo = QComboBox()
+            for text, val in FIGURE_COLOR_MODES:
+                mode_combo.addItem(text, val)
+            idx = mode_combo.findData(plot_dict.get("color_mode", "density"))
+            mode_combo.setCurrentIndex(max(0, idx))
+            mode_combo.setEnabled(enabled)
+            layout.addWidget(mode_combo)
+
+            if plot_dict.get("color_mode") == "parameter":
+                layout.addWidget(QLabel("Color parameter"))
+                cp_combo = self._figure_param_combo(columns, plot_dict.get("color_param"), enabled)
+                layout.addWidget(cp_combo)
+
+            layout.addWidget(QLabel("Palette"))
+            palette_combo = QComboBox()
+            palette_combo.addItems(FIGURE_PALETTES)
+            idx = palette_combo.findText(plot_dict.get("palette", "viridis"))
+            if idx >= 0:
+                palette_combo.setCurrentIndex(idx)
+            palette_combo.setEnabled(enabled)
+            layout.addWidget(palette_combo)
+
+        # X range.
+        layout.addWidget(QLabel("X range"))
+        layout.addWidget(self._figure_range_row(page, index, plot_dict, "x", enabled))
+
+        if plot_dict.get("type") == "scatter":
+            layout.addWidget(QLabel("Y range"))
+            layout.addWidget(self._figure_range_row(page, index, plot_dict, "y", enabled))
+
+        # Size (width/height in canvas units).
+        layout.addWidget(QLabel("Size (px)"))
+        size_row = QWidget()
+        sh = QHBoxLayout(size_row)
+        sh.setContentsMargins(0, 0, 0, 0)
+        sh.setSpacing(4)
+        size = plot_dict.get("size") or [440, 340]
+        width_field = _SizeField(size[0], lambda v: on_size_changed())
+        height_field = _SizeField(size[1], lambda v: on_size_changed())
+        width_field.set_enabled(enabled)
+        height_field.set_enabled(enabled)
+        sh.addWidget(QLabel("W"))
+        sh.addWidget(width_field)
+        sh.addWidget(QLabel("H"))
+        sh.addWidget(height_field)
+        sh.addStretch()
+        layout.addWidget(size_row)
+
+        layout.addStretch()
+
+        # Signal wiring (after initial values are set).
+        def on_file_changed():
+            plot_dict["file"] = file_combo.currentData()
+            plot_dict["file_name"] = file_combo.currentText()
+            new_rec = self._figure_record(plot_dict["file"])
+            new_cols = list(new_rec.get("columns") or []) if new_rec else []
+            plot_dict["x"] = new_cols[0] if new_cols else None
+            if plot_dict.get("type") == "scatter":
+                plot_dict["y"] = new_cols[1] if len(new_cols) > 1 else (new_cols[0] if new_cols else None)
+                plot_dict["color_param"] = plot_dict["x"]
+            self._figure_rebuild_settings(page)
+            self._figure_apply_change(page, index, plot_dict)
+
+        file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
+
+        def on_param(attr):
+            def handler(value):
+                plot_dict[attr] = value
+                self._figure_apply_change(page, index, plot_dict)
+            return handler
+
+        x_combo.currentTextChanged.connect(on_param("x"))
+        if y_combo is not None:
+            y_combo.currentTextChanged.connect(on_param("y"))
+
+        if mode_combo is not None:
+            def on_mode_changed(_=0):
+                plot_dict["color_mode"] = mode_combo.currentData()
+                self._figure_rebuild_settings(page)
+                self._figure_apply_change(page, index, plot_dict)
+            mode_combo.currentIndexChanged.connect(on_mode_changed)
+
+        if cp_combo is not None:
+            cp_combo.currentTextChanged.connect(on_param("color_param"))
+
+        if palette_combo is not None:
+            def on_palette_changed(_=0):
+                plot_dict["palette"] = palette_combo.currentText()
+                self._figure_apply_change(page, index, plot_dict)
+            palette_combo.currentIndexChanged.connect(on_palette_changed)
+
+        def on_size_changed():
+            self._figure_resize_card(page, index, width_field.value(), height_field.value())
+            self._figure_mark_dirty(page)
+
+    def _figure_param_combo(self, columns, current, enabled: bool) -> QComboBox:
+        """Build a combo listing parameter names, selecting `current` if present."""
+        combo = QComboBox()
+        for col in columns:
+            combo.addItem(str(col))
+        if current is not None:
+            idx = combo.findText(str(current))
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.setEnabled(enabled)
+        return combo
+
+    def _figure_range_row(self, page, index: int, plot_dict: dict, axis: str,
+                          enabled: bool) -> QWidget:
+        """Build an Auto/Min/Max row for one axis range."""
+        min_key = f"{axis}min"
+        max_key = f"{axis}max"
+        widget = page._fig_cards[index].plot_widget()
+        data_min = getattr(widget, f"_data_{axis}min", None)
+        data_max = getattr(widget, f"_data_{axis}max", None)
+
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        auto = QCheckBox("Auto")
+        auto.setChecked(plot_dict.get(min_key) is None and plot_dict.get(max_key) is None)
+        auto.setEnabled(enabled)
+
+        min_val = plot_dict.get(min_key)
+        max_val = plot_dict.get(max_key)
+        if min_val is None:
+            min_val = data_min
+        if max_val is None:
+            max_val = data_max
+
+        min_spin = _LogStepSpinBox(min_val, lambda v: commit())
+        max_spin = _LogStepSpinBox(max_val, lambda v: commit())
+
+        def commit():
+            if auto.isChecked():
+                plot_dict[min_key] = None
+                plot_dict[max_key] = None
+                min_spin.set_value(data_min)
+                max_spin.set_value(data_max)
+            else:
+                plot_dict[min_key] = min_spin.value()
+                plot_dict[max_key] = max_spin.value()
+            min_spin.set_enabled(enabled and not auto.isChecked())
+            max_spin.set_enabled(enabled and not auto.isChecked())
+            # A range change only affects the view, so apply the range directly
+            # instead of re-reading and re-rendering the plot's data.
+            self._figure_apply_ranges(plot_dict, widget)
+            self._figure_mark_dirty(page)
+
+        auto.toggled.connect(lambda _: commit())
+
+        min_spin.set_enabled(enabled and not auto.isChecked())
+        max_spin.set_enabled(enabled and not auto.isChecked())
+
+        h.addWidget(auto)
+        h.addWidget(QLabel("Min"))
+        h.addWidget(min_spin)
+        h.addWidget(QLabel("Max"))
+        h.addWidget(max_spin)
+        h.addStretch()
+        return row
+
+    def _open_module(self, task_id: str | None, task_type: str | None, name: str) -> None:
+        """Open (or focus) the module tab for the given task (identified by id)."""
+        for index in range(1, self.tabs.count()):  # skip Workflow at index 0
+            page = self.tabs.widget(index)
+            if page.property("task_id") == task_id:
+                self.tabs.setCurrentIndex(index)
+                return
+
+        task_def = self._find_task_by_id(task_id)
+        locked = task_def is not None and _task_is_locked(task_def)
+        kind = _task_kind(task_type or "")
+
+        if task_type == "import":
+            page = self._build_data_import_page()
+        elif task_type == "figure":
+            page = self._build_figure_page(name, task_def, locked)
+        elif kind == "generate":
+            page = self._build_generate_page(name, task_def)
+        else:
+            page = self._build_module_page(name, locked=locked)
+        page.setProperty("task_id", task_id)
+        self.tabs.addTab(page, name)
+        self.tabs.setCurrentWidget(page)
+
+    def _close_module_page(self, page: QWidget) -> None:
+        """Close a module page's tab (never the Workflow tab)."""
+        index = self.tabs.indexOf(page)
+        if index > 0:
+            self.tabs.removeTab(index)
 
 
 def main() -> int:
@@ -31,6 +2823,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_NAME)
+    app.setStyleSheet(APP_STYLE)
 
     window = MainWindow()
     window.show()
