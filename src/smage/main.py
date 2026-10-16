@@ -9,6 +9,7 @@ functionality comes in later phases.
 from __future__ import annotations
 
 import copy
+import math
 import shutil
 import sys
 from collections import Counter
@@ -18,8 +19,18 @@ from uuid import uuid4
 # Make the `smage` package importable when this file is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PySide6.QtCore import QEvent, QObject, QRectF, QSize, QTimer, Qt
-from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, QTimer, Qt
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCursor,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -62,6 +73,8 @@ from PySide6.QtWidgets import (
 from smage.dimensions import parameter_names, read_dimensions
 from smage.importer import import_file
 from smage.project import Project
+
+import pyqtgraph as pg
 
 APP_NAME = "Smage"
 
@@ -109,6 +122,7 @@ QPushButton {
 }
 QPushButton:hover { background: #f0f7fe; border-color: #5aa0e0; }
 QPushButton:pressed { background: #dbeafa; }
+QPushButton:checked { background: #c9ddf2; border-color: #4a90d9; }
 
 /* workflow tree */
 QTreeWidget { background: #f5f8fb; border: none; }
@@ -264,6 +278,91 @@ def _apply_scale_transforms(x, configs):
     return x
 
 
+def _point_in_polygon(x, y, points):
+    """Vectorized ray-casting point-in-polygon test (boolean mask)."""
+    import numpy as np
+    px = np.asarray([p[0] for p in points], dtype=float)
+    py = np.asarray([p[1] for p in points], dtype=float)
+    n = len(px)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    inside = np.zeros(x.shape, dtype=bool)
+    for i in range(n):
+        xi, yi = px[i], py[i]
+        xj, yj = px[(i + 1) % n], py[(i + 1) % n]
+        cond = (yi > y) != (yj > y)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_cross = (xj - xi) * (y - yi) / (yj - yi) + xi
+        inside ^= cond & (x < x_cross)
+    return inside
+
+
+def _gate_mask(x, y, gate):
+    """Return a boolean mask for the points inside `gate` (in data space)."""
+    import numpy as np
+    t = gate.get("type")
+    if t == "rect":
+        x0, y0 = gate["pos"]
+        w, h = gate["size"]
+        return (x >= x0) & (x <= x0 + w) & (y >= y0) & (y <= y0 + h)
+    if t == "ellipse":
+        x0, y0 = gate["pos"]
+        w, h = gate["size"]
+        cx = x0 + w / 2.0
+        cy = y0 + h / 2.0
+        rx = w / 2.0
+        ry = h / 2.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1.0
+    if t == "polygon":
+        return _point_in_polygon(x, y, gate["points"])
+    if t == "quadrant":
+        vx = gate.get("vx", 0.0)
+        hy = gate.get("hy", 0.0)
+        q = gate.get("quadrant", 1)
+        if q == 1:
+            return (x >= vx) & (y >= hy)
+        if q == 2:
+            return (x < vx) & (y >= hy)
+        if q == 3:
+            return (x < vx) & (y < hy)
+        if q == 4:
+            return (x >= vx) & (y < hy)
+    if t == "range":
+        x1 = min(gate["x1"], gate["x2"])
+        x2 = max(gate["x1"], gate["x2"])
+        return (x >= x1) & (x <= x2)
+    if t == "split":
+        vx = gate.get("vx", 0.0)
+        if gate.get("side") == "left":
+            return x < vx
+        return x >= vx
+    if t == "skewed_quadrant":
+        cx, cy = gate["center"]
+        vx = x - cx
+        vy = y - cy
+        dirs = []
+        for key in ("p_right", "p_up", "p_left", "p_down"):
+            px, py = gate[key]
+            dirs.append((px - cx, py - cy))
+        d_r, d_u, d_l, d_dn = dirs
+
+        def wedge(a, b):
+            # a point is in the wedge from arm a to arm b (counter-clockwise)
+            return (a[0] * vy - a[1] * vx >= 0) & (vx * b[1] - vy * b[0] >= 0)
+
+        q = gate.get("quadrant", 1)
+        if q == 1:
+            return wedge(d_r, d_u)
+        if q == 2:
+            return wedge(d_u, d_l)
+        if q == 3:
+            return wedge(d_l, d_dn)
+        if q == 4:
+            return wedge(d_dn, d_r)
+    return np.ones(x.shape, dtype=bool)
+
+
 def _figure_colormap(name: str):
     """Return a pyqtgraph ColorMap for a named palette, with a fallback."""
     import pyqtgraph as pg
@@ -329,13 +428,53 @@ def _letter_pixmap(text: str, size: int = 14) -> QPixmap:
     return pixmap
 
 
-def _make_fit_plot_item():
+def _gate_tool_icon(key: str) -> QIcon:
+    """Build a small shape icon for a gating tool button."""
+    pm = QPixmap(22, 22)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#37474f"))
+    pen.setWidthF(1.7)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    m = 3.0
+    r = QRectF(m, m, 22 - 2 * m, 22 - 2 * m)
+    cx, cy = 11.0, 11.0
+    if key == "rect":
+        p.drawRect(r)
+    elif key == "ellipse":
+        p.drawEllipse(r)
+    elif key == "polygon":
+        pts = [
+            QPointF(5, 15), QPointF(8, 7), QPointF(15, 5),
+            QPointF(18, 11), QPointF(14, 17), QPointF(9, 16),
+        ]
+        p.drawPolygon(QPolygonF(pts))
+    elif key == "quadrant":
+        p.drawLine(QPointF(cx, m), QPointF(cx, 22 - m))
+        p.drawLine(QPointF(m, cy), QPointF(22 - m, cy))
+    elif key == "skewed_quadrant":
+        p.drawLine(QPointF(cx, cy), QPointF(m, cy))       # left
+        p.drawLine(QPointF(cx, cy), QPointF(22 - m, cy))  # right
+        p.drawLine(QPointF(cx, cy), QPointF(cx, 22 - m))  # down
+        p.drawLine(QPointF(cx, cy), QPointF(cx + 5, m))   # up, tilted right
+    elif key == "split":
+        p.drawLine(QPointF(cx, m), QPointF(cx, 22 - m))
+    elif key == "range":
+        p.drawLine(QPointF(cx - 5, m), QPointF(cx - 5, 22 - m))
+        p.drawLine(QPointF(cx + 5, m), QPointF(cx + 5, 22 - m))
+    p.end()
+    return QIcon(pm)
+
+
+def _make_fit_plot_item(viewbox=None):
     """Return a PlotItem with an extra "F" button (fit to full data)."""
     import pyqtgraph as pg
 
     class _FitPlotItem(pg.PlotItem):
         def __init__(self):
-            super().__init__()
+            super().__init__(viewBox=viewbox)
             self._on_fit = None
             self.fitBtn = pg.ButtonItem(_letter_pixmap("F"), 14, self)
             self.fitBtn.clicked.connect(lambda _=None: self._fit_clicked())
@@ -351,6 +490,463 @@ def _make_fit_plot_item():
             self.fitBtn.setPos(w + 2, y)
 
     return _FitPlotItem()
+
+
+_GATE_PEN = "#2f81f7"
+_GATE_HOVER_PEN = "#1555b3"
+_POLY_CLOSE_RADIUS = 12  # pixels: click this close to the first anchor to close
+
+
+def _gate_roi_pens() -> dict:
+    """Pens for a gate ROI: blue edge, darker+thicker blue on hover."""
+    return dict(
+        pen=pg.mkPen(_GATE_PEN, width=2),
+        hoverPen=pg.mkPen(_GATE_HOVER_PEN, width=3),
+        handlePen=pg.mkPen(_GATE_PEN, width=1),
+        handleHoverPen=pg.mkPen(_GATE_HOVER_PEN, width=2),
+    )
+
+
+class _GateViewBox(pg.ViewBox):
+    """Scatter ViewBox that draws gate ROIs (rectangle / ellipse / polygon)."""
+
+    def __init__(self, on_gate_created, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_gate_created = on_gate_created
+        self._tool = None  # "rect" | "ellipse" | "polygon" | ...
+        self._start = None
+        self._preview = None
+        self._rubber = None
+        self._first_highlight = None
+        self._polygon_pts = []
+        self._range_x1 = None
+        self._range_y1 = None
+        self._range_anchor = None
+        self._range_band = None
+        self._range_arrow = None
+
+    def set_gate_tool(self, tool) -> None:
+        self._cancel_preview()
+        self._tool = tool
+        self._polygon_pts = []
+        self._range_x1 = None
+
+    def _cancel_preview(self) -> None:
+        if self._preview is not None:
+            self.removeItem(self._preview)
+            self._preview = None
+        if self._rubber is not None:
+            self.removeItem(self._rubber)
+            self._rubber = None
+        if self._first_highlight is not None:
+            self.removeItem(self._first_highlight)
+            self._first_highlight = None
+        if self._range_anchor is not None:
+            self.removeItem(self._range_anchor)
+            self._range_anchor = None
+        if self._range_band is not None:
+            self.removeItem(self._range_band)
+            self._range_band = None
+        if self._range_arrow is not None:
+            self.removeItem(self._range_arrow)
+            self._range_arrow = None
+        self._start = None
+        self._polygon_pts = []
+        self._range_x1 = None
+        self._range_y1 = None
+
+    def _pt(self, ev):
+        return self.mapSceneToView(ev.scenePos())
+
+    # -- rectangle / ellipse (click-drag) -----------------------------------
+    def mouseDragEvent(self, ev, axis=None) -> None:
+        if self._tool in ("rect", "ellipse"):
+            if self._preview is None:
+                start = self.mapSceneToView(ev.buttonDownScenePos())
+                self._start = start
+                self._preview = self._make_shape(self._tool, (start.x(), start.y()), (0.0, 0.0))
+                self.addItem(self._preview)
+            p = self._pt(ev)
+            x0, y0 = self._start.x(), self._start.y()
+            x1, y1 = p.x(), p.y()
+            pos = (min(x0, x1), min(y0, y1))
+            size = (abs(x1 - x0), abs(y1 - y0))
+            self._preview.setPos(pos)
+            self._preview.setSize(size)
+            if ev.isFinish():
+                roi = self._preview
+                self._preview = None
+                self._start = None
+                if roi.size().x() > 0 and roi.size().y() > 0:
+                    self._on_gate_created(self._tool, roi)
+                else:
+                    self.removeItem(roi)
+            ev.accept()
+            return
+        super().mouseDragEvent(ev, axis)
+
+    # -- polygon / quadrant / split / range / skewed-quadrant ----------------
+    def mouseClickEvent(self, ev) -> None:
+        if self._tool == "polygon" and ev.button() == Qt.MouseButton.RightButton:
+            self._finish_polygon()
+            ev.accept()
+            return
+        if ev.button() != Qt.MouseButton.LeftButton:
+            super().mouseClickEvent(ev)
+            return
+        p = self._pt(ev)
+        if self._tool == "polygon":
+            if len(self._polygon_pts) >= 3 and self._near_first_anchor(p):
+                self._finish_polygon()
+            else:
+                self._polygon_pts.append((p.x(), p.y()))
+                self._update_polygon_preview()
+            ev.accept()
+            return
+        if self._tool == "quadrant":
+            self._on_gate_created("quadrant", (p.x(), p.y()))
+            ev.accept()
+            return
+        if self._tool == "split":
+            self._on_gate_created("split", (p.x(), p.y()))
+            ev.accept()
+            return
+        if self._tool == "range":
+            if self._range_x1 is None:
+                self._range_x1 = p.x()
+                self._range_y1 = p.y()
+                self._update_range_preview((p.x(), p.y()))
+            else:
+                self._on_gate_created("range", (self._range_x1, p.x()))
+            ev.accept()
+            return
+        if self._tool == "skewed_quadrant":
+            import math
+            cx, cy = p.x(), p.y()
+            xr, yr = self.viewRange()
+            dx = (xr[1] - xr[0]) / 4.0
+            dy = (yr[1] - yr[0]) / 4.0
+            p_right = (cx + dx, cy)
+            p_left = (cx - dx, cy)
+            p_down = (cx, cy - dy)
+            # The top point is tilted 30 degrees to the right of vertical.
+            p_up = (cx + dy * math.sin(math.radians(30)), cy + dy * math.cos(math.radians(30)))
+            self._on_gate_created(
+                "skewed_quadrant",
+                ((cx, cy), p_right, p_up, p_left, p_down),
+            )
+            ev.accept()
+            return
+        super().mouseClickEvent(ev)
+
+    def _near_first_anchor(self, p) -> bool:
+        """True when the cursor is within a few pixels of the polygon's first anchor."""
+        if not self._polygon_pts:
+            return False
+        first = pg.Point(self._polygon_pts[0][0], self._polygon_pts[0][1])
+        f_dev = self.mapViewToDevice(first)
+        p_dev = self.mapViewToDevice(p)
+        dx = p_dev.x() - f_dev.x()
+        dy = p_dev.y() - f_dev.y()
+        return dx * dx + dy * dy <= _POLY_CLOSE_RADIUS * _POLY_CLOSE_RADIUS
+
+    def _update_range_preview(self, mouse_pos=None) -> None:
+        if self._range_x1 is None:
+            return
+        if self._range_anchor is None:
+            self._range_anchor = pg.InfiniteLine(
+                pos=self._range_x1, angle=90, movable=False,
+                pen=pg.mkPen(_GATE_PEN, width=2, style=Qt.PenStyle.DashLine),
+            )
+            self.addItem(self._range_anchor)
+        if self._range_band is None:
+            self._range_band = self._make_preview_item(
+                pen=pg.mkPen(_GATE_PEN, width=2, style=Qt.PenStyle.DashLine),
+            )
+            self.addItem(self._range_band)
+        if self._range_arrow is None:
+            self._range_arrow = pg.ArrowItem(
+                angle=0, headLen=10, tipAngle=30, tailLen=None,
+                brush=pg.mkBrush(_GATE_PEN), pen=None, pxMode=True,
+            )
+            self.addItem(self._range_arrow)
+        x0, y0 = self._range_x1, self._range_y1
+        if mouse_pos is not None:
+            self._range_band.setData([x0, mouse_pos[0]], [y0, mouse_pos[1]])
+            s_dev = self.mapViewToDevice(pg.Point(x0, y0))
+            m_dev = self.mapViewToDevice(pg.Point(mouse_pos[0], mouse_pos[1]))
+            dx = m_dev.x() - s_dev.x()
+            dy = m_dev.y() - s_dev.y()
+            ang = math.degrees(math.atan2(dy, dx)) + 180.0
+            self._range_arrow.setStyle(angle=ang)
+            self._range_arrow.setPos(mouse_pos[0], mouse_pos[1])
+            self._range_arrow.setVisible(True)
+        else:
+            self._range_band.setData([x0], [y0])
+            self._range_arrow.setVisible(False)
+
+    def _finish_polygon(self) -> None:
+        pts = self._polygon_pts
+        if len(pts) >= 3:
+            self._polygon_pts = []
+            if self._preview is not None:
+                self.removeItem(self._preview)
+                self._preview = None
+            if self._rubber is not None:
+                self.removeItem(self._rubber)
+                self._rubber = None
+            if self._first_highlight is not None:
+                self.removeItem(self._first_highlight)
+                self._first_highlight = None
+            roi = _GatePolygonROI(pts, closed=True, **_gate_roi_pens())
+            self.addItem(roi)
+            self._on_gate_created("polygon", roi)
+        else:
+            self._cancel_preview()
+
+    def hoverEvent(self, ev) -> None:
+        if self._tool == "polygon":
+            mouse_pos = None
+            if not ev.isExit() and self._polygon_pts:
+                p = self.mapSceneToView(ev.scenePos())
+                mouse_pos = (p.x(), p.y())
+            self._update_polygon_preview(mouse_pos)
+        elif self._tool == "range":
+            mouse_pos = None
+            if not ev.isExit() and self._range_x1 is not None:
+                p = self.mapSceneToView(ev.scenePos())
+                mouse_pos = (p.x(), p.y())
+            self._update_range_preview(mouse_pos)
+
+    def _make_preview_item(self, **kwargs) -> pg.PlotDataItem:
+        """A visual-only PlotDataItem that never swallows mouse events."""
+        item = pg.PlotDataItem(**kwargs)
+        item.setEnabled(False)
+        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        item.scatter.setEnabled(False)
+        item.curve.setEnabled(False)
+        return item
+
+    def _ensure_polygon_items(self) -> None:
+        if self._preview is None:
+            self._preview = self._make_preview_item(
+                pen=pg.mkPen(_GATE_PEN, width=2),
+                symbol="o", symbolSize=9, symbolBrush=_GATE_PEN,
+            )
+            self.addItem(self._preview)
+        if self._rubber is None:
+            self._rubber = self._make_preview_item(
+                pen=pg.mkPen(_GATE_PEN, width=1, style=Qt.PenStyle.DashLine),
+            )
+            self.addItem(self._rubber)
+        if self._first_highlight is None:
+            self._first_highlight = self._make_preview_item(
+                pen=None,
+                symbol="o", symbolSize=15,
+                symbolPen=pg.mkPen(_GATE_HOVER_PEN, width=2.5),
+                symbolBrush=pg.mkBrush(None),
+            )
+            self.addItem(self._first_highlight)
+
+    def _update_polygon_preview(self, mouse_pos=None) -> None:
+        pts = self._polygon_pts
+        if not pts:
+            if self._preview is not None:
+                self._preview.setData([], [])
+            if self._rubber is not None:
+                self._rubber.setData([], [])
+            if self._first_highlight is not None:
+                self._first_highlight.setData([], [])
+            return
+        self._ensure_polygon_items()
+        self._preview.setData([p[0] for p in pts], [p[1] for p in pts])
+        # Highlight the first anchor when the cursor is close enough to close.
+        near_first = (
+            len(pts) >= 3
+            and mouse_pos is not None
+            and self._near_first_anchor(pg.Point(mouse_pos[0], mouse_pos[1]))
+        )
+        if near_first:
+            self._first_highlight.setData([pts[0][0]], [pts[0][1]])
+        else:
+            self._first_highlight.setData([], [])
+        if mouse_pos is not None:
+            last = pts[-1]
+            self._rubber.setData([last[0], mouse_pos[0]], [last[1], mouse_pos[1]])
+        else:
+            self._rubber.setData([], [])
+
+    def _make_shape(self, tool, pos, size):
+        if tool == "ellipse":
+            return pg.EllipseROI(pos, size, **_gate_roi_pens())
+        return pg.RectROI(pos, size, **_gate_roi_pens())
+
+
+class _GatePolygonROI(pg.PolyLineROI):
+    """Polygon gate ROI whose vertices are edited via a right-click menu only."""
+
+    def __init__(self, positions, **kwargs):
+        super().__init__(positions, **kwargs)
+        self._click_pos = None
+        self._menu = None
+        self._fix_editing_mode()
+
+    def _fix_editing_mode(self) -> None:
+        # Don't insert a vertex when a segment is clicked; don't show the
+        # per-handle "remove" button. Both are handled by the context menu.
+        for seg in self.segments:
+            try:
+                seg.sigClicked.disconnect(self.segmentClicked)
+            except (TypeError, RuntimeError):
+                pass
+        for h in self.handles:
+            h["item"].setDeletable(False)
+
+    def addSegment(self, h1, h2, index=None):
+        super().addSegment(h1, h2, index=index)
+        self._fix_editing_mode()
+
+    def mouseClickEvent(self, ev) -> None:
+        if ev.button() == Qt.MouseButton.RightButton:
+            self._click_pos = ev.pos()
+            self._menu = self.getMenu()
+            self._menu.popup(ev.screenPos().toPoint())
+            ev.accept()
+            return
+        super().mouseClickEvent(ev)
+
+    def getMenu(self):
+        menu = QMenu()
+        menu.setTitle("Polygon")
+        add_act = QAction("Add point", menu)
+        add_act.triggered.connect(self._add_point_clicked)
+        menu.addAction(add_act)
+        rem_act = QAction("Remove point", menu)
+        rem_act.triggered.connect(self._remove_point_clicked)
+        menu.addAction(rem_act)
+        return menu
+
+    def _add_point_clicked(self) -> None:
+        if self._click_pos is None:
+            return
+        seg = self._nearest_segment(self._click_pos)
+        if seg is not None:
+            self.segmentClicked(seg, pos=self._click_pos)
+
+    def _remove_point_clicked(self) -> None:
+        if self._click_pos is None or len(self.handles) <= 3:
+            return
+        handle = self._nearest_handle(self._click_pos)
+        if handle is not None:
+            self.removeHandle(handle)
+
+    def _nearest_segment(self, pos):
+        best, best_d = None, None
+        for seg in self.segments:
+            h0 = seg.handles[0]["item"].pos()
+            h1 = seg.handles[1]["item"].pos()
+            mid = h0 + (h1 - h0) / 2
+            d = (mid - pos).length()
+            if best_d is None or d < best_d:
+                best_d, best = d, seg
+        return best
+
+    def _nearest_handle(self, pos):
+        best, best_d = None, None
+        for h in self.handles:
+            hp = h["item"].pos()
+            d = (hp - pos).length()
+            if best_d is None or d < best_d:
+                best_d, best = d, h["item"]
+        return best
+
+
+class _SkewedQuadrantROI(pg.ROI):
+    """A bent crosshair: 5 draggable points (center + 4 arms) joined by rays."""
+
+    def __init__(self, center, p_right, p_up, p_left, p_down, **args):
+        super().__init__([0, 0], [1, 1], removable=False, **args)
+        self.addFreeHandle(center)
+        self.addFreeHandle(p_right)
+        self.addFreeHandle(p_up)
+        self.addFreeHandle(p_left)
+        self.addFreeHandle(p_down)
+        self._bounds = None
+
+    def _handles(self):
+        return [h.pos() for h in self.getHandles()]
+
+    def viewTransformChanged(self):
+        # Ray endpoints depend on the visible range; recompute on pan/zoom.
+        self._bounds = None
+        super().viewTransformChanged()
+
+    def boundingRect(self):
+        if self._bounds is None:
+            self._bounds = self._compute_bounds()
+        return self._bounds
+
+    def _compute_bounds(self):
+        pts = self._handles()
+        if not pts:
+            return QRectF()
+        xs = [p.x() for p in pts]
+        ys = [p.y() for p in pts]
+        vr = self.viewRect()
+        if vr is not None:
+            # Include the visible range so the rays (drawn to the view edge)
+            # are never clipped away by a stale bounding rect.
+            xs += [vr.left(), vr.right()]
+            ys += [vr.top(), vr.bottom()]
+        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+    def paint(self, p, *args):
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(self.currentPen)
+        pts = self._handles()
+        if len(pts) < 5:
+            return
+        center = pts[0]
+        vr = self.viewRect()
+        for sp in pts[1:]:
+            dx = sp.x() - center.x()
+            dy = sp.y() - center.y()
+            if dx == 0 and dy == 0:
+                continue
+            if vr is None:
+                far = pg.Point(center.x() + 9 * dx, center.y() + 9 * dy)
+            else:
+                far = self._ray_to_rect(center, dx, dy, vr)
+            p.drawLine(center, far)
+
+    @staticmethod
+    def _ray_to_rect(center, dx, dy, rect):
+        """Point where the ray (center, direction (dx, dy)) leaves ``rect``."""
+        hits = []
+        if dx != 0:
+            for x in (rect.left(), rect.right()):
+                t = (x - center.x()) / dx
+                if t >= 0:
+                    y = center.y() + t * dy
+                    if rect.top() <= y <= rect.bottom():
+                        hits.append(t)
+        if dy != 0:
+            for y in (rect.top(), rect.bottom()):
+                t = (y - center.y()) / dy
+                if t >= 0:
+                    x = center.x() + t * dx
+                    if rect.left() <= x <= rect.right():
+                        hits.append(t)
+        if not hits:
+            return pg.Point(center.x(), center.y())
+        t = max(hits)
+        return pg.Point(center.x() + t * dx, center.y() + t * dy)
+
+    def shape(self):
+        """Empty hit region: the rays span far beyond the data, so the default
+        shape (== boundingRect) would cover the whole plot and swallow every
+        later click, blocking new gates. Only the five handles are interactive."""
+        return QPainterPath()
 
 
 class _ClickFilter(QObject):
@@ -839,7 +1435,11 @@ class MainWindow(QMainWindow):
     def _has_unsaved_module_changes(self) -> bool:
         for index in range(1, self.tabs.count()):  # skip Workflow at index 0
             widget = self.tabs.widget(index)
-            if getattr(widget, "_fig_dirty", False) or getattr(widget, "_scaling_dirty", False):
+            if (
+                getattr(widget, "_fig_dirty", False)
+                or getattr(widget, "_scaling_dirty", False)
+                or getattr(widget, "_gating_dirty", False)
+            ):
                 return True
         return False
 
@@ -2796,7 +3396,8 @@ class MainWindow(QMainWindow):
         else:
             self._figure_render_scatter(plot_dict, plot_widget, column_transforms)
 
-    def _figure_render_scatter(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
+    def _figure_render_scatter(self, plot_dict: dict, plot_widget, column_transforms=None,
+                               mask=None) -> None:
         import numpy as np
         import pandas as pd
 
@@ -2825,6 +3426,8 @@ class MainWindow(QMainWindow):
         x = _apply_scale_transforms(x, transforms.get(x_name))
         y = _apply_scale_transforms(y, transforms.get(y_name))
         keep = np.isfinite(x) & np.isfinite(y)
+        if mask is not None:
+            keep = keep & np.asarray(mask, dtype=bool)
         x, y = x[keep], y[keep]
         if x.size == 0:
             return
@@ -4047,7 +4650,1151 @@ class MainWindow(QMainWindow):
             self._figure_refresh_all(page)
         elif task_type == "scale":
             self._scaling_render_preview(page)
+        elif task_type == "gating":
+            self._gating_render(page)
         # Other module types have no live visualization to refresh yet.
+
+    # ----- gating module (map) -----------------------------------------
+    def _build_gating_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Gating page: gate tree (1) | gate area (3) | settings (2)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Toolbar with Save/Close.
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._gating_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        # Per-page state (preview config first so the plot widget can bind A/F).
+        records = self._imported_files()
+        rec = records[0] if records else None
+        cols = self._columns_for(rec.get("parquet")) if rec else []
+        page._gating_preview = {
+            "type": "scatter",
+            "file": rec.get("parquet") if rec else None,
+            "file_name": rec.get("name") if rec else None,
+            "x": cols[0] if cols else None,
+            "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
+            "color_mode": "density",
+            "color_param": None,
+            "palette": "viridis",
+            "xmin": None,
+            "xmax": None,
+            "ymin": None,
+            "ymax": None,
+            "point_size": 4,
+            "fixed_point_size": False,
+            "solid_color": (0, 0, 200),
+            "show_axes": True,
+            "show_axis_names": True,
+            "show_indices": True,
+            "show_sample_name": True,
+        }
+        page._gating_task_def = task_def
+        page._gating_task_id = task_def.get("id")
+        page._gating_gates = task_def.setdefault("params", {}).setdefault("gates", [])
+        page._gating_rois = []
+        page._gating_crosshairs = {}
+        page._gating_split_lines = {}
+        page._gating_skewed_lines = {}
+        page._gating_active_gate_id = None
+        page._gating_context_gate_id = None
+        # The x/y that the user configured in Plot settings (independent of a
+        # gate click, which temporarily switches to that gate's axes).
+        page._gating_settings_x = page._gating_preview.get("x")
+        page._gating_settings_y = page._gating_preview.get("y")
+        page._gating_render_timer = None
+        page._gating_locked = locked
+        page._gating_parent_id = None
+        page._gating_save_btn = save_btn
+        page._gating_dirty = False
+        page._gating_snapshot = copy.deepcopy(task_def.get("params", {}))
+        save_btn.clicked.connect(lambda _=False: self._gating_save_now(page))
+        self._gating_update_save_btn(page)
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        cl = QHBoxLayout(content)
+        cl.setContentsMargins(12, 12, 12, 12)
+        cl.setSpacing(12)
+
+        # Left: gate tree (placeholder for now).
+        tree_panel = self._build_panel_frame()
+        tree_lay = QVBoxLayout(tree_panel)
+        tree_lay.setContentsMargins(10, 10, 10, 10)
+        tree_lay.setSpacing(6)
+        tree_lay.addWidget(QLabel("<b>Gates</b>"))
+        tree = QTreeWidget()
+        tree.setHeaderHidden(True)
+        tree.setStyleSheet(
+            "QTreeWidget { background: #ffffff; border: none; }"
+            "QTreeWidget::item:selected { background: #dbeafa; }"
+        )
+        tree_lay.addWidget(tree, 1)
+        page._gating_tree = tree
+
+        # Middle: tool area (top) + scatter (bottom).
+        mid_panel = self._build_panel_frame()
+        mid_lay = QVBoxLayout(mid_panel)
+        mid_lay.setContentsMargins(0, 0, 0, 0)
+        mid_lay.setSpacing(0)
+        tools = QWidget()
+        tools.setStyleSheet("background: #fbfcfe; border-bottom: 1px solid #e3e8ef;")
+        tools_lay = QHBoxLayout(tools)
+        tools_lay.setContentsMargins(10, 8, 10, 8)
+        tools_lay.setSpacing(6)
+        tools_lay.addWidget(QLabel("<b>Tools</b>"))
+        tool_buttons = {}
+        for text, key in (
+            ("Rectangle", "rect"),
+            ("Ellipse", "ellipse"),
+            ("Polygon", "polygon"),
+            ("Quadrant", "quadrant"),
+            ("Skewed Quadrant", "skewed_quadrant"),
+            ("Split", "split"),
+            ("Range", "range"),
+        ):
+            btn = QPushButton()
+            btn.setIcon(_gate_tool_icon(key))
+            btn.setIconSize(QSize(20, 20))
+            btn.setFixedSize(30, 30)
+            btn.setToolTip(text)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setEnabled(not locked)
+
+            def on_clicked(_=False, k=key):
+                # Clicking the active tool again switches back to pan/zoom.
+                self._gating_set_tool(page, None if page._gating_tool == k else k)
+
+            btn.clicked.connect(on_clicked)
+            tools_lay.addWidget(btn)
+            tool_buttons[key] = btn
+        tools_lay.addStretch()
+        mid_lay.addWidget(tools, 1)
+
+        plot_widget, viewbox = self._gating_make_plot(page)
+        # Overlay shown when the current file lacks the scatter's x/y parameter.
+        plot_host = QWidget()
+        host_grid = QGridLayout(plot_host)
+        host_grid.setContentsMargins(0, 0, 0, 0)
+        host_grid.addWidget(plot_widget, 0, 0)
+        overlay = QWidget()
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        ov = QVBoxLayout(overlay)
+        ov.setContentsMargins(0, 0, 0, 0)
+        ov.addStretch()
+        ov_row = QHBoxLayout()
+        ov_row.addStretch()
+        overlay_box = QLabel("")
+        overlay_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        overlay_box.setWordWrap(True)
+        overlay_box.setStyleSheet(
+            "background-color: rgba(200, 200, 200, 210); color: #444; "
+            "border: 1px solid #999; border-radius: 6px; padding: 14px 18px;"
+        )
+        overlay_box.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        ov_row.addWidget(overlay_box)
+        ov_row.addStretch()
+        ov.addLayout(ov_row)
+        ov.addStretch()
+        overlay.hide()
+        host_grid.addWidget(overlay, 0, 0)
+        mid_lay.addWidget(plot_host, 5)
+        page._gating_plot_widget = plot_widget
+        page._gating_viewbox = viewbox
+        page._gating_overlay = overlay
+        page._gating_overlay_box = overlay_box
+        page._gating_tool = None
+        page._gating_tool_buttons = tool_buttons
+
+        # Right: scatter settings.
+        settings_panel = self._build_panel_frame()
+        settings_lay = QVBoxLayout(settings_panel)
+        settings_lay.setContentsMargins(10, 10, 10, 10)
+        settings_lay.setSpacing(6)
+        settings_lay.addWidget(QLabel("<b>Plot settings</b>"))
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        settings_scroll.setStyleSheet("background: transparent;")
+        settings_host = QWidget()
+        settings_host.setStyleSheet("background: transparent;")
+        settings_layout = QVBoxLayout(settings_host)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(6)
+        settings_scroll.setWidget(settings_host)
+        settings_lay.addWidget(settings_scroll, 1)
+        page._gating_settings_layout = settings_layout
+
+        cl.addWidget(tree_panel, 1)
+        cl.addWidget(mid_panel, 3)
+        cl.addWidget(settings_panel, 2)
+        layout.addWidget(content, 1)
+
+        tree.itemClicked.connect(lambda item, col=0: self._gating_on_tree_selection(page, item, col))
+        tree.itemDoubleClicked.connect(lambda item, col=0: self._gating_on_tree_double_clicked(page, item, col))
+        tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tree.customContextMenuRequested.connect(lambda pos: self._gating_tree_context_menu(page, pos))
+        self._gating_load_rois(page)
+        self._gating_rebuild_tree(page)
+        self._gating_render(page)
+        self._gating_rebuild_settings(page)
+        return page
+
+    def _gating_make_plot(self, page):
+        """Create the gating scatter plot (sci axes + A/F buttons + gate ViewBox)."""
+        viewbox = _GateViewBox(
+            on_gate_created=lambda tool, roi: self._gating_add_gate(page, tool, roi)
+        )
+        plot_item = _make_fit_plot_item(viewbox=viewbox)
+        plot_widget = pg.PlotWidget(plotItem=plot_item)
+        plot_widget.setBackground("w")
+        plot_widget.showGrid(x=True, y=True, alpha=0.2)
+        plot_widget.getPlotItem().setAxisItems({
+            "bottom": _make_sci_axis("bottom"),
+            "left": _make_sci_axis("left"),
+        })
+        viewbox.setMouseEnabled(True, True)
+        try:
+            plot_item.autoBtn.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        plot_item.autoBtn.clicked.connect(
+            lambda _=None: self._figure_apply_ranges(page._gating_preview, plot_widget)
+        )
+        plot_item._on_fit = lambda: self._figure_fit_all(page._gating_preview, plot_widget)
+        return plot_widget, viewbox
+
+    def _gating_set_tool(self, page, tool) -> None:
+        page._gating_tool = tool
+        page._gating_viewbox.set_gate_tool(tool)
+        for key, btn in page._gating_tool_buttons.items():
+            btn.setChecked(key == tool)
+
+    def _gating_sync_gate(self, gate: dict, roi) -> None:
+        t = gate.get("type")
+        if t in ("rect", "ellipse"):
+            gate["pos"] = [roi.pos().x(), roi.pos().y()]
+            gate["size"] = [roi.size().x(), roi.size().y()]
+        elif t == "polygon":
+            # Handles are in ROI-local coords; add the ROI position for absolute.
+            ox = roi.pos().x()
+            oy = roi.pos().y()
+            gate["points"] = [[p.x() + ox, p.y() + oy] for p in roi.getState()["points"]]
+
+    def _gating_quadrant_sync(self, page, crosshair_id, key, line) -> None:
+        for g in page._gating_gates:
+            if g.get("crosshair_id") == crosshair_id:
+                g[key] = line.value()
+
+    def _gating_split_sync(self, page, split_id, line) -> None:
+        for g in page._gating_gates:
+            if g.get("split_id") == split_id:
+                g["vx"] = line.value()
+
+    def _gating_skewed_sync(self, page, skewed_id) -> None:
+        entry = page._gating_skewed_lines.get(skewed_id)
+        if entry is None:
+            return
+        roi = entry["roi"]
+        pts = [h.pos() for h in roi.getHandles()]
+        if len(pts) < 5:
+            return
+        center = pts[0]
+        keys = ("p_right", "p_up", "p_left", "p_down")
+        for g in page._gating_gates:
+            if g.get("skewed_id") == skewed_id:
+                g["center"] = [center.x(), center.y()]
+                for i, key in enumerate(keys):
+                    sp = pts[i + 1]
+                    g[key] = [sp.x(), sp.y()]
+
+    def _gating_default_name(self, page, tool: str) -> str:
+        prefixes = {"rect": "Rect", "ellipse": "Oval", "polygon": "Poly", "range": "Range"}
+        count = sum(1 for g in page._gating_gates if g.get("type") == tool) + 1
+        return f"{prefixes.get(tool, 'Gate')} {count}"
+
+    def _gating_add_gate(self, page, tool, arg) -> None:
+        preview = page._gating_preview
+        xr, yr = page._gating_viewbox.viewRange()
+        if tool == "quadrant":
+            x0, y0 = arg
+            crosshair_id = uuid4().hex[:8]
+            pen = pg.mkPen(_GATE_PEN, width=2)
+            hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+            vline = pg.InfiniteLine(pos=x0, angle=90, movable=True, pen=pen, hoverPen=hover)
+            hline = pg.InfiniteLine(pos=y0, angle=0, movable=True, pen=pen, hoverPen=hover)
+            page._gating_viewbox.addItem(vline)
+            page._gating_viewbox.addItem(hline)
+            page._gating_crosshairs[crosshair_id] = {
+                "lines": [vline, hline],
+                "x": preview.get("x"),
+                "y": preview.get("y"),
+            }
+            for qnum in (1, 2, 3, 4):
+                gate = {
+                    "id": uuid4().hex[:8],
+                    "name": f"Q{qnum}",
+                    "type": "quadrant",
+                    "quadrant": qnum,
+                    "vx": x0,
+                    "hy": y0,
+                    "crosshair_id": crosshair_id,
+                    "x": preview.get("x"),
+                    "y": preview.get("y"),
+                    "parent": page._gating_parent_id,
+                    "xmin": xr[0], "xmax": xr[1],
+                    "ymin": yr[0], "ymax": yr[1],
+                }
+                page._gating_gates.append(gate)
+                page._gating_rois.append([])
+            vline.sigPositionChangeFinished.connect(
+                lambda l=vline, cid=crosshair_id: self._gating_quadrant_sync(page, cid, "vx", l)
+            )
+            hline.sigPositionChangeFinished.connect(
+                lambda l=hline, cid=crosshair_id: self._gating_quadrant_sync(page, cid, "hy", l)
+            )
+            self._gating_update_roi_visibility(page)
+            self._gating_rebuild_tree(page)
+            self._gating_set_tool(page, None)
+            self._gating_mark_dirty(page)
+            return
+
+        if tool == "range":
+            x1, x2 = arg
+            gate = {
+                "id": uuid4().hex[:8],
+                "name": self._gating_default_name(page, "range"),
+                "type": "range",
+                "x": preview.get("x"),
+                "y": preview.get("y"),
+                "x1": x1,
+                "x2": x2,
+                "parent": page._gating_parent_id,
+                "xmin": xr[0], "xmax": xr[1],
+                "ymin": yr[0], "ymax": yr[1],
+            }
+            pen = pg.mkPen(_GATE_PEN, width=2)
+            hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+            vline1 = pg.InfiniteLine(pos=x1, angle=90, movable=True, pen=pen, hoverPen=hover)
+            vline2 = pg.InfiniteLine(pos=x2, angle=90, movable=True, pen=pen, hoverPen=hover)
+            page._gating_viewbox.addItem(vline1)
+            page._gating_viewbox.addItem(vline2)
+            vline1.sigPositionChangeFinished.connect(
+                lambda l=vline1, g=gate: g.__setitem__("x1", l.value())
+            )
+            vline2.sigPositionChangeFinished.connect(
+                lambda l=vline2, g=gate: g.__setitem__("x2", l.value())
+            )
+            page._gating_gates.append(gate)
+            page._gating_rois.append([vline1, vline2])
+            self._gating_set_items_handles_visible([vline1, vline2], False)
+            self._gating_update_roi_visibility(page)
+            self._gating_rebuild_tree(page)
+            self._gating_set_tool(page, None)
+            self._gating_mark_dirty(page)
+            return
+
+        if tool == "split":
+            x0, _ = arg
+            split_id = uuid4().hex[:8]
+            pen = pg.mkPen(_GATE_PEN, width=2)
+            hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+            vline = pg.InfiniteLine(pos=x0, angle=90, movable=True, pen=pen, hoverPen=hover)
+            page._gating_viewbox.addItem(vline)
+            page._gating_split_lines[split_id] = {
+                "lines": [vline],
+                "x": preview.get("x"),
+                "y": preview.get("y"),
+            }
+            for side, name in (("left", "Left"), ("right", "Right")):
+                gate = {
+                    "id": uuid4().hex[:8],
+                    "name": name,
+                    "type": "split",
+                    "side": side,
+                    "vx": x0,
+                    "split_id": split_id,
+                    "x": preview.get("x"),
+                    "y": preview.get("y"),
+                    "parent": page._gating_parent_id,
+                    "xmin": xr[0], "xmax": xr[1],
+                    "ymin": yr[0], "ymax": yr[1],
+                }
+                page._gating_gates.append(gate)
+                page._gating_rois.append([])
+            vline.sigPositionChangeFinished.connect(
+                lambda l=vline, cid=split_id: self._gating_split_sync(page, cid, l)
+            )
+            self._gating_update_roi_visibility(page)
+            self._gating_rebuild_tree(page)
+            self._gating_set_tool(page, None)
+            self._gating_mark_dirty(page)
+            return
+
+        if tool == "skewed_quadrant":
+            center, p_right, p_up, p_left, p_down = arg
+            cx, cy = center
+            skewed_id = uuid4().hex[:8]
+            roi = _SkewedQuadrantROI(
+                center, p_right, p_up, p_left, p_down, **_gate_roi_pens(),
+            )
+            self._gating_style_handles(roi)
+            page._gating_viewbox.addItem(roi, ignoreBounds=True)
+            page._gating_skewed_lines[skewed_id] = {
+                "roi": roi,
+                "x": preview.get("x"),
+                "y": preview.get("y"),
+            }
+            for qnum in (1, 2, 3, 4):
+                gate = {
+                    "id": uuid4().hex[:8],
+                    "name": f"Q{qnum}",
+                    "type": "skewed_quadrant",
+                    "quadrant": qnum,
+                    "center": [cx, cy],
+                    "p_right": list(p_right),
+                    "p_up": list(p_up),
+                    "p_left": list(p_left),
+                    "p_down": list(p_down),
+                    "skewed_id": skewed_id,
+                    "x": preview.get("x"),
+                    "y": preview.get("y"),
+                    "parent": page._gating_parent_id,
+                    "xmin": xr[0], "xmax": xr[1],
+                    "ymin": yr[0], "ymax": yr[1],
+                }
+                page._gating_gates.append(gate)
+                page._gating_rois.append([])
+            roi.sigRegionChangeFinished.connect(
+                lambda: self._gating_skewed_sync(page, skewed_id)
+            )
+            self._gating_set_items_handles_visible([roi], False)
+            self._gating_update_roi_visibility(page)
+            self._gating_rebuild_tree(page)
+            self._gating_set_tool(page, None)
+            self._gating_mark_dirty(page)
+            return
+
+        gate = {
+            "id": uuid4().hex[:8],
+            "name": self._gating_default_name(page, tool),
+            "type": tool,
+            "x": preview.get("x"),
+            "y": preview.get("y"),
+            "parent": page._gating_parent_id,
+            "xmin": xr[0], "xmax": xr[1],
+            "ymin": yr[0], "ymax": yr[1],
+        }
+        self._gating_sync_gate(gate, arg)
+        self._gating_style_handles(arg)
+        arg.sigRegionChangeFinished.connect(
+            lambda r=arg, g=gate: self._gating_sync_gate(g, r)
+        )
+        page._gating_gates.append(gate)
+        page._gating_rois.append([arg])
+        self._gating_set_items_handles_visible([arg], False)
+        self._gating_update_roi_visibility(page)
+        self._gating_rebuild_tree(page)
+        self._gating_set_tool(page, None)
+        self._gating_mark_dirty(page)
+
+    def _gating_style_handles(self, roi) -> None:
+        """Make a gate ROI's handles round and a bit larger."""
+        roi.handleSize = 10
+        for h in roi.handles:
+            item = h["item"]
+            item.radius = 10
+            item.sides = 24
+            item.buildPath()
+
+    def _gating_set_items_handles_visible(self, items, visible: bool) -> None:
+        """Show a gate's handles/nodes only when selected."""
+        for item in items:
+            if isinstance(item, pg.InfiniteLine):
+                item.setMovable(visible)
+            else:
+                for h in item.handles:
+                    h["item"].setVisible(visible)
+
+    def _gating_descendant_ids(self, page, gate_id) -> set:
+        """Return the set of a gate's descendant ids (not including itself)."""
+        by_parent = {}
+        for g in page._gating_gates:
+            by_parent.setdefault(g.get("parent"), []).append(g)
+        result = set()
+        stack = [gate_id]
+        while stack:
+            pid = stack.pop()
+            for child in by_parent.get(pid, []):
+                if child["id"] not in result:
+                    result.add(child["id"])
+                    stack.append(child["id"])
+        return result
+
+    def _gating_visible_ids(self, page):
+        """Return the set of visible gate ids for the current view mode, or None."""
+        active = page._gating_active_gate_id
+        if active:
+            # Subset view: show only the gate's descendants (not the gate/ancestors).
+            return self._gating_descendant_ids(page, active)
+        context = page._gating_context_gate_id
+        if context:
+            ctx = next((g for g in page._gating_gates if g["id"] == context), None)
+            if ctx is not None:
+                p = ctx.get("parent")
+                return {g["id"] for g in page._gating_gates if g.get("parent") == p}
+            return set()
+        return None
+
+    def _gating_update_roi_visibility(self, page) -> None:
+        """Show gates bound to the current (x, y) axes and gating-tree context."""
+        x = page._gating_preview.get("x")
+        y = page._gating_preview.get("y")
+        visible_ids = self._gating_visible_ids(page)
+        visible_crosshairs = None
+        visible_splits = None
+        visible_skewed = None
+        if visible_ids is not None:
+            visible_crosshairs = set()
+            visible_splits = set()
+            visible_skewed = set()
+            for g in page._gating_gates:
+                if g.get("id") not in visible_ids:
+                    continue
+                if g.get("crosshair_id"):
+                    visible_crosshairs.add(g.get("crosshair_id"))
+                if g.get("split_id"):
+                    visible_splits.add(g.get("split_id"))
+                if g.get("skewed_id"):
+                    visible_skewed.add(g.get("skewed_id"))
+        for gate, items in zip(page._gating_gates, page._gating_rois):
+            xy_ok = gate.get("x") == x and gate.get("y") == y
+            hier_ok = visible_ids is None or gate.get("id") in visible_ids
+            visible = xy_ok and hier_ok
+            for item in items:
+                item.setVisible(visible)
+        for cid, entry in page._gating_crosshairs.items():
+            xy_ok = entry.get("x") == x and entry.get("y") == y
+            hier_ok = visible_crosshairs is None or cid in visible_crosshairs
+            visible = xy_ok and hier_ok
+            for line in entry["lines"]:
+                line.setVisible(visible)
+        for sid, entry in page._gating_split_lines.items():
+            xy_ok = entry.get("x") == x and entry.get("y") == y
+            hier_ok = visible_splits is None or sid in visible_splits
+            visible = xy_ok and hier_ok
+            for line in entry["lines"]:
+                line.setVisible(visible)
+        for sid, entry in page._gating_skewed_lines.items():
+            xy_ok = entry.get("x") == x and entry.get("y") == y
+            hier_ok = visible_skewed is None or sid in visible_skewed
+            visible = xy_ok and hier_ok
+            entry["roi"].setVisible(visible)
+
+    def _gating_load_rois(self, page) -> None:
+        viewbox = page._gating_viewbox
+        page._gating_rois = []
+        page._gating_crosshairs = {}
+        page._gating_split_lines = {}
+        page._gating_skewed_lines = {}
+        for gate in page._gating_gates:
+            items = []
+            t = gate.get("type")
+            try:
+                if t == "rect":
+                    roi = pg.RectROI(
+                        (gate["pos"][0], gate["pos"][1]),
+                        (gate["size"][0], gate["size"][1]),
+                        **_gate_roi_pens(),
+                    )
+                    self._gating_style_handles(roi)
+                    roi.sigRegionChangeFinished.connect(
+                        lambda r=roi, g=gate: self._gating_sync_gate(g, r)
+                    )
+                    items = [roi]
+                elif t == "ellipse":
+                    roi = pg.EllipseROI(
+                        (gate["pos"][0], gate["pos"][1]),
+                        (gate["size"][0], gate["size"][1]),
+                        **_gate_roi_pens(),
+                    )
+                    self._gating_style_handles(roi)
+                    roi.sigRegionChangeFinished.connect(
+                        lambda r=roi, g=gate: self._gating_sync_gate(g, r)
+                    )
+                    items = [roi]
+                elif t == "polygon":
+                    roi = _GatePolygonROI(
+                        [tuple(p) for p in gate["points"]],
+                        closed=True, **_gate_roi_pens(),
+                    )
+                    self._gating_style_handles(roi)
+                    roi.sigRegionChangeFinished.connect(
+                        lambda r=roi, g=gate: self._gating_sync_gate(g, r)
+                    )
+                    items = [roi]
+                elif t == "quadrant":
+                    cid = gate.get("crosshair_id")
+                    if cid and cid not in page._gating_crosshairs:
+                        pen = pg.mkPen(_GATE_PEN, width=2)
+                        hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+                        vline = pg.InfiniteLine(pos=gate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
+                        hline = pg.InfiniteLine(pos=gate.get("hy", 0), angle=0, movable=True, pen=pen, hoverPen=hover)
+                        viewbox.addItem(vline)
+                        viewbox.addItem(hline)
+                        page._gating_crosshairs[cid] = {
+                            "lines": [vline, hline],
+                            "x": gate.get("x"),
+                            "y": gate.get("y"),
+                        }
+                        vline.sigPositionChangeFinished.connect(
+                            lambda l=vline, c=cid: self._gating_quadrant_sync(page, c, "vx", l)
+                        )
+                        hline.sigPositionChangeFinished.connect(
+                            lambda l=hline, c=cid: self._gating_quadrant_sync(page, c, "hy", l)
+                        )
+                    items = []
+                elif t == "range":
+                    pen = pg.mkPen(_GATE_PEN, width=2)
+                    hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+                    vline1 = pg.InfiniteLine(pos=gate.get("x1", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
+                    vline2 = pg.InfiniteLine(pos=gate.get("x2", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
+                    viewbox.addItem(vline1)
+                    viewbox.addItem(vline2)
+                    vline1.sigPositionChangeFinished.connect(
+                        lambda l=vline1, g=gate: g.__setitem__("x1", l.value())
+                    )
+                    vline2.sigPositionChangeFinished.connect(
+                        lambda l=vline2, g=gate: g.__setitem__("x2", l.value())
+                    )
+                    items = [vline1, vline2]
+                elif t == "split":
+                    sid = gate.get("split_id")
+                    if sid and sid not in page._gating_split_lines:
+                        pen = pg.mkPen(_GATE_PEN, width=2)
+                        hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+                        vline = pg.InfiniteLine(pos=gate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
+                        viewbox.addItem(vline)
+                        page._gating_split_lines[sid] = {
+                            "lines": [vline],
+                            "x": gate.get("x"),
+                            "y": gate.get("y"),
+                        }
+                        vline.sigPositionChangeFinished.connect(
+                            lambda l=vline, c=sid: self._gating_split_sync(page, c, l)
+                        )
+                    items = []
+                elif t == "skewed_quadrant":
+                    sid = gate.get("skewed_id")
+                    if sid and sid not in page._gating_skewed_lines:
+                        cx, cy = gate.get("center", (0, 0))
+                        roi = _SkewedQuadrantROI(
+                            (cx, cy),
+                            gate.get("p_right", (cx, cy)),
+                            gate.get("p_up", (cx, cy)),
+                            gate.get("p_left", (cx, cy)),
+                            gate.get("p_down", (cx, cy)),
+                            **_gate_roi_pens(),
+                        )
+                        self._gating_style_handles(roi)
+                        viewbox.addItem(roi, ignoreBounds=True)
+                        page._gating_skewed_lines[sid] = {
+                            "roi": roi,
+                            "x": gate.get("x"),
+                            "y": gate.get("y"),
+                        }
+                        roi.sigRegionChangeFinished.connect(
+                            lambda c=sid: self._gating_skewed_sync(page, c)
+                        )
+                    items = []
+            except (KeyError, IndexError, TypeError):
+                items = []
+            for item in items:
+                viewbox.addItem(item)
+            self._gating_set_items_handles_visible(items, False)
+            page._gating_rois.append(items)
+
+    def _gating_delete_selected(self, page) -> None:
+        items = page._gating_tree.selectedItems()
+        if not items:
+            return
+        idx = items[0].data(0, Qt.ItemDataRole.UserRole)
+        self._gating_delete_gate(page, idx, cascade=True)
+
+    def _gating_delete_gate(self, page, idx, cascade: bool) -> None:
+        """Delete a gate. If `cascade`, also delete all its descendants."""
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        gate = page._gating_gates[idx]
+        gate_id = gate["id"]
+        parent_id = gate.get("parent")
+
+        to_delete = {gate_id}
+        if cascade:
+            changed = True
+            while changed:
+                changed = False
+                for g in page._gating_gates:
+                    if g.get("parent") in to_delete and g["id"] not in to_delete:
+                        to_delete.add(g["id"])
+                        changed = True
+        else:
+            # Keep children; re-parent them to this gate's parent.
+            for g in page._gating_gates:
+                if g.get("parent") == gate_id:
+                    g["parent"] = parent_id
+
+        indices = [i for i, g in enumerate(page._gating_gates) if g["id"] in to_delete]
+        for i in reversed(indices):
+            for item in page._gating_rois[i]:
+                page._gating_viewbox.removeItem(item)
+            del page._gating_gates[i]
+            del page._gating_rois[i]
+        self._gating_prune_crosshairs(page)
+        page._gating_parent_id = None
+        page._gating_active_gate_id = None
+        page._gating_context_gate_id = None
+        self._gating_rebuild_tree(page)
+        self._gating_mark_dirty(page)
+
+    def _gating_prune_crosshairs(self, page) -> None:
+        """Remove shared boundary lines whose gates are all gone."""
+        used = {g.get("crosshair_id") for g in page._gating_gates if g.get("crosshair_id")}
+        for cid in list(page._gating_crosshairs.keys()):
+            if cid not in used:
+                for line in page._gating_crosshairs[cid]["lines"]:
+                    page._gating_viewbox.removeItem(line)
+                del page._gating_crosshairs[cid]
+        used_splits = {g.get("split_id") for g in page._gating_gates if g.get("split_id")}
+        for sid in list(page._gating_split_lines.keys()):
+            if sid not in used_splits:
+                for line in page._gating_split_lines[sid]["lines"]:
+                    page._gating_viewbox.removeItem(line)
+                del page._gating_split_lines[sid]
+        used_skewed = {g.get("skewed_id") for g in page._gating_gates if g.get("skewed_id")}
+        for sid in list(page._gating_skewed_lines.keys()):
+            if sid not in used_skewed:
+                page._gating_viewbox.removeItem(page._gating_skewed_lines[sid]["roi"])
+                del page._gating_skewed_lines[sid]
+
+    def _gating_gate_chain(self, page, gate_id) -> list:
+        """Return the gates from root to `gate_id` (inclusive), in order."""
+        by_id = {g["id"]: g for g in page._gating_gates}
+        chain = []
+        cur = by_id.get(gate_id)
+        while cur is not None:
+            chain.append(cur)
+            cur = by_id.get(cur.get("parent"))
+        chain.reverse()
+        return chain
+
+    def _gating_compute_mask(self, page, gate_id, parquet_path):
+        """Return the AND mask of a gate and all its ancestors (on transformed data)."""
+        import numpy as np
+        import pandas as pd
+        chain = self._gating_gate_chain(page, gate_id)
+        transforms = self._upstream_scale_transforms(page._gating_task_id)
+        needed = set()
+        for g in chain:
+            if g.get("x"):
+                needed.add(g["x"])
+            if g.get("y"):
+                needed.add(g["y"])
+        if not needed:
+            return None
+        try:
+            df = pd.read_parquet(parquet_path, columns=list(needed))
+        except Exception:
+            return None
+        mask = None
+        for g in chain:
+            x_name = g.get("x")
+            y_name = g.get("y")
+            if not x_name or not y_name:
+                continue
+            x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
+            y = pd.to_numeric(df[y_name], errors="coerce").to_numpy(dtype="float64")
+            x = _apply_scale_transforms(x, transforms.get(x_name))
+            y = _apply_scale_transforms(y, transforms.get(y_name))
+            gm = _gate_mask(x, y, g)
+            mask = gm if mask is None else (mask & gm)
+        return mask
+
+    def _gating_context_mask(self, page, gate_id, parquet_path):
+        """Return the parent's population mask (the points the parent includes)."""
+        gate = next((g for g in page._gating_gates if g["id"] == gate_id), None)
+        if gate is None or not gate.get("parent"):
+            return None  # top-level gate -> all events
+        return self._gating_compute_mask(page, gate.get("parent"), parquet_path)
+
+    def _gating_on_tree_double_clicked(self, page, item, column) -> None:
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        preview = page._gating_preview
+        self._gating_cancel_pending_render(page)
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            page._gating_active_gate_id = None
+            page._gating_parent_id = None
+            page._gating_context_gate_id = None
+        else:
+            gate = page._gating_gates[idx]
+            page._gating_active_gate_id = gate["id"]
+            page._gating_context_gate_id = None
+            # New gates drawn inside this subset become children of this gate.
+            page._gating_parent_id = gate["id"]
+            if gate.get("x"):
+                preview["x"] = gate["x"]
+            if gate.get("y"):
+                preview["y"] = gate["y"]
+        self._gating_render(page)
+        self._gating_rebuild_settings(page)
+
+    def _gating_tree_context_menu(self, page, pos) -> None:
+        tree = page._gating_tree
+        item = tree.itemAt(pos)
+        if item is None:
+            return
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        menu = QMenu(tree)
+        ren_act = QAction("Rename", menu)
+        ren_act.triggered.connect(lambda: self._gating_rename_gate(page, idx))
+        menu.addAction(ren_act)
+        del_one = QAction("Delete this gate", menu)
+        del_one.triggered.connect(lambda: self._gating_delete_gate(page, idx, cascade=False))
+        menu.addAction(del_one)
+        del_all = QAction("Delete gate and all children", menu)
+        del_all.triggered.connect(lambda: self._gating_delete_gate(page, idx, cascade=True))
+        menu.addAction(del_all)
+        menu.exec(tree.viewport().mapToGlobal(pos))
+
+    def _gating_on_tree_selection(self, page, item, column) -> None:
+        """Single-click: open the gate's drawing context (axes + range + parent points)."""
+        idx = item.data(0, Qt.ItemDataRole.UserRole) if item else -1
+        page._gating_active_gate_id = None  # single-click clears any subset view
+        preview = page._gating_preview
+        if idx is not None and isinstance(idx, int) and 0 <= idx < len(page._gating_gates):
+            gate = page._gating_gates[idx]
+            page._gating_context_gate_id = gate["id"]
+            # New gates drawn here are siblings of this gate (same parent level).
+            page._gating_parent_id = gate.get("parent")
+            if gate.get("x"):
+                preview["x"] = gate["x"]
+            if gate.get("y"):
+                preview["y"] = gate["y"]
+            preview["xmin"] = gate.get("xmin")
+            preview["xmax"] = gate.get("xmax")
+            preview["ymin"] = gate.get("ymin")
+            preview["ymax"] = gate.get("ymax")
+        else:
+            page._gating_context_gate_id = None
+            page._gating_parent_id = None
+            # "All Events": show all points using the Plot settings' axes/file.
+            preview["x"] = page._gating_settings_x
+            preview["y"] = page._gating_settings_y
+            preview["xmin"] = None
+            preview["xmax"] = None
+            preview["ymin"] = None
+            preview["ymax"] = None
+        selected = idx if isinstance(idx, int) and idx >= 0 else -1
+        for i, gate_items in enumerate(page._gating_rois):
+            self._gating_set_items_handles_visible(gate_items, i == selected)
+        # Skewed-quadrant handles live on a shared ROI, not per-gate items.
+        selected_skewed = None
+        if isinstance(idx, int) and 0 <= idx < len(page._gating_gates):
+            selected_skewed = page._gating_gates[idx].get("skewed_id")
+        for sid, entry in page._gating_skewed_lines.items():
+            self._gating_set_items_handles_visible(
+                [entry["roi"]], sid == selected_skewed
+            )
+        # Defer the (heavy) render so a double-click on the same item is
+        # detected first and can take over the view.
+        self._gating_cancel_pending_render(page)
+        page._gating_render_timer = QTimer()
+        page._gating_render_timer.setSingleShot(True)
+        page._gating_render_timer.setInterval(QApplication.doubleClickInterval())
+        page._gating_render_timer.timeout.connect(
+            lambda: self._gating_render_and_settings(page)
+        )
+        page._gating_render_timer.start()
+
+    def _gating_cancel_pending_render(self, page) -> None:
+        timer = getattr(page, "_gating_render_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._gating_render_timer = None
+
+    def _gating_render_and_settings(self, page) -> None:
+        self._gating_render(page)
+        self._gating_rebuild_settings(page)
+
+    def _gating_rename_gate(self, page, idx) -> None:
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        gate = page._gating_gates[idx]
+        text, ok = QInputDialog.getText(
+            self, "Rename gate", "Name:", QLineEdit.EchoMode.Normal,
+            gate.get("name", ""),
+        )
+        if ok and text.strip():
+            gate["name"] = text.strip()
+            self._gating_rebuild_tree(page)
+            self._gating_mark_dirty(page)
+
+    def _gating_rebuild_tree(self, page) -> None:
+        """Rebuild the hierarchical gate tree."""
+        tree = page._gating_tree
+        tree.blockSignals(True)
+        tree.clear()
+        root = QTreeWidgetItem(["All Events"])
+        root.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+        root.setData(0, Qt.ItemDataRole.UserRole, -1)
+        root.setData(0, Qt.ItemDataRole.UserRole + 1, None)
+        tree.addTopLevelItem(root)
+
+        by_parent = {}
+        for idx, gate in enumerate(page._gating_gates):
+            by_parent.setdefault(gate.get("parent"), []).append((idx, gate))
+
+        def add_children(parent_item, parent_id):
+            for idx, gate in by_parent.get(parent_id, []):
+                item = QTreeWidgetItem([gate.get("name", f"Gate {idx + 1}")])
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+                )
+                item.setData(0, Qt.ItemDataRole.UserRole, idx)
+                item.setData(0, Qt.ItemDataRole.UserRole + 1, gate["id"])
+                parent_item.addChild(item)
+                add_children(item, gate["id"])
+
+        add_children(root, None)
+        root.setExpanded(True)
+        tree.blockSignals(False)
+        for gate_items in page._gating_rois:
+            self._gating_set_items_handles_visible(gate_items, False)
+        for entry in page._gating_skewed_lines.values():
+            self._gating_set_items_handles_visible([entry["roi"]], False)
+
+    def _gating_render(self, page) -> None:
+        """Render the gating scatter for the current view mode."""
+        transforms = self._upstream_scale_transforms(page._gating_task_id)
+        rec = self._figure_record(page._gating_preview.get("file"))
+        preview = page._gating_preview
+
+        # Show a gray overlay when the current file lacks x/y parameters.
+        cols = self._columns_for(rec.get("parquet")) if rec else []
+        missing = [
+            str(n) for n in (preview.get("x"), preview.get("y"))
+            if n and n not in cols
+        ]
+        if missing:
+            page._gating_overlay_box.setText(
+                "Parameter not in this file:\n" + ", ".join(missing)
+            )
+            page._gating_overlay.show()
+        else:
+            page._gating_overlay.hide()
+
+        mask = None
+        active = page._gating_active_gate_id
+        context = page._gating_context_gate_id
+        if active:
+            # Subset view: show only the double-clicked gate's points.
+            if rec:
+                mask = self._gating_compute_mask(page, active, rec["parquet"])
+        elif context:
+            # Editing context: show the parent's points (not the gate's own).
+            if rec:
+                mask = self._gating_context_mask(page, context, rec["parquet"])
+        # Preserve the current view range for the subset view (don't auto-fit).
+        preserved = None
+        if active:
+            preserved = page._gating_viewbox.viewRange()
+        self._figure_render_scatter(
+            page._gating_preview, page._gating_plot_widget,
+            column_transforms=transforms, mask=mask,
+        )
+        if preserved is not None:
+            xr, yr = preserved
+            page._gating_viewbox.setXRange(xr[0], xr[1], padding=0)
+            page._gating_viewbox.setYRange(yr[0], yr[1], padding=0)
+        self._gating_update_roi_visibility(page)
+
+    def _gating_param_combo(self, columns, current, enabled):
+        """A parameter combo that also shows `current` when it isn't in `columns`."""
+        combo = self._figure_param_combo(columns, current, enabled)
+        if current is not None and combo.findText(str(current)) < 0:
+            combo.addItem(str(current))
+            combo.setCurrentIndex(combo.count() - 1)
+        return combo
+
+    def _gating_rebuild_settings(self, page) -> None:
+        layout = page._gating_settings_layout
+        self._clear_layout(layout)
+        preview = page._gating_preview
+        enabled = not page._gating_locked
+        plot_widget = page._gating_plot_widget
+
+        records = self._imported_files()
+        rec = self._figure_record(preview.get("file"))
+        columns = self._columns_for(rec.get("parquet")) if rec else []
+
+        layout.addWidget(QLabel("File"))
+        file_combo = QComboBox()
+        for r in records:
+            file_combo.addItem(r.get("name", ""), r.get("parquet", ""))
+        if preview.get("file") is not None:
+            idx = file_combo.findData(preview["file"])
+            if idx >= 0:
+                file_combo.setCurrentIndex(idx)
+        file_combo.setEnabled(enabled)
+        layout.addWidget(file_combo)
+
+        layout.addWidget(QLabel("X parameter"))
+        x_combo = self._gating_param_combo(columns, preview.get("x"), enabled)
+        layout.addWidget(x_combo)
+
+        layout.addWidget(QLabel("Y parameter"))
+        y_combo = self._gating_param_combo(columns, preview.get("y"), enabled)
+        layout.addWidget(y_combo)
+
+        self._figure_scatter_color_settings(
+            layout, preview, plot_widget, columns, enabled,
+            on_change=lambda: self._gating_render(page),
+            on_rebuild=lambda: (
+                self._gating_rebuild_settings(page),
+                self._gating_render(page),
+            ),
+        )
+
+        layout.addWidget(QLabel("X range"))
+        layout.addWidget(self._figure_range_row(preview, "x", plot_widget, enabled))
+        layout.addWidget(QLabel("Y range"))
+        layout.addWidget(self._figure_range_row(preview, "y", plot_widget, enabled))
+
+        self._figure_display_toggles(
+            layout, preview, enabled,
+            on_change=lambda: self._gating_render(page),
+        )
+        layout.addStretch()
+
+        def on_file_changed():
+            preview["file"] = file_combo.currentData()
+            preview["file_name"] = file_combo.currentText()
+            page._gating_active_gate_id = None
+            page._gating_context_gate_id = None
+            page._gating_parent_id = None
+            # Keep the current x/y axes and visible range when switching files.
+            vb = page._gating_viewbox
+            xr, yr = vb.viewRange()
+            self._gating_render(page)
+            vb.setXRange(xr[0], xr[1], padding=0)
+            vb.setYRange(yr[0], yr[1], padding=0)
+            self._gating_rebuild_settings(page)
+        file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
+
+        def on_param(attr):
+            def handler(value):
+                preview[attr] = value
+                if attr == "x":
+                    page._gating_settings_x = value
+                elif attr == "y":
+                    page._gating_settings_y = value
+                page._gating_active_gate_id = None
+                page._gating_context_gate_id = None
+                page._gating_parent_id = None
+                self._gating_render(page)
+            return handler
+        x_combo.currentTextChanged.connect(on_param("x"))
+        y_combo.currentTextChanged.connect(on_param("y"))
+
+    def _gating_mark_dirty(self, page) -> None:
+        page._gating_dirty = True
+        self._gating_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _gating_save_now(self, page) -> None:
+        page._gating_task_def.setdefault("params", {})["gates"] = page._gating_gates
+        if self.project is not None:
+            self.project.save()
+        page._gating_snapshot = copy.deepcopy(page._gating_task_def.get("params", {}))
+        page._gating_dirty = False
+        self._gating_update_save_btn(page)
+        self.statusBar().showMessage("Gating saved")
+        self._module_saved(page)
+
+    def _gating_update_save_btn(self, page) -> None:
+        page._gating_save_btn.setEnabled(page._gating_dirty and not page._gating_locked)
+
+    def _gating_cleanup(self, page) -> None:
+        """Remove gate items from the ViewBox before the page is torn down."""
+        for items in page._gating_rois:
+            for item in items:
+                try:
+                    page._gating_viewbox.removeItem(item)
+                except Exception:
+                    pass
+        for entry in page._gating_crosshairs.values():
+            for line in entry["lines"]:
+                try:
+                    page._gating_viewbox.removeItem(line)
+                except Exception:
+                    pass
+        for entry in page._gating_split_lines.values():
+            for line in entry["lines"]:
+                try:
+                    page._gating_viewbox.removeItem(line)
+                except Exception:
+                    pass
+        for entry in page._gating_skewed_lines.values():
+            try:
+                page._gating_viewbox.removeItem(entry["roi"])
+            except Exception:
+                pass
+        page._gating_rois = []
+        page._gating_crosshairs = {}
+        page._gating_split_lines = {}
+        page._gating_skewed_lines = {}
+
+    def _gating_close(self, page) -> None:
+        if page._gating_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Close Gating",
+                "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._gating_task_def["params"] = page._gating_snapshot
+        self._gating_cleanup(page)
+        self._close_module_page(page)
 
     def _open_module(self, task_id: str | None, task_type: str | None, name: str) -> None:
         """Open (or focus) the module tab for the given task (identified by id)."""
@@ -4067,6 +5814,8 @@ class MainWindow(QMainWindow):
             page = self._build_figure_page(name, task_def, locked)
         elif task_type == "scale":
             page = self._build_scaling_page(name, task_def, locked)
+        elif task_type == "gating":
+            page = self._build_gating_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
