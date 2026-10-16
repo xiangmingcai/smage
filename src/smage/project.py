@@ -78,3 +78,23 @@ class Project:
         (self.path / MANIFEST_FILENAME).write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
+
+    @property
+    def columns_path(self) -> Path:
+        """Path to the lightweight column-name index for the data store."""
+        return self.data_dir / "columns.json"
+
+    def load_columns(self) -> dict:
+        """Return the column-name index ({relative_path: [columns]}), or {}."""
+        if not self.columns_path.is_file():
+            return {}
+        try:
+            with self.columns_path.open("r", encoding="utf-8") as file:
+                return json.load(file)
+        except (OSError, ValueError):
+            return {}
+
+    def save_columns(self, columns: dict) -> None:
+        """Write the column-name index."""
+        self.columns_path.parent.mkdir(parents=True, exist_ok=True)
+        self.columns_path.write_text(json.dumps(columns, indent=2), encoding="utf-8")

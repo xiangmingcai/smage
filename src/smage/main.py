@@ -21,8 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PySide6.QtCore import QEvent, QObject, QRectF, QSize, QTimer, Qt
 from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -32,6 +34,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -46,6 +49,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
@@ -202,11 +207,25 @@ STATUS_DESCRIPTIONS = {
 PARAM_ORIG_WIDTH = 150
 
 # Figure module settings: scatter color modes and palette choices.
-FIGURE_COLOR_MODES = [("Density", "density"), ("Parameter", "parameter")]
+FIGURE_COLOR_MODES = [
+    ("Density", "density"),
+    ("Parameter", "parameter"),
+    ("Solid", "solid"),
+]
 FIGURE_PALETTES = [
     "viridis", "plasma", "magma", "inferno", "cividis",
     "turbo", "jet", "coolwarm", "grayscale",
 ]
+
+# Figure module histogram display modes.
+FIGURE_HISTOGRAM_MODES = [
+    ("Histogram", "histogram"),
+    ("Curve fit", "curve"),
+    ("Overlap", "overlap"),
+]
+
+# Scaling (map) module: available transforms.
+SCALING_METHODS = ["linear", "log10", "arcsinh"]
 
 
 def _figure_colormap(name: str):
@@ -216,6 +235,86 @@ def _figure_colormap(name: str):
         return pg.colormap.get(name)
     except Exception:
         return pg.ColorMap([0.0, 1.0], [(0, 0, 255), (255, 0, 0)])
+
+
+_SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
+
+
+def _format_sci(value: float) -> str:
+    """Format a number as mantissa×10^exponent with a superscript exponent."""
+    if value == 0:
+        return "0"
+    mant, exp = f"{value:.1e}".split("e")
+    return f"{mant}×10{str(int(exp)).translate(_SUPERSCRIPT)}"
+
+
+def _make_sci_axis(orientation: str):
+    """Return an axis item with scientific-notation, outward (non-crossing) ticks."""
+    import pyqtgraph as pg
+
+    class _SciAxis(pg.AxisItem):
+        def tickStrings(self, values, scale, spacing):
+            return [_format_sci(v * scale) for v in values]
+
+        def generateDrawSpecs(self, p):
+            specs = super().generateDrawSpecs(p)
+            if specs is None:
+                return specs
+            axisSpec, tickSpecs, textSpecs = specs
+            # Anchor each tick at the spine so it points outward without crossing.
+            if self.orientation in ("left", "right"):
+                spine = axisSpec[1].x()
+                tickSpecs = [(pen, pg.Point(spine, p1.y()), p2)
+                             for pen, p1, p2 in tickSpecs]
+            else:
+                spine = axisSpec[1].y()
+                tickSpecs = [(pen, pg.Point(p1.x(), spine), p2)
+                             for pen, p1, p2 in tickSpecs]
+            return axisSpec, tickSpecs, textSpecs
+
+    ax = _SciAxis(orientation)
+    ax.setStyle(tickLength=5)  # positive -> outward
+    return ax
+
+
+def _letter_pixmap(text: str, size: int = 14) -> QPixmap:
+    """Build a small pixmap with a letter (for plot corner buttons)."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QColor("#666666"))
+    font = painter.font()
+    font.setPixelSize(10)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, text)
+    painter.end()
+    return pixmap
+
+
+def _make_fit_plot_item():
+    """Return a PlotItem with an extra "F" button (fit to full data)."""
+    import pyqtgraph as pg
+
+    class _FitPlotItem(pg.PlotItem):
+        def __init__(self):
+            super().__init__()
+            self._on_fit = None
+            self.fitBtn = pg.ButtonItem(_letter_pixmap("F"), 14, self)
+            self.fitBtn.clicked.connect(lambda _=None: self._fit_clicked())
+
+        def _fit_clicked(self):
+            if self._on_fit is not None:
+                self._on_fit()
+
+        def resizeEvent(self, ev):
+            super().resizeEvent(ev)
+            w = self.autoBtn.boundingRect().width()
+            y = self.size().height() - self.fitBtn.boundingRect().height()
+            self.fitBtn.setPos(w + 2, y)
+
+    return _FitPlotItem()
 
 
 class _ClickFilter(QObject):
@@ -229,6 +328,19 @@ class _ClickFilter(QObject):
         if event.type() == QEvent.Type.MouseButtonPress:
             self._callback()
         return False  # let the event continue (plots still pan/zoom)
+
+
+class _DoubleClickFilter(QObject):
+    """Focus a plot card when its widget (or embedded plot) is double-clicked."""
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._callback = callback
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonDblClick:
+            self._callback()
+        return False
 
 
 class _PlotDragHandle(QFrame):
@@ -299,6 +411,11 @@ class _ZoomableGraphicsView(QGraphicsView):
         super().__init__(scene)
         self.enter_callback = None
         self.delete_callback = None
+        self.unfocus_callback = None
+        self.plot_wheel_cb = None
+        self.plot_pan_start_cb = None
+        self.plot_pan_move_cb = None
+        self.plot_pan_end_cb = None
         self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -307,8 +424,39 @@ class _ZoomableGraphicsView(QGraphicsView):
         self.setRenderHints(QPainter.RenderHint.Antialiasing)
 
     def wheelEvent(self, event) -> None:
+        # Route the wheel to a focused plot, else zoom the canvas.
+        if self.plot_wheel_cb is not None:
+            item = self.itemAt(event.position().toPoint())
+            if self.plot_wheel_cb(item, event.angleDelta().y()):
+                event.accept()
+                return
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self.plot_pan_start_cb is not None and self.plot_pan_start_cb(item, scene_pos):
+                event.accept()
+                return
+            if item is None and self.unfocus_callback is not None:
+                self.unfocus_callback()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.plot_pan_move_cb is not None:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self.plot_pan_move_cb(scene_pos):
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self.plot_pan_end_cb is not None and self.plot_pan_end_cb():
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -325,10 +473,11 @@ class _ZoomableGraphicsView(QGraphicsView):
 
 
 class _FigureCard(QFrame):
-    """A bordered plot card (click to select)."""
+    """A bordered plot card (click to select, double-click to focus)."""
 
     _BASE = "#plotCard { background: #ffffff; border: 1px solid #c9d5e2; border-radius: 6px; }"
     _SELECTED = "#plotCard { background: #ffffff; border: 2px solid #4285f4; border-radius: 6px; }"
+    _FOCUSED = "#plotCard { background: #ffffff; border: 2px solid #34a853; border-radius: 6px; }"
 
     def __init__(self, title: str, plot_widget, index: int, select_callback) -> None:
         super().__init__()
@@ -336,15 +485,26 @@ class _FigureCard(QFrame):
         self._select_callback = select_callback
         self._plot_widget = plot_widget
         self._proxy = None
+        self._selected = False
+        self._focused = False
         self.setObjectName("plotCard")
-        self.setStyleSheet(self._BASE)
         self.setMinimumSize(200, 200)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 4, 6, 6)
         lay.setSpacing(4)
-        lay.addWidget(_PlotDragHandle(title))
+        self._title_bar = _PlotDragHandle(title)
+        lay.addWidget(self._title_bar)
         lay.addWidget(plot_widget, 1)
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        if self._focused:
+            self.setStyleSheet(self._FOCUSED)
+        elif self._selected:
+            self.setStyleSheet(self._SELECTED)
+        else:
+            self.setStyleSheet(self._BASE)
 
     def index(self) -> int:
         return self._index
@@ -362,7 +522,12 @@ class _FigureCard(QFrame):
         self._select_callback(self._index)
 
     def set_selected(self, selected: bool) -> None:
-        self.setStyleSheet(self._SELECTED if selected else self._BASE)
+        self._selected = selected
+        self._apply_style()
+
+    def set_focused(self, focused: bool) -> None:
+        self._focused = focused
+        self._apply_style()
 
 
 def _format_number(value) -> str:
@@ -581,6 +746,7 @@ class MainWindow(QMainWindow):
         self._clipboard = None
         self._import_files = []
         self._processed_files = []
+        self._column_index = {}
         self._updating_checks = False
         self._updating_sample = False
         self._current_entry = None
@@ -652,6 +818,7 @@ class MainWindow(QMainWindow):
             return
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
+        self._column_index = self.project.load_columns()
         self._reset_module_tabs()
         self._load_import_files()
         self._refresh_workflow_tree()
@@ -669,6 +836,7 @@ class MainWindow(QMainWindow):
             return
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
+        self._column_index = self.project.load_columns()
         self._reset_module_tabs()
         self._load_import_files()
         self._refresh_workflow_tree()
@@ -754,6 +922,8 @@ class MainWindow(QMainWindow):
             files = []
             params["files"] = files
         self._import_files = files
+        for entry in self._import_files:
+            entry.setdefault("id", uuid4().hex)
         processed = params.get("processed")
         if processed is None:
             processed = []
@@ -1443,6 +1613,7 @@ class MainWindow(QMainWindow):
         for path in files:
             self._import_files.append(
                 {
+                    "id": uuid4().hex,
                     "path": path,
                     "status": "pending",
                     "checked": True,
@@ -1483,11 +1654,13 @@ class MainWindow(QMainWindow):
                             Path(parquet).unlink(missing_ok=True)
                         except OSError:
                             pass
+                        self._column_index.pop(self._rel_data_key(parquet), None)
             self._processed_files[:] = [
                 r for r in self._processed_files if r.get("source") != source
             ]
             del self._import_files[i]
 
+        self.project.save_columns(self._column_index)
         self._persist_import_files()
         self._refresh_import_list()
         self._refresh_processed_panel()
@@ -1677,7 +1850,7 @@ class MainWindow(QMainWindow):
                 break
             entry = self._import_files[i]
             try:
-                out_path = self.project.data_dir / f"{Path(entry['path']).stem}.parquet"
+                out_path = self.project.data_dir / f"{entry['id']}.parquet"
                 result = import_file(
                     entry["path"],
                     entry.get("parameters") or [],
@@ -1690,8 +1863,10 @@ class MainWindow(QMainWindow):
                 entry["imported"] = {
                     "parquet": str(out_path),
                     "rows": result["rows"],
-                    "columns": result["columns"],
                 }
+                # Publish column names to the lightweight index.
+                self._column_index[self._rel_data_key(out_path)] = result["columns"]
+                self.project.save_columns(self._column_index)
                 self._processed_files[:] = [
                     r for r in self._processed_files if r.get("source") != entry["path"]
                 ]
@@ -1700,7 +1875,6 @@ class MainWindow(QMainWindow):
                     "source": entry["path"],
                     "parquet": str(out_path),
                     "rows": result["rows"],
-                    "columns": result["columns"],
                 })
             except Exception as exc:
                 entry["status"] = "error"
@@ -2090,6 +2264,19 @@ class MainWindow(QMainWindow):
             return []
         return task.get("params", {}).get("processed", [])
 
+    def _rel_data_key(self, parquet_path) -> str:
+        """Return the parquet path relative to the data dir (index key)."""
+        try:
+            return Path(parquet_path).relative_to(self.project.data_dir).as_posix()
+        except ValueError:
+            return Path(parquet_path).name
+
+    def _columns_for(self, parquet_path) -> list:
+        """Return the column names for a parquet file from the column index."""
+        if not parquet_path:
+            return []
+        return list(self._column_index.get(self._rel_data_key(parquet_path), []))
+
     def _figure_record(self, file_path):
         """Return the imported-file record matching a parquet path, or None."""
         for rec in self._imported_files():
@@ -2199,12 +2386,20 @@ class MainWindow(QMainWindow):
         page._fig_selected = -1
         page._fig_settings_layout = settings_layout
         page._fig_locked = locked
+        page._fig_focused = None
+        page._fig_pan_scene = None
+        page._fig_pan_range = None
         page._fig_save_btn = save_btn
         page._fig_dirty = False
         save_btn.clicked.connect(lambda _=False: self._figure_save_now(page))
         self._figure_update_save_btn(page)
         canvas_view.enter_callback = lambda: self._figure_toggle_break(page, page._fig_selected)
         canvas_view.delete_callback = lambda: self._figure_delete_selected(page)
+        canvas_view.unfocus_callback = lambda: self._figure_unfocus(page)
+        canvas_view.plot_wheel_cb = lambda item, d: self._figure_plot_wheel(page, item, d)
+        canvas_view.plot_pan_start_cb = lambda item, sp: self._figure_plot_pan_start(page, item, sp)
+        canvas_view.plot_pan_move_cb = lambda sp: self._figure_plot_pan_move(page, sp)
+        canvas_view.plot_pan_end_cb = lambda: self._figure_plot_pan_end(page)
 
         for plot_dict in page._fig_plots:
             self._figure_new_card(page, plot_dict)
@@ -2226,9 +2421,26 @@ class MainWindow(QMainWindow):
     def _figure_new_card(self, page, plot_dict) -> int:
         """Create a plot card for one plot, wrap it in a proxy, and render."""
         import pyqtgraph as pg
-        plot_widget = pg.PlotWidget()
+        plot_widget = pg.PlotWidget(plotItem=_make_fit_plot_item())
         plot_widget.setBackground("w")
         plot_widget.showGrid(x=True, y=True, alpha=0.2)
+        plot_widget.getPlotItem().setAxisItems({
+            "bottom": _make_sci_axis("bottom"),
+            "left": _make_sci_axis("left"),
+        })
+        # Read-only by default; wheel/drag act on the canvas until focused.
+        plot_widget.getPlotItem().getViewBox().setMouseEnabled(False, False)
+        # Make the "A" button revert to the settings' min/max (not fit-all).
+        plot_item = plot_widget.getPlotItem()
+        try:
+            plot_item.autoBtn.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        plot_item.autoBtn.clicked.connect(
+            lambda _=None: self._figure_apply_ranges(plot_dict, plot_widget)
+        )
+        # "F" button fits to the full data extent (without changing settings).
+        plot_item._on_fit = lambda: self._figure_fit_all(plot_dict, plot_widget)
         title = plot_dict.get("title") or plot_dict.get("type", "Plot").title()
 
         index = len(page._fig_cards)
@@ -2257,6 +2469,13 @@ class MainWindow(QMainWindow):
         plot_widget.viewport().installEventFilter(click_filter)
         page._fig_filters = getattr(page, "_fig_filters", [])
         page._fig_filters.append(click_filter)
+
+        # Double-click focuses the plot (wheel/drag act on its data).
+        dbl_click_filter = _DoubleClickFilter(lambda: self._figure_focus(page, card.index()))
+        card.installEventFilter(dbl_click_filter)
+        card._title_bar.installEventFilter(dbl_click_filter)
+        plot_widget.viewport().installEventFilter(dbl_click_filter)
+        page._fig_filters.append(dbl_click_filter)
 
         page._fig_cards.append(card)
         self._figure_render(plot_dict, plot_widget)
@@ -2408,7 +2627,7 @@ class MainWindow(QMainWindow):
         """Append a new plot (scatter or histogram) and select it."""
         records = self._imported_files()
         rec = records[0] if records else None
-        columns = list(rec.get("columns") or []) if rec else []
+        columns = self._columns_for(rec.get("parquet")) if rec else []
         x = columns[0] if columns else None
         y = columns[1] if len(columns) > 1 else x
         count = sum(1 for p in page._fig_plots if p.get("type") == ptype)
@@ -2427,6 +2646,17 @@ class MainWindow(QMainWindow):
             "ymin": None,
             "ymax": None,
             "break_before": False,
+            "show_axes": True,
+            "show_axis_names": True,
+            "show_indices": True,
+            "show_sample_name": True,
+            "point_size": 4,
+            "fixed_point_size": False,
+            "bins": 20,
+            "hist_mode": "histogram",
+            "hist_color": (0, 0, 200),
+            "curve_color": (200, 40, 40),
+            "solid_color": (0, 0, 200),
         }
         page._fig_plots.append(plot_dict)
         index = self._figure_new_card(page, plot_dict)
@@ -2474,44 +2704,71 @@ class MainWindow(QMainWindow):
         plot_widget._data_ymin = float(y.min())
         plot_widget._data_ymax = float(y.max())
 
-        cmap = _figure_colormap(plot_dict.get("palette", "viridis"))
-
-        if mode == "parameter" and color_param:
-            values = pd.to_numeric(df[color_param], errors="coerce").to_numpy(dtype="float64")[keep]
+        if plot_dict.get("fixed_point_size"):
+            # Fixed: size is in data units, so points scale with the zoom.
+            size = float(plot_dict.get("point_size", 4))
+            px_mode = False
         else:
-            # Density: color each actual point by its local (binned) density,
-            # without painting empty regions of the plot.
-            hist, xe, ye = np.histogram2d(x, y, bins=200)
-            xi = np.clip(np.digitize(x, xe) - 1, 0, hist.shape[0] - 1)
-            yi = np.clip(np.digitize(y, ye) - 1, 0, hist.shape[1] - 1)
-            values = np.log1p(hist[xi, yi].astype(float))
+            # Not fixed: constant on-screen pixel size.
+            size = 4.0
+            px_mode = True
 
-        self._figure_draw_colored_scatter(plot_widget, x, y, values, cmap)
+        if mode == "solid":
+            # Solid: every point shares one user-chosen color.
+            solid = plot_dict.get("solid_color", (0, 0, 200))
+            self._figure_draw_colored_scatter(
+                plot_widget, x, y, None, None, size=size, px_mode=px_mode, solid_color=solid
+            )
+        else:
+            cmap = _figure_colormap(plot_dict.get("palette", "viridis"))
+            if mode == "parameter" and color_param:
+                values = pd.to_numeric(df[color_param], errors="coerce").to_numpy(dtype="float64")[keep]
+            else:
+                # Density: color each actual point by its local (binned) density,
+                # without painting empty regions of the plot.
+                hist, xe, ye = np.histogram2d(x, y, bins=200)
+                xi = np.clip(np.digitize(x, xe) - 1, 0, hist.shape[0] - 1)
+                yi = np.clip(np.digitize(y, ye) - 1, 0, hist.shape[1] - 1)
+                values = np.log1p(hist[xi, yi].astype(float))
+            self._figure_draw_colored_scatter(plot_widget, x, y, values, cmap, size=size, px_mode=px_mode)
         self._figure_apply_ranges(plot_dict, plot_widget)
+        self._figure_apply_display_options(plot_dict, plot_widget)
 
     def _figure_draw_colored_scatter(self, plot_widget, x, y, values, cmap,
-                                     max_points: int = 50000) -> None:
-        """Draw points colored by `values`, normalized through the colormap."""
+                                     max_points: int = 50000, size: float = 4,
+                                     px_mode: bool = True, solid_color=None) -> None:
+        """Draw points colored by `values`, normalized through the colormap.
+
+        When `solid_color` is given, every point uses that single color instead.
+        """
         import numpy as np
         import pyqtgraph as pg
-
-        lo = float(np.nanmin(values))
-        hi = float(np.nanmax(values))
-        if not np.isfinite(lo):
-            lo = 0.0
-        if not np.isfinite(hi) or hi <= lo:
-            hi = lo + 1.0
 
         if x.size > max_points:
             rng = np.random.default_rng(42)
             idx = rng.choice(x.size, max_points, replace=False)
-            x, y, values = x[idx], y[idx], values[idx]
+            x = x[idx]
+            y = y[idx]
+            if values is not None:
+                values = values[idx]
 
-        norm = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
-        rgba = cmap.map(norm, mode="byte")
-        brushes = [pg.mkBrush(int(r), int(g), int(b), 200) for r, g, b, _ in rgba]
+        if solid_color is not None:
+            brushes = pg.mkBrush(
+                int(solid_color[0]), int(solid_color[1]), int(solid_color[2]), 200
+            )
+        else:
+            lo = float(np.nanmin(values))
+            hi = float(np.nanmax(values))
+            if not np.isfinite(lo):
+                lo = 0.0
+            if not np.isfinite(hi) or hi <= lo:
+                hi = lo + 1.0
+            norm = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+            rgba = cmap.map(norm, mode="byte")
+            brushes = [pg.mkBrush(int(r), int(g), int(b), 200) for r, g, b, _ in rgba]
+
         plot_widget.addItem(
-            pg.ScatterPlotItem(x=x, y=y, symbol="o", size=4, pen=None, brush=brushes)
+            pg.ScatterPlotItem(x=x, y=y, symbol="o", size=size, pen=None, brush=brushes, pxMode=px_mode)
         )
 
     def _figure_render_histogram(self, plot_dict: dict, plot_widget) -> None:
@@ -2534,14 +2791,48 @@ class MainWindow(QMainWindow):
             return
         plot_widget._data_xmin = float(x.min())
         plot_widget._data_xmax = float(x.max())
-        counts, edges = np.histogram(x, bins=256)
-        plot_widget.addItem(
-            pg.PlotDataItem(
-                edges, counts, stepMode="center", fillLevel=0,
-                brush=(0, 0, 200, 60), pen=(0, 0, 200),
+
+        bins = max(2, int(plot_dict.get("bins", 20)))
+        mode = plot_dict.get("hist_mode", "histogram")
+        counts, edges = np.histogram(x, bins=bins)
+        centers = (edges[:-1] + edges[1:]) / 2.0
+
+        hist_color = plot_dict.get("hist_color", (0, 0, 200))
+        curve_color = plot_dict.get("curve_color", (200, 40, 40))
+
+        # Curve fit: Gaussian-smoothed version of the current histogram, so it
+        # updates in step with the bin count. Upsampled for a smooth line.
+        curve_x = None
+        curve_y = None
+        if mode in ("curve", "overlap"):
+            from scipy.ndimage import gaussian_filter1d
+            sigma = max(1.0, bins / 40.0)
+            smooth = gaussian_filter1d(counts.astype(float), sigma=sigma, mode="nearest")
+            n_up = max(bins * 8, 100)
+            up_x = np.linspace(centers[0], centers[-1], n_up)
+            curve_y = np.interp(up_x, centers, smooth)
+            curve_x = up_x
+
+        ymax = float(counts.max())
+        if curve_y is not None and curve_y.size:
+            ymax = max(ymax, float(np.nanmax(curve_y)))
+        plot_widget._data_ymin = 0.0
+        plot_widget._data_ymax = ymax
+
+        if mode in ("histogram", "overlap"):
+            plot_widget.addItem(
+                pg.PlotDataItem(
+                    edges, counts, stepMode="center", fillLevel=0,
+                    brush=(*hist_color, 60), pen=hist_color,
+                )
             )
-        )
+        if mode in ("curve", "overlap") and curve_y is not None:
+            plot_widget.addItem(
+                pg.PlotDataItem(curve_x, curve_y, pen=pg.mkPen(*curve_color, width=2))
+            )
+
         self._figure_apply_ranges(plot_dict, plot_widget)
+        self._figure_apply_display_options(plot_dict, plot_widget)
 
     def _figure_apply_ranges(self, plot_dict: dict, plot_widget) -> None:
         """Apply manual/auto X and Y ranges from the plot settings."""
@@ -2556,6 +2847,50 @@ class MainWindow(QMainWindow):
         else:
             plot_widget.enableAutoRange("y", True)
 
+    def _figure_fit_all(self, plot_dict: dict, plot_widget) -> None:
+        """Fit the view to the full data extent (without changing settings)."""
+        vb = plot_widget.getPlotItem().getViewBox()
+        xmin = getattr(plot_widget, "_data_xmin", None)
+        xmax = getattr(plot_widget, "_data_xmax", None)
+        ymin = getattr(plot_widget, "_data_ymin", None)
+        ymax = getattr(plot_widget, "_data_ymax", None)
+        if xmin is not None and xmax is not None and xmax > xmin:
+            pad = 0.02 * (xmax - xmin)
+            vb.setXRange(xmin - pad, xmax + pad, padding=0)
+        else:
+            vb.enableAutoRange("x", True)
+        if ymin is not None and ymax is not None and ymax > ymin:
+            pad = 0.02 * (ymax - ymin)
+            vb.setYRange(ymin - pad, ymax + pad, padding=0)
+        else:
+            vb.enableAutoRange("y", True)
+
+    def _figure_apply_display_options(self, plot_dict: dict, plot_widget) -> None:
+        """Apply axis labels, visibility, tick notation, and sample-name title."""
+        plot_item = plot_widget.getPlotItem()
+        x_name = plot_dict.get("x")
+        y_name = plot_dict.get("y") if plot_dict.get("type") == "scatter" else "Count"
+
+        plot_item.setLabel("bottom", x_name or "")
+        plot_item.setLabel("left", y_name or "")
+
+        show_axes = plot_dict.get("show_axes", True)
+        show_names = plot_dict.get("show_axis_names", True)
+        show_indices = plot_dict.get("show_indices", True)
+        for ax in ("bottom", "left"):
+            plot_item.showAxis(ax, show_axes)
+            plot_item.getAxis(ax).showLabel(show_names)
+            plot_item.getAxis(ax).setStyle(showValues=show_indices)
+
+        if plot_dict.get("show_sample_name", True) and plot_dict.get("file_name"):
+            plot_item.setTitle(plot_dict["file_name"], color="#808080", size="9pt")
+        else:
+            plot_item.setTitle(None)
+
+    def _figure_toggle_display(self, page, index, plot_dict, key, checked) -> None:
+        plot_dict[key] = checked
+        self._figure_apply_change(page, index, plot_dict)
+
     def _figure_apply_change(self, page, index: int, plot_dict: dict) -> None:
         """Re-render a plot after a settings change (marks the page dirty)."""
         if 0 <= index < len(page._fig_cards):
@@ -2569,6 +2904,91 @@ class MainWindow(QMainWindow):
             card.set_selected(i == index)
         self._figure_rebuild_settings(page)
         page._fig_view.setFocus()
+        if page._fig_focused != index:
+            self._figure_unfocus(page)
+
+    def _figure_focus(self, page, index: int) -> None:
+        """Focus a plot: wheel/drag act on its data instead of the canvas."""
+        if not (0 <= index < len(page._fig_cards)):
+            return
+        page._fig_focused = index
+        page._fig_selected = index
+        for i, card in enumerate(page._fig_cards):
+            card.set_selected(i == index)
+            card.set_focused(i == index)
+        self._figure_rebuild_settings(page)
+        self._figure_update_plot_mouse(page)
+        page._fig_view.setFocus()
+
+    def _figure_unfocus(self, page) -> None:
+        """Leave focus mode (wheel/drag act on the canvas again)."""
+        page._fig_focused = None
+        for card in page._fig_cards:
+            card.set_focused(False)
+        self._figure_update_plot_mouse(page)
+
+    def _figure_update_plot_mouse(self, page) -> None:
+        for i, card in enumerate(page._fig_cards):
+            enabled = (i == page._fig_focused)
+            card.plot_widget().getPlotItem().getViewBox().setMouseEnabled(enabled, enabled)
+
+    def _figure_plot_wheel(self, page, item, delta_y) -> bool:
+        focused = page._fig_focused
+        if focused is None or not (0 <= focused < len(page._fig_cards)):
+            return False
+        card = page._fig_cards[focused]
+        if item is not card.proxy():
+            return False
+        factor = 1.15 if delta_y > 0 else 1 / 1.15
+        card.plot_widget().getPlotItem().getViewBox().scaleBy((1 / factor, 1 / factor))
+        return True
+
+    def _figure_plot_pan_start(self, page, item, scene_pos) -> bool:
+        focused = page._fig_focused
+        if focused is None or not (0 <= focused < len(page._fig_cards)):
+            return False
+        card = page._fig_cards[focused]
+        if item is not card.proxy():
+            return False
+        local = card.proxy().mapFromScene(scene_pos)
+        if local.y() <= _CardProxy.TITLE_HEIGHT:
+            return False  # title bar -> reorder, not pan
+        # Corner buttons (bottom-left): "A" resets to settings range, "F" fits all.
+        if local.y() >= card.height() - 40:
+            if local.x() <= 21:
+                self._figure_apply_ranges(page._fig_plots[focused], card.plot_widget())
+                return True
+            if local.x() <= 40:
+                self._figure_fit_all(page._fig_plots[focused], card.plot_widget())
+                return True
+        page._fig_pan_scene = scene_pos
+        page._fig_pan_range = card.plot_widget().getPlotItem().getViewBox().viewRange()
+        return True
+
+    def _figure_plot_pan_move(self, page, scene_pos) -> bool:
+        if page._fig_pan_scene is None:
+            return False
+        focused = page._fig_focused
+        if focused is None or not (0 <= focused < len(page._fig_cards)):
+            return False
+        card = page._fig_cards[focused]
+        vb = card.plot_widget().getPlotItem().getViewBox()
+        rect = card.proxy().boundingRect()
+        plot_h = max(1.0, rect.height() - _CardProxy.TITLE_HEIGHT)
+        xr = page._fig_pan_range[0]
+        yr = page._fig_pan_range[1]
+        d = scene_pos - page._fig_pan_scene
+        x_scale = (xr[1] - xr[0]) / rect.width() if rect.width() else 1.0
+        y_scale = (yr[1] - yr[0]) / plot_h if plot_h else 1.0
+        vb.setXRange(xr[0] - d.x() * x_scale, xr[1] - d.x() * x_scale, padding=0)
+        vb.setYRange(yr[0] + d.y() * y_scale, yr[1] + d.y() * y_scale, padding=0)
+        return True
+
+    def _figure_plot_pan_end(self, page) -> bool:
+        was_panning = page._fig_pan_scene is not None
+        page._fig_pan_scene = None
+        page._fig_pan_range = None
+        return was_panning
 
     def _figure_rebuild_settings(self, page) -> None:
         """Rebuild the right-hand settings panel for the selected plot."""
@@ -2594,7 +3014,7 @@ class MainWindow(QMainWindow):
 
         records = self._imported_files()
         rec = self._figure_record(plot_dict.get("file"))
-        columns = list(rec.get("columns") or []) if rec else []
+        columns = self._columns_for(rec.get("parquet")) if rec else []
 
         # File.
         layout.addWidget(QLabel("File"))
@@ -2617,6 +3037,10 @@ class MainWindow(QMainWindow):
         mode_combo = None
         palette_combo = None
         cp_combo = None
+        point_fixed = None
+        point_spin = None
+        bins_spin = None
+        hist_mode_combo = None
 
         if plot_dict.get("type") == "scatter":
             layout.addWidget(QLabel("Y parameter"))
@@ -2637,14 +3061,120 @@ class MainWindow(QMainWindow):
                 cp_combo = self._figure_param_combo(columns, plot_dict.get("color_param"), enabled)
                 layout.addWidget(cp_combo)
 
-            layout.addWidget(QLabel("Palette"))
-            palette_combo = QComboBox()
-            palette_combo.addItems(FIGURE_PALETTES)
-            idx = palette_combo.findText(plot_dict.get("palette", "viridis"))
-            if idx >= 0:
-                palette_combo.setCurrentIndex(idx)
-            palette_combo.setEnabled(enabled)
-            layout.addWidget(palette_combo)
+            if plot_dict.get("color_mode") == "solid":
+                # Solid color: a swatch button opens a color picker.
+                def make_solid_button():
+                    cur = plot_dict.get("solid_color", (0, 0, 200))
+                    btn = QPushButton()
+                    btn.setFixedSize(36, 20)
+                    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    btn.setEnabled(enabled)
+                    btn.setStyleSheet(
+                        f"background-color: rgb({cur[0]},{cur[1]},{cur[2]}); "
+                        "border: 1px solid #555;"
+                    )
+
+                    def on_pick(_=False):
+                        current = plot_dict.get("solid_color", (0, 0, 200))
+                        chosen = QColorDialog.getColor(
+                            QColor(current[0], current[1], current[2]), self, "Choose color"
+                        )
+                        if chosen.isValid():
+                            plot_dict["solid_color"] = (chosen.red(), chosen.green(), chosen.blue())
+                            btn.setStyleSheet(
+                                f"background-color: rgb({chosen.red()},{chosen.green()},{chosen.blue()}); "
+                                "border: 1px solid #555;"
+                            )
+                            self._figure_apply_change(page, index, plot_dict)
+
+                    btn.clicked.connect(on_pick)
+                    return btn
+
+                layout.addWidget(QLabel("Solid color"))
+                layout.addWidget(make_solid_button())
+            else:
+                layout.addWidget(QLabel("Palette"))
+                palette_combo = QComboBox()
+                palette_combo.addItems(FIGURE_PALETTES)
+                idx = palette_combo.findText(plot_dict.get("palette", "viridis"))
+                if idx >= 0:
+                    palette_combo.setCurrentIndex(idx)
+                palette_combo.setEnabled(enabled)
+                layout.addWidget(palette_combo)
+
+            # Point size: constant on-screen size (unchecked), or a fixed size in
+            # data units that scales with the zoom (checked).
+            def on_point_size(v):
+                plot_dict["point_size"] = float(v)
+                self._figure_apply_change(page, index, plot_dict)
+
+            layout.addWidget(QLabel("Point size"))
+            ps_row = QWidget()
+            ph = QHBoxLayout(ps_row)
+            ph.setContentsMargins(0, 0, 0, 0)
+            ph.setSpacing(4)
+            point_fixed = QCheckBox("Fixed")
+            point_fixed.setChecked(plot_dict.get("fixed_point_size", False))
+            point_fixed.setEnabled(enabled)
+            point_spin = _LogStepSpinBox(plot_dict.get("point_size", 4), on_point_size)
+            point_spin.set_enabled(enabled and point_fixed.isChecked())
+            ph.addWidget(point_fixed)
+            ph.addWidget(point_spin)
+            ph.addStretch()
+            layout.addWidget(ps_row)
+
+        if plot_dict.get("type") == "histogram":
+            # Number of bins for the histogram.
+            layout.addWidget(QLabel("Bins"))
+            bins_spin = QSpinBox()
+            bins_spin.setRange(2, 2000)
+            bins_spin.setValue(int(plot_dict.get("bins", 20)))
+            bins_spin.setKeyboardTracking(False)
+            bins_spin.setEnabled(enabled)
+            layout.addWidget(bins_spin)
+
+            # Display mode: histogram bars, fitted curve, or both overlaid.
+            layout.addWidget(QLabel("Display mode"))
+            hist_mode_combo = QComboBox()
+            for text, val in FIGURE_HISTOGRAM_MODES:
+                hist_mode_combo.addItem(text, val)
+            idx = hist_mode_combo.findData(plot_dict.get("hist_mode", "histogram"))
+            hist_mode_combo.setCurrentIndex(max(0, idx))
+            hist_mode_combo.setEnabled(enabled)
+            layout.addWidget(hist_mode_combo)
+
+            # Colors: a swatch button opens a color picker.
+            def make_color_button(key, default):
+                cur = plot_dict.get(key, default)
+                btn = QPushButton()
+                btn.setFixedSize(36, 20)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setEnabled(enabled)
+                btn.setStyleSheet(
+                    f"background-color: rgb({cur[0]},{cur[1]},{cur[2]}); "
+                    "border: 1px solid #555;"
+                )
+
+                def on_pick(_=False):
+                    current = plot_dict.get(key, default)
+                    chosen = QColorDialog.getColor(
+                        QColor(current[0], current[1], current[2]), self, "Choose color"
+                    )
+                    if chosen.isValid():
+                        plot_dict[key] = (chosen.red(), chosen.green(), chosen.blue())
+                        btn.setStyleSheet(
+                            f"background-color: rgb({chosen.red()},{chosen.green()},{chosen.blue()}); "
+                            "border: 1px solid #555;"
+                        )
+                        self._figure_apply_change(page, index, plot_dict)
+
+                btn.clicked.connect(on_pick)
+                return btn
+
+            layout.addWidget(QLabel("Histogram color"))
+            layout.addWidget(make_color_button("hist_color", (0, 0, 200)))
+            layout.addWidget(QLabel("Curve color"))
+            layout.addWidget(make_color_button("curve_color", (200, 40, 40)))
 
         # X range.
         layout.addWidget(QLabel("X range"))
@@ -2672,6 +3202,22 @@ class MainWindow(QMainWindow):
         sh.addStretch()
         layout.addWidget(size_row)
 
+        # Display options.
+        layout.addWidget(QLabel("Display"))
+        for label, key in (
+            ("Show axes", "show_axes"),
+            ("Show axis names", "show_axis_names"),
+            ("Show indices", "show_indices"),
+            ("Show sample name", "show_sample_name"),
+        ):
+            cb = QCheckBox(label)
+            cb.setChecked(plot_dict.get(key, True))
+            cb.setEnabled(enabled)
+            cb.toggled.connect(
+                lambda checked, k=key: self._figure_toggle_display(page, index, plot_dict, k, checked)
+            )
+            layout.addWidget(cb)
+
         layout.addStretch()
 
         # Signal wiring (after initial values are set).
@@ -2679,7 +3225,7 @@ class MainWindow(QMainWindow):
             plot_dict["file"] = file_combo.currentData()
             plot_dict["file_name"] = file_combo.currentText()
             new_rec = self._figure_record(plot_dict["file"])
-            new_cols = list(new_rec.get("columns") or []) if new_rec else []
+            new_cols = self._columns_for(new_rec.get("parquet")) if new_rec else []
             plot_dict["x"] = new_cols[0] if new_cols else None
             if plot_dict.get("type") == "scatter":
                 plot_dict["y"] = new_cols[1] if len(new_cols) > 1 else (new_cols[0] if new_cols else None)
@@ -2695,9 +3241,24 @@ class MainWindow(QMainWindow):
                 self._figure_apply_change(page, index, plot_dict)
             return handler
 
-        x_combo.currentTextChanged.connect(on_param("x"))
+        def on_axis_param(attr):
+            def handler(value):
+                plot_dict[attr] = value
+                # Reset the axis range to Auto so the plot refits to the new
+                # parameter and the settings panel shows the updated range.
+                if attr == "x":
+                    plot_dict["xmin"] = None
+                    plot_dict["xmax"] = None
+                elif attr == "y":
+                    plot_dict["ymin"] = None
+                    plot_dict["ymax"] = None
+                self._figure_apply_change(page, index, plot_dict)
+                self._figure_rebuild_settings(page)
+            return handler
+
+        x_combo.currentTextChanged.connect(on_axis_param("x"))
         if y_combo is not None:
-            y_combo.currentTextChanged.connect(on_param("y"))
+            y_combo.currentTextChanged.connect(on_axis_param("y"))
 
         if mode_combo is not None:
             def on_mode_changed(_=0):
@@ -2714,6 +3275,35 @@ class MainWindow(QMainWindow):
                 plot_dict["palette"] = palette_combo.currentText()
                 self._figure_apply_change(page, index, plot_dict)
             palette_combo.currentIndexChanged.connect(on_palette_changed)
+
+        if point_fixed is not None:
+            def on_point_fixed(toggled):
+                plot_dict["fixed_point_size"] = toggled
+                point_spin.set_enabled(enabled and toggled)
+                if toggled:
+                    # Seed a sensible data-unit size from the current x-range so
+                    # the fixed size starts off visible rather than at 4 units.
+                    widget = page._fig_cards[index].plot_widget()
+                    xmin = getattr(widget, "_data_xmin", None)
+                    xmax = getattr(widget, "_data_xmax", None)
+                    if xmin is not None and xmax is not None and xmax > xmin:
+                        auto_size = 0.01 * (xmax - xmin)
+                        point_spin.set_value(auto_size)
+                        plot_dict["point_size"] = auto_size
+                self._figure_apply_change(page, index, plot_dict)
+            point_fixed.toggled.connect(on_point_fixed)
+
+        if bins_spin is not None:
+            def on_bins(v):
+                plot_dict["bins"] = int(v)
+                self._figure_apply_change(page, index, plot_dict)
+            bins_spin.valueChanged.connect(on_bins)
+
+        if hist_mode_combo is not None:
+            def on_hist_mode(_=0):
+                plot_dict["hist_mode"] = hist_mode_combo.currentData()
+                self._figure_apply_change(page, index, plot_dict)
+            hist_mode_combo.currentIndexChanged.connect(on_hist_mode)
 
         def on_size_changed():
             self._figure_resize_card(page, index, width_field.value(), height_field.value())
@@ -2787,6 +3377,320 @@ class MainWindow(QMainWindow):
         h.addStretch()
         return row
 
+    # ----- scaling module (map) -------------------------------------
+    def _scaling_column_set(self) -> list:
+        """Return the sorted, de-duplicated set of input column names."""
+        cols = set()
+        for rec in self._imported_files():
+            for c in self._columns_for(rec.get("parquet")):
+                cols.add(c)
+        return sorted(cols)
+
+    def _scaling_load_config(self, task_def: dict) -> list:
+        """Return the per-column scaling config, merged with the current columns."""
+        cols = self._scaling_column_set()
+        params = task_def.setdefault("params", {})
+        existing = params.get("columns") or []
+        by_name = {c.get("name"): c for c in existing}
+        merged = []
+        for name in cols:
+            c = by_name.get(name)
+            if c is None:
+                merged.append({"name": name, "method": "linear",
+                               "param": None, "min": None, "max": None})
+            else:
+                merged.append({
+                    "name": name,
+                    "method": c.get("method", "linear"),
+                    "param": c.get("param"),
+                    "min": c.get("min"),
+                    "max": c.get("max"),
+                })
+        params["columns"] = merged
+        return merged
+
+    def _build_scaling_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Scale page: Columns table (2) | Preview (1)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._build_module_toolbar(name, page, include_save=False, locked=locked))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        cl = QHBoxLayout(content)
+        cl.setContentsMargins(12, 12, 12, 12)
+        cl.setSpacing(12)
+
+        # Left: columns table.
+        colnames_panel = self._build_panel_frame()
+        cll = QVBoxLayout(colnames_panel)
+        cll.setContentsMargins(10, 10, 10, 10)
+        cll.setSpacing(6)
+        cll.addWidget(QLabel("<b>Columns</b>"))
+        table = QTableWidget()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Name", "Method", "Param", "Min", "Max"])
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: none; }"
+            "QTableWidget::item:selected { background: #dbeafa; }"
+        )
+        cll.addWidget(table, 1)
+
+        # Right: preview (scatter + settings).
+        preview_panel = self._build_panel_frame()
+        pl = QVBoxLayout(preview_panel)
+        pl.setContentsMargins(10, 10, 10, 10)
+        pl.setSpacing(6)
+        pl.addWidget(QLabel("<b>Preview</b>"))
+        import pyqtgraph as pg
+        plot_widget = pg.PlotWidget()
+        plot_widget.setBackground("w")
+        plot_widget.showGrid(x=True, y=True, alpha=0.2)
+        pl.addWidget(plot_widget, 3)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        settings_scroll.setStyleSheet("background: transparent;")
+        settings_host = QWidget()
+        settings_host.setStyleSheet("background: transparent;")
+        settings_layout = QVBoxLayout(settings_host)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(6)
+        settings_scroll.setWidget(settings_host)
+        pl.addWidget(settings_scroll, 2)
+
+        cl.addWidget(colnames_panel, 2)
+        cl.addWidget(preview_panel, 1)
+        layout.addWidget(content, 1)
+
+        page._scaling_task_def = task_def
+        page._scaling_columns = self._scaling_load_config(task_def)
+        page._scaling_table = table
+        page._scaling_plot_widget = plot_widget
+        page._scaling_settings_layout = settings_layout
+        page._scaling_locked = locked
+
+        records = self._imported_files()
+        rec = records[0] if records else None
+        cols = self._columns_for(rec.get("parquet")) if rec else []
+        page._scaling_preview = {
+            "type": "scatter",
+            "file": rec.get("parquet") if rec else None,
+            "x": cols[0] if cols else None,
+            "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
+            "color_mode": "density",
+            "color_param": None,
+            "palette": "viridis",
+            "xmin": None,
+            "xmax": None,
+            "ymin": None,
+            "ymax": None,
+        }
+
+        self._scaling_populate_table(page)
+        table.itemSelectionChanged.connect(lambda: self._scaling_on_selection(page))
+        self._scaling_render_preview(page)
+        self._scaling_rebuild_settings(page)
+        return page
+
+    def _scaling_populate_table(self, page) -> None:
+        table = page._scaling_table
+        locked = page._scaling_locked
+        table.setRowCount(0)
+        for row_idx, config in enumerate(page._scaling_columns):
+            table.insertRow(row_idx)
+            name_item = QTableWidgetItem(config["name"])
+            name_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            table.setItem(row_idx, 0, name_item)
+
+            method_combo = QComboBox()
+            method_combo.addItems(SCALING_METHODS)
+            idx = method_combo.findText(config.get("method", "linear"))
+            method_combo.setCurrentIndex(max(0, idx))
+            method_combo.setEnabled(not locked)
+            method_combo.currentIndexChanged.connect(
+                lambda _=0, c=config, m=method_combo: self._scaling_method_changed(page, c, m)
+            )
+            table.setCellWidget(row_idx, 1, method_combo)
+
+            for col_idx, key in ((2, "param"), (3, "min"), (4, "max")):
+                edit = QLineEdit()
+                val = config.get(key)
+                edit.setText("" if val is None else str(val))
+                edit.setEnabled(not locked)
+                edit.editingFinished.connect(
+                    lambda e=edit, c=config, k=key: self._scaling_field_edited(page, c, k, e)
+                )
+                table.setCellWidget(row_idx, col_idx, edit)
+
+        if table.rowCount() > 0:
+            table.selectRow(0)
+
+    def _scaling_method_changed(self, page, config, combo) -> None:
+        config["method"] = combo.currentText()
+        self._scaling_save(page)
+
+    def _scaling_field_edited(self, page, config, key, edit) -> None:
+        text = edit.text().strip()
+        if text == "":
+            config[key] = None
+        else:
+            try:
+                config[key] = float(text)
+            except ValueError:
+                edit.setText("" if config.get(key) is None else str(config[key]))
+                return
+        self._scaling_save(page)
+
+    def _scaling_save(self, page) -> None:
+        page._scaling_task_def.setdefault("params", {})["columns"] = page._scaling_columns
+        if self.project is not None:
+            self.project.save()
+
+    def _scaling_on_selection(self, page) -> None:
+        row = page._scaling_table.currentRow()
+        if row < 0 or row >= len(page._scaling_columns):
+            return
+        page._scaling_preview["x"] = page._scaling_columns[row]["name"]
+        self._scaling_render_preview(page)
+        self._scaling_rebuild_settings(page)
+
+    def _scaling_render_preview(self, page) -> None:
+        self._figure_render_scatter(page._scaling_preview, page._scaling_plot_widget)
+
+    def _scaling_rebuild_settings(self, page) -> None:
+        layout = page._scaling_settings_layout
+        self._clear_layout(layout)
+        preview = page._scaling_preview
+        enabled = not page._scaling_locked
+
+        records = self._imported_files()
+        rec = self._figure_record(preview.get("file"))
+        columns = self._columns_for(rec.get("parquet")) if rec else []
+
+        layout.addWidget(QLabel("File"))
+        file_combo = QComboBox()
+        for r in records:
+            file_combo.addItem(r.get("name", ""), r.get("parquet", ""))
+        if preview.get("file") is not None:
+            idx = file_combo.findData(preview["file"])
+            if idx >= 0:
+                file_combo.setCurrentIndex(idx)
+        file_combo.setEnabled(enabled)
+        layout.addWidget(file_combo)
+
+        layout.addWidget(QLabel("X parameter"))
+        x_combo = self._figure_param_combo(columns, preview.get("x"), enabled)
+        layout.addWidget(x_combo)
+
+        layout.addWidget(QLabel("Y parameter"))
+        y_combo = self._figure_param_combo(columns, preview.get("y"), enabled)
+        layout.addWidget(y_combo)
+
+        layout.addWidget(QLabel("Color mode"))
+        mode_combo = QComboBox()
+        for text, val in FIGURE_COLOR_MODES:
+            mode_combo.addItem(text, val)
+        idx = mode_combo.findData(preview.get("color_mode", "density"))
+        mode_combo.setCurrentIndex(max(0, idx))
+        mode_combo.setEnabled(enabled)
+        layout.addWidget(mode_combo)
+
+        cp_combo = None
+        if preview.get("color_mode") == "parameter":
+            layout.addWidget(QLabel("Color parameter"))
+            cp_combo = self._figure_param_combo(columns, preview.get("color_param"), enabled)
+            layout.addWidget(cp_combo)
+
+        layout.addWidget(QLabel("Palette"))
+        palette_combo = QComboBox()
+        palette_combo.addItems(FIGURE_PALETTES)
+        idx = palette_combo.findText(preview.get("palette", "viridis"))
+        if idx >= 0:
+            palette_combo.setCurrentIndex(idx)
+        palette_combo.setEnabled(enabled)
+        layout.addWidget(palette_combo)
+
+        layout.addWidget(QLabel("X range"))
+        layout.addWidget(self._scaling_range_row(page, preview, "x", enabled))
+        layout.addWidget(QLabel("Y range"))
+        layout.addWidget(self._scaling_range_row(page, preview, "y", enabled))
+        layout.addStretch()
+
+        def on_file_changed():
+            preview["file"] = file_combo.currentData()
+            new_rec = self._figure_record(preview["file"])
+            new_cols = self._columns_for(new_rec.get("parquet")) if new_rec else []
+            preview["x"] = new_cols[0] if new_cols else None
+            preview["y"] = new_cols[1] if len(new_cols) > 1 else (new_cols[0] if new_cols else None)
+            self._scaling_render_preview(page)
+            self._scaling_rebuild_settings(page)
+        file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
+
+        def on_param(attr):
+            def handler(value):
+                preview[attr] = value
+                self._scaling_render_preview(page)
+            return handler
+        x_combo.currentTextChanged.connect(on_param("x"))
+        y_combo.currentTextChanged.connect(on_param("y"))
+
+        def on_mode_changed(_=0):
+            preview["color_mode"] = mode_combo.currentData()
+            self._scaling_rebuild_settings(page)
+            self._scaling_render_preview(page)
+        mode_combo.currentIndexChanged.connect(on_mode_changed)
+
+        if cp_combo is not None:
+            cp_combo.currentTextChanged.connect(on_param("color_param"))
+
+        def on_palette_changed(_=0):
+            preview["palette"] = palette_combo.currentText()
+            self._scaling_render_preview(page)
+        palette_combo.currentIndexChanged.connect(on_palette_changed)
+
+    def _scaling_range_row(self, page, preview, axis, enabled) -> QWidget:
+        min_key = f"{axis}min"
+        max_key = f"{axis}max"
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        auto = QCheckBox("Auto")
+        auto.setChecked(preview.get(min_key) is None and preview.get(max_key) is None)
+        auto.setEnabled(enabled)
+        min_spin = _LogStepSpinBox(preview.get(min_key), lambda v: commit())
+        max_spin = _LogStepSpinBox(preview.get(max_key), lambda v: commit())
+
+        def commit():
+            if auto.isChecked():
+                preview[min_key] = None
+                preview[max_key] = None
+            else:
+                preview[min_key] = min_spin.value()
+                preview[max_key] = max_spin.value()
+            min_spin.set_enabled(enabled and not auto.isChecked())
+            max_spin.set_enabled(enabled and not auto.isChecked())
+            self._figure_apply_ranges(preview, page._scaling_plot_widget)
+
+        auto.toggled.connect(lambda _: commit())
+        min_spin.set_enabled(enabled and not auto.isChecked())
+        max_spin.set_enabled(enabled and not auto.isChecked())
+        h.addWidget(auto)
+        h.addWidget(QLabel("Min"))
+        h.addWidget(min_spin)
+        h.addWidget(QLabel("Max"))
+        h.addWidget(max_spin)
+        h.addStretch()
+        return row
+
     def _open_module(self, task_id: str | None, task_type: str | None, name: str) -> None:
         """Open (or focus) the module tab for the given task (identified by id)."""
         for index in range(1, self.tabs.count()):  # skip Workflow at index 0
@@ -2803,6 +3707,8 @@ class MainWindow(QMainWindow):
             page = self._build_data_import_page()
         elif task_type == "figure":
             page = self._build_figure_page(name, task_def, locked)
+        elif task_type == "scale":
+            page = self._build_scaling_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
