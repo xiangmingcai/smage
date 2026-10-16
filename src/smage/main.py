@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QTabBar,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -226,6 +227,41 @@ FIGURE_HISTOGRAM_MODES = [
 
 # Scaling (map) module: available transforms.
 SCALING_METHODS = ["linear", "log10", "arcsinh"]
+
+
+def _apply_scale_transform(x, config):
+    """Apply a scaling transform (linear/log10/arcsinh) to a numeric array.
+
+    log10 and arcsinh are applied to the magnitude with the sign restored, so
+    negatives stay negative and zero stays zero.
+    """
+    import numpy as np
+    if config is None:
+        return x
+    method = config.get("method", "linear")
+    if method == "log10":
+        abs_x = np.abs(x)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            y = np.log10(abs_x)
+        y = np.where(abs_x == 0, 0.0, y)  # zero stays zero
+        return np.sign(x) * y
+    if method == "arcsinh":
+        cofactor = config.get("param")
+        try:
+            cofactor = float(cofactor) if cofactor else 5.0
+        except (TypeError, ValueError):
+            cofactor = 5.0
+        abs_x = np.abs(x)
+        y = np.arcsinh(abs_x / cofactor)
+        return np.sign(x) * y
+    return x
+
+
+def _apply_scale_transforms(x, configs):
+    """Apply a chain of scaling transforms (in order) to a numeric array."""
+    for config in (configs or []):
+        x = _apply_scale_transform(x, config)
+    return x
 
 
 def _figure_colormap(name: str):
@@ -553,6 +589,27 @@ class _SelectAllFilter(QObject):
         return False
 
 
+class _PinnedFirstTabBar(QTabBar):
+    """A tab bar whose first tab can be selected but not dragged to reorder."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._pressed_index = -1
+
+    def mousePressEvent(self, event) -> None:
+        self._pressed_index = self.tabAt(event.position().toPoint())
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        self._pressed_index = -1
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._pressed_index == 0:
+            return  # block dragging the pinned first (Workflow) tab
+        super().mouseMoveEvent(event)
+
+
 class _SizeField(QWidget):
     """Integer size field: a plain line edit with ±10 step buttons."""
 
@@ -727,6 +784,14 @@ def _task_kind(task_type: str) -> str:
     return MODULE_KINDS.get(task_type, "map")
 
 
+# Open-module registry states: a module is unmodified, modified-but-unsaved, or
+# just saved (transient, used to trigger a downstream update before returning
+# to unmodified).
+MODULE_STATE_UNMODIFIED = "unmodified"
+MODULE_STATE_MODIFIED = "modified"
+MODULE_STATE_SAVED = "saved"
+
+
 def _task_is_locked(task: dict) -> bool:
     """True if the task (or any descendant) is a generate module with saved data."""
     if (
@@ -750,6 +815,7 @@ class MainWindow(QMainWindow):
         self._updating_checks = False
         self._updating_sample = False
         self._current_entry = None
+        self._module_registry = {}
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 800)
         self._build_menu_bar()
@@ -757,8 +823,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def closeEvent(self, event) -> None:
-        """Warn before closing the app if any Figure page has unsaved changes."""
-        if self._has_unsaved_figure_changes():
+        """Warn before closing the app if any open module has unsaved changes."""
+        if self._has_unsaved_module_changes():
             reply = QMessageBox.question(
                 self,
                 "Close Smage",
@@ -770,9 +836,10 @@ class MainWindow(QMainWindow):
                 return
         event.accept()
 
-    def _has_unsaved_figure_changes(self) -> bool:
+    def _has_unsaved_module_changes(self) -> bool:
         for index in range(1, self.tabs.count()):  # skip Workflow at index 0
-            if getattr(self.tabs.widget(index), "_fig_dirty", False):
+            widget = self.tabs.widget(index)
+            if getattr(widget, "_fig_dirty", False) or getattr(widget, "_scaling_dirty", False):
                 return True
         return False
 
@@ -938,6 +1005,9 @@ class MainWindow(QMainWindow):
     # ----- main area: a single tabbed workspace ---------------------
     def _build_main_area(self) -> None:
         self.tabs = QTabWidget()
+        # Module tabs (everything except Workflow) can be dragged to reorder.
+        self.tabs.setTabBar(_PinnedFirstTabBar())
+        self.tabs.setMovable(True)
         self.setCentralWidget(self.tabs)
 
         self._build_workflow_tab()
@@ -1241,14 +1311,14 @@ class MainWindow(QMainWindow):
 
     # ----- module tabs ----------------------------------------------
     def _build_module_toolbar(self, name: str, page: QWidget, include_save: bool = True,
-                              locked: bool = False) -> QFrame:
+                              locked: bool = False, task_id: str | None = None) -> QFrame:
         """Build the module toolbar (title + Save/Settings/Close, plus a lock badge)."""
         bar = QFrame()
         bar.setObjectName("moduleBar")
         tl = QHBoxLayout(bar)
         tl.setContentsMargins(12, 6, 12, 6)
         tl.setSpacing(4)
-        tl.addWidget(QLabel(f"<b>{name}</b>"))
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_id, name)}</b>"))
         if locked:
             lock = QLabel()
             lock.setPixmap(_lock_pixmap())
@@ -1273,13 +1343,14 @@ class MainWindow(QMainWindow):
         tl.addWidget(close_btn)
         return bar
 
-    def _build_module_page(self, name: str, locked: bool = False) -> QWidget:
+    def _build_module_page(self, name: str, locked: bool = False,
+                           task_id: str | None = None) -> QWidget:
         """Build a generic (placeholder) module page."""
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self._build_module_toolbar(name, page, locked=locked))
+        layout.addWidget(self._build_module_toolbar(name, page, locked=locked, task_id=task_id))
 
         content = QWidget()
         content.setStyleSheet("background: #f5f8fb;")
@@ -1308,7 +1379,7 @@ class MainWindow(QMainWindow):
         tl = QHBoxLayout(bar)
         tl.setContentsMargins(12, 6, 12, 6)
         tl.setSpacing(4)
-        tl.addWidget(QLabel(f"<b>{name}</b>"))
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
         lock_label = QLabel()
         lock_label.setPixmap(_lock_pixmap())
         lock_label.setFixedSize(14, 14)
@@ -2284,6 +2355,52 @@ class MainWindow(QMainWindow):
                 return rec
         return None
 
+    def _task_chain(self, task_id) -> list:
+        """Return the workflow task chain from root down to (and including) task_id."""
+        if self.project is None or not task_id:
+            return []
+        result = []
+
+        def walk(tasks, path):
+            for task in tasks:
+                new_path = path + [task]
+                if task.get("id") == task_id:
+                    result.extend(new_path)
+                    return True
+                if walk(task.get("children", []), new_path):
+                    return True
+            return False
+
+        walk(self.project.workflow.get("tasks", []), [])
+        return result
+
+    def _parent_task_name(self, task_id) -> str | None:
+        """Return the name of the parent task in the workflow, or None (root)."""
+        chain = self._task_chain(task_id)
+        if len(chain) >= 2:
+            return chain[-2].get("name")
+        return None
+
+    def _module_display_title(self, task_id, name: str) -> str:
+        """Return the toolbar title as '<parent> → <name>' when a parent exists."""
+        parent = self._parent_task_name(task_id) if task_id else None
+        if parent:
+            return f"{parent} → {name}"
+        return name
+
+    def _upstream_scale_transforms(self, task_id) -> dict:
+        """Return {column: [config, ...]} for every scale module strictly upstream
+        of task_id, in chain order (root first), so transforms compose correctly."""
+        transforms = {}
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id:
+                continue  # exclude the module itself
+            if task.get("type") == "scale":
+                for col in task.get("params", {}).get("columns", []):
+                    if col.get("name"):
+                        transforms.setdefault(col["name"], []).append(col)
+        return transforms
+
     def _clear_layout(self, layout) -> None:
         """Remove and delete every widget/layout inside a layout."""
         while layout.count():
@@ -2308,7 +2425,7 @@ class MainWindow(QMainWindow):
         tl = QHBoxLayout(bar)
         tl.setContentsMargins(12, 6, 12, 6)
         tl.setSpacing(4)
-        tl.addWidget(QLabel(f"<b>{name}</b>"))
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
         if locked:
             lock_icon = QLabel()
             lock_icon.setPixmap(_lock_pixmap())
@@ -2379,6 +2496,8 @@ class MainWindow(QMainWindow):
         # Per-page state (each Figure module instance has its own).
         page._fig_snapshot = copy.deepcopy(task_def.get("params", {}))
         page._fig_task_def = task_def
+        page._fig_task_id = task_def.get("id")
+        page._fig_column_transforms = self._upstream_scale_transforms(page._fig_task_id)
         page._fig_plots = task_def.setdefault("params", {}).setdefault("plots", [])
         page._fig_cards = []
         page._fig_scene = scene
@@ -2418,8 +2537,8 @@ class MainWindow(QMainWindow):
             self._figure_rebuild_settings(page)
         return page
 
-    def _figure_new_card(self, page, plot_dict) -> int:
-        """Create a plot card for one plot, wrap it in a proxy, and render."""
+    def _figure_make_plot_widget(self, plot_dict: dict):
+        """Create a scatter/histogram PlotWidget with sci axes and A/F buttons."""
         import pyqtgraph as pg
         plot_widget = pg.PlotWidget(plotItem=_make_fit_plot_item())
         plot_widget.setBackground("w")
@@ -2430,8 +2549,8 @@ class MainWindow(QMainWindow):
         })
         # Read-only by default; wheel/drag act on the canvas until focused.
         plot_widget.getPlotItem().getViewBox().setMouseEnabled(False, False)
-        # Make the "A" button revert to the settings' min/max (not fit-all).
         plot_item = plot_widget.getPlotItem()
+        # Make the "A" button revert to the settings' min/max (not fit-all).
         try:
             plot_item.autoBtn.clicked.disconnect()
         except (RuntimeError, TypeError):
@@ -2441,6 +2560,11 @@ class MainWindow(QMainWindow):
         )
         # "F" button fits to the full data extent (without changing settings).
         plot_item._on_fit = lambda: self._figure_fit_all(plot_dict, plot_widget)
+        return plot_widget
+
+    def _figure_new_card(self, page, plot_dict) -> int:
+        """Create a plot card for one plot, wrap it in a proxy, and render."""
+        plot_widget = self._figure_make_plot_widget(plot_dict)
         title = plot_dict.get("title") or plot_dict.get("type", "Plot").title()
 
         index = len(page._fig_cards)
@@ -2478,7 +2602,7 @@ class MainWindow(QMainWindow):
         page._fig_filters.append(dbl_click_filter)
 
         page._fig_cards.append(card)
-        self._figure_render(plot_dict, plot_widget)
+        self._figure_render(plot_dict, plot_widget, column_transforms=page._fig_column_transforms)
         self._figure_relayout(page)
         return index
 
@@ -2494,6 +2618,7 @@ class MainWindow(QMainWindow):
     def _figure_mark_dirty(self, page) -> None:
         page._fig_dirty = True
         self._figure_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
 
     def _figure_save_now(self, page) -> None:
         if self.project is not None:
@@ -2502,6 +2627,7 @@ class MainWindow(QMainWindow):
         page._fig_dirty = False
         self._figure_update_save_btn(page)
         self.statusBar().showMessage("Figure saved")
+        self._module_saved(page)
 
     def _figure_close(self, page) -> None:
         """Close the page, prompting first if there are unsaved changes."""
@@ -2663,14 +2789,14 @@ class MainWindow(QMainWindow):
         self._figure_mark_dirty(page)
         self._figure_select(page, index)
 
-    def _figure_render(self, plot_dict: dict, plot_widget) -> None:
+    def _figure_render(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
         """(Re)draw a plot widget from its plot_dict."""
         if plot_dict.get("type") == "histogram":
-            self._figure_render_histogram(plot_dict, plot_widget)
+            self._figure_render_histogram(plot_dict, plot_widget, column_transforms)
         else:
-            self._figure_render_scatter(plot_dict, plot_widget)
+            self._figure_render_scatter(plot_dict, plot_widget, column_transforms)
 
-    def _figure_render_scatter(self, plot_dict: dict, plot_widget) -> None:
+    def _figure_render_scatter(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
         import numpy as np
         import pandas as pd
 
@@ -2680,6 +2806,8 @@ class MainWindow(QMainWindow):
         y_name = plot_dict.get("y")
         if not rec or not x_name or not y_name:
             return
+
+        transforms = column_transforms or {}
 
         columns = [x_name, y_name]
         mode = plot_dict.get("color_mode", "density")
@@ -2694,6 +2822,8 @@ class MainWindow(QMainWindow):
 
         x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
         y = pd.to_numeric(df[y_name], errors="coerce").to_numpy(dtype="float64")
+        x = _apply_scale_transforms(x, transforms.get(x_name))
+        y = _apply_scale_transforms(y, transforms.get(y_name))
         keep = np.isfinite(x) & np.isfinite(y)
         x, y = x[keep], y[keep]
         if x.size == 0:
@@ -2723,6 +2853,7 @@ class MainWindow(QMainWindow):
             cmap = _figure_colormap(plot_dict.get("palette", "viridis"))
             if mode == "parameter" and color_param:
                 values = pd.to_numeric(df[color_param], errors="coerce").to_numpy(dtype="float64")[keep]
+                values = _apply_scale_transforms(values, transforms.get(color_param))
             else:
                 # Density: color each actual point by its local (binned) density,
                 # without painting empty regions of the plot.
@@ -2771,7 +2902,7 @@ class MainWindow(QMainWindow):
             pg.ScatterPlotItem(x=x, y=y, symbol="o", size=size, pen=None, brush=brushes, pxMode=px_mode)
         )
 
-    def _figure_render_histogram(self, plot_dict: dict, plot_widget) -> None:
+    def _figure_render_histogram(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
         import numpy as np
         import pandas as pd
         import pyqtgraph as pg
@@ -2786,6 +2917,7 @@ class MainWindow(QMainWindow):
         except Exception:
             return
         x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
+        x = _apply_scale_transforms(x, (column_transforms or {}).get(x_name))
         x = x[np.isfinite(x)]
         if x.size == 0:
             return
@@ -2887,15 +3019,24 @@ class MainWindow(QMainWindow):
         else:
             plot_item.setTitle(None)
 
-    def _figure_toggle_display(self, page, index, plot_dict, key, checked) -> None:
-        plot_dict[key] = checked
-        self._figure_apply_change(page, index, plot_dict)
-
     def _figure_apply_change(self, page, index: int, plot_dict: dict) -> None:
         """Re-render a plot after a settings change (marks the page dirty)."""
         if 0 <= index < len(page._fig_cards):
-            self._figure_render(plot_dict, page._fig_cards[index].plot_widget())
+            self._figure_render(
+                plot_dict, page._fig_cards[index].plot_widget(),
+                column_transforms=page._fig_column_transforms,
+            )
         self._figure_mark_dirty(page)
+
+    def _figure_refresh_all(self, page) -> None:
+        """Re-render every plot card (used when an upstream module saved)."""
+        page._fig_column_transforms = self._upstream_scale_transforms(page._fig_task_id)
+        for i, card in enumerate(page._fig_cards):
+            if i < len(page._fig_plots):
+                self._figure_render(
+                    page._fig_plots[i], card.plot_widget(),
+                    column_transforms=page._fig_column_transforms,
+                )
 
     def _figure_select(self, page, index: int) -> None:
         """Mark the plot at `index` selected and refresh its settings."""
@@ -3006,6 +3147,7 @@ class MainWindow(QMainWindow):
         plot_dict = page._fig_plots[index]
         locked = page._fig_locked
         enabled = not locked
+        plot_widget = page._fig_cards[index].plot_widget()
         if locked:
             note = QLabel("Draft (locked) — settings are read-only.")
             note.setStyleSheet("color: #b58900;")
@@ -3034,11 +3176,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(x_combo)
 
         y_combo = None
-        mode_combo = None
-        palette_combo = None
-        cp_combo = None
-        point_fixed = None
-        point_spin = None
         bins_spin = None
         hist_mode_combo = None
 
@@ -3047,81 +3184,14 @@ class MainWindow(QMainWindow):
             y_combo = self._figure_param_combo(columns, plot_dict.get("y"), enabled)
             layout.addWidget(y_combo)
 
-            layout.addWidget(QLabel("Color mode"))
-            mode_combo = QComboBox()
-            for text, val in FIGURE_COLOR_MODES:
-                mode_combo.addItem(text, val)
-            idx = mode_combo.findData(plot_dict.get("color_mode", "density"))
-            mode_combo.setCurrentIndex(max(0, idx))
-            mode_combo.setEnabled(enabled)
-            layout.addWidget(mode_combo)
-
-            if plot_dict.get("color_mode") == "parameter":
-                layout.addWidget(QLabel("Color parameter"))
-                cp_combo = self._figure_param_combo(columns, plot_dict.get("color_param"), enabled)
-                layout.addWidget(cp_combo)
-
-            if plot_dict.get("color_mode") == "solid":
-                # Solid color: a swatch button opens a color picker.
-                def make_solid_button():
-                    cur = plot_dict.get("solid_color", (0, 0, 200))
-                    btn = QPushButton()
-                    btn.setFixedSize(36, 20)
-                    btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                    btn.setEnabled(enabled)
-                    btn.setStyleSheet(
-                        f"background-color: rgb({cur[0]},{cur[1]},{cur[2]}); "
-                        "border: 1px solid #555;"
-                    )
-
-                    def on_pick(_=False):
-                        current = plot_dict.get("solid_color", (0, 0, 200))
-                        chosen = QColorDialog.getColor(
-                            QColor(current[0], current[1], current[2]), self, "Choose color"
-                        )
-                        if chosen.isValid():
-                            plot_dict["solid_color"] = (chosen.red(), chosen.green(), chosen.blue())
-                            btn.setStyleSheet(
-                                f"background-color: rgb({chosen.red()},{chosen.green()},{chosen.blue()}); "
-                                "border: 1px solid #555;"
-                            )
-                            self._figure_apply_change(page, index, plot_dict)
-
-                    btn.clicked.connect(on_pick)
-                    return btn
-
-                layout.addWidget(QLabel("Solid color"))
-                layout.addWidget(make_solid_button())
-            else:
-                layout.addWidget(QLabel("Palette"))
-                palette_combo = QComboBox()
-                palette_combo.addItems(FIGURE_PALETTES)
-                idx = palette_combo.findText(plot_dict.get("palette", "viridis"))
-                if idx >= 0:
-                    palette_combo.setCurrentIndex(idx)
-                palette_combo.setEnabled(enabled)
-                layout.addWidget(palette_combo)
-
-            # Point size: constant on-screen size (unchecked), or a fixed size in
-            # data units that scales with the zoom (checked).
-            def on_point_size(v):
-                plot_dict["point_size"] = float(v)
-                self._figure_apply_change(page, index, plot_dict)
-
-            layout.addWidget(QLabel("Point size"))
-            ps_row = QWidget()
-            ph = QHBoxLayout(ps_row)
-            ph.setContentsMargins(0, 0, 0, 0)
-            ph.setSpacing(4)
-            point_fixed = QCheckBox("Fixed")
-            point_fixed.setChecked(plot_dict.get("fixed_point_size", False))
-            point_fixed.setEnabled(enabled)
-            point_spin = _LogStepSpinBox(plot_dict.get("point_size", 4), on_point_size)
-            point_spin.set_enabled(enabled and point_fixed.isChecked())
-            ph.addWidget(point_fixed)
-            ph.addWidget(point_spin)
-            ph.addStretch()
-            layout.addWidget(ps_row)
+            self._figure_scatter_color_settings(
+                layout, plot_dict, plot_widget, columns, enabled,
+                on_change=lambda: self._figure_apply_change(page, index, plot_dict),
+                on_rebuild=lambda: (
+                    self._figure_rebuild_settings(page),
+                    self._figure_apply_change(page, index, plot_dict),
+                ),
+            )
 
         if plot_dict.get("type") == "histogram":
             # Number of bins for the histogram.
@@ -3178,11 +3248,15 @@ class MainWindow(QMainWindow):
 
         # X range.
         layout.addWidget(QLabel("X range"))
-        layout.addWidget(self._figure_range_row(page, index, plot_dict, "x", enabled))
+        layout.addWidget(self._figure_range_row(
+            plot_dict, "x", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
+        ))
 
         if plot_dict.get("type") == "scatter":
             layout.addWidget(QLabel("Y range"))
-            layout.addWidget(self._figure_range_row(page, index, plot_dict, "y", enabled))
+            layout.addWidget(self._figure_range_row(
+                plot_dict, "y", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
+            ))
 
         # Size (width/height in canvas units).
         layout.addWidget(QLabel("Size (px)"))
@@ -3203,20 +3277,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(size_row)
 
         # Display options.
-        layout.addWidget(QLabel("Display"))
-        for label, key in (
-            ("Show axes", "show_axes"),
-            ("Show axis names", "show_axis_names"),
-            ("Show indices", "show_indices"),
-            ("Show sample name", "show_sample_name"),
-        ):
-            cb = QCheckBox(label)
-            cb.setChecked(plot_dict.get(key, True))
-            cb.setEnabled(enabled)
-            cb.toggled.connect(
-                lambda checked, k=key: self._figure_toggle_display(page, index, plot_dict, k, checked)
-            )
-            layout.addWidget(cb)
+        self._figure_display_toggles(
+            layout, plot_dict, enabled,
+            on_change=lambda: self._figure_apply_change(page, index, plot_dict),
+        )
 
         layout.addStretch()
 
@@ -3234,12 +3298,6 @@ class MainWindow(QMainWindow):
             self._figure_apply_change(page, index, plot_dict)
 
         file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
-
-        def on_param(attr):
-            def handler(value):
-                plot_dict[attr] = value
-                self._figure_apply_change(page, index, plot_dict)
-            return handler
 
         def on_axis_param(attr):
             def handler(value):
@@ -3259,39 +3317,6 @@ class MainWindow(QMainWindow):
         x_combo.currentTextChanged.connect(on_axis_param("x"))
         if y_combo is not None:
             y_combo.currentTextChanged.connect(on_axis_param("y"))
-
-        if mode_combo is not None:
-            def on_mode_changed(_=0):
-                plot_dict["color_mode"] = mode_combo.currentData()
-                self._figure_rebuild_settings(page)
-                self._figure_apply_change(page, index, plot_dict)
-            mode_combo.currentIndexChanged.connect(on_mode_changed)
-
-        if cp_combo is not None:
-            cp_combo.currentTextChanged.connect(on_param("color_param"))
-
-        if palette_combo is not None:
-            def on_palette_changed(_=0):
-                plot_dict["palette"] = palette_combo.currentText()
-                self._figure_apply_change(page, index, plot_dict)
-            palette_combo.currentIndexChanged.connect(on_palette_changed)
-
-        if point_fixed is not None:
-            def on_point_fixed(toggled):
-                plot_dict["fixed_point_size"] = toggled
-                point_spin.set_enabled(enabled and toggled)
-                if toggled:
-                    # Seed a sensible data-unit size from the current x-range so
-                    # the fixed size starts off visible rather than at 4 units.
-                    widget = page._fig_cards[index].plot_widget()
-                    xmin = getattr(widget, "_data_xmin", None)
-                    xmax = getattr(widget, "_data_xmax", None)
-                    if xmin is not None and xmax is not None and xmax > xmin:
-                        auto_size = 0.01 * (xmax - xmin)
-                        point_spin.set_value(auto_size)
-                        plot_dict["point_size"] = auto_size
-                self._figure_apply_change(page, index, plot_dict)
-            point_fixed.toggled.connect(on_point_fixed)
 
         if bins_spin is not None:
             def on_bins(v):
@@ -3321,21 +3346,158 @@ class MainWindow(QMainWindow):
         combo.setEnabled(enabled)
         return combo
 
-    def _figure_range_row(self, page, index: int, plot_dict: dict, axis: str,
-                          enabled: bool) -> QWidget:
+    def _figure_scatter_color_settings(self, layout, plot_dict, plot_widget, columns,
+                                       enabled, on_change, on_rebuild) -> None:
+        """Build + wire color mode/param, palette/solid, and point-size rows.
+
+        Shared by the Figure and Scaling scatter settings panels.
+        """
+        layout.addWidget(QLabel("Color mode"))
+        mode_combo = QComboBox()
+        for text, val in FIGURE_COLOR_MODES:
+            mode_combo.addItem(text, val)
+        idx = mode_combo.findData(plot_dict.get("color_mode", "density"))
+        mode_combo.setCurrentIndex(max(0, idx))
+        mode_combo.setEnabled(enabled)
+        layout.addWidget(mode_combo)
+
+        cp_combo = None
+        if plot_dict.get("color_mode") == "parameter":
+            layout.addWidget(QLabel("Color parameter"))
+            cp_combo = self._figure_param_combo(columns, plot_dict.get("color_param"), enabled)
+            layout.addWidget(cp_combo)
+
+        palette_combo = None
+        if plot_dict.get("color_mode") == "solid":
+            def make_solid_button():
+                cur = plot_dict.get("solid_color", (0, 0, 200))
+                btn = QPushButton()
+                btn.setFixedSize(36, 20)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setEnabled(enabled)
+                btn.setStyleSheet(
+                    f"background-color: rgb({cur[0]},{cur[1]},{cur[2]}); "
+                    "border: 1px solid #555;"
+                )
+
+                def on_pick(_=False):
+                    current = plot_dict.get("solid_color", (0, 0, 200))
+                    chosen = QColorDialog.getColor(
+                        QColor(current[0], current[1], current[2]), self, "Choose color"
+                    )
+                    if chosen.isValid():
+                        plot_dict["solid_color"] = (chosen.red(), chosen.green(), chosen.blue())
+                        btn.setStyleSheet(
+                            f"background-color: rgb({chosen.red()},{chosen.green()},{chosen.blue()}); "
+                            "border: 1px solid #555;"
+                        )
+                        on_change()
+
+                btn.clicked.connect(on_pick)
+                return btn
+
+            layout.addWidget(QLabel("Solid color"))
+            layout.addWidget(make_solid_button())
+        else:
+            layout.addWidget(QLabel("Palette"))
+            palette_combo = QComboBox()
+            palette_combo.addItems(FIGURE_PALETTES)
+            idx = palette_combo.findText(plot_dict.get("palette", "viridis"))
+            if idx >= 0:
+                palette_combo.setCurrentIndex(idx)
+            palette_combo.setEnabled(enabled)
+            layout.addWidget(palette_combo)
+
+        # Point size: constant on-screen size (unchecked), or a fixed size in
+        # data units that scales with the zoom (checked).
+        def on_point_size(v):
+            plot_dict["point_size"] = float(v)
+            on_change()
+
+        layout.addWidget(QLabel("Point size"))
+        ps_row = QWidget()
+        ph = QHBoxLayout(ps_row)
+        ph.setContentsMargins(0, 0, 0, 0)
+        ph.setSpacing(4)
+        point_fixed = QCheckBox("Fixed")
+        point_fixed.setChecked(plot_dict.get("fixed_point_size", False))
+        point_fixed.setEnabled(enabled)
+        point_spin = _LogStepSpinBox(plot_dict.get("point_size", 4), on_point_size)
+        point_spin.set_enabled(enabled and point_fixed.isChecked())
+        ph.addWidget(point_fixed)
+        ph.addWidget(point_spin)
+        ph.addStretch()
+        layout.addWidget(ps_row)
+
+        def on_point_fixed(toggled):
+            plot_dict["fixed_point_size"] = toggled
+            point_spin.set_enabled(enabled and toggled)
+            if toggled:
+                # Seed a sensible data-unit size from the current x-range.
+                xmin = getattr(plot_widget, "_data_xmin", None)
+                xmax = getattr(plot_widget, "_data_xmax", None)
+                if xmin is not None and xmax is not None and xmax > xmin:
+                    auto_size = 0.01 * (xmax - xmin)
+                    point_spin.set_value(auto_size)
+                    plot_dict["point_size"] = auto_size
+            on_change()
+        point_fixed.toggled.connect(on_point_fixed)
+
+        def on_mode_changed(_=0):
+            plot_dict["color_mode"] = mode_combo.currentData()
+            on_rebuild()
+        mode_combo.currentIndexChanged.connect(on_mode_changed)
+
+        if cp_combo is not None:
+            def on_cp(v):
+                plot_dict["color_param"] = v
+                on_change()
+            cp_combo.currentTextChanged.connect(on_cp)
+
+        if palette_combo is not None:
+            def on_palette(_=0):
+                plot_dict["palette"] = palette_combo.currentText()
+                on_change()
+            palette_combo.currentIndexChanged.connect(on_palette)
+
+    def _figure_display_toggles(self, layout, plot_dict, enabled, on_change) -> None:
+        """Build + wire the show axes/names/indices/sample-name checkboxes."""
+        layout.addWidget(QLabel("Display"))
+        for label, key in (
+            ("Show axes", "show_axes"),
+            ("Show axis names", "show_axis_names"),
+            ("Show indices", "show_indices"),
+            ("Show sample name", "show_sample_name"),
+        ):
+            cb = QCheckBox(label)
+            cb.setChecked(plot_dict.get(key, True))
+            cb.setEnabled(enabled)
+
+            def toggle(checked, k=key):
+                plot_dict[k] = checked
+                on_change()
+
+            cb.toggled.connect(toggle)
+            layout.addWidget(cb)
+
+    def _figure_range_row(self, plot_dict: dict, axis: str, plot_widget,
+                          enabled: bool, on_commit=None, auto_checked: bool = True) -> QWidget:
         """Build an Auto/Min/Max row for one axis range."""
         min_key = f"{axis}min"
         max_key = f"{axis}max"
-        widget = page._fig_cards[index].plot_widget()
-        data_min = getattr(widget, f"_data_{axis}min", None)
-        data_max = getattr(widget, f"_data_{axis}max", None)
+        data_min = getattr(plot_widget, f"_data_{axis}min", None)
+        data_max = getattr(plot_widget, f"_data_{axis}max", None)
 
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(4)
         auto = QCheckBox("Auto")
-        auto.setChecked(plot_dict.get(min_key) is None and plot_dict.get(max_key) is None)
+        auto.setChecked(
+            auto_checked
+            and plot_dict.get(min_key) is None
+            and plot_dict.get(max_key) is None
+        )
         auto.setEnabled(enabled)
 
         min_val = plot_dict.get(min_key)
@@ -3361,8 +3523,9 @@ class MainWindow(QMainWindow):
             max_spin.set_enabled(enabled and not auto.isChecked())
             # A range change only affects the view, so apply the range directly
             # instead of re-reading and re-rendering the plot's data.
-            self._figure_apply_ranges(plot_dict, widget)
-            self._figure_mark_dirty(page)
+            self._figure_apply_ranges(plot_dict, plot_widget)
+            if on_commit is not None:
+                on_commit()
 
         auto.toggled.connect(lambda _: commit())
 
@@ -3415,7 +3578,32 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self._build_module_toolbar(name, page, include_save=False, locked=locked))
+        # Toolbar with a Save button (scale changes are saved only on click).
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._scaling_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
 
         content = QWidget()
         content.setStyleSheet("background: #f5f8fb;")
@@ -3443,17 +3631,71 @@ class MainWindow(QMainWindow):
         )
         cll.addWidget(table, 1)
 
+        # Build the preview config first so the plot widget's A/F buttons can
+        # bind to it (same dict object is mutated in place later).
+        records = self._imported_files()
+        rec = records[0] if records else None
+        cols = self._columns_for(rec.get("parquet")) if rec else []
+        page._scaling_preview = {
+            "type": "scatter",
+            "file": rec.get("parquet") if rec else None,
+            "file_name": rec.get("name") if rec else None,
+            "x": cols[0] if cols else None,
+            "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
+            "color_mode": "density",
+            "color_param": None,
+            "palette": "viridis",
+            "xmin": None,
+            "xmax": None,
+            "ymin": None,
+            "ymax": None,
+            "point_size": 4,
+            "fixed_point_size": False,
+            "solid_color": (0, 0, 200),
+            "show_axes": True,
+            "show_axis_names": True,
+            "show_indices": True,
+            "show_sample_name": True,
+        }
+
         # Right: preview (scatter + settings).
         preview_panel = self._build_panel_frame()
         pl = QVBoxLayout(preview_panel)
         pl.setContentsMargins(10, 10, 10, 10)
         pl.setSpacing(6)
         pl.addWidget(QLabel("<b>Preview</b>"))
-        import pyqtgraph as pg
-        plot_widget = pg.PlotWidget()
-        plot_widget.setBackground("w")
-        plot_widget.showGrid(x=True, y=True, alpha=0.2)
-        pl.addWidget(plot_widget, 3)
+        plot_widget = self._figure_make_plot_widget(page._scaling_preview)
+        # The preview is a normal interactive plot (unlike a figure card).
+        plot_widget.getPlotItem().getViewBox().setMouseEnabled(True, True)
+
+        # Overlay shown when a selected column is missing from the current file.
+        plot_host = QWidget()
+        host_grid = QGridLayout(plot_host)
+        host_grid.setContentsMargins(0, 0, 0, 0)
+        host_grid.addWidget(plot_widget, 0, 0)
+        overlay = QWidget()
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        ov = QVBoxLayout(overlay)
+        ov.setContentsMargins(0, 0, 0, 0)
+        ov.addStretch()
+        ov_row = QHBoxLayout()
+        ov_row.addStretch()
+        overlay_box = QLabel("")
+        overlay_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        overlay_box.setWordWrap(True)
+        overlay_box.setStyleSheet(
+            "background-color: rgba(200, 200, 200, 210); color: #444; "
+            "border: 1px solid #999; border-radius: 6px; padding: 14px 18px;"
+        )
+        overlay_box.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        ov_row.addWidget(overlay_box)
+        ov_row.addStretch()
+        ov.addLayout(ov_row)
+        ov.addStretch()
+        overlay.hide()
+        host_grid.addWidget(overlay, 0, 0)
+        pl.addWidget(plot_host, 3)
+
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -3471,39 +3713,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(content, 1)
 
         page._scaling_task_def = task_def
+        page._scaling_task_id = task_def.get("id")
         page._scaling_columns = self._scaling_load_config(task_def)
         page._scaling_table = table
         page._scaling_plot_widget = plot_widget
         page._scaling_settings_layout = settings_layout
         page._scaling_locked = locked
-
-        records = self._imported_files()
-        rec = records[0] if records else None
-        cols = self._columns_for(rec.get("parquet")) if rec else []
-        page._scaling_preview = {
-            "type": "scatter",
-            "file": rec.get("parquet") if rec else None,
-            "x": cols[0] if cols else None,
-            "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
-            "color_mode": "density",
-            "color_param": None,
-            "palette": "viridis",
-            "xmin": None,
-            "xmax": None,
-            "ymin": None,
-            "ymax": None,
-        }
+        page._scaling_overlay = overlay
+        page._scaling_overlay_box = overlay_box
+        page._scaling_save_btn = save_btn
+        page._scaling_dirty = False
+        page._scaling_minmax_filled = set()
+        page._scaling_snapshot = copy.deepcopy(task_def.get("params", {}))
+        save_btn.clicked.connect(lambda _=False: self._scaling_save_now(page))
+        self._scaling_update_save_btn(page)
 
         self._scaling_populate_table(page)
         table.itemSelectionChanged.connect(lambda: self._scaling_on_selection(page))
-        self._scaling_render_preview(page)
-        self._scaling_rebuild_settings(page)
+        self._scaling_on_selection(page)
         return page
 
     def _scaling_populate_table(self, page) -> None:
         table = page._scaling_table
         locked = page._scaling_locked
         table.setRowCount(0)
+        page._scaling_param_edits = {}
+        page._scaling_min_edits = {}
+        page._scaling_max_edits = {}
         for row_idx, config in enumerate(page._scaling_columns):
             table.insertRow(row_idx)
             name_item = QTableWidgetItem(config["name"])
@@ -3516,11 +3752,23 @@ class MainWindow(QMainWindow):
             method_combo.setCurrentIndex(max(0, idx))
             method_combo.setEnabled(not locked)
             method_combo.currentIndexChanged.connect(
-                lambda _=0, c=config, m=method_combo: self._scaling_method_changed(page, c, m)
+                lambda _=0, r=row_idx, c=config, m=method_combo:
+                    self._scaling_method_changed(page, r, c, m)
             )
             table.setCellWidget(row_idx, 1, method_combo)
 
-            for col_idx, key in ((2, "param"), (3, "min"), (4, "max")):
+            # Param (arcsinh cofactor) is only editable for arcsinh.
+            param_edit = QLineEdit()
+            param_val = config.get("param")
+            param_edit.setText("" if param_val is None else str(param_val))
+            param_edit.editingFinished.connect(
+                lambda e=param_edit, c=config: self._scaling_field_edited(page, c, "param", e)
+            )
+            table.setCellWidget(row_idx, 2, param_edit)
+            page._scaling_param_edits[row_idx] = param_edit
+            self._scaling_update_param_cell(page, config, param_edit)
+
+            for col_idx, key in ((3, "min"), (4, "max")):
                 edit = QLineEdit()
                 val = config.get(key)
                 edit.setText("" if val is None else str(val))
@@ -3529,13 +3777,33 @@ class MainWindow(QMainWindow):
                     lambda e=edit, c=config, k=key: self._scaling_field_edited(page, c, k, e)
                 )
                 table.setCellWidget(row_idx, col_idx, edit)
+                if key == "min":
+                    page._scaling_min_edits[row_idx] = edit
+                else:
+                    page._scaling_max_edits[row_idx] = edit
 
         if table.rowCount() > 0:
             table.selectRow(0)
 
-    def _scaling_method_changed(self, page, config, combo) -> None:
+    def _scaling_update_param_cell(self, page, config, param_edit) -> None:
+        """Enable the Param cell only for arcsinh; gray it out otherwise."""
+        is_arcsinh = config.get("method") == "arcsinh"
+        param_edit.setEnabled((not page._scaling_locked) and is_arcsinh)
+        param_edit.setStyleSheet(
+            "QLineEdit:disabled { background: #e0e0e0; color: #9ca3af; }"
+        )
+        if is_arcsinh and config.get("param") is None:
+            # Show the default cofactor when the user hasn't set one yet.
+            param_edit.setText("5")
+
+    def _scaling_method_changed(self, page, row_idx, config, combo) -> None:
         config["method"] = combo.currentText()
-        self._scaling_save(page)
+        param_edit = page._scaling_param_edits.get(row_idx)
+        if param_edit is not None:
+            self._scaling_update_param_cell(page, config, param_edit)
+        self._scaling_mark_dirty(page)
+        self._scaling_render_preview(page)
+        self._scaling_rebuild_settings(page)
 
     def _scaling_field_edited(self, page, config, key, edit) -> None:
         text = edit.text().strip()
@@ -3543,33 +3811,132 @@ class MainWindow(QMainWindow):
             config[key] = None
         else:
             try:
-                config[key] = float(text)
+                if key in ("min", "max"):
+                    # Min/max are display ranges shown as integers only.
+                    config[key] = int(float(text))
+                    edit.setText(str(config[key]))
+                else:
+                    config[key] = float(text)
             except ValueError:
                 edit.setText("" if config.get(key) is None else str(config[key]))
                 return
-        self._scaling_save(page)
+        self._scaling_mark_dirty(page)
+        self._scaling_render_preview(page)
+        self._scaling_rebuild_settings(page)
 
-    def _scaling_save(self, page) -> None:
+    def _scaling_mark_dirty(self, page) -> None:
+        page._scaling_dirty = True
+        self._scaling_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _scaling_save_now(self, page) -> None:
         page._scaling_task_def.setdefault("params", {})["columns"] = page._scaling_columns
         if self.project is not None:
             self.project.save()
+        page._scaling_snapshot = copy.deepcopy(page._scaling_task_def.get("params", {}))
+        page._scaling_dirty = False
+        self._scaling_update_save_btn(page)
+        self.statusBar().showMessage("Scale saved")
+        self._module_saved(page)
+
+    def _scaling_update_save_btn(self, page) -> None:
+        page._scaling_save_btn.setEnabled(page._scaling_dirty and not page._scaling_locked)
+
+    def _scaling_close(self, page) -> None:
+        """Close the page, prompting first if there are unsaved changes."""
+        if page._scaling_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Close Scale",
+                "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._scaling_task_def["params"] = page._scaling_snapshot
+        self._close_module_page(page)
 
     def _scaling_on_selection(self, page) -> None:
         row = page._scaling_table.currentRow()
         if row < 0 or row >= len(page._scaling_columns):
             return
         page._scaling_preview["x"] = page._scaling_columns[row]["name"]
+        self._scaling_autofill_minmax(page, row)
         self._scaling_render_preview(page)
         self._scaling_rebuild_settings(page)
 
+    def _scaling_config_for(self, page, column):
+        """Return the config dict for `column`, or None."""
+        for c in page._scaling_columns:
+            if c.get("name") == column:
+                return c
+        return None
+
+    def _scaling_autofill_minmax(self, page, row_idx) -> None:
+        """Fill a row's min/max from the preview sample's data (once)."""
+        if row_idx in page._scaling_minmax_filled:
+            return
+        page._scaling_minmax_filled.add(row_idx)
+        config = page._scaling_columns[row_idx]
+        name = config.get("name")
+        rec = self._figure_record(page._scaling_preview.get("file"))
+        if not rec or not name:
+            return
+        import numpy as np
+        import pandas as pd
+        try:
+            df = pd.read_parquet(rec["parquet"], columns=[name])
+        except Exception:
+            return  # column not in this file -> leave empty
+        vals = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype="float64")
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return
+        config["min"] = int(vals.min())
+        config["max"] = int(vals.max())
+        min_edit = page._scaling_min_edits.get(row_idx)
+        max_edit = page._scaling_max_edits.get(row_idx)
+        if min_edit is not None:
+            min_edit.setText(_format_number(config["min"]))
+        if max_edit is not None:
+            max_edit.setText(_format_number(config["max"]))
+
     def _scaling_render_preview(self, page) -> None:
-        self._figure_render_scatter(page._scaling_preview, page._scaling_plot_widget)
+        preview = page._scaling_preview
+        rec = self._figure_record(preview.get("file"))
+        cols = self._columns_for(rec.get("parquet")) if rec else []
+        missing = [
+            str(n) for n in (preview.get("x"), preview.get("y"))
+            if n and n not in cols
+        ]
+        if missing:
+            page._scaling_overlay_box.setText(
+                "Parameter not in this file:\n" + ", ".join(missing)
+            )
+            page._scaling_overlay.show()
+        else:
+            page._scaling_overlay.hide()
+        # Drive the preview axes from each column's min/max (if set).
+        x_cfg = self._scaling_config_for(page, preview.get("x"))
+        y_cfg = self._scaling_config_for(page, preview.get("y"))
+        preview["xmin"] = x_cfg.get("min") if x_cfg else None
+        preview["xmax"] = x_cfg.get("max") if x_cfg else None
+        preview["ymin"] = y_cfg.get("min") if y_cfg else None
+        preview["ymax"] = y_cfg.get("max") if y_cfg else None
+        # Compose transforms: upstream scale modules (chain order), then this
+        # module's own current (possibly unsaved) config on top.
+        transforms = self._upstream_scale_transforms(page._scaling_task_id)
+        for c in page._scaling_columns:
+            if c.get("name"):
+                transforms.setdefault(c["name"], []).append(c)
+        self._figure_render_scatter(preview, page._scaling_plot_widget, column_transforms=transforms)
 
     def _scaling_rebuild_settings(self, page) -> None:
         layout = page._scaling_settings_layout
         self._clear_layout(layout)
         preview = page._scaling_preview
         enabled = not page._scaling_locked
+        plot_widget = page._scaling_plot_widget
 
         records = self._imported_files()
         rec = self._figure_record(preview.get("file"))
@@ -3594,42 +3961,34 @@ class MainWindow(QMainWindow):
         y_combo = self._figure_param_combo(columns, preview.get("y"), enabled)
         layout.addWidget(y_combo)
 
-        layout.addWidget(QLabel("Color mode"))
-        mode_combo = QComboBox()
-        for text, val in FIGURE_COLOR_MODES:
-            mode_combo.addItem(text, val)
-        idx = mode_combo.findData(preview.get("color_mode", "density"))
-        mode_combo.setCurrentIndex(max(0, idx))
-        mode_combo.setEnabled(enabled)
-        layout.addWidget(mode_combo)
-
-        cp_combo = None
-        if preview.get("color_mode") == "parameter":
-            layout.addWidget(QLabel("Color parameter"))
-            cp_combo = self._figure_param_combo(columns, preview.get("color_param"), enabled)
-            layout.addWidget(cp_combo)
-
-        layout.addWidget(QLabel("Palette"))
-        palette_combo = QComboBox()
-        palette_combo.addItems(FIGURE_PALETTES)
-        idx = palette_combo.findText(preview.get("palette", "viridis"))
-        if idx >= 0:
-            palette_combo.setCurrentIndex(idx)
-        palette_combo.setEnabled(enabled)
-        layout.addWidget(palette_combo)
+        self._figure_scatter_color_settings(
+            layout, preview, plot_widget, columns, enabled,
+            on_change=lambda: self._scaling_render_preview(page),
+            on_rebuild=lambda: (
+                self._scaling_rebuild_settings(page),
+                self._scaling_render_preview(page),
+            ),
+        )
 
         layout.addWidget(QLabel("X range"))
-        layout.addWidget(self._scaling_range_row(page, preview, "x", enabled))
+        layout.addWidget(self._figure_range_row(preview, "x", plot_widget, enabled, auto_checked=False))
         layout.addWidget(QLabel("Y range"))
-        layout.addWidget(self._scaling_range_row(page, preview, "y", enabled))
+        layout.addWidget(self._figure_range_row(preview, "y", plot_widget, enabled, auto_checked=False))
+
+        self._figure_display_toggles(
+            layout, preview, enabled,
+            on_change=lambda: self._scaling_render_preview(page),
+        )
         layout.addStretch()
 
         def on_file_changed():
             preview["file"] = file_combo.currentData()
+            preview["file_name"] = file_combo.currentText()
             new_rec = self._figure_record(preview["file"])
             new_cols = self._columns_for(new_rec.get("parquet")) if new_rec else []
             preview["x"] = new_cols[0] if new_cols else None
             preview["y"] = new_cols[1] if len(new_cols) > 1 else (new_cols[0] if new_cols else None)
+            preview["color_param"] = preview["x"]
             self._scaling_render_preview(page)
             self._scaling_rebuild_settings(page)
         file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
@@ -3642,54 +4001,53 @@ class MainWindow(QMainWindow):
         x_combo.currentTextChanged.connect(on_param("x"))
         y_combo.currentTextChanged.connect(on_param("y"))
 
-        def on_mode_changed(_=0):
-            preview["color_mode"] = mode_combo.currentData()
-            self._scaling_rebuild_settings(page)
+    # ----- open-module registry & save->update propagation --------------
+    def _module_register(self, task_id, task_type, page) -> None:
+        """Register an opened module with its initial (unmodified) state."""
+        self._module_registry[task_id] = {
+            "task_id": task_id,
+            "task_type": task_type,
+            "page": page,
+            "state": MODULE_STATE_UNMODIFIED,
+        }
+
+    def _module_set_state(self, page, state) -> None:
+        """Update an open module's registry state."""
+        task_id = page.property("task_id")
+        if task_id and task_id in self._module_registry:
+            self._module_registry[task_id]["state"] = state
+
+    def _module_descendant_ids(self, task_id) -> list:
+        """Return open descendants of `task_id`, top-down (pre-order)."""
+        task = self._find_task_by_id(task_id)
+        ordered = []
+
+        def walk(tasks):
+            for t in tasks:
+                ordered.append(t.get("id"))
+                walk(t.get("children", []))
+
+        if task is not None:
+            walk(task.get("children", []))
+        return [tid for tid in ordered if tid in self._module_registry]
+
+    def _module_saved(self, page) -> None:
+        """Mark a module as saved and push updates to its open downstream modules."""
+        self._module_set_state(page, MODULE_STATE_SAVED)
+        task_id = page.property("task_id")
+        for dtid in self._module_descendant_ids(task_id):
+            reg = self._module_registry[dtid]
+            self._module_refresh_from_upstream(reg["page"], dtid, reg["task_type"])
+        self._module_set_state(page, MODULE_STATE_UNMODIFIED)
+
+    def _module_refresh_from_upstream(self, page, task_id, task_type) -> None:
+        """Refresh a downstream module's content (visualization only) after an
+        upstream save. This module's own unsaved edits are left untouched."""
+        if task_type == "figure":
+            self._figure_refresh_all(page)
+        elif task_type == "scale":
             self._scaling_render_preview(page)
-        mode_combo.currentIndexChanged.connect(on_mode_changed)
-
-        if cp_combo is not None:
-            cp_combo.currentTextChanged.connect(on_param("color_param"))
-
-        def on_palette_changed(_=0):
-            preview["palette"] = palette_combo.currentText()
-            self._scaling_render_preview(page)
-        palette_combo.currentIndexChanged.connect(on_palette_changed)
-
-    def _scaling_range_row(self, page, preview, axis, enabled) -> QWidget:
-        min_key = f"{axis}min"
-        max_key = f"{axis}max"
-        row = QWidget()
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(4)
-        auto = QCheckBox("Auto")
-        auto.setChecked(preview.get(min_key) is None and preview.get(max_key) is None)
-        auto.setEnabled(enabled)
-        min_spin = _LogStepSpinBox(preview.get(min_key), lambda v: commit())
-        max_spin = _LogStepSpinBox(preview.get(max_key), lambda v: commit())
-
-        def commit():
-            if auto.isChecked():
-                preview[min_key] = None
-                preview[max_key] = None
-            else:
-                preview[min_key] = min_spin.value()
-                preview[max_key] = max_spin.value()
-            min_spin.set_enabled(enabled and not auto.isChecked())
-            max_spin.set_enabled(enabled and not auto.isChecked())
-            self._figure_apply_ranges(preview, page._scaling_plot_widget)
-
-        auto.toggled.connect(lambda _: commit())
-        min_spin.set_enabled(enabled and not auto.isChecked())
-        max_spin.set_enabled(enabled and not auto.isChecked())
-        h.addWidget(auto)
-        h.addWidget(QLabel("Min"))
-        h.addWidget(min_spin)
-        h.addWidget(QLabel("Max"))
-        h.addWidget(max_spin)
-        h.addStretch()
-        return row
+        # Other module types have no live visualization to refresh yet.
 
     def _open_module(self, task_id: str | None, task_type: str | None, name: str) -> None:
         """Open (or focus) the module tab for the given task (identified by id)."""
@@ -3712,13 +4070,18 @@ class MainWindow(QMainWindow):
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
-            page = self._build_module_page(name, locked=locked)
+            page = self._build_module_page(name, locked=locked, task_id=task_id)
         page.setProperty("task_id", task_id)
         self.tabs.addTab(page, name)
         self.tabs.setCurrentWidget(page)
+        if task_id:
+            self._module_register(task_id, task_type, page)
 
     def _close_module_page(self, page: QWidget) -> None:
         """Close a module page's tab (never the Workflow tab)."""
+        task_id = page.property("task_id")
+        if task_id:
+            self._module_registry.pop(task_id, None)
         index = self.tabs.indexOf(page)
         if index > 0:
             self.tabs.removeTab(index)
