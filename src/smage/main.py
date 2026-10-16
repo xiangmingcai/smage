@@ -4723,6 +4723,7 @@ class MainWindow(QMainWindow):
         page._gating_skewed_lines = {}
         page._gating_active_gate_id = None
         page._gating_context_gate_id = None
+        page._gating_collapsed = set()
         # The x/y that the user configured in Plot settings (independent of a
         # gate click, which temporarily switches to that gate's axes).
         page._gating_settings_x = page._gating_preview.get("x")
@@ -4750,12 +4751,20 @@ class MainWindow(QMainWindow):
         tree_lay.addWidget(QLabel("<b>Gates</b>"))
         tree = QTreeWidget()
         tree.setHeaderHidden(True)
+        tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        tree.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         tree.setStyleSheet(
             "QTreeWidget { background: #ffffff; border: none; }"
             "QTreeWidget::item:selected { background: #dbeafa; }"
         )
         tree_lay.addWidget(tree, 1)
         page._gating_tree = tree
+        tree.itemCollapsed.connect(
+            lambda item: self._gating_on_collapse(page, item)
+        )
+        tree.itemExpanded.connect(
+            lambda item: self._gating_on_expand(page, item)
+        )
 
         # Middle: tool area (top) + scatter (bottom).
         mid_panel = self._build_panel_frame()
@@ -4852,8 +4861,8 @@ class MainWindow(QMainWindow):
         page._gating_settings_layout = settings_layout
 
         cl.addWidget(tree_panel, 1)
-        cl.addWidget(mid_panel, 3)
-        cl.addWidget(settings_panel, 2)
+        cl.addWidget(mid_panel, 2)
+        cl.addWidget(settings_panel, 1)
         layout.addWidget(content, 1)
 
         tree.itemClicked.connect(lambda item, col=0: self._gating_on_tree_selection(page, item, col))
@@ -4907,15 +4916,25 @@ class MainWindow(QMainWindow):
             oy = roi.pos().y()
             gate["points"] = [[p.x() + ox, p.y() + oy] for p in roi.getState()["points"]]
 
+    def _gating_on_roi_drag(self, page, gate, roi) -> None:
+        self._gating_sync_gate(gate, roi)
+        self._gating_refresh_tree_stats(page)
+
     def _gating_quadrant_sync(self, page, crosshair_id, key, line) -> None:
         for g in page._gating_gates:
             if g.get("crosshair_id") == crosshair_id:
                 g[key] = line.value()
+        self._gating_refresh_tree_stats(page)
 
     def _gating_split_sync(self, page, split_id, line) -> None:
         for g in page._gating_gates:
             if g.get("split_id") == split_id:
                 g["vx"] = line.value()
+        self._gating_refresh_tree_stats(page)
+
+    def _gating_range_sync(self, page, gate, key, line) -> None:
+        gate[key] = line.value()
+        self._gating_refresh_tree_stats(page)
 
     def _gating_skewed_sync(self, page, skewed_id) -> None:
         entry = page._gating_skewed_lines.get(skewed_id)
@@ -4933,6 +4952,7 @@ class MainWindow(QMainWindow):
                 for i, key in enumerate(keys):
                     sp = pts[i + 1]
                     g[key] = [sp.x(), sp.y()]
+        self._gating_refresh_tree_stats(page)
 
     def _gating_default_name(self, page, tool: str) -> str:
         prefixes = {"rect": "Rect", "ellipse": "Oval", "polygon": "Poly", "range": "Range"}
@@ -4979,6 +4999,7 @@ class MainWindow(QMainWindow):
             hline.sigPositionChangeFinished.connect(
                 lambda l=hline, cid=crosshair_id: self._gating_quadrant_sync(page, cid, "hy", l)
             )
+            page._gating_context_gate_id = page._gating_gates[-1]["id"]
             self._gating_update_roi_visibility(page)
             self._gating_rebuild_tree(page)
             self._gating_set_tool(page, None)
@@ -5006,14 +5027,15 @@ class MainWindow(QMainWindow):
             page._gating_viewbox.addItem(vline1)
             page._gating_viewbox.addItem(vline2)
             vline1.sigPositionChangeFinished.connect(
-                lambda l=vline1, g=gate: g.__setitem__("x1", l.value())
+                lambda l=vline1, g=gate: self._gating_range_sync(page, g, "x1", l)
             )
             vline2.sigPositionChangeFinished.connect(
-                lambda l=vline2, g=gate: g.__setitem__("x2", l.value())
+                lambda l=vline2, g=gate: self._gating_range_sync(page, g, "x2", l)
             )
             page._gating_gates.append(gate)
             page._gating_rois.append([vline1, vline2])
             self._gating_set_items_handles_visible([vline1, vline2], False)
+            page._gating_context_gate_id = page._gating_gates[-1]["id"]
             self._gating_update_roi_visibility(page)
             self._gating_rebuild_tree(page)
             self._gating_set_tool(page, None)
@@ -5051,6 +5073,7 @@ class MainWindow(QMainWindow):
             vline.sigPositionChangeFinished.connect(
                 lambda l=vline, cid=split_id: self._gating_split_sync(page, cid, l)
             )
+            page._gating_context_gate_id = page._gating_gates[-1]["id"]
             self._gating_update_roi_visibility(page)
             self._gating_rebuild_tree(page)
             self._gating_set_tool(page, None)
@@ -5095,6 +5118,7 @@ class MainWindow(QMainWindow):
                 lambda: self._gating_skewed_sync(page, skewed_id)
             )
             self._gating_set_items_handles_visible([roi], False)
+            page._gating_context_gate_id = page._gating_gates[-1]["id"]
             self._gating_update_roi_visibility(page)
             self._gating_rebuild_tree(page)
             self._gating_set_tool(page, None)
@@ -5114,11 +5138,12 @@ class MainWindow(QMainWindow):
         self._gating_sync_gate(gate, arg)
         self._gating_style_handles(arg)
         arg.sigRegionChangeFinished.connect(
-            lambda r=arg, g=gate: self._gating_sync_gate(g, r)
+            lambda r=arg, g=gate: self._gating_on_roi_drag(page, g, r)
         )
         page._gating_gates.append(gate)
         page._gating_rois.append([arg])
         self._gating_set_items_handles_visible([arg], False)
+        page._gating_context_gate_id = gate["id"]
         self._gating_update_roi_visibility(page)
         self._gating_rebuild_tree(page)
         self._gating_set_tool(page, None)
@@ -5158,7 +5183,7 @@ class MainWindow(QMainWindow):
         return result
 
     def _gating_visible_ids(self, page):
-        """Return the set of visible gate ids for the current view mode, or None."""
+        """Return the set of gate ids to show for the current view mode."""
         active = page._gating_active_gate_id
         if active:
             # Subset view: show only the gate's descendants (not the gate/ancestors).
@@ -5170,7 +5195,8 @@ class MainWindow(QMainWindow):
                 p = ctx.get("parent")
                 return {g["id"] for g in page._gating_gates if g.get("parent") == p}
             return set()
-        return None
+        # "All Events" view: no gate is bound to it, so show nothing.
+        return set()
 
     def _gating_update_roi_visibility(self, page) -> None:
         """Show gates bound to the current (x, y) axes and gating-tree context."""
@@ -5235,7 +5261,7 @@ class MainWindow(QMainWindow):
                     )
                     self._gating_style_handles(roi)
                     roi.sigRegionChangeFinished.connect(
-                        lambda r=roi, g=gate: self._gating_sync_gate(g, r)
+                        lambda r=roi, g=gate: self._gating_on_roi_drag(page, g, r)
                     )
                     items = [roi]
                 elif t == "ellipse":
@@ -5246,7 +5272,7 @@ class MainWindow(QMainWindow):
                     )
                     self._gating_style_handles(roi)
                     roi.sigRegionChangeFinished.connect(
-                        lambda r=roi, g=gate: self._gating_sync_gate(g, r)
+                        lambda r=roi, g=gate: self._gating_on_roi_drag(page, g, r)
                     )
                     items = [roi]
                 elif t == "polygon":
@@ -5256,7 +5282,7 @@ class MainWindow(QMainWindow):
                     )
                     self._gating_style_handles(roi)
                     roi.sigRegionChangeFinished.connect(
-                        lambda r=roi, g=gate: self._gating_sync_gate(g, r)
+                        lambda r=roi, g=gate: self._gating_on_roi_drag(page, g, r)
                     )
                     items = [roi]
                 elif t == "quadrant":
@@ -5288,10 +5314,10 @@ class MainWindow(QMainWindow):
                     viewbox.addItem(vline1)
                     viewbox.addItem(vline2)
                     vline1.sigPositionChangeFinished.connect(
-                        lambda l=vline1, g=gate: g.__setitem__("x1", l.value())
+                        lambda l=vline1, g=gate: self._gating_range_sync(page, g, "x1", l)
                     )
                     vline2.sigPositionChangeFinished.connect(
-                        lambda l=vline2, g=gate: g.__setitem__("x2", l.value())
+                        lambda l=vline2, g=gate: self._gating_range_sync(page, g, "x2", l)
                     )
                     items = [vline1, vline2]
                 elif t == "split":
@@ -5567,6 +5593,129 @@ class MainWindow(QMainWindow):
             self._gating_rebuild_tree(page)
             self._gating_mark_dirty(page)
 
+    def _gating_gate_statistics(self, page):
+        """Return {gate_id: (count, percent_of_parent)} for the current file."""
+        import numpy as np
+        import pandas as pd
+        parquet_path = page._gating_preview.get("file")
+        if not parquet_path or not page._gating_gates:
+            return {}
+        transforms = self._upstream_scale_transforms(page._gating_task_id)
+        existing = set(self._columns_for(parquet_path))
+        needed = set()
+        for g in page._gating_gates:
+            for key in ("x", "y"):
+                v = g.get(key)
+                if v and v in existing:
+                    needed.add(v)
+        if not needed:
+            return {}
+        try:
+            df = pd.read_parquet(parquet_path, columns=sorted(needed))
+        except Exception:
+            return {}
+        n_total = len(df)
+        cache = {}
+
+        def col(name):
+            if name not in cache:
+                cache[name] = pd.to_numeric(
+                    df[name], errors="coerce"
+                ).to_numpy(dtype="float64")
+            return cache[name]
+
+        own = {}
+        for g in page._gating_gates:
+            x_name = g.get("x")
+            y_name = g.get("y")
+            if (
+                not x_name or not y_name
+                or x_name not in existing or y_name not in existing
+            ):
+                own[g["id"]] = None
+                continue
+            x = _apply_scale_transforms(col(x_name), transforms.get(x_name))
+            y = _apply_scale_transforms(col(y_name), transforms.get(y_name))
+            own[g["id"]] = _gate_mask(x, y, g)
+
+        by_parent = {}
+        for g in page._gating_gates:
+            by_parent.setdefault(g.get("parent"), []).append(g)
+
+        counts = {}
+
+        def populate(gid, parent_mask, computable):
+            om = own.get(gid)
+            if not computable or om is None:
+                counts[gid] = None
+                for child in by_parent.get(gid, []):
+                    populate(child["id"], None, False)
+                return
+            m = om if parent_mask is None else (parent_mask & om)
+            counts[gid] = int(np.sum(m))
+            for child in by_parent.get(gid, []):
+                populate(child["id"], m, True)
+
+        for top in by_parent.get(None, []):
+            populate(top["id"], None, True)
+
+        result = {}
+        for g in page._gating_gates:
+            c = counts.get(g["id"])
+            if c is None:
+                continue
+            pid = g.get("parent")
+            if pid:
+                pc = counts.get(pid)
+                if pc is None:
+                    pc = n_total
+            else:
+                pc = n_total
+            pct = (c / pc * 100.0) if pc else 0.0
+            result[g["id"]] = (c, pct)
+        return result
+
+    @staticmethod
+    def _gating_gate_display_name(gate, idx, stats) -> str:
+        name = gate.get("name", f"Gate {idx + 1}")
+        st = stats.get(gate["id"])
+        if st is None:
+            return name
+        count, pct = st
+        return f"{name} ({pct:.2f}%, {count})"
+
+    def _gating_refresh_tree_stats(self, page) -> None:
+        """Refresh gate count/percent labels without rebuilding the tree."""
+        stats = self._gating_gate_statistics(page)
+        tree = page._gating_tree
+        tree.blockSignals(True)
+
+        def update(item):
+            for i in range(item.childCount()):
+                child = item.child(i)
+                idx = child.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(idx, int) and 0 <= idx < len(page._gating_gates):
+                    gate = page._gating_gates[idx]
+                    child.setText(
+                        0, self._gating_gate_display_name(gate, idx, stats)
+                    )
+                update(child)
+
+        for i in range(tree.topLevelItemCount()):
+            update(tree.topLevelItem(i))
+        tree.blockSignals(False)
+        tree.resizeColumnToContents(0)
+
+    def _gating_on_collapse(self, page, item) -> None:
+        gid = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if gid:
+            page._gating_collapsed.add(gid)
+
+    def _gating_on_expand(self, page, item) -> None:
+        gid = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if gid:
+            page._gating_collapsed.discard(gid)
+
     def _gating_rebuild_tree(self, page) -> None:
         """Rebuild the hierarchical gate tree."""
         tree = page._gating_tree
@@ -5582,9 +5731,13 @@ class MainWindow(QMainWindow):
         for idx, gate in enumerate(page._gating_gates):
             by_parent.setdefault(gate.get("parent"), []).append((idx, gate))
 
+        stats = self._gating_gate_statistics(page)
+
         def add_children(parent_item, parent_id):
             for idx, gate in by_parent.get(parent_id, []):
-                item = QTreeWidgetItem([gate.get("name", f"Gate {idx + 1}")])
+                item = QTreeWidgetItem(
+                    [self._gating_gate_display_name(gate, idx, stats)]
+                )
                 item.setFlags(
                     Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
                 )
@@ -5594,8 +5747,16 @@ class MainWindow(QMainWindow):
                 add_children(item, gate["id"])
 
         add_children(root, None)
-        root.setExpanded(True)
+
+        def expand_item(item):
+            gid = item.data(0, Qt.ItemDataRole.UserRole + 1)
+            item.setExpanded(gid not in page._gating_collapsed)
+            for i in range(item.childCount()):
+                expand_item(item.child(i))
+
+        expand_item(root)
         tree.blockSignals(False)
+        tree.resizeColumnToContents(0)
         for gate_items in page._gating_rois:
             self._gating_set_items_handles_visible(gate_items, False)
         for entry in page._gating_skewed_lines.values():
@@ -5716,6 +5877,7 @@ class MainWindow(QMainWindow):
             self._gating_render(page)
             vb.setXRange(xr[0], xr[1], padding=0)
             vb.setYRange(yr[0], yr[1], padding=0)
+            self._gating_refresh_tree_stats(page)
             self._gating_rebuild_settings(page)
         file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
 
