@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import copy
 import math
+import queue
 import shutil
 import sys
+import threading
 from collections import Counter
 from pathlib import Path
 from uuid import uuid4
@@ -361,6 +363,156 @@ def _gate_mask(x, y, gate):
         if q == 4:
             return wedge(d_dn, d_r)
     return np.ones(x.shape, dtype=bool)
+
+
+class _GatingStatsWorker:
+    """Background worker that computes gate statistics with column/mask caches.
+
+    The worker owns its caches so no shared mutable state is touched by the
+    main thread. Requests are queued FIFO; each carries a generation number so
+    the main thread can discard stale results.
+    """
+
+    def __init__(self):
+        self._req_q = queue.Queue()
+        self._res_q = queue.Queue()
+        self._stop = threading.Event()
+        self._columns = {}   # {parquet_path: {col: float64 ndarray}}
+        self._current_path = None
+        self._masks = {}     # {gate_id: population bool ndarray}
+        self._counts = {}    # {gate_id: int}
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def request(self, generation, parquet_path, gates, transforms, existing, affected):
+        self._req_q.put(
+            (generation, parquet_path, gates, transforms, existing, affected)
+        )
+
+    def poll(self):
+        """Return any finished (generation, stats) results."""
+        out = []
+        while True:
+            try:
+                out.append(self._res_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                req = self._req_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                res = self._compute(*req)
+            except Exception:
+                res = None
+            self._res_q.put(res)
+
+    def _compute(self, generation, parquet_path, gates, transforms, existing, affected):
+        import numpy as np
+        import pandas as pd
+        if not parquet_path or not gates:
+            return (generation, {})
+        if self._current_path != parquet_path:
+            self._columns = {}
+            self._masks = {}
+            self._counts = {}
+            self._current_path = parquet_path
+        if affected is None:
+            # Full recompute: the gate set may have changed, so reset caches.
+            self._masks = {}
+            self._counts = {}
+        needed = set()
+        for g in gates:
+            for key in ("x", "y"):
+                v = g.get(key)
+                if v and v in existing:
+                    needed.add(v)
+        if not needed:
+            return (generation, {})
+        cols = self._columns
+        missing = needed - set(cols)
+        if missing:
+            try:
+                df = pd.read_parquet(parquet_path, columns=sorted(missing))
+            except Exception:
+                return (generation, {})
+            for name in missing:
+                cols[name] = pd.to_numeric(
+                    df[name], errors="coerce"
+                ).to_numpy(dtype="float64")
+            self._columns = cols
+        n_total = len(next(iter(cols.values()))) if cols else 0
+        by_id = {g["id"]: g for g in gates}
+        by_parent = {}
+        for g in gates:
+            by_parent.setdefault(g.get("parent"), []).append(g)
+
+        def own_mask(g):
+            x_name = g.get("x")
+            y_name = g.get("y")
+            if (
+                not x_name or not y_name
+                or x_name not in existing or y_name not in existing
+            ):
+                return None
+            x = _apply_scale_transforms(cols[x_name], transforms.get(x_name))
+            y = _apply_scale_transforms(cols[y_name], transforms.get(y_name))
+            return _gate_mask(x, y, g)
+
+        def compute_subtree(gid):
+            stack = [gid]
+            while stack:
+                cur = stack.pop()
+                g = by_id.get(cur)
+                if g is None:
+                    continue
+                om = own_mask(g)
+                if om is None:
+                    self._masks[cur] = None
+                    self._counts[cur] = None
+                    continue
+                parent_id = g.get("parent")
+                pm = self._masks.get(parent_id) if parent_id else None
+                m = om if pm is None else (pm & om)
+                self._masks[cur] = m
+                self._counts[cur] = int(np.sum(m))
+                for child in by_parent.get(cur, []):
+                    stack.append(child["id"])
+
+        if affected is None:
+            for top in by_parent.get(None, []):
+                compute_subtree(top["id"])
+        else:
+            affected_set = set(affected)
+            tops = [
+                gid for gid in affected_set
+                if by_id.get(gid, {}).get("parent") not in affected_set
+            ]
+            for gid in tops:
+                compute_subtree(gid)
+
+        result = {}
+        for g in gates:
+            c = self._counts.get(g["id"])
+            if c is None:
+                continue
+            pid = g.get("parent")
+            if pid:
+                pc = self._counts.get(pid)
+                if pc is None:
+                    pc = n_total
+            else:
+                pc = n_total
+            pct = (c / pc * 100.0) if pc else 0.0
+            result[g["id"]] = (c, pct)
+        return (generation, result)
 
 
 def _figure_colormap(name: str):
@@ -4693,27 +4845,39 @@ class MainWindow(QMainWindow):
         records = self._imported_files()
         rec = records[0] if records else None
         cols = self._columns_for(rec.get("parquet")) if rec else []
-        page._gating_preview = {
-            "type": "scatter",
-            "file": rec.get("parquet") if rec else None,
-            "file_name": rec.get("name") if rec else None,
-            "x": cols[0] if cols else None,
-            "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
-            "color_mode": "density",
-            "color_param": None,
-            "palette": "viridis",
-            "xmin": None,
-            "xmax": None,
-            "ymin": None,
-            "ymax": None,
-            "point_size": 4,
-            "fixed_point_size": False,
-            "solid_color": (0, 0, 200),
-            "show_axes": True,
-            "show_axis_names": True,
-            "show_indices": True,
-            "show_sample_name": True,
-        }
+
+        def _default_preview():
+            return {
+                "type": "scatter",
+                "file": rec.get("parquet") if rec else None,
+                "file_name": rec.get("name") if rec else None,
+                "x": cols[0] if cols else None,
+                "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
+                "color_mode": "density",
+                "color_param": None,
+                "palette": "viridis",
+                "xmin": None,
+                "xmax": None,
+                "ymin": None,
+                "ymax": None,
+                "point_size": 4,
+                "fixed_point_size": False,
+                "solid_color": (0, 0, 200),
+                "show_axes": True,
+                "show_axis_names": True,
+                "show_indices": True,
+                "show_sample_name": True,
+            }
+
+        params = task_def.setdefault("params", {})
+        preview = params.get("preview")
+        valid = isinstance(preview, dict) and any(
+            r.get("parquet") == preview.get("file") for r in records
+        )
+        if not valid:
+            preview = _default_preview()
+            params["preview"] = preview
+        page._gating_preview = preview
         page._gating_task_def = task_def
         page._gating_task_id = task_def.get("id")
         page._gating_gates = task_def.setdefault("params", {}).setdefault("gates", [])
@@ -4724,6 +4888,15 @@ class MainWindow(QMainWindow):
         page._gating_active_gate_id = None
         page._gating_context_gate_id = None
         page._gating_collapsed = set()
+        page._gating_stats_worker = _GatingStatsWorker()
+        page._gating_stat_generation = 0
+        page._gating_last_stats = {}
+        page._gating_stat_timer = QTimer(self)
+        page._gating_stat_timer.setInterval(100)
+        page._gating_stat_timer.timeout.connect(
+            lambda: self._gating_on_stats_timer(page)
+        )
+        page._gating_stat_timer.start()
         # The x/y that the user configured in Plot settings (independent of a
         # gate click, which temporarily switches to that gate's axes).
         page._gating_settings_x = page._gating_preview.get("x")
@@ -4918,23 +5091,31 @@ class MainWindow(QMainWindow):
 
     def _gating_on_roi_drag(self, page, gate, roi) -> None:
         self._gating_sync_gate(gate, roi)
-        self._gating_refresh_tree_stats(page)
+        self._gating_refresh_tree_stats(page, affected={gate["id"]})
+        self._gating_mark_dirty(page)
 
     def _gating_quadrant_sync(self, page, crosshair_id, key, line) -> None:
+        affected = set()
         for g in page._gating_gates:
             if g.get("crosshair_id") == crosshair_id:
                 g[key] = line.value()
-        self._gating_refresh_tree_stats(page)
+                affected.add(g["id"])
+        self._gating_refresh_tree_stats(page, affected=affected)
+        self._gating_mark_dirty(page)
 
     def _gating_split_sync(self, page, split_id, line) -> None:
+        affected = set()
         for g in page._gating_gates:
             if g.get("split_id") == split_id:
                 g["vx"] = line.value()
-        self._gating_refresh_tree_stats(page)
+                affected.add(g["id"])
+        self._gating_refresh_tree_stats(page, affected=affected)
+        self._gating_mark_dirty(page)
 
     def _gating_range_sync(self, page, gate, key, line) -> None:
         gate[key] = line.value()
-        self._gating_refresh_tree_stats(page)
+        self._gating_refresh_tree_stats(page, affected={gate["id"]})
+        self._gating_mark_dirty(page)
 
     def _gating_skewed_sync(self, page, skewed_id) -> None:
         entry = page._gating_skewed_lines.get(skewed_id)
@@ -4946,13 +5127,16 @@ class MainWindow(QMainWindow):
             return
         center = pts[0]
         keys = ("p_right", "p_up", "p_left", "p_down")
+        affected = set()
         for g in page._gating_gates:
             if g.get("skewed_id") == skewed_id:
                 g["center"] = [center.x(), center.y()]
                 for i, key in enumerate(keys):
                     sp = pts[i + 1]
                     g[key] = [sp.x(), sp.y()]
-        self._gating_refresh_tree_stats(page)
+                affected.add(g["id"])
+        self._gating_refresh_tree_stats(page, affected=affected)
+        self._gating_mark_dirty(page)
 
     def _gating_default_name(self, page, tool: str) -> str:
         prefixes = {"rect": "Rect", "ellipse": "Oval", "polygon": "Poly", "range": "Range"}
@@ -5593,100 +5777,29 @@ class MainWindow(QMainWindow):
             self._gating_rebuild_tree(page)
             self._gating_mark_dirty(page)
 
-    def _gating_gate_statistics(self, page):
-        """Return {gate_id: (count, percent_of_parent)} for the current file."""
-        import numpy as np
-        import pandas as pd
+    def _gating_request_stats(self, page, affected=None) -> None:
+        """Submit a background statistics recomputation (incremental if affected)."""
+        worker = getattr(page, "_gating_stats_worker", None)
+        if worker is None:
+            return
         parquet_path = page._gating_preview.get("file")
         if not parquet_path or not page._gating_gates:
-            return {}
-        transforms = self._upstream_scale_transforms(page._gating_task_id)
+            page._gating_last_stats = {}
+            return
+        gates = copy.deepcopy(page._gating_gates)
+        transforms = copy.deepcopy(
+            self._upstream_scale_transforms(page._gating_task_id)
+        )
         existing = set(self._columns_for(parquet_path))
-        needed = set()
-        for g in page._gating_gates:
-            for key in ("x", "y"):
-                v = g.get(key)
-                if v and v in existing:
-                    needed.add(v)
-        if not needed:
-            return {}
-        try:
-            df = pd.read_parquet(parquet_path, columns=sorted(needed))
-        except Exception:
-            return {}
-        n_total = len(df)
-        cache = {}
+        page._gating_stat_generation += 1
+        worker.request(
+            page._gating_stat_generation,
+            parquet_path, gates, transforms, existing, affected,
+        )
 
-        def col(name):
-            if name not in cache:
-                cache[name] = pd.to_numeric(
-                    df[name], errors="coerce"
-                ).to_numpy(dtype="float64")
-            return cache[name]
-
-        own = {}
-        for g in page._gating_gates:
-            x_name = g.get("x")
-            y_name = g.get("y")
-            if (
-                not x_name or not y_name
-                or x_name not in existing or y_name not in existing
-            ):
-                own[g["id"]] = None
-                continue
-            x = _apply_scale_transforms(col(x_name), transforms.get(x_name))
-            y = _apply_scale_transforms(col(y_name), transforms.get(y_name))
-            own[g["id"]] = _gate_mask(x, y, g)
-
-        by_parent = {}
-        for g in page._gating_gates:
-            by_parent.setdefault(g.get("parent"), []).append(g)
-
-        counts = {}
-
-        def populate(gid, parent_mask, computable):
-            om = own.get(gid)
-            if not computable or om is None:
-                counts[gid] = None
-                for child in by_parent.get(gid, []):
-                    populate(child["id"], None, False)
-                return
-            m = om if parent_mask is None else (parent_mask & om)
-            counts[gid] = int(np.sum(m))
-            for child in by_parent.get(gid, []):
-                populate(child["id"], m, True)
-
-        for top in by_parent.get(None, []):
-            populate(top["id"], None, True)
-
-        result = {}
-        for g in page._gating_gates:
-            c = counts.get(g["id"])
-            if c is None:
-                continue
-            pid = g.get("parent")
-            if pid:
-                pc = counts.get(pid)
-                if pc is None:
-                    pc = n_total
-            else:
-                pc = n_total
-            pct = (c / pc * 100.0) if pc else 0.0
-            result[g["id"]] = (c, pct)
-        return result
-
-    @staticmethod
-    def _gating_gate_display_name(gate, idx, stats) -> str:
-        name = gate.get("name", f"Gate {idx + 1}")
-        st = stats.get(gate["id"])
-        if st is None:
-            return name
-        count, pct = st
-        return f"{name} ({pct:.2f}%, {count})"
-
-    def _gating_refresh_tree_stats(self, page) -> None:
-        """Refresh gate count/percent labels without rebuilding the tree."""
-        stats = self._gating_gate_statistics(page)
+    def _gating_apply_stats(self, page, stats) -> None:
+        """Update the gate tree labels with a fresh stats dict."""
+        page._gating_last_stats = stats
         tree = page._gating_tree
         tree.blockSignals(True)
 
@@ -5705,6 +5818,30 @@ class MainWindow(QMainWindow):
             update(tree.topLevelItem(i))
         tree.blockSignals(False)
         tree.resizeColumnToContents(0)
+
+    def _gating_on_stats_timer(self, page) -> None:
+        """Poll the worker and apply the latest non-stale result."""
+        if not hasattr(page, "_gating_tree"):
+            return
+        worker = getattr(page, "_gating_stats_worker", None)
+        if worker is None:
+            return
+        for generation, stats in worker.poll():
+            if generation == page._gating_stat_generation:
+                self._gating_apply_stats(page, stats)
+
+    @staticmethod
+    def _gating_gate_display_name(gate, idx, stats) -> str:
+        name = gate.get("name", f"Gate {idx + 1}")
+        st = stats.get(gate["id"])
+        if st is None:
+            return name
+        count, pct = st
+        return f"{name} ({pct:.2f}%, {count})"
+
+    def _gating_refresh_tree_stats(self, page, affected=None) -> None:
+        """Refresh gate count/percent labels (background, incremental if affected)."""
+        self._gating_request_stats(page, affected=affected)
 
     def _gating_on_collapse(self, page, item) -> None:
         gid = item.data(0, Qt.ItemDataRole.UserRole + 1)
@@ -5731,7 +5868,8 @@ class MainWindow(QMainWindow):
         for idx, gate in enumerate(page._gating_gates):
             by_parent.setdefault(gate.get("parent"), []).append((idx, gate))
 
-        stats = self._gating_gate_statistics(page)
+        # Show last-known stats immediately; a background recompute follows.
+        stats = page._gating_last_stats
 
         def add_children(parent_item, parent_id):
             for idx, gate in by_parent.get(parent_id, []):
@@ -5761,6 +5899,7 @@ class MainWindow(QMainWindow):
             self._gating_set_items_handles_visible(gate_items, False)
         for entry in page._gating_skewed_lines.values():
             self._gating_set_items_handles_visible([entry["roi"]], False)
+        self._gating_refresh_tree_stats(page)
 
     def _gating_render(self, page) -> None:
         """Render the gating scatter for the current view mode."""
@@ -5847,21 +5986,27 @@ class MainWindow(QMainWindow):
 
         self._figure_scatter_color_settings(
             layout, preview, plot_widget, columns, enabled,
-            on_change=lambda: self._gating_render(page),
+            on_change=lambda: self._gating_on_preview_change(page),
             on_rebuild=lambda: (
                 self._gating_rebuild_settings(page),
-                self._gating_render(page),
+                self._gating_on_preview_change(page),
             ),
         )
 
         layout.addWidget(QLabel("X range"))
-        layout.addWidget(self._figure_range_row(preview, "x", plot_widget, enabled))
+        layout.addWidget(self._figure_range_row(
+            preview, "x", plot_widget, enabled,
+            on_commit=lambda: self._gating_mark_dirty(page),
+        ))
         layout.addWidget(QLabel("Y range"))
-        layout.addWidget(self._figure_range_row(preview, "y", plot_widget, enabled))
+        layout.addWidget(self._figure_range_row(
+            preview, "y", plot_widget, enabled,
+            on_commit=lambda: self._gating_mark_dirty(page),
+        ))
 
         self._figure_display_toggles(
             layout, preview, enabled,
-            on_change=lambda: self._gating_render(page),
+            on_change=lambda: self._gating_on_preview_change(page),
         )
         layout.addStretch()
 
@@ -5878,6 +6023,7 @@ class MainWindow(QMainWindow):
             vb.setXRange(xr[0], xr[1], padding=0)
             vb.setYRange(yr[0], yr[1], padding=0)
             self._gating_refresh_tree_stats(page)
+            self._gating_mark_dirty(page)
             self._gating_rebuild_settings(page)
         file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
 
@@ -5892,9 +6038,15 @@ class MainWindow(QMainWindow):
                 page._gating_context_gate_id = None
                 page._gating_parent_id = None
                 self._gating_render(page)
+                self._gating_mark_dirty(page)
             return handler
         x_combo.currentTextChanged.connect(on_param("x"))
         y_combo.currentTextChanged.connect(on_param("y"))
+
+    def _gating_on_preview_change(self, page) -> None:
+        """Re-render and mark dirty after a scatter setting change."""
+        self._gating_render(page)
+        self._gating_mark_dirty(page)
 
     def _gating_mark_dirty(self, page) -> None:
         page._gating_dirty = True
@@ -5902,7 +6054,9 @@ class MainWindow(QMainWindow):
         self._module_set_state(page, MODULE_STATE_MODIFIED)
 
     def _gating_save_now(self, page) -> None:
-        page._gating_task_def.setdefault("params", {})["gates"] = page._gating_gates
+        params = page._gating_task_def.setdefault("params", {})
+        params["gates"] = page._gating_gates
+        params["preview"] = page._gating_preview
         if self.project is not None:
             self.project.save()
         page._gating_snapshot = copy.deepcopy(page._gating_task_def.get("params", {}))
@@ -5943,6 +6097,16 @@ class MainWindow(QMainWindow):
         page._gating_crosshairs = {}
         page._gating_split_lines = {}
         page._gating_skewed_lines = {}
+        # Stop the background worker and drop its column/mask caches.
+        worker = getattr(page, "_gating_stats_worker", None)
+        if worker is not None:
+            worker.stop()
+            page._gating_stats_worker = None
+        timer = getattr(page, "_gating_stat_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._gating_stat_timer = None
+        page._gating_last_stats = {}
 
     def _gating_close(self, page) -> None:
         if page._gating_dirty:
