@@ -80,6 +80,15 @@ import pyqtgraph as pg
 
 APP_NAME = "Smage"
 
+
+class _NoWheelComboBox(QComboBox):
+    """A combo box that ignores the mouse wheel, so scrolling the page never
+    accidentally changes the selection. Options are changed only by clicking."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
 # Light-blue "tech" theme, loosely inspired by Positron's blue accents.
 APP_STYLE = """
 QMainWindow { background: #f5f8fb; }
@@ -779,6 +788,23 @@ def _letter_pixmap(text: str, size: int = 14) -> QPixmap:
     painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, text)
     painter.end()
     return pixmap
+
+
+def _triangle_icon(direction: str) -> QIcon:
+    """A filled triangle pointing 'up' or 'down'."""
+    pm = QPixmap(16, 16)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#37474f"))
+    if direction == "up":
+        pts = [QPointF(8, 3), QPointF(3, 13), QPointF(13, 13)]
+    else:
+        pts = [QPointF(8, 13), QPointF(3, 3), QPointF(13, 3)]
+    p.drawPolygon(QPolygonF(pts))
+    p.end()
+    return QIcon(pm)
 
 
 def _gate_tool_icon(key: str) -> QIcon:
@@ -2523,7 +2549,7 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.setSpacing(6)
-        self.sample_combo = QComboBox()
+        self.sample_combo = _NoWheelComboBox()
         self.sample_combo.addItem("Full sampling", "full")
         self.sample_combo.addItem("Partial random sampling", "partial")
         row.addWidget(self.sample_combo)
@@ -3505,6 +3531,10 @@ class MainWindow(QMainWindow):
         page._fig_task_id = task_def.get("id")
         page._fig_column_transforms = self._upstream_scale_transforms(page._fig_task_id)
         page._fig_plots = task_def.setdefault("params", {}).setdefault("plots", [])
+        # Backfill last-used axis parameters for older projects.
+        for pd_ in page._fig_plots:
+            pd_.setdefault("last_x", pd_.get("x"))
+            pd_.setdefault("last_y", pd_.get("y"))
         page._fig_cards = []
         page._fig_scene = scene
         page._fig_view = canvas_view
@@ -3770,6 +3800,8 @@ class MainWindow(QMainWindow):
             "file_name": rec.get("name") if rec else None,
             "x": x,
             "y": y if ptype == "scatter" else None,
+            "last_x": x,
+            "last_y": y if ptype == "scatter" else None,
             "color_mode": "density",
             "color_param": x,
             "palette": "viridis",
@@ -3875,7 +3907,11 @@ class MainWindow(QMainWindow):
         rec = self._figure_record(plot_dict.get("file"))
         x_name = plot_dict.get("x")
         y_name = plot_dict.get("y")
-        if not rec or not x_name or not y_name:
+        if not rec:
+            plot_widget.setTitle("No data file", color="#c0392b", size="10pt")
+            return
+        if not x_name or not y_name:
+            plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
             return
 
         transforms = column_transforms or {}
@@ -3983,7 +4019,11 @@ class MainWindow(QMainWindow):
         plot_widget.clear()
         rec = self._figure_record(plot_dict.get("file"))
         x_name = plot_dict.get("x")
-        if not rec or not x_name:
+        if not rec:
+            plot_widget.setTitle("No data file", color="#c0392b", size="10pt")
+            return
+        if not x_name:
+            plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
             return
         try:
             df = pd.read_parquet(rec["parquet"], columns=[x_name])
@@ -4236,7 +4276,7 @@ class MainWindow(QMainWindow):
 
         # File.
         layout.addWidget(QLabel("File"))
-        file_combo = QComboBox()
+        file_combo = _NoWheelComboBox()
         for r in records:
             file_combo.addItem(r.get("name", ""), r.get("parquet", ""))
         if plot_dict.get("file") is not None:
@@ -4244,7 +4284,7 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 file_combo.setCurrentIndex(idx)
         file_combo.setEnabled(enabled)
-        layout.addWidget(file_combo)
+        layout.addWidget(self._file_nav_row(file_combo, enabled))
 
         # X parameter.
         layout.addWidget(QLabel("X parameter"))
@@ -4253,7 +4293,7 @@ class MainWindow(QMainWindow):
 
         # Filter: apply an upstream gate (gate + ancestors) to the data.
         layout.addWidget(QLabel("Filter"))
-        filter_combo = QComboBox()
+        filter_combo = _NoWheelComboBox()
         filter_combo.addItem("None", None)
         filter_options = self._figure_filter_options(page._fig_task_id)
         selected_idx = 0
@@ -4305,7 +4345,7 @@ class MainWindow(QMainWindow):
 
             # Display mode: histogram bars, fitted curve, or both overlaid.
             layout.addWidget(QLabel("Display mode"))
-            hist_mode_combo = QComboBox()
+            hist_mode_combo = _NoWheelComboBox()
             for text, val in FIGURE_HISTOGRAM_MODES:
                 hist_mode_combo.addItem(text, val)
             idx = hist_mode_combo.findData(plot_dict.get("hist_mode", "histogram"))
@@ -4390,9 +4430,14 @@ class MainWindow(QMainWindow):
             plot_dict["file_name"] = file_combo.currentText()
             new_rec = self._figure_record(plot_dict["file"])
             new_cols = self._columns_for(new_rec.get("parquet")) if new_rec else []
-            plot_dict["x"] = new_cols[0] if new_cols else None
+            # Keep the last-used x/y; blank them if this file lacks them.
+            plot_dict["x"] = (
+                plot_dict.get("last_x") if plot_dict.get("last_x") in new_cols else None
+            )
             if plot_dict.get("type") == "scatter":
-                plot_dict["y"] = new_cols[1] if len(new_cols) > 1 else (new_cols[0] if new_cols else None)
+                plot_dict["y"] = (
+                    plot_dict.get("last_y") if plot_dict.get("last_y") in new_cols else None
+                )
                 plot_dict["color_param"] = plot_dict["x"]
             self._figure_rebuild_settings(page)
             self._figure_apply_change(page, index, plot_dict)
@@ -4412,7 +4457,10 @@ class MainWindow(QMainWindow):
 
         def on_axis_param(attr):
             def handler(value):
+                value = value or None
                 plot_dict[attr] = value
+                # Remember this as the last-used parameter.
+                plot_dict["last_" + attr] = value
                 # Reset the axis range to Auto so the plot refits to the new
                 # parameter and the settings panel shows the updated range.
                 if attr == "x":
@@ -4445,9 +4493,48 @@ class MainWindow(QMainWindow):
             self._figure_resize_card(page, index, width_field.value(), height_field.value())
             self._figure_mark_dirty(page)
 
+    def _file_nav_row(self, combo, enabled: bool) -> QWidget:
+        """Wrap a file combo with prev/next buttons that cycle through files."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        h.addWidget(combo, 1)
+        prev_btn = QPushButton()
+        prev_btn.setIcon(_triangle_icon("up"))
+        next_btn = QPushButton()
+        next_btn.setIcon(_triangle_icon("down"))
+        for btn in (prev_btn, next_btn):
+            btn.setFixedSize(24, 24)
+            btn.setIconSize(QSize(16, 16))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setEnabled(enabled)
+        prev_btn.setToolTip("Previous file")
+        next_btn.setToolTip("Next file")
+
+        def prev():
+            n = combo.count()
+            if n > 0:
+                combo.setCurrentIndex((combo.currentIndex() - 1) % n)
+
+        def nxt():
+            n = combo.count()
+            if n > 0:
+                combo.setCurrentIndex((combo.currentIndex() + 1) % n)
+
+        prev_btn.clicked.connect(prev)
+        next_btn.clicked.connect(nxt)
+        h.addWidget(prev_btn)
+        h.addWidget(next_btn)
+        return row
+
     def _figure_param_combo(self, columns, current, enabled: bool) -> QComboBox:
-        """Build a combo listing parameter names, selecting `current` if present."""
-        combo = QComboBox()
+        """Build a combo listing parameter names, selecting `current` if present.
+
+        A blank first item is shown when `current` is None (no parameter).
+        """
+        combo = _NoWheelComboBox()
+        combo.addItem("", None)
         for col in columns:
             combo.addItem(str(col))
         if current is not None:
@@ -4464,7 +4551,7 @@ class MainWindow(QMainWindow):
         Shared by the Figure and Scaling scatter settings panels.
         """
         layout.addWidget(QLabel("Color mode"))
-        mode_combo = QComboBox()
+        mode_combo = _NoWheelComboBox()
         for text, val in FIGURE_COLOR_MODES:
             mode_combo.addItem(text, val)
         idx = mode_combo.findData(plot_dict.get("color_mode", "density"))
@@ -4511,7 +4598,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(make_solid_button())
         else:
             layout.addWidget(QLabel("Palette"))
-            palette_combo = QComboBox()
+            palette_combo = _NoWheelComboBox()
             palette_combo.addItems(FIGURE_PALETTES)
             idx = palette_combo.findText(plot_dict.get("palette", "viridis"))
             if idx >= 0:
@@ -4857,7 +4944,7 @@ class MainWindow(QMainWindow):
             name_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
             table.setItem(row_idx, 0, name_item)
 
-            method_combo = QComboBox()
+            method_combo = _NoWheelComboBox()
             method_combo.addItems(SCALING_METHODS)
             idx = method_combo.findText(config.get("method", "linear"))
             method_combo.setCurrentIndex(max(0, idx))
@@ -5054,7 +5141,7 @@ class MainWindow(QMainWindow):
         columns = self._columns_for(rec.get("parquet")) if rec else []
 
         layout.addWidget(QLabel("File"))
-        file_combo = QComboBox()
+        file_combo = _NoWheelComboBox()
         for r in records:
             file_combo.addItem(r.get("name", ""), r.get("parquet", ""))
         if preview.get("file") is not None:
@@ -5210,6 +5297,8 @@ class MainWindow(QMainWindow):
                 "file_name": rec.get("name") if rec else None,
                 "x": cols[0] if cols else None,
                 "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
+                "last_x": cols[0] if cols else None,
+                "last_y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
                 "color_mode": "density",
                 "color_param": None,
                 "palette": "viridis",
@@ -5239,6 +5328,10 @@ class MainWindow(QMainWindow):
         if not valid:
             preview = _default_preview()
             params["preview"] = preview
+        else:
+            # Backfill last-used axis parameters for older projects.
+            preview.setdefault("last_x", preview.get("x"))
+            preview.setdefault("last_y", preview.get("y"))
         page._gating_preview = preview
         page._gating_task_def = task_def
         page._gating_task_id = task_def.get("id")
@@ -6664,7 +6757,7 @@ class MainWindow(QMainWindow):
         columns = self._columns_for(rec.get("parquet")) if rec else []
 
         layout.addWidget(QLabel("File"))
-        file_combo = QComboBox()
+        file_combo = _NoWheelComboBox()
         for r in records:
             file_combo.addItem(r.get("name", ""), r.get("parquet", ""))
         if preview.get("file") is not None:
@@ -6672,7 +6765,7 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 file_combo.setCurrentIndex(idx)
         file_combo.setEnabled(enabled)
-        layout.addWidget(file_combo)
+        layout.addWidget(self._file_nav_row(file_combo, enabled))
 
         layout.addWidget(QLabel("X parameter"))
         x_combo = self._gating_param_combo(columns, preview.get("x"), enabled)
@@ -6760,7 +6853,16 @@ class MainWindow(QMainWindow):
             page._gating_active_gate_id = None
             page._gating_context_gate_id = None
             page._gating_parent_id = None
-            # Keep the current x/y axes and visible range when switching files.
+            # Keep the last-used x/y; blank them if this file lacks them.
+            new_rec = self._figure_record(preview["file"])
+            new_cols = self._columns_for(new_rec.get("parquet")) if new_rec else []
+            preview["x"] = (
+                preview.get("last_x") if preview.get("last_x") in new_cols else None
+            )
+            preview["y"] = (
+                preview.get("last_y") if preview.get("last_y") in new_cols else None
+            )
+            # Keep the visible range when switching files.
             vb = page._gating_viewbox
             xr, yr = vb.viewRange()
             self._gating_render(page)
@@ -6773,7 +6875,10 @@ class MainWindow(QMainWindow):
 
         def on_param(attr):
             def handler(value):
+                value = value or None
                 preview[attr] = value
+                # Remember this as the last-used parameter.
+                preview["last_" + attr] = value
                 if attr == "x":
                     page._gating_settings_x = value
                 elif attr == "y":
