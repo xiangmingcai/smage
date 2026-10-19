@@ -3589,6 +3589,7 @@ class MainWindow(QMainWindow):
         for pd_ in page._fig_plots:
             pd_.setdefault("last_x", pd_.get("x"))
             pd_.setdefault("last_y", pd_.get("y"))
+            pd_.setdefault("last_color_param", pd_.get("color_param"))
         page._fig_cards = []
         page._fig_scene = scene
         page._fig_view = canvas_view
@@ -3870,6 +3871,7 @@ class MainWindow(QMainWindow):
             "last_y": y if ptype == "scatter" else None,
             "color_mode": "density",
             "color_param": x,
+            "last_color_param": x,
             "palette": "viridis",
             "xmin": None,
             "xmax": None,
@@ -4558,7 +4560,11 @@ class MainWindow(QMainWindow):
                 plot_dict["y"] = (
                     plot_dict.get("last_y") if plot_dict.get("last_y") in new_cols else None
                 )
-                plot_dict["color_param"] = plot_dict["x"]
+                plot_dict["color_param"] = (
+                    plot_dict.get("last_color_param")
+                    if plot_dict.get("last_color_param") in new_cols
+                    else None
+                )
             self._figure_rebuild_settings(page)
             self._figure_apply_change(page, index, plot_dict)
 
@@ -4789,7 +4795,11 @@ class MainWindow(QMainWindow):
                 p["x"] = p.get("last_x") if p.get("last_x") in cols else None
                 if p.get("type") == "scatter":
                     p["y"] = p.get("last_y") if p.get("last_y") in cols else None
-                    p["color_param"] = p["x"]
+                    p["color_param"] = (
+                        p.get("last_color_param")
+                        if p.get("last_color_param") in cols
+                        else None
+                    )
             self._figure_apply_change_multi(page)
             self._figure_rebuild_settings_multi(page)
 
@@ -4909,6 +4919,7 @@ class MainWindow(QMainWindow):
 
                     def on_cp(v):
                         apply(scatter_plots, "color_param", v or None)
+                        apply(scatter_plots, "last_color_param", v or None)
                         self._figure_apply_change_multi(page)
 
                     cp_combo.currentTextChanged.connect(on_cp)
@@ -5234,6 +5245,7 @@ class MainWindow(QMainWindow):
         if cp_combo is not None:
             def on_cp(v):
                 plot_dict["color_param"] = v
+                plot_dict["last_color_param"] = v
                 on_change()
             cp_combo.currentTextChanged.connect(on_cp)
 
