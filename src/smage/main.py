@@ -739,6 +739,197 @@ def _figure_colormap(name: str):
         return pg.ColorMap([0.0, 1.0], [(0, 0, 255), (255, 0, 0)])
 
 
+def _is_scatter_plot(ptype: str) -> bool:
+    """Whether a Figure plot type is scatter-like (plots x/y data points)."""
+    return ptype in ("scatter", "image")
+
+
+# --- Image plot: level-of-detail sample index (disk-cached) ----------------
+
+_IMAGE_FINEST_CAP = 2_000_000   # most points in the finest precomputed level
+_IMAGE_COARSEST = 4096          # stop coarsening once a level is this small
+_IMAGE_POINT_CAP = 200_000      # most points drawn per frame
+
+
+def _image_index_dir(parquet_path) -> Path:
+    return Path(str(parquet_path) + ".imgidx")
+
+
+def _image_geometry(parquet_path):
+    """Return (xmin, xmax, ymin, ymax, total_rows, columns) for an image Parquet.
+
+    x/y extents come from row-group statistics when present (no data is read);
+    otherwise the x/y columns are streamed once to compute min/max.
+    """
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(parquet_path)
+    names = list(pf.schema_arrow.names)
+    total = int(pf.metadata.num_rows)
+
+    def col_stat(col):
+        idx = names.index(col)
+        for rg in range(pf.metadata.num_row_groups):
+            st = pf.metadata.row_group(rg).column(idx).statistics
+            if (
+                st is not None
+                and getattr(st, "min", None) is not None
+                and getattr(st, "max", None) is not None
+            ):
+                return float(st.min), float(st.max)
+        return None
+
+    xs = col_stat("x")
+    ys = col_stat("y")
+    if xs is not None and ys is not None and total > 0:
+        return xs[0], xs[1], ys[0], ys[1], total, names
+
+    xmin = ymin = float("inf")
+    xmax = ymax = float("-inf")
+    for batch in pf.iter_batches(batch_size=1_000_000, columns=["x", "y"]):
+        x = batch.column("x").to_numpy()
+        y = batch.column("y").to_numpy()
+        if x.size:
+            xmin = min(xmin, float(np.nanmin(x)))
+            xmax = max(xmax, float(np.nanmax(x)))
+            ymin = min(ymin, float(np.nanmin(y)))
+            ymax = max(ymax, float(np.nanmax(y)))
+    if not np.isfinite(xmin):
+        raise ValueError("image file has no x/y coordinates")
+    return xmin, xmax, ymin, ymax, total, names
+
+
+def _image_write_level(idx_dir, block, means2d):
+    import numpy as np
+    fname = f"level_{block}.npy"
+    np.save(idx_dir / fname, means2d.astype(np.float32))
+    return {"block": int(block), "file": fname}
+
+
+def _build_image_index_files(parquet_path, progress_cb=None):
+    """Build the multi-level raster pyramid for one image file (disk-cached).
+
+    Each level is a 2D array `(H/b, W/b, C)` of per-block channel means (a
+    downsampled image). The finest level's block size `b0` is chosen so the
+    level fits _IMAGE_FINEST_CAP; coarser levels double the block via 2x2
+    pooling. Only one level is materialised in memory at a time.
+    """
+    import json
+    import math
+    import numpy as np
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    xmin, xmax, ymin, ymax, total, names = _image_geometry(parquet_path)
+    # Store per-block means for every column (including x/y, so the user may
+    # color the image by a coordinate too). The default color parameter is
+    # still the first non-x/y column, chosen in _figure_add_plot.
+    color_cols = list(names)
+    width = xmax - xmin + 1.0
+    height = ymax - ymin + 1.0
+    if width < 1 or height < 1 or total == 0:
+        raise ValueError("image file has no pixels")
+
+    block = 1
+    while True:
+        nbx = int(math.ceil(width / block))
+        nby = int(math.ceil(height / block))
+        if nbx * nby <= _IMAGE_FINEST_CAP:
+            break
+        block *= 2
+    b0 = block
+
+    idx_dir = _image_index_dir(parquet_path)
+    idx_dir.mkdir(parents=True, exist_ok=True)
+
+    pf = pq.ParquetFile(parquet_path)
+    ncol = len(color_cols)
+
+    # Finest level: aggregate raw pixels into b0-sized blocks (single pass).
+    nbx = int(math.ceil(width / b0))
+    nby = int(math.ceil(height / b0))
+    nblocks = nbx * nby
+    cnt = np.zeros(nblocks, dtype=np.int64)
+    sm = np.zeros((nblocks, ncol), dtype=np.float64)
+    ch_min = np.full(ncol, np.inf)
+    ch_max = np.full(ncol, -np.inf)
+    processed = 0
+    for batch in pf.iter_batches(batch_size=1_000_000, columns=names):
+        tbl = batch.to_pandas()
+        x = tbl["x"].to_numpy(dtype="float64")
+        y = tbl["y"].to_numpy(dtype="float64")
+        bi = ((x - xmin) // b0).astype(np.int64) + ((y - ymin) // b0).astype(np.int64) * nbx
+        np.clip(bi, 0, nblocks - 1, out=bi)
+        cnt += np.bincount(bi, minlength=nblocks)
+        for j, cc in enumerate(color_cols):
+            v = pd.to_numeric(tbl[cc], errors="coerce").to_numpy(dtype="float64")
+            sm[:, j] += np.bincount(bi, weights=np.nan_to_num(v), minlength=nblocks)
+            fin = np.isfinite(v)
+            if fin.any():
+                ch_min[j] = min(ch_min[j], float(v[fin].min()))
+                ch_max[j] = max(ch_max[j], float(v[fin].max()))
+        processed += x.size
+        if progress_cb is not None:
+            progress_cb(min(1.0, processed / total))
+
+    means = (sm / np.maximum(cnt, 1)[:, None]).reshape(nby, nbx, ncol)
+    levels = [_image_write_level(idx_dir, b0, means)]
+
+    # Coarser levels by 2x2 count-weighted pooling of the previous level.
+    prev = means
+    prev_cnt = cnt.reshape(nby, nbx)
+    prev_b = b0
+    while prev_b < max(width, height):
+        nb = prev_b * 2
+        h, w = prev.shape[0], prev.shape[1]
+        nbx2 = int(math.ceil(w / 2.0))
+        nby2 = int(math.ceil(h / 2.0))
+        ph, pw = nby2 * 2, nbx2 * 2
+        pad_m = np.zeros((ph, pw, ncol), dtype=np.float64)
+        pad_c = np.zeros((ph, pw), dtype=np.float64)
+        pad_m[:h, :w] = prev * prev_cnt[:, :, None]
+        pad_c[:h, :w] = prev_cnt
+        sum_m = pad_m.reshape(nby2, 2, nbx2, 2, ncol).sum(axis=(1, 3))
+        sum_c = pad_c.reshape(nby2, 2, nbx2, 2).sum(axis=(1, 3))
+        prev = sum_m / np.maximum(sum_c, 1)[:, :, None]
+        prev_cnt = sum_c
+        levels.append(_image_write_level(idx_dir, nb, prev))
+        prev_b = nb
+        if nby2 * nbx2 <= _IMAGE_COARSEST:
+            break
+
+    color_ranges = {}
+    for j, cc in enumerate(color_cols):
+        color_ranges[cc] = [
+            float(ch_min[j]) if np.isfinite(ch_min[j]) else 0.0,
+            float(ch_max[j]) if np.isfinite(ch_max[j]) else 1.0,
+        ]
+
+    manifest = {
+        "file_size": int(Path(parquet_path).stat().st_size),
+        "file_mtime": float(Path(parquet_path).stat().st_mtime),
+        "xmin": float(xmin),
+        "xmax": float(xmax),
+        "ymin": float(ymin),
+        "ymax": float(ymax),
+        "total": int(total),
+        "color_cols": color_cols,
+        "color_ranges": color_ranges,
+        "levels": levels,
+    }
+    with open(idx_dir / "manifest.json", "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)
+    if progress_cb is not None:
+        progress_cb(1.0)
+    return manifest
+
+
+def _image_load_level(parquet_path, info):
+    import numpy as np
+    return np.load(_image_index_dir(parquet_path) / info["file"])
+
+
 _SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
 
 
@@ -1735,6 +1926,15 @@ class _SizeField(QWidget):
         self.edit.setEnabled(enabled)
         self._up.setEnabled(enabled)
         self._down.setEnabled(enabled)
+
+    def set_value(self, value) -> None:
+        """Set the displayed value without triggering on_change."""
+        if value is None:
+            self._value = None
+            self.edit.setText("")
+        else:
+            self._value = self._clamp(value)
+            self.edit.setText(str(self._value))
 
     def _clamp(self, value) -> int:
         return max(self._min, min(self._max, int(value)))
@@ -3033,6 +3233,20 @@ class MainWindow(QMainWindow):
                     "parquet": str(out_path),
                     "rows": result["rows"],
                 })
+                # Build the image LOD sample index now, so Figure views open
+                # image files instantly (no first-open build).
+                if Path(entry["path"]).suffix.lower() in (".tif", ".tiff"):
+                    name = Path(entry["path"]).name
+                    try:
+                        def _idx_progress(f, _name=name):
+                            progress.setLabelText(
+                                f"Importing {_name}: building image index… {int(f * 100)}%"
+                            )
+                            QApplication.processEvents()
+
+                        _build_image_index_files(str(out_path), _idx_progress)
+                    except Exception:
+                        pass  # Figure will fall back to a lazy build
             except Exception as exc:
                 entry["status"] = "error"
                 entry["error"] = str(exc)
@@ -3547,10 +3761,13 @@ class MainWindow(QMainWindow):
         header.addStretch()
         add_scatter = QPushButton("Add Scatter")
         add_hist = QPushButton("Add Histogram")
+        add_image = QPushButton("Add Image")
         add_scatter.setCursor(Qt.CursorShape.PointingHandCursor)
         add_hist.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_image.setCursor(Qt.CursorShape.PointingHandCursor)
         header.addWidget(add_scatter)
         header.addWidget(add_hist)
+        header.addWidget(add_image)
         fl.addLayout(header)
 
         scene = QGraphicsScene()
@@ -3618,10 +3835,12 @@ class MainWindow(QMainWindow):
 
         add_scatter.clicked.connect(lambda _=False: self._figure_add_plot(page, "scatter"))
         add_hist.clicked.connect(lambda _=False: self._figure_add_plot(page, "histogram"))
+        add_image.clicked.connect(lambda _=False: self._figure_add_plot(page, "image"))
 
         if locked:
             add_scatter.setEnabled(False)
             add_hist.setEnabled(False)
+            add_image.setEnabled(False)
 
         self._figure_relayout(page)
         if page._fig_plots:
@@ -3695,6 +3914,18 @@ class MainWindow(QMainWindow):
         card._title_bar.installEventFilter(dbl_click_filter)
         plot_widget.viewport().installEventFilter(dbl_click_filter)
         page._fig_filters.append(dbl_click_filter)
+
+        # Image plots re-sample (LOD) when the user zooms/pans their data.
+        if plot_dict.get("type") == "image":
+            vb = plot_widget.getPlotItem().getViewBox()
+            rt = QTimer(plot_widget)
+            rt.setSingleShot(True)
+            rt.setInterval(30)
+            rt.timeout.connect(
+                lambda: self._figure_image_refresh(page, plot_dict, plot_widget)
+            )
+            vb.sigRangeChanged.connect(lambda *_: rt.start())
+            plot_widget._img_refresh_timer = rt
 
         page._fig_cards.append(card)
         self._figure_render(plot_dict, plot_widget, column_transforms=page._fig_column_transforms)
@@ -3860,18 +4091,25 @@ class MainWindow(QMainWindow):
         x = columns[0] if columns else None
         y = columns[1] if len(columns) > 1 else x
         count = sum(1 for p in page._fig_plots if p.get("type") == ptype)
+        if ptype == "image":
+            # Image plots default to coloring by the first non-coordinate channel.
+            color_mode = "parameter"
+            color_param = next((c for c in columns if c not in ("x", "y")), None)
+        else:
+            color_mode = "density"
+            color_param = x
         plot_dict = {
             "type": ptype,
             "title": f"{ptype.title()} {count + 1}",
             "file": rec.get("parquet") if rec else None,
             "file_name": rec.get("name") if rec else None,
             "x": x,
-            "y": y if ptype == "scatter" else None,
+            "y": y if _is_scatter_plot(ptype) else None,
             "last_x": x,
-            "last_y": y if ptype == "scatter" else None,
-            "color_mode": "density",
-            "color_param": x,
-            "last_color_param": x,
+            "last_y": y if _is_scatter_plot(ptype) else None,
+            "color_mode": color_mode,
+            "color_param": color_param,
+            "last_color_param": color_param,
             "palette": "viridis",
             "xmin": None,
             "xmax": None,
@@ -3954,8 +4192,229 @@ class MainWindow(QMainWindow):
             return None, "Filter could not be applied"
         return mask, None
 
+    def _image_load_manifest(self, parquet_path):
+        import json
+        mf = _image_index_dir(parquet_path) / "manifest.json"
+        if not mf.exists():
+            return None
+        try:
+            with open(mf, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    def _image_index_valid(self, parquet_path, manifest):
+        try:
+            st = Path(parquet_path).stat()
+            return (
+                manifest.get("file_size") == int(st.st_size)
+                and abs(manifest.get("file_mtime", 0.0) - st.st_mtime) < 1e-6
+            )
+        except Exception:
+            return False
+
+    def _ensure_image_index(self, parquet_path):
+        """Return the cached index entry for a file, or None when it has none.
+
+        Image indexes are built at import time. A file without one is left
+        alone (the caller prompts the user); it may be a flow/table file, or
+        an image that needs re-importing.
+        """
+        cache = getattr(self, "_image_index_cache", None)
+        if cache is None:
+            cache = {}
+            self._image_index_cache = cache
+        ent = cache.get(parquet_path)
+        if ent is not None and ent.get("manifest") is not None:
+            return ent
+        manifest = self._image_load_manifest(parquet_path)
+        if manifest is not None and self._image_index_valid(parquet_path, manifest):
+            ent = {"manifest": manifest, "levels": {}}
+            cache[parquet_path] = ent
+            return ent
+        return None
+
+    def _image_level_2d(self, parquet_path, block):
+        ent = getattr(self, "_image_index_cache", {}).get(parquet_path)
+        if ent is None:
+            return None
+        lv = ent.get("levels", {}).get(block)
+        if lv is None:
+            manifest = ent.get("manifest") or {}
+            for info in manifest.get("levels", []):
+                if info["block"] == block:
+                    lv = _image_load_level(parquet_path, info)
+                    ent.setdefault("levels", {})[block] = lv
+                    break
+        return lv
+
+    def _image_raster_raw(self, parquet_path, manifest, bbox, channel):
+        """Rasterise raw pixels inside a bbox (deep zoom beyond the finest level)."""
+        import math
+        import numpy as np
+        import pyarrow.parquet as pq
+        color_cols = manifest.get("color_cols", [])
+        if channel is None or channel not in color_cols:
+            channel = color_cols[0] if color_cols else None
+        x0, x1, y0, y1 = bbox
+        cols = ["x", "y"] if channel in ("x", "y") else ["x", "y"] + ([channel] if channel else [])
+        filters = [("y", ">=", y0), ("y", "<=", y1), ("x", ">=", x0), ("x", "<=", x1)]
+        try:
+            df = pq.read_table(parquet_path, columns=cols, filters=filters).to_pandas()
+        except Exception:
+            return None, None
+        if len(df) == 0:
+            return None, None
+        x = df["x"].to_numpy(dtype="float64")
+        y = df["y"].to_numpy(dtype="float64")
+        if channel == "x":
+            v = x
+        elif channel == "y":
+            v = y
+        elif channel:
+            v = df[channel].to_numpy(dtype="float64")
+        else:
+            v = np.ones(len(df))
+        nbx = max(1, int(math.ceil(x1 - x0)))
+        nby = max(1, int(math.ceil(y1 - y0)))
+        bi = np.clip((x - x0).astype(np.int64), 0, nbx - 1)
+        bj = np.clip((y - y0).astype(np.int64), 0, nby - 1)
+        bidx = bj * nbx + bi
+        cnt = np.bincount(bidx, minlength=nbx * nby).reshape(nby, nbx)
+        ssum = np.bincount(bidx, weights=v, minlength=nbx * nby).reshape(nby, nbx)
+        chan = np.divide(ssum, cnt, out=np.zeros_like(ssum), where=cnt > 0)
+        rect = QRectF(x0, y0, x1 - x0, y1 - y0)
+        return chan, rect
+
+    def _image_raster(self, parquet_path, manifest, bbox, spacing, channel):
+        """Return (channel_2d_array, data_rect) for the visible bbox."""
+        import math
+        color_cols = manifest.get("color_cols", [])
+        if not color_cols:
+            return None, None
+        if channel is None or channel not in color_cols:
+            channel = color_cols[0] if color_cols else None
+        cidx = color_cols.index(channel) if channel else 0
+        x0, x1, y0, y1 = bbox
+        xmin = manifest["xmin"]
+        ymin = manifest["ymin"]
+        levels = manifest.get("levels", [])
+        if not levels:
+            return None, None
+        if spacing < levels[0]["block"]:
+            return self._image_raster_raw(parquet_path, manifest, bbox, channel)
+        chosen = levels[-1]
+        for info in levels:
+            if info["block"] >= spacing:
+                chosen = info
+                break
+        arr = self._image_level_2d(parquet_path, chosen["block"])
+        if arr is None:
+            return None, None
+        b = chosen["block"]
+        i0 = max(0, int(math.floor((x0 - xmin) / b)))
+        i1 = min(arr.shape[1], int(math.ceil((x1 - xmin) / b)))
+        j0 = max(0, int(math.floor((y0 - ymin) / b)))
+        j1 = min(arr.shape[0], int(math.ceil((y1 - ymin) / b)))
+        if i1 <= i0 or j1 <= j0:
+            return None, None
+        crop = arr[j0:j1, i0:i1, cidx]
+        rect = QRectF(xmin + i0 * b, ymin + j0 * b, (i1 - i0) * b, (j1 - j0) * b)
+        return crop, rect
+
+    def _figure_render_image(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
+        """Render an Image plot as a raster (LOD pyramid), ImageJ-style."""
+        import numpy as np
+        rec = self._figure_record(plot_dict.get("file"))
+        if not rec:
+            plot_widget.clear()
+            plot_widget.setTitle("No data file", color="#c0392b", size="10pt")
+            return
+        parquet_path = rec.get("parquet")
+        ent = self._ensure_image_index(parquet_path)
+        if ent is None or ent.get("manifest") is None:
+            plot_widget.clear()
+            plot_widget.setTitle(
+                "No image index — re-import if this is an image",
+                color="#c0392b", size="10pt",
+            )
+            return
+        manifest = ent["manifest"]
+        vb = plot_widget.getPlotItem().getViewBox()
+        if not getattr(plot_widget, "_img_fitted", False):
+            plot_widget.clear()
+            img = pg.ImageItem()
+            plot_widget.addItem(img)
+            plot_widget._img_item = img
+            plot_widget._img_extent = (
+                manifest["xmin"], manifest["xmax"],
+                manifest["ymin"], manifest["ymax"],
+            )
+            vb.invertY(True)
+            vb.disableAutoRange()
+            vb.setXRange(manifest["xmin"], manifest["xmax"], padding=0)
+            vb.setYRange(manifest["ymin"], manifest["ymax"], padding=0)
+            plot_widget._img_fitted = True
+        img = plot_widget._img_item
+        xr = vb.viewRange()[0]
+        yr = vb.viewRange()[1]
+        x0, x1 = min(xr), max(xr)
+        y0, y1 = min(yr), max(yr)
+        if x1 <= x0 or y1 <= y0:
+            return
+        wpx = max(1, plot_widget.width())
+        hpx = max(1, plot_widget.height())
+        spacing = max(1e-12, min((x1 - x0) / wpx, (y1 - y0) / hpx))
+
+        mode = plot_dict.get("color_mode", "parameter")
+        if mode == "solid":
+            rgb = plot_dict.get("solid_color", (0, 0, 200))
+            lut = np.tile(np.array(rgb, dtype=np.uint8), (256, 1))
+            img.setImage(
+                np.zeros((2, 2), dtype="float32"),
+                autoLevels=False, levels=(0.0, 1.0), lut=lut,
+            )
+            img.setRect(QRectF(
+                manifest["xmin"], manifest["ymin"],
+                manifest["xmax"] - manifest["xmin"], manifest["ymax"] - manifest["ymin"],
+            ))
+            img.setVisible(True)
+            self._figure_apply_display_options(plot_dict, plot_widget)
+            return
+
+        channel = plot_dict.get("color_param")
+        chan, rect = self._image_raster(
+            parquet_path, manifest, (x0, x1, y0, y1), spacing, channel
+        )
+        if chan is None:
+            img.setVisible(False)
+            return
+        color_cols = manifest.get("color_cols", [])
+        cname = channel if channel in color_cols else (color_cols[0] if color_cols else None)
+        ranges = manifest.get("color_ranges", {}) or {}
+        lo, hi = ranges.get(cname, (None, None))
+        if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo = float(np.nanmin(chan))
+            hi = float(np.nanmax(chan))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = 0.0, 1.0
+        cmap = _figure_colormap(plot_dict.get("palette", "viridis"))
+        lut = cmap.getLookupTable(0.0, 1.0, 256)
+        img.setImage(chan, autoLevels=False, levels=(lo, hi), lut=lut)
+        img.setRect(rect)
+        img.setVisible(True)
+        self._figure_apply_display_options(plot_dict, plot_widget)
+
+    def _figure_image_refresh(self, page, plot_dict, plot_widget) -> None:
+        self._figure_render_image(
+            plot_dict, plot_widget, column_transforms=page._fig_column_transforms
+        )
+
     def _figure_render(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
         """(Re)draw a plot widget from its plot_dict."""
+        if plot_dict.get("type") == "image":
+            self._figure_render_image(plot_dict, plot_widget, column_transforms)
+            return
         mask, error = self._figure_filter_mask(plot_dict)
         if error:
             plot_widget.clear()
@@ -4152,6 +4611,23 @@ class MainWindow(QMainWindow):
 
     def _figure_apply_ranges(self, plot_dict: dict, plot_widget) -> None:
         """Apply manual/auto X and Y ranges from the plot settings."""
+        if plot_dict.get("type") == "image":
+            # Image plots keep autoRange off: fit to the settings range, else
+            # to the full image extent (so no auto-fit loop on a cropped image).
+            extent = getattr(plot_widget, "_img_extent", None)
+            xmin, xmax = plot_dict.get("xmin"), plot_dict.get("xmax")
+            ymin, ymax = plot_dict.get("ymin"), plot_dict.get("ymax")
+            if (xmin is None or xmax is None) and extent:
+                xmin, xmax = extent[0], extent[1]
+            if (ymin is None or ymax is None) and extent:
+                ymin, ymax = extent[2], extent[3]
+            vb = plot_widget.getPlotItem().getViewBox()
+            vb.disableAutoRange()
+            if xmin is not None and xmax is not None and xmax > xmin:
+                vb.setXRange(float(xmin), float(xmax), padding=0)
+            if ymin is not None and ymax is not None and ymax > ymin:
+                vb.setYRange(float(ymin), float(ymax), padding=0)
+            return
         xmin, xmax = plot_dict.get("xmin"), plot_dict.get("xmax")
         if xmin is not None and xmax is not None and xmax > xmin:
             plot_widget.setXRange(float(xmin), float(xmax), padding=0)
@@ -4166,6 +4642,13 @@ class MainWindow(QMainWindow):
     def _figure_fit_all(self, plot_dict: dict, plot_widget) -> None:
         """Fit the view to the full data extent (without changing settings)."""
         vb = plot_widget.getPlotItem().getViewBox()
+        if plot_dict.get("type") == "image":
+            extent = getattr(plot_widget, "_img_extent", None)
+            if extent:
+                vb.disableAutoRange()
+                vb.setXRange(extent[0], extent[1], padding=0)
+                vb.setYRange(extent[2], extent[3], padding=0)
+            return
         xmin = getattr(plot_widget, "_data_xmin", None)
         xmax = getattr(plot_widget, "_data_xmax", None)
         ymin = getattr(plot_widget, "_data_ymin", None)
@@ -4185,7 +4668,7 @@ class MainWindow(QMainWindow):
         """Apply axis labels, visibility, tick notation, and sample-name title."""
         plot_item = plot_widget.getPlotItem()
         x_name = plot_dict.get("x")
-        y_name = plot_dict.get("y") if plot_dict.get("type") == "scatter" else "Count"
+        y_name = plot_dict.get("y") if _is_scatter_plot(plot_dict.get("type")) else "Count"
 
         plot_item.setLabel("bottom", x_name or "")
         plot_item.setLabel("left", y_name or "")
@@ -4441,7 +4924,7 @@ class MainWindow(QMainWindow):
         bins_spin = None
         hist_mode_combo = None
 
-        if plot_dict.get("type") == "scatter":
+        if _is_scatter_plot(plot_dict.get("type")):
             layout.addWidget(QLabel("Y parameter"))
             y_combo = self._figure_param_combo(columns, plot_dict.get("y"), enabled)
             layout.addWidget(y_combo)
@@ -4514,7 +4997,7 @@ class MainWindow(QMainWindow):
             plot_dict, "x", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
         ))
 
-        if plot_dict.get("type") == "scatter":
+        if _is_scatter_plot(plot_dict.get("type")):
             layout.addWidget(QLabel("Y range"))
             layout.addWidget(self._figure_range_row(
                 plot_dict, "y", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
@@ -4527,8 +5010,8 @@ class MainWindow(QMainWindow):
         sh.setContentsMargins(0, 0, 0, 0)
         sh.setSpacing(4)
         size = plot_dict.get("size") or [440, 340]
-        width_field = _SizeField(size[0], lambda v: on_size_changed())
-        height_field = _SizeField(size[1], lambda v: on_size_changed())
+        width_field = _SizeField(size[0], lambda v: on_width_changed())
+        height_field = _SizeField(size[1], lambda v: on_height_changed())
         width_field.set_enabled(enabled)
         height_field.set_enabled(enabled)
         sh.addWidget(QLabel("W"))
@@ -4537,6 +5020,34 @@ class MainWindow(QMainWindow):
         sh.addWidget(height_field)
         sh.addStretch()
         layout.addWidget(size_row)
+
+        # Resolution = W / 10; editing it rescales W (and H) keeping the ratio.
+        layout.addWidget(QLabel("Resolution"))
+        res_row = QWidget()
+        rh = QHBoxLayout(res_row)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.setSpacing(4)
+        res_value = int(round(size[0] / 10.0)) if size[0] else 20
+        resolution_field = _SizeField(
+            res_value, lambda v: on_resolution_changed(), minimum=20, maximum=400
+        )
+        resolution_field.set_enabled(enabled)
+        rh.addWidget(resolution_field)
+        if plot_dict.get("type") == "image":
+            origin_btn = QPushButton("Origin")
+            origin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            origin_btn.setEnabled(enabled)
+            origin_btn.setToolTip("Match the original image's aspect ratio")
+            origin_btn.clicked.connect(lambda _=False: on_origin())
+            rh.addWidget(origin_btn)
+        square_btn = QPushButton("Square")
+        square_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        square_btn.setEnabled(enabled)
+        square_btn.setToolTip("Make width equal to height")
+        square_btn.clicked.connect(lambda _=False: on_square())
+        rh.addWidget(square_btn)
+        rh.addStretch()
+        layout.addWidget(res_row)
 
         # Display options.
         self._figure_display_toggles(
@@ -4556,7 +5067,7 @@ class MainWindow(QMainWindow):
             plot_dict["x"] = (
                 plot_dict.get("last_x") if plot_dict.get("last_x") in new_cols else None
             )
-            if plot_dict.get("type") == "scatter":
+            if _is_scatter_plot(plot_dict.get("type")):
                 plot_dict["y"] = (
                     plot_dict.get("last_y") if plot_dict.get("last_y") in new_cols else None
                 )
@@ -4615,8 +5126,70 @@ class MainWindow(QMainWindow):
                 self._figure_apply_change(page, index, plot_dict)
             hist_mode_combo.currentIndexChanged.connect(on_hist_mode)
 
-        def on_size_changed():
-            self._figure_resize_card(page, index, width_field.value(), height_field.value())
+        def on_width_changed():
+            w = width_field.value()
+            if w is None:
+                return
+            h = height_field.value()
+            h = h if h is not None else w
+            plot_dict["size"] = [int(w), int(h)]
+            resolution_field.set_value(int(round(w / 10.0)))
+            self._figure_resize_card(page, index, w, h)
+            self._figure_mark_dirty(page)
+
+        def on_height_changed():
+            w = width_field.value()
+            h = height_field.value()
+            if w is None or h is None:
+                return
+            plot_dict["size"] = [int(w), int(h)]
+            self._figure_resize_card(page, index, w, h)
+            self._figure_mark_dirty(page)
+
+        def on_resolution_changed():
+            r = resolution_field.value()
+            if r is None:
+                return
+            w_old = width_field.value()
+            h_old = height_field.value()
+            w_new = r * 10
+            if w_old and w_old > 0:
+                h_new = int(round(h_old * w_new / w_old)) if h_old else int(round(w_new * 0.77))
+            else:
+                h_new = int(round(w_new * 0.77))
+            plot_dict["size"] = [int(w_new), int(h_new)]
+            width_field.set_value(w_new)
+            height_field.set_value(h_new)
+            self._figure_resize_card(page, index, w_new, h_new)
+            self._figure_mark_dirty(page)
+
+        def on_origin():
+            # Match the original image's aspect ratio, keeping H unchanged.
+            extent = getattr(plot_widget, "_img_extent", None)
+            if not extent:
+                return
+            img_w = extent[1] - extent[0] + 1
+            img_h = extent[3] - extent[2] + 1
+            h = height_field.value()
+            if not h or img_w <= 0 or img_h <= 0:
+                return
+            w_new = int(round(h * img_h / img_w))
+            w_new = max(200, min(4000, w_new))
+            plot_dict["size"] = [w_new, int(h)]
+            width_field.set_value(w_new)
+            resolution_field.set_value(int(round(w_new / 10.0)))
+            self._figure_resize_card(page, index, w_new, h)
+            self._figure_mark_dirty(page)
+
+        def on_square():
+            h = height_field.value()
+            if h is None:
+                return
+            w_new = int(h)
+            plot_dict["size"] = [w_new, int(h)]
+            width_field.set_value(w_new)
+            resolution_field.set_value(int(round(w_new / 10.0)))
+            self._figure_resize_card(page, index, w_new, h)
             self._figure_mark_dirty(page)
 
     def _figure_rebuild_settings_multi(self, page) -> None:
@@ -4649,7 +5222,7 @@ class MainWindow(QMainWindow):
             note.setWordWrap(True)
             layout.addWidget(note)
 
-        scatter_plots = [p for p in plots if p.get("type") == "scatter"]
+        scatter_plots = [p for p in plots if _is_scatter_plot(p.get("type"))]
         hist_plots = [p for p in plots if p.get("type") == "histogram"]
 
         def common(ps, key, default=None):
@@ -4793,7 +5366,7 @@ class MainWindow(QMainWindow):
                 rec = self._figure_record(f)
                 cols = self._columns_for(rec.get("parquet")) if rec else []
                 p["x"] = p.get("last_x") if p.get("last_x") in cols else None
-                if p.get("type") == "scatter":
+                if _is_scatter_plot(p.get("type")):
                     p["y"] = p.get("last_y") if p.get("last_y") in cols else None
                     p["color_param"] = (
                         p.get("last_color_param")
@@ -5148,9 +5721,15 @@ class MainWindow(QMainWindow):
         """
         layout.addWidget(QLabel("Color mode"))
         mode_combo = _NoWheelComboBox()
-        for text, val in FIGURE_COLOR_MODES:
+        modes = (
+            [("Parameter", "parameter"), ("Solid", "solid")]
+            if plot_dict.get("type") == "image"
+            else FIGURE_COLOR_MODES
+        )
+        for text, val in modes:
             mode_combo.addItem(text, val)
-        idx = mode_combo.findData(plot_dict.get("color_mode", "density"))
+        default_mode = "parameter" if plot_dict.get("type") == "image" else "density"
+        idx = mode_combo.findData(plot_dict.get("color_mode", default_mode))
         mode_combo.setCurrentIndex(max(0, idx))
         mode_combo.setEnabled(enabled)
         layout.addWidget(mode_combo)
@@ -5202,40 +5781,41 @@ class MainWindow(QMainWindow):
             palette_combo.setEnabled(enabled)
             layout.addWidget(palette_combo)
 
-        # Point size: constant on-screen size (unchecked), or a fixed size in
-        # data units that scales with the zoom (checked).
-        def on_point_size(v):
-            plot_dict["point_size"] = float(v)
-            on_change()
+        # Point size (scatter only; an Image renders as a raster, so this row
+        # is hidden for image plots).
+        if plot_dict.get("type") != "image":
+            def on_point_size(v):
+                plot_dict["point_size"] = float(v)
+                on_change()
 
-        layout.addWidget(QLabel("Point size"))
-        ps_row = QWidget()
-        ph = QHBoxLayout(ps_row)
-        ph.setContentsMargins(0, 0, 0, 0)
-        ph.setSpacing(4)
-        point_fixed = QCheckBox("Fixed")
-        point_fixed.setChecked(plot_dict.get("fixed_point_size", False))
-        point_fixed.setEnabled(enabled)
-        point_spin = _LogStepSpinBox(plot_dict.get("point_size", 4), on_point_size)
-        point_spin.set_enabled(enabled and point_fixed.isChecked())
-        ph.addWidget(point_fixed)
-        ph.addWidget(point_spin)
-        ph.addStretch()
-        layout.addWidget(ps_row)
+            layout.addWidget(QLabel("Point size"))
+            ps_row = QWidget()
+            ph = QHBoxLayout(ps_row)
+            ph.setContentsMargins(0, 0, 0, 0)
+            ph.setSpacing(4)
+            point_fixed = QCheckBox("Fixed")
+            point_fixed.setChecked(plot_dict.get("fixed_point_size", False))
+            point_fixed.setEnabled(enabled)
+            point_spin = _LogStepSpinBox(plot_dict.get("point_size", 4), on_point_size)
+            point_spin.set_enabled(enabled and point_fixed.isChecked())
+            ph.addWidget(point_fixed)
+            ph.addWidget(point_spin)
+            ph.addStretch()
+            layout.addWidget(ps_row)
 
-        def on_point_fixed(toggled):
-            plot_dict["fixed_point_size"] = toggled
-            point_spin.set_enabled(enabled and toggled)
-            if toggled:
-                # Seed a sensible data-unit size from the current x-range.
-                xmin = getattr(plot_widget, "_data_xmin", None)
-                xmax = getattr(plot_widget, "_data_xmax", None)
-                if xmin is not None and xmax is not None and xmax > xmin:
-                    auto_size = 0.01 * (xmax - xmin)
-                    point_spin.set_value(auto_size)
-                    plot_dict["point_size"] = auto_size
-            on_change()
-        point_fixed.toggled.connect(on_point_fixed)
+            def on_point_fixed(toggled):
+                plot_dict["fixed_point_size"] = toggled
+                point_spin.set_enabled(enabled and toggled)
+                if toggled:
+                    # Seed a sensible data-unit size from the current x-range.
+                    xmin = getattr(plot_widget, "_data_xmin", None)
+                    xmax = getattr(plot_widget, "_data_xmax", None)
+                    if xmin is not None and xmax is not None and xmax > xmin:
+                        auto_size = 0.01 * (xmax - xmin)
+                        point_spin.set_value(auto_size)
+                        plot_dict["point_size"] = auto_size
+                on_change()
+            point_fixed.toggled.connect(on_point_fixed)
 
         def on_mode_changed(_=0):
             plot_dict["color_mode"] = mode_combo.currentData()
