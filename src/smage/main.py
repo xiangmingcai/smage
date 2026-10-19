@@ -365,6 +365,115 @@ def _gate_mask(x, y, gate):
     return np.ones(x.shape, dtype=bool)
 
 
+def _gate_source_ids(gate):
+    """Return the ids of the source gates a boolean gate depends on."""
+    if gate.get("type") == "not":
+        s = gate.get("source")
+        return [s] if s else []
+    if gate.get("type") in ("and", "or"):
+        return list(gate.get("sources", []))
+    return []
+
+
+def _gate_needed_columns(gate, by_id):
+    """Return the x/y column names needed to compute a gate's own mask."""
+    cols = set()
+    for key in ("x", "y"):
+        v = gate.get(key)
+        if v:
+            cols.add(v)
+    for sid in _gate_source_ids(gate):
+        src = by_id.get(sid)
+        if src is not None:
+            for key in ("x", "y"):
+                v = src.get(key)
+                if v:
+                    cols.add(v)
+    return cols
+
+
+def _gate_own_mask(gate, by_id, get_col, transforms, existing):
+    """Return a gate's own boolean mask (transformed data), handling boolean
+    gates (NOT / AND / OR)."""
+    if gate.get("type") == "not":
+        src = by_id.get(gate.get("source"))
+        if src is None:
+            return None
+        sx, sy = src.get("x"), src.get("y")
+        if not sx or not sy or sx not in existing or sy not in existing:
+            return None
+        x = _apply_scale_transforms(get_col(sx), transforms.get(sx))
+        y = _apply_scale_transforms(get_col(sy), transforms.get(sy))
+        return ~_gate_mask(x, y, src)
+    if gate.get("type") in ("and", "or"):
+        combine_and = gate.get("type") == "and"
+        result = None
+        for sid in gate.get("sources", []):
+            src = by_id.get(sid)
+            if src is None:
+                continue
+            sx, sy = src.get("x"), src.get("y")
+            if not sx or not sy or sx not in existing or sy not in existing:
+                continue
+            x = _apply_scale_transforms(get_col(sx), transforms.get(sx))
+            y = _apply_scale_transforms(get_col(sy), transforms.get(sy))
+            sm = _gate_mask(x, y, src)
+            if result is None:
+                result = sm
+            elif combine_and:
+                result = result & sm
+            else:
+                result = result | sm
+        return result
+    x_name, y_name = gate.get("x"), gate.get("y")
+    if not x_name or not y_name or x_name not in existing or y_name not in existing:
+        return None
+    x = _apply_scale_transforms(get_col(x_name), transforms.get(x_name))
+    y = _apply_scale_transforms(get_col(y_name), transforms.get(y_name))
+    return _gate_mask(x, y, gate)
+
+
+def _compute_gate_filter_mask(gates, gate_id, parquet_path, transforms):
+    """Return the AND mask of a gate and all its ancestors (transformed data).
+
+    Returns None if the gate cannot be computed (no x/y columns). Raises
+    KeyError if a needed column is missing from the parquet file.
+    """
+    import pandas as pd
+    by_id = {g["id"]: g for g in gates}
+    chain = []
+    cur = by_id.get(gate_id)
+    while cur is not None:
+        chain.append(cur)
+        cur = by_id.get(cur.get("parent"))
+    chain.reverse()
+    if not chain:
+        return None
+    needed = set()
+    for g in chain:
+        needed |= _gate_needed_columns(g, by_id)
+    if not needed:
+        return None
+    df = pd.read_parquet(parquet_path, columns=sorted(needed))
+    existing = set(df.columns)
+    cache = {}
+
+    def get_col(name):
+        if name not in cache:
+            cache[name] = pd.to_numeric(
+                df[name], errors="coerce"
+            ).to_numpy(dtype="float64")
+        return cache[name]
+
+    mask = None
+    for g in chain:
+        gm = _gate_own_mask(g, by_id, get_col, transforms, existing)
+        if gm is None:
+            continue
+        mask = gm if mask is None else (mask & gm)
+    return mask
+
+
 def _gate_label_position(gate):
     """Return an (x, y) point inside `gate` for placing its name label."""
     t = gate.get("type")
@@ -528,12 +637,12 @@ class _GatingStatsWorker:
             # Full recompute: the gate set may have changed, so reset caches.
             self._masks = {}
             self._counts = {}
+        by_id = {g["id"]: g for g in gates}
         needed = set()
         for g in gates:
-            for key in ("x", "y"):
-                v = g.get(key)
-                if v and v in existing:
-                    needed.add(v)
+            for col in _gate_needed_columns(g, by_id):
+                if col in existing:
+                    needed.add(col)
         if not needed:
             return (generation, {})
         cols = self._columns
@@ -549,22 +658,14 @@ class _GatingStatsWorker:
                 ).to_numpy(dtype="float64")
             self._columns = cols
         n_total = len(next(iter(cols.values()))) if cols else 0
-        by_id = {g["id"]: g for g in gates}
         by_parent = {}
         for g in gates:
             by_parent.setdefault(g.get("parent"), []).append(g)
 
         def own_mask(g):
-            x_name = g.get("x")
-            y_name = g.get("y")
-            if (
-                not x_name or not y_name
-                or x_name not in existing or y_name not in existing
-            ):
-                return None
-            x = _apply_scale_transforms(cols[x_name], transforms.get(x_name))
-            y = _apply_scale_transforms(cols[y_name], transforms.get(y_name))
-            return _gate_mask(x, y, g)
+            return _gate_own_mask(
+                g, by_id, lambda name: cols[name], transforms, existing
+            )
 
         def compute_subtree(gid):
             stack = [gid]
@@ -3688,18 +3789,82 @@ class MainWindow(QMainWindow):
             "hist_color": (0, 0, 200),
             "curve_color": (200, 40, 40),
             "solid_color": (0, 0, 200),
+            "filter": None,
         }
         page._fig_plots.append(plot_dict)
         index = self._figure_new_card(page, plot_dict)
         self._figure_mark_dirty(page)
         self._figure_select(page, index)
 
+    def _figure_filter_options(self, figure_task_id):
+        """Return [(display_name, {"task_id":..,"gate_id":..}), ...] for gates
+        in gating modules strictly upstream of the figure module."""
+        options = []
+        for task in self._task_chain(figure_task_id):
+            if task.get("id") == figure_task_id:
+                continue
+            if task.get("type") != "gating":
+                continue
+            module_name = task.get("name", "Gating")
+            for gate in task.get("params", {}).get("gates", []):
+                options.append((
+                    f"{module_name} → {gate.get('name', gate.get('id'))}",
+                    {"task_id": task.get("id"), "gate_id": gate.get("id")},
+                ))
+        return options
+
+    def _figure_filter_mask(self, plot_dict):
+        """Return (mask, error) for the plot's filter, or (None, None) when
+        there is no filter (or it is trivially empty)."""
+        f = plot_dict.get("filter")
+        if not f:
+            return None, None
+        gating_task = self._find_task_by_id(f.get("task_id"))
+        if gating_task is None:
+            return None, "Filter module not found"
+        gates = gating_task.get("params", {}).get("gates", [])
+        by_id = {g["id"]: g for g in gates}
+        chain = []
+        cur = by_id.get(f.get("gate_id"))
+        while cur is not None:
+            chain.append(cur)
+            cur = by_id.get(cur.get("parent"))
+        if not chain:
+            return None, "Filter gate not found"
+        needed = set()
+        for g in chain:
+            needed |= _gate_needed_columns(g, by_id)
+        rec = self._figure_record(plot_dict.get("file"))
+        if rec is None:
+            return None, "No data file"
+        existing = set(self._columns_for(rec.get("parquet")))
+        missing = needed - existing
+        if missing:
+            return None, "Filter parameter not in this file: " + ", ".join(
+                sorted(str(m) for m in missing)
+            )
+        transforms = self._upstream_scale_transforms(f.get("task_id"))
+        try:
+            mask = _compute_gate_filter_mask(
+                gates, f.get("gate_id"), rec["parquet"], transforms
+            )
+        except Exception:
+            return None, "Filter could not be applied"
+        if mask is None:
+            return None, "Filter could not be applied"
+        return mask, None
+
     def _figure_render(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
         """(Re)draw a plot widget from its plot_dict."""
+        mask, error = self._figure_filter_mask(plot_dict)
+        if error:
+            plot_widget.clear()
+            plot_widget.setTitle(error, color="#c0392b", size="10pt")
+            return
         if plot_dict.get("type") == "histogram":
-            self._figure_render_histogram(plot_dict, plot_widget, column_transforms)
+            self._figure_render_histogram(plot_dict, plot_widget, column_transforms, mask)
         else:
-            self._figure_render_scatter(plot_dict, plot_widget, column_transforms)
+            self._figure_render_scatter(plot_dict, plot_widget, column_transforms, mask)
 
     def _figure_render_scatter(self, plot_dict: dict, plot_widget, column_transforms=None,
                                mask=None) -> None:
@@ -3810,7 +3975,7 @@ class MainWindow(QMainWindow):
             pg.ScatterPlotItem(x=x, y=y, symbol="o", size=size, pen=None, brush=brushes, pxMode=px_mode)
         )
 
-    def _figure_render_histogram(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
+    def _figure_render_histogram(self, plot_dict: dict, plot_widget, column_transforms=None, mask=None) -> None:
         import numpy as np
         import pandas as pd
         import pyqtgraph as pg
@@ -3826,7 +3991,10 @@ class MainWindow(QMainWindow):
             return
         x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
         x = _apply_scale_transforms(x, (column_transforms or {}).get(x_name))
-        x = x[np.isfinite(x)]
+        keep = np.isfinite(x)
+        if mask is not None:
+            keep = keep & np.asarray(mask, dtype=bool)
+        x = x[keep]
         if x.size == 0:
             return
         plot_widget._data_xmin = float(x.min())
@@ -4083,6 +4251,30 @@ class MainWindow(QMainWindow):
         x_combo = self._figure_param_combo(columns, plot_dict.get("x"), enabled)
         layout.addWidget(x_combo)
 
+        # Filter: apply an upstream gate (gate + ancestors) to the data.
+        layout.addWidget(QLabel("Filter"))
+        filter_combo = QComboBox()
+        filter_combo.addItem("None", None)
+        filter_options = self._figure_filter_options(page._fig_task_id)
+        selected_idx = 0
+        current_filter = plot_dict.get("filter")
+        filter_found = False
+        for i, (label, val) in enumerate(filter_options):
+            filter_combo.addItem(label, val)
+            if (
+                current_filter
+                and val.get("task_id") == current_filter.get("task_id")
+                and val.get("gate_id") == current_filter.get("gate_id")
+            ):
+                selected_idx = i + 1
+                filter_found = True
+        if current_filter and not filter_found:
+            # The selected gate was removed upstream; clear the stale filter.
+            plot_dict["filter"] = None
+        filter_combo.setCurrentIndex(selected_idx)
+        filter_combo.setEnabled(enabled)
+        layout.addWidget(filter_combo)
+
         y_combo = None
         bins_spin = None
         hist_mode_combo = None
@@ -4206,6 +4398,17 @@ class MainWindow(QMainWindow):
             self._figure_apply_change(page, index, plot_dict)
 
         file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
+
+        def on_filter_changed():
+            plot_dict["filter"] = filter_combo.currentData()
+            # Keep the current view range; only the data subset changes.
+            vb = plot_widget.getPlotItem().getViewBox()
+            xr, yr = vb.viewRange()
+            self._figure_apply_change(page, index, plot_dict)
+            vb.setXRange(xr[0], xr[1], padding=0)
+            vb.setYRange(yr[0], yr[1], padding=0)
+
+        filter_combo.currentIndexChanged.connect(lambda _=0: on_filter_changed())
 
         def on_axis_param(attr):
             def handler(value):
@@ -4953,6 +5156,7 @@ class MainWindow(QMainWindow):
         upstream save. This module's own unsaved edits are left untouched."""
         if task_type == "figure":
             self._figure_refresh_all(page)
+            self._figure_rebuild_settings(page)
         elif task_type == "scale":
             self._scaling_render_preview(page)
         elif task_type == "gating":
@@ -5503,7 +5707,7 @@ class MainWindow(QMainWindow):
             lambda r=arg, g=gate: self._gating_on_roi_drag(page, g, r)
         )
         arg.sigClicked.connect(
-            lambda *a, g=gate: self._gating_select_gate_by_id(page, g["id"])
+            lambda roi, ev, g=gate: self._gating_gate_clicked(page, g["id"], ev)
         )
         page._gating_gates.append(gate)
         page._gating_rois.append([arg])
@@ -5580,6 +5784,45 @@ class MainWindow(QMainWindow):
         tree.blockSignals(True)
         tree.clearSelection()
         tree.blockSignals(False)
+
+    def _gating_open_gate_subset(self, page, gate_id) -> None:
+        """Open a gate's subset view (same as double-clicking it in the tree)."""
+        idx = -1
+        for i, g in enumerate(page._gating_gates):
+            if g["id"] == gate_id:
+                idx = i
+                break
+        preview = page._gating_preview
+        if idx < 0:
+            page._gating_active_gate_id = None
+            page._gating_parent_id = None
+            page._gating_context_gate_id = None
+        else:
+            gate = page._gating_gates[idx]
+            page._gating_active_gate_id = gate["id"]
+            page._gating_context_gate_id = None
+            page._gating_parent_id = gate["id"]
+            if gate.get("x"):
+                preview["x"] = gate["x"]
+            if gate.get("y"):
+                preview["y"] = gate["y"]
+        self._gating_render(page)
+        self._gating_rebuild_settings(page)
+        tree = page._gating_tree
+        tree.blockSignals(True)
+        tree.clearSelection()
+        item = self._gating_tree_item_for_index(page, idx)
+        if item is not None:
+            item.setSelected(True)
+            tree.setCurrentItem(item)
+        tree.blockSignals(False)
+
+    def _gating_gate_clicked(self, page, gate_id, ev) -> None:
+        """Handle a click on a gate ROI: double-click opens the subset view."""
+        if ev is not None and ev.double():
+            self._gating_open_gate_subset(page, gate_id)
+        else:
+            self._gating_select_gate_by_id(page, gate_id)
 
     def _gating_descendant_ids(self, page, gate_id) -> set:
         """Return the set of a gate's descendant ids (not including itself)."""
@@ -5721,6 +5964,10 @@ class MainWindow(QMainWindow):
         show_percent = page._gating_preview.get("label_show_percent", True)
         for i, gate in enumerate(gates):
             label = labels[i]
+            if gate.get("type") in ("not", "and", "or"):
+                # Boolean gates have no scatter label.
+                label.setVisible(False)
+                continue
             name = gate.get("name", f"Gate {i + 1}")
             st = page._gating_last_stats.get(gate["id"])
             if show_percent and st is not None:
@@ -5759,7 +6006,7 @@ class MainWindow(QMainWindow):
                         lambda r=roi, g=gate: self._gating_on_roi_drag(page, g, r)
                     )
                     roi.sigClicked.connect(
-                        lambda *a, g=gate: self._gating_select_gate_by_id(page, g["id"])
+                        lambda roi, ev, g=gate: self._gating_gate_clicked(page, g["id"], ev)
                     )
                     items = [roi]
                 elif t == "ellipse":
@@ -5776,7 +6023,7 @@ class MainWindow(QMainWindow):
                         lambda r=roi, g=gate: self._gating_on_roi_drag(page, g, r)
                     )
                     roi.sigClicked.connect(
-                        lambda *a, g=gate: self._gating_select_gate_by_id(page, g["id"])
+                        lambda roi, ev, g=gate: self._gating_gate_clicked(page, g["id"], ev)
                     )
                     items = [roi]
                 elif t == "polygon":
@@ -5792,7 +6039,7 @@ class MainWindow(QMainWindow):
                         lambda r=roi, g=gate: self._gating_on_roi_drag(page, g, r)
                     )
                     roi.sigClicked.connect(
-                        lambda *a, g=gate: self._gating_select_gate_by_id(page, g["id"])
+                        lambda roi, ev, g=gate: self._gating_gate_clicked(page, g["id"], ev)
                     )
                     items = [roi]
                 elif t == "quadrant":
@@ -5983,35 +6230,13 @@ class MainWindow(QMainWindow):
 
     def _gating_compute_mask(self, page, gate_id, parquet_path):
         """Return the AND mask of a gate and all its ancestors (on transformed data)."""
-        import numpy as np
-        import pandas as pd
-        chain = self._gating_gate_chain(page, gate_id)
         transforms = self._upstream_scale_transforms(page._gating_task_id)
-        needed = set()
-        for g in chain:
-            if g.get("x"):
-                needed.add(g["x"])
-            if g.get("y"):
-                needed.add(g["y"])
-        if not needed:
-            return None
         try:
-            df = pd.read_parquet(parquet_path, columns=list(needed))
+            return _compute_gate_filter_mask(
+                page._gating_gates, gate_id, parquet_path, transforms
+            )
         except Exception:
             return None
-        mask = None
-        for g in chain:
-            x_name = g.get("x")
-            y_name = g.get("y")
-            if not x_name or not y_name:
-                continue
-            x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
-            y = pd.to_numeric(df[y_name], errors="coerce").to_numpy(dtype="float64")
-            x = _apply_scale_transforms(x, transforms.get(x_name))
-            y = _apply_scale_transforms(y, transforms.get(y_name))
-            gm = _gate_mask(x, y, g)
-            mask = gm if mask is None else (mask & gm)
-        return mask
 
     def _gating_context_mask(self, page, gate_id, parquet_path):
         """Return the parent's population mask (the points the parent includes)."""
@@ -6053,6 +6278,24 @@ class MainWindow(QMainWindow):
         ren_act = QAction("Rename", menu)
         ren_act.triggered.connect(lambda: self._gating_rename_gate(page, idx))
         menu.addAction(ren_act)
+
+        # Boolean gating.
+        bool_menu = QMenu("Boolean gating", menu)
+        not_act = QAction("NOT", bool_menu)
+        not_act.triggered.connect(lambda _=False: self._gating_add_not_gate(page, idx))
+        bool_menu.addAction(not_act)
+        and_act = QAction("AND", bool_menu)
+        and_act.triggered.connect(
+            lambda _=False: self._gating_add_boolean_gate(page, idx, "and")
+        )
+        bool_menu.addAction(and_act)
+        or_act = QAction("OR", bool_menu)
+        or_act.triggered.connect(
+            lambda _=False: self._gating_add_boolean_gate(page, idx, "or")
+        )
+        bool_menu.addAction(or_act)
+        menu.addMenu(bool_menu)
+
         del_one = QAction("Delete this gate", menu)
         del_one.triggered.connect(lambda: self._gating_delete_gate(page, idx, cascade=False))
         menu.addAction(del_one)
@@ -6143,6 +6386,93 @@ class MainWindow(QMainWindow):
             self._gating_rebuild_tree(page)
             self._gating_update_labels(page)
             self._gating_mark_dirty(page)
+
+    def _gating_add_not_gate(self, page, idx) -> None:
+        """Create a 'NOT <gate>' gate, a sibling of `gate` that selects points
+        outside it. It has no shape or label on the scatter."""
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        gate = page._gating_gates[idx]
+        not_gate = {
+            "id": uuid4().hex[:8],
+            "name": f"NOT {gate.get('name', f'Gate {idx + 1}')}",
+            "type": "not",
+            "source": gate["id"],
+            "x": gate.get("x"),
+            "y": gate.get("y"),
+            "parent": gate.get("parent"),
+            "xmin": gate.get("xmin"), "xmax": gate.get("xmax"),
+            "ymin": gate.get("ymin"), "ymax": gate.get("ymax"),
+        }
+        page._gating_gates.append(not_gate)
+        page._gating_rois.append([])
+        self._gating_rebuild_tree(page)
+        self._gating_update_labels(page)
+        self._gating_mark_dirty(page)
+
+    def _gating_add_boolean_gate(self, page, idx, op) -> None:
+        """Create a '<A> op <B> op …' gate combining `gate` with selected
+        siblings (`op` is "and" or "or"). It has no shape or label on the scatter."""
+        sep = " AND " if op == "and" else " OR "
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        gate = page._gating_gates[idx]
+        parent_id = gate.get("parent")
+        siblings = [
+            g for g in page._gating_gates
+            if g.get("parent") == parent_id and g["id"] != gate["id"]
+        ]
+        if not siblings:
+            QMessageBox.information(
+                self, f"{op.upper()} gate",
+                "This gate has no sibling gates at the same level.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{op.upper()} gate")
+        dlg_layout = QVBoxLayout(dialog)
+        dlg_layout.addWidget(QLabel(f"Select sibling gates to {op.upper()} together:"))
+        checkboxes = []
+        for g in siblings:
+            cb = QCheckBox(g.get("name", g["id"]))
+            cb.setChecked(False)
+            checkboxes.append((g, cb))
+            dlg_layout.addWidget(cb)
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        dlg_layout.addLayout(btn_row)
+
+        selected = []
+
+        def on_ok():
+            for g, cb in checkboxes:
+                if cb.isChecked():
+                    selected.append(g)
+            dialog.accept()
+
+        ok_btn.clicked.connect(on_ok)
+        cancel_btn.clicked.connect(dialog.reject)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not selected:
+            return
+
+        sources = [gate] + selected
+        bool_gate = {
+            "id": uuid4().hex[:8],
+            "name": sep.join(g.get("name", g["id"]) for g in sources),
+            "type": op,
+            "sources": [g["id"] for g in sources],
+            "parent": parent_id,
+        }
+        page._gating_gates.append(bool_gate)
+        page._gating_rois.append([])
+        self._gating_rebuild_tree(page)
+        self._gating_update_labels(page)
+        self._gating_mark_dirty(page)
 
     def _gating_request_stats(self, page, affected=None) -> None:
         """Submit a background statistics recomputation (incremental if affected)."""
@@ -6448,9 +6778,7 @@ class MainWindow(QMainWindow):
                     page._gating_settings_x = value
                 elif attr == "y":
                     page._gating_settings_y = value
-                page._gating_active_gate_id = None
-                page._gating_context_gate_id = None
-                page._gating_parent_id = None
+                # Keep the active subset / context; only the display axes change.
                 self._gating_render(page)
                 self._gating_mark_dirty(page)
             return handler
