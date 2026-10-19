@@ -21,7 +21,7 @@ from uuid import uuid4
 # Make the `smage` package importable when this file is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, QTimer, Qt
+from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, QSize, QTimer, Qt
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QRubberBand,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -249,6 +250,10 @@ FIGURE_HISTOGRAM_MODES = [
     ("Curve fit", "curve"),
     ("Overlap", "overlap"),
 ]
+
+# Sentinel used by the Figure multi-select settings panel: the selected plots
+# disagree on a value, so the field shows blank instead of any one value.
+_MIXED = object()
 
 # Scaling (map) module: available transforms.
 SCALING_METHODS = ["linear", "log10", "arcsinh"]
@@ -1390,7 +1395,8 @@ class _ClickFilter(QObject):
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.MouseButtonPress:
-            self._callback()
+            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            self._callback(ctrl)
         return False  # let the event continue (plots still pan/zoom)
 
 
@@ -1446,7 +1452,7 @@ class _CardProxy(QGraphicsProxyWidget):
             self._press_scene = event.scenePos()
             self._start_pos = self.pos()
             self.setZValue(1)
-            self._on_select()
+            self._on_select(bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier))
             event.accept()
             return
         super().mousePressEvent(event)
@@ -1480,6 +1486,11 @@ class _ZoomableGraphicsView(QGraphicsView):
         self.plot_pan_start_cb = None
         self.plot_pan_move_cb = None
         self.plot_pan_end_cb = None
+        self.rubber_select_cb = None
+        self.rubber_clear_cb = None
+        self._rubber_band = None
+        self._rubber_origin = None
+        self._rubber_ctrl = False
         self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -1504,11 +1515,21 @@ class _ZoomableGraphicsView(QGraphicsView):
             if self.plot_pan_start_cb is not None and self.plot_pan_start_cb(item, scene_pos):
                 event.accept()
                 return
-            if item is None and self.unfocus_callback is not None:
-                self.unfocus_callback()
+            if item is None:
+                if self.unfocus_callback is not None:
+                    self.unfocus_callback()
+                self._begin_rubber_band(event.position().toPoint(), event.modifiers())
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._rubber_origin is not None:
+            self._rubber_band.setGeometry(
+                QRect(self._rubber_origin, event.position().toPoint()).normalized()
+            )
+            event.accept()
+            return
         if self.plot_pan_move_cb is not None:
             scene_pos = self.mapToScene(event.position().toPoint())
             if self.plot_pan_move_cb(scene_pos):
@@ -1517,10 +1538,37 @@ class _ZoomableGraphicsView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._rubber_origin is not None:
+            self._finish_rubber_band(event.position().toPoint())
+            event.accept()
+            return
         if self.plot_pan_end_cb is not None and self.plot_pan_end_cb():
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def _begin_rubber_band(self, view_pos, modifiers) -> None:
+        self._rubber_origin = view_pos
+        self._rubber_ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        if self._rubber_band is None:
+            self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self._rubber_band.setGeometry(QRect(view_pos, QSize()))
+        self._rubber_band.show()
+
+    def _finish_rubber_band(self, view_pos) -> None:
+        rect = QRect(self._rubber_origin, view_pos).normalized()
+        self._rubber_origin = None
+        self._rubber_band.hide()
+        if rect.width() < 4 and rect.height() < 4:
+            # A plain click on empty canvas: clear the selection.
+            if self.rubber_clear_cb is not None:
+                self.rubber_clear_cb()
+            return
+        top_left = self.mapToScene(rect.topLeft())
+        bottom_right = self.mapToScene(rect.bottomRight())
+        scene_rect = QRectF(top_left, bottom_right).normalized()
+        if self.rubber_select_cb is not None:
+            self.rubber_select_cb(scene_rect, self._rubber_ctrl)
 
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -1643,7 +1691,7 @@ class _SizeField(QWidget):
 
     def __init__(self, value, on_change, minimum: int = 200, maximum: int = 4000) -> None:
         super().__init__()
-        self._value = int(value)
+        self._value = None if value is None else int(value)
         self._on_change = on_change
         self._min = minimum
         self._max = maximum
@@ -1655,7 +1703,7 @@ class _SizeField(QWidget):
 
         self.edit = QLineEdit()
         self.edit.setFixedWidth(56)
-        self.edit.setText(str(self._value))
+        self.edit.setText("" if self._value is None else str(self._value))
         self.edit.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.edit.editingFinished.connect(self._commit)
         # Select all after a click so typing replaces the old value.
@@ -1692,16 +1740,22 @@ class _SizeField(QWidget):
         return max(self._min, min(self._max, int(value)))
 
     def _step(self, delta: int) -> None:
-        self._value = self._clamp(self._value + delta)
+        base = self._value if self._value is not None else self._min
+        self._value = self._clamp(base + delta)
         self.edit.setText(str(self._value))
         if self._on_change is not None:
             self._on_change(self._value)
 
     def _commit(self) -> None:
+        text = self.edit.text().strip()
+        if text == "":
+            self._value = None
+            self.edit.setText("")
+            return
         try:
-            self._value = self._clamp(int(self.edit.text().strip()))
+            self._value = self._clamp(int(text))
         except (ValueError, TypeError):
-            self.edit.setText(str(self._value))
+            self.edit.setText("" if self._value is None else str(self._value))
             return
         self.edit.setText(str(self._value))
         if self._on_change is not None:
@@ -3538,7 +3592,7 @@ class MainWindow(QMainWindow):
         page._fig_cards = []
         page._fig_scene = scene
         page._fig_view = canvas_view
-        page._fig_selected = -1
+        page._fig_selected = []
         page._fig_settings_layout = settings_layout
         page._fig_locked = locked
         page._fig_focused = None
@@ -3555,6 +3609,8 @@ class MainWindow(QMainWindow):
         canvas_view.plot_pan_start_cb = lambda item, sp: self._figure_plot_pan_start(page, item, sp)
         canvas_view.plot_pan_move_cb = lambda sp: self._figure_plot_pan_move(page, sp)
         canvas_view.plot_pan_end_cb = lambda: self._figure_plot_pan_end(page)
+        canvas_view.rubber_select_cb = lambda rect, ctrl: self._figure_box_select(page, rect, ctrl)
+        canvas_view.rubber_clear_cb = lambda: self._figure_clear_selection(page)
 
         for plot_dict in page._fig_plots:
             self._figure_new_card(page, plot_dict)
@@ -3615,7 +3671,7 @@ class MainWindow(QMainWindow):
             select_callback=lambda i: self._figure_select(page, i),
         )
         proxy = _CardProxy(
-            on_select=lambda: self._figure_select(page, card.index()),
+            on_select=lambda ctrl: self._figure_card_clicked(page, card.index(), ctrl),
             on_drop=lambda pos: self._figure_reorder(page, card.index(), pos),
         )
         proxy.setWidget(card)
@@ -3624,7 +3680,9 @@ class MainWindow(QMainWindow):
         card._proxy = proxy
 
         # Clicking the plot (not just the title bar) also selects the card.
-        click_filter = _ClickFilter(card.select)
+        click_filter = _ClickFilter(
+            lambda ctrl: self._figure_card_clicked(page, card.index(), ctrl)
+        )
         card.installEventFilter(click_filter)
         plot_widget.viewport().installEventFilter(click_filter)
         page._fig_filters = getattr(page, "_fig_filters", [])
@@ -3695,7 +3753,7 @@ class MainWindow(QMainWindow):
         cards.insert(new_index, cards.pop(index))
         for i, card in enumerate(cards):
             card.set_index(i)
-        page._fig_selected = new_index
+        page._fig_selected = [new_index]
         self._figure_relayout(page)
         self._figure_mark_dirty(page)
 
@@ -3741,32 +3799,40 @@ class MainWindow(QMainWindow):
                 break
         return idx
 
-    def _figure_toggle_break(self, page, index: int) -> None:
-        """Toggle a line break before the selected plot (like pressing Enter)."""
-        if 0 <= index < len(page._fig_plots):
-            p = page._fig_plots[index]
-            p["break_before"] = not p.get("break_before", False)
+    def _figure_toggle_break(self, page, indices) -> None:
+        """Toggle a line break before each selected plot (like pressing Enter)."""
+        changed = False
+        for index in indices:
+            if 0 <= index < len(page._fig_plots):
+                p = page._fig_plots[index]
+                p["break_before"] = not p.get("break_before", False)
+                changed = True
+        if changed:
             self._figure_relayout(page)
             self._figure_mark_dirty(page)
 
     def _figure_delete_selected(self, page) -> None:
-        """Delete the currently selected plot."""
-        index = page._fig_selected
-        if not (0 <= index < len(page._fig_plots)):
+        """Delete every currently selected plot."""
+        indices = sorted(
+            set(i for i in page._fig_selected if 0 <= i < len(page._fig_plots)),
+            reverse=True,
+        )
+        if not indices:
             return
-        page._fig_plots.pop(index)
-        card = page._fig_cards.pop(index)
-        proxy = card.proxy()
-        page._fig_scene.removeItem(proxy)
-        proxy.deleteLater()
+        for index in indices:
+            page._fig_plots.pop(index)
+            card = page._fig_cards.pop(index)
+            proxy = card.proxy()
+            page._fig_scene.removeItem(proxy)
+            proxy.deleteLater()
         for i, c in enumerate(page._fig_cards):
             c.set_index(i)
         if page._fig_cards:
-            page._fig_selected = min(index, len(page._fig_cards) - 1)
+            page._fig_selected = [min(indices[-1], len(page._fig_cards) - 1)]
             self._figure_relayout(page)
-            self._figure_select(page, page._fig_selected)
+            self._figure_set_selection(page, page._fig_selected)
         else:
-            page._fig_selected = -1
+            page._fig_selected = []
             self._figure_relayout(page)
             self._figure_rebuild_settings(page)
         self._figure_mark_dirty(page)
@@ -4144,6 +4210,16 @@ class MainWindow(QMainWindow):
             )
         self._figure_mark_dirty(page)
 
+    def _figure_apply_change_multi(self, page) -> None:
+        """Re-render every selected plot after a batch edit (marks the page dirty)."""
+        for i in page._fig_selected:
+            if 0 <= i < len(page._fig_cards):
+                self._figure_render(
+                    page._fig_plots[i], page._fig_cards[i].plot_widget(),
+                    column_transforms=page._fig_column_transforms,
+                )
+        self._figure_mark_dirty(page)
+
     def _figure_refresh_all(self, page) -> None:
         """Re-render every plot card (used when an upstream module saved)."""
         page._fig_column_transforms = self._upstream_scale_transforms(page._fig_task_id)
@@ -4154,22 +4230,59 @@ class MainWindow(QMainWindow):
                     column_transforms=page._fig_column_transforms,
                 )
 
-    def _figure_select(self, page, index: int) -> None:
-        """Mark the plot at `index` selected and refresh its settings."""
-        page._fig_selected = index
+    def _figure_set_selection(self, page, indices) -> None:
+        """Set the selected plot set (a list of indices) and refresh settings."""
+        indices = sorted(set(i for i in indices if 0 <= i < len(page._fig_cards)))
+        page._fig_selected = indices
+        sel = set(indices)
         for i, card in enumerate(page._fig_cards):
-            card.set_selected(i == index)
+            card.set_selected(i in sel)
         self._figure_rebuild_settings(page)
         page._fig_view.setFocus()
+
+    def _figure_select(self, page, index: int) -> None:
+        """Select a single plot (clicking a card with no modifier)."""
+        self._figure_set_selection(page, [index])
         if page._fig_focused != index:
             self._figure_unfocus(page)
+
+    def _figure_card_clicked(self, page, index: int, ctrl: bool) -> None:
+        """Handle a click on a card: Ctrl toggles it in the selection."""
+        if ctrl:
+            sel = list(page._fig_selected)
+            if index in sel:
+                sel.remove(index)
+            else:
+                sel.append(index)
+            self._figure_unfocus(page)
+            self._figure_set_selection(page, sel)
+        else:
+            self._figure_select(page, index)
+
+    def _figure_box_select(self, page, scene_rect, ctrl: bool) -> None:
+        """Select every plot whose card intersects the rubber-band rectangle."""
+        hits = []
+        for i, card in enumerate(page._fig_cards):
+            if scene_rect.intersects(card.proxy().sceneBoundingRect()):
+                hits.append(i)
+        if ctrl:
+            sel = set(page._fig_selected)
+            sel.update(hits)
+            hits = sorted(sel)
+        self._figure_unfocus(page)
+        self._figure_set_selection(page, hits)
+
+    def _figure_clear_selection(self, page) -> None:
+        """Deselect every plot (a plain click on empty canvas)."""
+        self._figure_unfocus(page)
+        self._figure_set_selection(page, [])
 
     def _figure_focus(self, page, index: int) -> None:
         """Focus a plot: wheel/drag act on its data instead of the canvas."""
         if not (0 <= index < len(page._fig_cards)):
             return
         page._fig_focused = index
-        page._fig_selected = index
+        page._fig_selected = [index]
         for i, card in enumerate(page._fig_cards):
             card.set_selected(i == index)
             card.set_focused(i == index)
@@ -4248,10 +4361,17 @@ class MainWindow(QMainWindow):
         return was_panning
 
     def _figure_rebuild_settings(self, page) -> None:
-        """Rebuild the right-hand settings panel for the selected plot."""
+        """Rebuild the right-hand settings panel for the current selection."""
+        if len(page._fig_selected) > 1:
+            self._figure_rebuild_settings_multi(page)
+        else:
+            self._figure_rebuild_settings_single(page)
+
+    def _figure_rebuild_settings_single(self, page) -> None:
+        """Rebuild the right-hand settings panel for a single selected plot."""
         layout = page._fig_settings_layout
         self._clear_layout(layout)
-        index = page._fig_selected
+        index = page._fig_selected[0] if page._fig_selected else -1
         if index < 0 or index >= len(page._fig_plots):
             hint = QLabel("Add a plot to see its settings.")
             hint.setStyleSheet("color: gray;")
@@ -4492,6 +4612,471 @@ class MainWindow(QMainWindow):
         def on_size_changed():
             self._figure_resize_card(page, index, width_field.value(), height_field.value())
             self._figure_mark_dirty(page)
+
+    def _figure_rebuild_settings_multi(self, page) -> None:
+        """Rebuild the settings panel for a multi-selection of plots.
+
+        Each field shows the value when all selected plots agree, and blank
+        when they differ; setting a field applies it to every selected plot.
+        """
+        layout = page._fig_settings_layout
+        self._clear_layout(layout)
+        indices = page._fig_selected
+        plots = [page._fig_plots[i] for i in indices if 0 <= i < len(page._fig_plots)]
+        if not plots:
+            self._figure_rebuild_settings_single(page)
+            return
+        locked = page._fig_locked
+        enabled = not locked
+
+        layout.addWidget(QLabel(f"<b>{len(plots)} plots selected</b>"))
+        hint = QLabel(
+            "A value is shown only when all selected plots agree; otherwise it "
+            "is blank. Setting a value applies it to all selected plots."
+        )
+        hint.setStyleSheet("color: gray;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        if locked:
+            note = QLabel("Draft (locked) — settings are read-only.")
+            note.setStyleSheet("color: #b58900;")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+
+        scatter_plots = [p for p in plots if p.get("type") == "scatter"]
+        hist_plots = [p for p in plots if p.get("type") == "histogram"]
+
+        def common(ps, key, default=None):
+            vals = [p.get(key, default) for p in ps]
+            if not vals:
+                return default
+            first = vals[0]
+            for v in vals[1:]:
+                if v != first:
+                    return _MIXED
+            return first
+
+        def apply(ps, key, value):
+            for p in ps:
+                p[key] = value
+
+        def make_value_combo(items, current):
+            combo = _NoWheelComboBox()
+            combo.addItem("", _MIXED)
+            for text, val in items:
+                combo.addItem(text, val)
+            if current is _MIXED:
+                combo.setCurrentIndex(0)
+            else:
+                combo.setCurrentIndex(max(0, combo.findData(current)))
+            combo.setEnabled(enabled)
+            return combo
+
+        def make_color_button(ps, key, default):
+            cur = common(ps, key, default)
+            btn = QPushButton()
+            btn.setFixedSize(36, 20)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setEnabled(enabled)
+            if cur is _MIXED:
+                btn.setStyleSheet(
+                    "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+                    "stop:0 #cccccc, stop:1 #999999); border: 1px solid #555;"
+                )
+                btn.setToolTip("Colors differ")
+            else:
+                btn.setStyleSheet(
+                    f"background-color: rgb({cur[0]},{cur[1]},{cur[2]}); "
+                    "border: 1px solid #555;"
+                )
+
+            def on_pick(_=False):
+                chosen = QColorDialog.getColor(QColor(0, 0, 200), self, "Choose color")
+                if chosen.isValid():
+                    rgb = (chosen.red(), chosen.green(), chosen.blue())
+                    apply(ps, key, rgb)
+                    btn.setStyleSheet(
+                        f"background-color: rgb({rgb[0]},{rgb[1]},{rgb[2]}); "
+                        "border: 1px solid #555;"
+                    )
+                    self._figure_apply_change_multi(page)
+
+            btn.clicked.connect(on_pick)
+            return btn
+
+        def make_range_row(ps, axis):
+            min_key = f"{axis}min"
+            max_key = f"{axis}max"
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            auto = QCheckBox("Auto")
+            amin = common(ps, min_key)
+            amax = common(ps, max_key)
+            if amin is _MIXED or amax is _MIXED:
+                auto.setTristate(True)
+                auto.setCheckState(Qt.CheckState.PartiallyChecked)
+            else:
+                auto.setChecked(amin is None and amax is None)
+            auto.setEnabled(enabled)
+
+            min_spin = _LogStepSpinBox(
+                None if amin is _MIXED else amin, lambda v: commit()
+            )
+            max_spin = _LogStepSpinBox(
+                None if amax is _MIXED else amax, lambda v: commit()
+            )
+
+            def commit():
+                st = auto.checkState()
+                if st == Qt.CheckState.Checked:
+                    apply(ps, min_key, None)
+                    apply(ps, max_key, None)
+                    min_spin.set_value(None)
+                    max_spin.set_value(None)
+                elif st == Qt.CheckState.Unchecked:
+                    mn = min_spin.value()
+                    mx = max_spin.value()
+                    if mn is not None and mx is not None:
+                        apply(ps, min_key, mn)
+                        apply(ps, max_key, mx)
+                min_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
+                max_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
+                self._figure_apply_change_multi(page)
+
+            auto.stateChanged.connect(lambda _=0: commit())
+            min_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
+            max_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
+
+            h.addWidget(auto)
+            h.addWidget(QLabel("Min"))
+            h.addWidget(min_spin)
+            h.addWidget(QLabel("Max"))
+            h.addWidget(max_spin)
+            h.addStretch()
+            return row
+
+        records = self._imported_files()
+
+        # Union of columns across every selected plot's file.
+        col_set = []
+        seen = set()
+        for p in plots:
+            rec = self._figure_record(p.get("file"))
+            for c in self._columns_for(rec.get("parquet")) if rec else []:
+                if c not in seen:
+                    seen.add(c)
+                    col_set.append(c)
+
+        # File.
+        layout.addWidget(QLabel("File"))
+        file_combo = make_value_combo(
+            [(r.get("name", ""), r.get("parquet", "")) for r in records],
+            common(plots, "file"),
+        )
+        layout.addWidget(file_combo)
+
+        def on_file_changed(_=0):
+            f = file_combo.currentData()
+            if f is None or f is _MIXED:
+                return
+            for p in plots:
+                p["file"] = f
+                p["file_name"] = file_combo.currentText()
+                rec = self._figure_record(f)
+                cols = self._columns_for(rec.get("parquet")) if rec else []
+                p["x"] = p.get("last_x") if p.get("last_x") in cols else None
+                if p.get("type") == "scatter":
+                    p["y"] = p.get("last_y") if p.get("last_y") in cols else None
+                    p["color_param"] = p["x"]
+            self._figure_apply_change_multi(page)
+            self._figure_rebuild_settings_multi(page)
+
+        file_combo.currentIndexChanged.connect(on_file_changed)
+
+        # X parameter.
+        layout.addWidget(QLabel("X parameter"))
+        xv = common(plots, "x")
+        x_combo = self._figure_param_combo(col_set, None if xv is _MIXED else xv, enabled)
+        layout.addWidget(x_combo)
+
+        def on_x(v):
+            v = v or None
+            for p in plots:
+                p["x"] = v
+                p["last_x"] = v
+                p["xmin"] = None
+                p["xmax"] = None
+            self._figure_apply_change_multi(page)
+            self._figure_rebuild_settings_multi(page)
+
+        x_combo.currentTextChanged.connect(on_x)
+
+        # Filter: apply an upstream gate (gate + ancestors) to the data.
+        layout.addWidget(QLabel("Filter"))
+        filter_combo = _NoWheelComboBox()
+        filter_combo.addItem("", _MIXED)
+        filter_combo.addItem("None", None)
+        filter_options = self._figure_filter_options(page._fig_task_id)
+        for label, val in filter_options:
+            filter_combo.addItem(label, val)
+        fv = common(plots, "filter")
+        if fv is _MIXED:
+            filter_combo.setCurrentIndex(0)
+        elif fv is None:
+            filter_combo.setCurrentIndex(1)
+        else:
+            idx = 0
+            for k, (label, val) in enumerate(filter_options):
+                if (
+                    val.get("task_id") == fv.get("task_id")
+                    and val.get("gate_id") == fv.get("gate_id")
+                ):
+                    idx = k + 2
+                    break
+            filter_combo.setCurrentIndex(idx)
+        filter_combo.setEnabled(enabled)
+        layout.addWidget(filter_combo)
+
+        def on_filter_changed(_=0):
+            data = filter_combo.currentData()
+            if data is _MIXED:
+                return
+            apply(plots, "filter", data)
+            # Keep the current view range; only the data subset changes.
+            for i in indices:
+                if 0 <= i < len(page._fig_cards):
+                    vb = page._fig_cards[i].plot_widget().getPlotItem().getViewBox()
+                    xr, yr = vb.viewRange()
+                    self._figure_render(
+                        page._fig_plots[i], page._fig_cards[i].plot_widget(),
+                        column_transforms=page._fig_column_transforms,
+                    )
+                    vb.setXRange(xr[0], xr[1], padding=0)
+                    vb.setYRange(yr[0], yr[1], padding=0)
+            self._figure_mark_dirty(page)
+
+        filter_combo.currentIndexChanged.connect(on_filter_changed)
+
+        # Y parameter (scatter only).
+        y_combo = None
+        if scatter_plots:
+            layout.addWidget(QLabel("Y parameter"))
+            yv = common(scatter_plots, "y")
+            y_combo = self._figure_param_combo(col_set, None if yv is _MIXED else yv, enabled)
+            layout.addWidget(y_combo)
+
+            def on_y(v):
+                v = v or None
+                for p in scatter_plots:
+                    p["y"] = v
+                    p["last_y"] = v
+                    p["ymin"] = None
+                    p["ymax"] = None
+                self._figure_apply_change_multi(page)
+                self._figure_rebuild_settings_multi(page)
+
+            y_combo.currentTextChanged.connect(on_y)
+
+        # Color settings (scatter only).
+        if scatter_plots:
+            layout.addWidget(QLabel("Color mode"))
+            mode_combo = make_value_combo(
+                FIGURE_COLOR_MODES, common(scatter_plots, "color_mode", "density")
+            )
+            layout.addWidget(mode_combo)
+
+            def on_mode_changed(_=0):
+                data = mode_combo.currentData()
+                if data is _MIXED:
+                    return
+                apply(scatter_plots, "color_mode", data)
+                self._figure_apply_change_multi(page)
+                self._figure_rebuild_settings_multi(page)
+
+            mode_combo.currentIndexChanged.connect(on_mode_changed)
+
+            mode_val = common(scatter_plots, "color_mode", "density")
+            if mode_val is not _MIXED:
+                if mode_val == "parameter":
+                    layout.addWidget(QLabel("Color parameter"))
+                    cpv = common(scatter_plots, "color_param")
+                    cp_combo = self._figure_param_combo(
+                        col_set, None if cpv is _MIXED else cpv, enabled
+                    )
+                    layout.addWidget(cp_combo)
+
+                    def on_cp(v):
+                        apply(scatter_plots, "color_param", v or None)
+                        self._figure_apply_change_multi(page)
+
+                    cp_combo.currentTextChanged.connect(on_cp)
+                elif mode_val == "solid":
+                    layout.addWidget(QLabel("Solid color"))
+                    layout.addWidget(make_color_button(
+                        scatter_plots, "solid_color", (0, 0, 200)
+                    ))
+                else:
+                    layout.addWidget(QLabel("Palette"))
+                    palette_combo = make_value_combo(
+                        [(p, p) for p in FIGURE_PALETTES],
+                        common(scatter_plots, "palette", "viridis"),
+                    )
+                    layout.addWidget(palette_combo)
+
+                    def on_palette(_=0):
+                        data = palette_combo.currentData()
+                        if data is _MIXED:
+                            return
+                        apply(scatter_plots, "palette", data)
+                        self._figure_apply_change_multi(page)
+
+                    palette_combo.currentIndexChanged.connect(on_palette)
+
+            # Point size.
+            layout.addWidget(QLabel("Point size"))
+            ps_row = QWidget()
+            ph = QHBoxLayout(ps_row)
+            ph.setContentsMargins(0, 0, 0, 0)
+            ph.setSpacing(4)
+            point_fixed = QCheckBox("Fixed")
+            fixed_val = common(scatter_plots, "fixed_point_size", False)
+            if fixed_val is _MIXED:
+                point_fixed.setTristate(True)
+                point_fixed.setCheckState(Qt.CheckState.PartiallyChecked)
+            else:
+                point_fixed.setChecked(bool(fixed_val))
+            point_fixed.setEnabled(enabled)
+
+            ps_val = common(scatter_plots, "point_size", 4)
+
+            def on_point_size(v):
+                apply(scatter_plots, "point_size", float(v))
+                self._figure_apply_change_multi(page)
+
+            point_spin = _LogStepSpinBox(None if ps_val is _MIXED else ps_val, on_point_size)
+            point_spin.set_enabled(enabled and point_fixed.isChecked())
+
+            def on_point_fixed(_=0):
+                st = point_fixed.checkState()
+                if st == Qt.CheckState.PartiallyChecked:
+                    return
+                apply(scatter_plots, "fixed_point_size", st == Qt.CheckState.Checked)
+                point_spin.set_enabled(enabled and st == Qt.CheckState.Checked)
+                self._figure_apply_change_multi(page)
+
+            point_fixed.stateChanged.connect(on_point_fixed)
+
+            ph.addWidget(point_fixed)
+            ph.addWidget(point_spin)
+            ph.addStretch()
+            layout.addWidget(ps_row)
+
+        # Histogram settings.
+        if hist_plots:
+            layout.addWidget(QLabel("Bins"))
+            bv = common(hist_plots, "bins", 20)
+
+            def on_bins(v):
+                apply(hist_plots, "bins", int(float(v)))
+                self._figure_apply_change_multi(page)
+
+            bins_spin = _LogStepSpinBox(None if bv is _MIXED else bv, on_bins)
+            bins_spin.set_enabled(enabled)
+            layout.addWidget(bins_spin)
+
+            layout.addWidget(QLabel("Display mode"))
+            hist_mode_combo = make_value_combo(
+                FIGURE_HISTOGRAM_MODES, common(hist_plots, "hist_mode", "histogram")
+            )
+            layout.addWidget(hist_mode_combo)
+
+            def on_hist_mode(_=0):
+                data = hist_mode_combo.currentData()
+                if data is _MIXED:
+                    return
+                apply(hist_plots, "hist_mode", data)
+                self._figure_apply_change_multi(page)
+
+            hist_mode_combo.currentIndexChanged.connect(on_hist_mode)
+
+            layout.addWidget(QLabel("Histogram color"))
+            layout.addWidget(make_color_button(hist_plots, "hist_color", (0, 0, 200)))
+            layout.addWidget(QLabel("Curve color"))
+            layout.addWidget(make_color_button(hist_plots, "curve_color", (200, 40, 40)))
+
+        # X range.
+        layout.addWidget(QLabel("X range"))
+        layout.addWidget(make_range_row(plots, "x"))
+
+        if scatter_plots:
+            layout.addWidget(QLabel("Y range"))
+            layout.addWidget(make_range_row(scatter_plots, "y"))
+
+        # Size (width/height in canvas units).
+        layout.addWidget(QLabel("Size (px)"))
+        size_row = QWidget()
+        sh = QHBoxLayout(size_row)
+        sh.setContentsMargins(0, 0, 0, 0)
+        sh.setSpacing(4)
+        size_val = common(plots, "size", [440, 340])
+        if size_val is _MIXED:
+            w_val = h_val = _MIXED
+        else:
+            w_val, h_val = int(size_val[0]), int(size_val[1])
+
+        def on_size_changed(v=None):
+            w = width_field.value()
+            h = height_field.value()
+            if w is None or h is None:
+                return
+            for i in indices:
+                self._figure_resize_card(page, i, int(w), int(h))
+            self._figure_mark_dirty(page)
+
+        width_field = _SizeField(None if w_val is _MIXED else w_val, on_size_changed)
+        height_field = _SizeField(None if h_val is _MIXED else h_val, on_size_changed)
+        width_field.set_enabled(enabled)
+        height_field.set_enabled(enabled)
+        sh.addWidget(QLabel("W"))
+        sh.addWidget(width_field)
+        sh.addWidget(QLabel("H"))
+        sh.addWidget(height_field)
+        sh.addStretch()
+        layout.addWidget(size_row)
+
+        # Display options.
+        layout.addWidget(QLabel("Display"))
+        for label, key in (
+            ("Show axes", "show_axes"),
+            ("Show axis names", "show_axis_names"),
+            ("Show indices", "show_indices"),
+            ("Show sample name", "show_sample_name"),
+        ):
+            cb = QCheckBox(label)
+            v = common(plots, key, True)
+            if v is _MIXED:
+                cb.setTristate(True)
+                cb.setCheckState(Qt.CheckState.PartiallyChecked)
+            else:
+                cb.setChecked(bool(v))
+            cb.setEnabled(enabled)
+
+            def make_toggle(k, c):
+                def h(_=0):
+                    st = c.checkState()
+                    if st == Qt.CheckState.PartiallyChecked:
+                        return
+                    apply(plots, k, st == Qt.CheckState.Checked)
+                    self._figure_apply_change_multi(page)
+
+                return h
+
+            cb.stateChanged.connect(make_toggle(key, cb))
+            layout.addWidget(cb)
+
+        layout.addStretch()
 
     def _file_nav_row(self, combo, enabled: bool) -> QWidget:
         """Wrap a file combo with prev/next buttons that cycle through files."""
