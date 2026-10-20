@@ -472,12 +472,16 @@ def _gate_own_mask(gate, by_id, get_col, transforms, existing):
     return _gate_mask(x, y, gate)
 
 
-def _compute_gate_filter_mask(gates, gate_id, parquet_path, transforms):
+def _compute_gate_filter_mask(gates, gate_id, parquet_path, transforms,
+                              existing=None, extra=None):
     """Return the AND mask of a gate and all its ancestors (transformed data).
 
-    Returns None if the gate cannot be computed (no x/y columns). Raises
-    KeyError if a needed column is missing from the parquet file.
+    `existing` lists the usable column names and `extra` supplies values for
+    columns that are computed on the fly (unmixed parameters). Returns None if
+    the gate cannot be computed (no x/y columns). Raises KeyError if a needed
+    column is missing.
     """
+    import numpy as np
     import pandas as pd
     by_id = {g["id"]: g for g in gates}
     chain = []
@@ -493,15 +497,30 @@ def _compute_gate_filter_mask(gates, gate_id, parquet_path, transforms):
         needed |= _gate_needed_columns(g, by_id)
     if not needed:
         return None
-    df = pd.read_parquet(parquet_path, columns=sorted(needed))
-    existing = set(df.columns)
+    extra = extra or {}
+    if existing is None:
+        base_cols = [c for c in sorted(needed) if c not in extra]
+        df = pd.read_parquet(parquet_path, columns=base_cols)
+        existing = set(df.columns) | set(extra)
+    else:
+        existing = set(existing)
+        base_cols = [
+            c for c in sorted(needed) if c in existing and c not in extra
+        ]
+        df = (
+            pd.read_parquet(parquet_path, columns=base_cols)
+            if base_cols else pd.DataFrame()
+        )
     cache = {}
 
     def get_col(name):
         if name not in cache:
-            cache[name] = pd.to_numeric(
-                df[name], errors="coerce"
-            ).to_numpy(dtype="float64")
+            if name in extra:
+                cache[name] = np.asarray(extra[name], dtype="float64")
+            else:
+                cache[name] = pd.to_numeric(
+                    df[name], errors="coerce"
+                ).to_numpy(dtype="float64")
         return cache[name]
 
     mask = None
@@ -677,9 +696,11 @@ class _GatingStatsWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def request(self, generation, parquet_path, gates, transforms, existing, affected):
+    def request(self, generation, parquet_path, gates, transforms, existing,
+                affected, extra=None):
         self._req_q.put(
-            (generation, parquet_path, gates, transforms, existing, affected)
+            (generation, parquet_path, gates, transforms, existing, affected,
+             extra or {})
         )
 
     def poll(self):
@@ -707,9 +728,11 @@ class _GatingStatsWorker:
                 res = None
             self._res_q.put(res)
 
-    def _compute(self, generation, parquet_path, gates, transforms, existing, affected):
+    def _compute(self, generation, parquet_path, gates, transforms, existing,
+                 affected, extra=None):
         import numpy as np
         import pandas as pd
+        extra = extra or {}
         if not parquet_path or not gates:
             return (generation, {})
         if self._current_path != parquet_path:
@@ -730,7 +753,8 @@ class _GatingStatsWorker:
         if not needed:
             return (generation, {})
         cols = self._columns
-        missing = needed - set(cols)
+        base_needed = [c for c in needed if c not in extra]
+        missing = set(base_needed) - set(cols)
         if missing:
             try:
                 df = pd.read_parquet(parquet_path, columns=sorted(missing))
@@ -741,14 +765,18 @@ class _GatingStatsWorker:
                     df[name], errors="coerce"
                 ).to_numpy(dtype="float64")
             self._columns = cols
-        n_total = len(next(iter(cols.values()))) if cols else 0
+        arrays = {name: cols[name] for name in base_needed if name in cols}
+        for name in needed:
+            if name in extra:
+                arrays[name] = np.asarray(extra[name], dtype="float64")
+        n_total = len(next(iter(arrays.values()))) if arrays else 0
         by_parent = {}
         for g in gates:
             by_parent.setdefault(g.get("parent"), []).append(g)
 
         def own_mask(g):
             return _gate_own_mask(
-                g, by_id, lambda name: cols[name], transforms, existing
+                g, by_id, lambda name: arrays[name], transforms, existing
             )
 
         def compute_subtree(gid):
@@ -1048,8 +1076,12 @@ class _ImageFilterWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def request(self, key, parquet_path, gates, gate_id, transforms, height, width, blocks):
-        self._req_q.put((key, parquet_path, gates, gate_id, transforms, height, width, blocks))
+    def request(self, key, parquet_path, gates, gate_id, transforms, height,
+                width, blocks, existing=None, extra=None):
+        self._req_q.put((
+            key, parquet_path, gates, gate_id, transforms, height, width,
+            blocks, existing, extra or {},
+        ))
 
     def poll(self):
         out = []
@@ -1075,10 +1107,14 @@ class _ImageFilterWorker:
                 res = (req[0], f"Filter could not be applied: {exc}")
             self._res_q.put(res)
 
-    def _compute(self, key, parquet_path, gates, gate_id, transforms, height, width, blocks):
+    def _compute(self, key, parquet_path, gates, gate_id, transforms, height,
+                 width, blocks, existing=None, extra=None):
         import numpy as np
         try:
-            mask = _compute_gate_filter_mask(gates, gate_id, parquet_path, transforms)
+            mask = _compute_gate_filter_mask(
+                gates, gate_id, parquet_path, transforms,
+                existing=existing, extra=extra or {},
+            )
         except KeyError as exc:
             return (key, f"Filter parameter not found: {exc}")
         except Exception as exc:  # noqa: BLE001
@@ -2298,6 +2334,9 @@ class MainWindow(QMainWindow):
         self._updating_sample = False
         self._current_entry = None
         self._module_registry = {}
+        # On-the-fly Unmix outputs: per-task matrix configs and per-file values.
+        self._unmix_flow_cache = {}
+        self._unmix_value_cache = {}
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 800)
         self._build_menu_bar()
@@ -2325,6 +2364,7 @@ class MainWindow(QMainWindow):
                 getattr(widget, "_fig_dirty", False)
                 or getattr(widget, "_scaling_dirty", False)
                 or getattr(widget, "_gating_dirty", False)
+                or getattr(widget, "_unmix_dirty", False)
             ):
                 return True
         return False
@@ -2431,6 +2471,8 @@ class MainWindow(QMainWindow):
         """Close all module tabs, keeping only the Workflow tab."""
         while self.tabs.count() > 1:
             self.tabs.removeTab(self.tabs.count() - 1)
+        self._unmix_flow_cache = {}
+        self._unmix_value_cache = {}
 
     def _import_task(self):
         """Return the fixed 'import' task, or None."""
@@ -3842,11 +3884,20 @@ class MainWindow(QMainWindow):
         except ValueError:
             return Path(parquet_path).name
 
-    def _columns_for(self, parquet_path) -> list:
-        """Return the column names for a parquet file from the column index."""
+    def _columns_for(self, parquet_path, task_id=None) -> list:
+        """Return the column names for a parquet file from the column index.
+
+        When `task_id` is given, the unmixed parameters produced by upstream
+        Unmix modules for this file are appended.
+        """
         if not parquet_path:
             return []
-        return list(self._column_index.get(self._rel_data_key(parquet_path), []))
+        columns = list(self._column_index.get(self._rel_data_key(parquet_path), []))
+        if task_id:
+            for name in self._unmix_output_names(task_id, parquet_path):
+                if name not in columns:
+                    columns.append(name)
+        return columns
 
     def _figure_record(self, file_path):
         """Return the imported-file record matching a parquet path, or None."""
@@ -3900,6 +3951,219 @@ class MainWindow(QMainWindow):
                     if col.get("name"):
                         transforms.setdefault(col["name"], []).append(col)
         return transforms
+
+    # ----- Unmix data flow (computed on the fly) ------------------------
+    def _upstream_unmix_configs(self, task_id, parquet_path) -> list:
+        """Return the Unmix matrix configs upstream of `task_id` that apply to
+        this file, in chain order (root first)."""
+        configs = []
+        if not task_id or not parquet_path or self.project is None:
+            return configs
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id:
+                continue  # exclude the module itself
+            if task.get("type") != "unmix":
+                continue
+            params = task.get("params") or {}
+            if parquet_path not in (params.get("samples") or []):
+                continue
+            config = self._unmix_flow_config(task)
+            if config is not None:
+                configs.append(config)
+        return configs
+
+    def _unmix_output_names(self, task_id, parquet_path) -> list:
+        """Names of the parameters an upstream Unmix module adds to this file."""
+        names = []
+        for config in self._upstream_unmix_configs(task_id, parquet_path):
+            for name in config["names"]:
+                if name not in names:
+                    names.append(name)
+        return names
+
+    def _unmix_flow_config(self, task_def) -> dict | None:
+        """Build (and cache) the unmixing matrix of a saved Unmix task.
+
+        Returns ``{"task_id", "names", "columns", "matrix", "method"}`` with the
+        matrix at full precision, or None when there is nothing to apply.
+        """
+        import numpy as np
+
+        task_id = task_def.get("id")
+        cached = self._unmix_flow_cache.get(task_id)
+        if cached is not None:
+            return cached or None
+        # Downstream modules only see the saved configuration: when the module
+        # is open, use its last-saved snapshot rather than live edits.
+        reg = self._module_registry.get(task_id)
+        if reg is not None and reg.get("task_type") == "unmix":
+            params = getattr(reg["page"], "_unmix_snapshot", None)
+            if not isinstance(params, dict):
+                params = task_def.get("params") or {}
+        else:
+            params = task_def.get("params") or {}
+        settings = params.get("spectrum_settings") or {}
+        enabled = set(settings.get("enabled") or [])
+        columns = [p for p in settings.get("params", []) if p in enabled]
+        stat = settings.get("stat", "median")
+        spectra = {s["id"]: s for s in params.get("spectra", [])}
+        names = []
+        rows = []
+        for row in params.get("matrix", []):
+            positive = spectra.get(row.get("positive"))
+            if positive is None:
+                continue
+            pos = self._unmix_params_vector(task_id, params, positive, columns, stat)
+            if pos is None:
+                continue
+            values = []
+            negative = spectra.get(row.get("negative"))
+            neg = {}
+            if negative is not None:
+                neg = self._unmix_params_vector(
+                    task_id, params, negative, columns, stat
+                ) or {}
+            for column in columns:
+                p = pos.get(column, float("nan"))
+                n = neg.get(column, 0.0) if negative is not None else 0.0
+                values.append(p - n if np.isfinite(p) else float("nan"))
+            if row.get("normalize", True):
+                finite = [v for v in values if np.isfinite(v)]
+                peak = max(finite) if finite else None
+                if peak is not None and peak > 0:
+                    values = [
+                        (v / peak) if np.isfinite(v) else v for v in values
+                    ]
+            if not all(np.isfinite(v) for v in values):
+                continue  # a signature with missing data cannot unmix
+            names.append(row.get("name", f"Signature {len(names) + 1}"))
+            rows.append(values)
+        if not rows or not columns:
+            self._unmix_flow_cache[task_id] = False
+            return None
+        config = {
+            "task_id": task_id,
+            "names": names,
+            "columns": columns,
+            "matrix": np.asarray(rows, dtype="float64"),
+            "method": params.get("method", "ols"),
+        }
+        self._unmix_flow_cache[task_id] = config
+        return config
+
+    def _unmix_params_vector(self, task_id, params, spectrum, columns, stat):
+        """Statistic per parameter for a spectrum stored in task params."""
+        import numpy as np
+
+        names, arrays, error = self._unmix_spectrum_arrays_for(
+            task_id, params, spectrum, columns
+        )
+        if error:
+            return None
+        values = {}
+        for name, arr in zip(names, arrays):
+            if arr.size == 0:
+                values[name] = float("nan")
+            elif stat == "mean":
+                values[name] = float(arr.mean())
+            else:
+                values[name] = float(np.median(arr))
+        return values
+
+    def _unmix_file_values(self, config, parquet_path) -> dict:
+        """Compute ``C = X · pinv(M)`` for one file; return {name: array}."""
+        import numpy as np
+        import pandas as pd
+
+        key = (config["task_id"], parquet_path)
+        cached = self._unmix_value_cache.get(key)
+        if cached is not None:
+            return cached
+        base = set(self._column_index.get(self._rel_data_key(parquet_path), []))
+        columns = list(config["columns"])
+        if any(c not in base for c in columns):
+            return {}
+        transforms = self._upstream_scale_transforms(config["task_id"])
+        try:
+            df = pd.read_parquet(parquet_path, columns=columns)
+        except Exception:  # noqa: BLE001
+            return {}
+        arrays = []
+        for column in columns:
+            arr = pd.to_numeric(df[column], errors="coerce").to_numpy(
+                dtype="float64"
+            )
+            arr = _apply_scale_transforms(arr, transforms.get(column))
+            arrays.append(np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0))
+        matrix = np.column_stack(arrays) if arrays else np.empty((len(df), 0))
+        pseudo_inverse = config.get("_pinv")
+        if pseudo_inverse is None:
+            pseudo_inverse = np.linalg.pinv(config["matrix"])
+            config["_pinv"] = pseudo_inverse
+        coefficients = matrix @ pseudo_inverse
+        result = {
+            name: coefficients[:, i]
+            for i, name in enumerate(config["names"])
+        }
+        self._unmix_value_cache[key] = result
+        return result
+
+    def _unmix_column_values(self, task_id, parquet_path, name):
+        """Values of one unmixed parameter, or None if it does not apply."""
+        for config in self._upstream_unmix_configs(task_id, parquet_path):
+            if name in config["names"]:
+                values = self._unmix_file_values(config, parquet_path)
+                return values.get(name)
+        return None
+
+    def _unmix_weights_for(self, task_id, parquet_path, name):
+        """Linear channel weights that produce an unmixed parameter.
+
+        An unmixed coefficient is ``sum_j pinv(M)[j, k] * channel_j``, so an
+        image raster can be built from per-channel means (or raw pixels).
+        """
+        import numpy as np
+
+        for config in self._upstream_unmix_configs(task_id, parquet_path):
+            if name not in config["names"]:
+                continue
+            pseudo_inverse = config.get("_pinv")
+            if pseudo_inverse is None:
+                pseudo_inverse = np.linalg.pinv(config["matrix"])
+                config["_pinv"] = pseudo_inverse
+            k = config["names"].index(name)
+            return {
+                column: float(pseudo_inverse[i, k])
+                for i, column in enumerate(config["columns"])
+            }
+        return None
+
+    def _unmix_extras(self, task_id, parquet_path, names=None) -> dict:
+        """Unmixed parameters of a file as {name: array}, for gate masks."""
+        extras = {}
+        for config in self._upstream_unmix_configs(task_id, parquet_path):
+            values = self._unmix_file_values(config, parquet_path)
+            for name, array in values.items():
+                if names is None or name in names:
+                    extras[name] = array
+        return extras
+
+    def _read_columns(self, parquet_path, columns, task_id=None):
+        """Read columns from a parquet, computing unmixed ones on the fly."""
+        import pandas as pd
+
+        base = set(self._column_index.get(self._rel_data_key(parquet_path), []))
+        base_cols = [c for c in columns if c in base]
+        virtual = [c for c in columns if c not in base]
+        df = pd.read_parquet(parquet_path, columns=base_cols) if base_cols else pd.DataFrame()
+        for name in virtual:
+            values = self._unmix_column_values(task_id, parquet_path, name)
+            if values is None:
+                continue
+            if len(df) not in (0, len(values)):
+                continue
+            df[name] = values
+        return df
 
     def _clear_layout(self, layout) -> None:
         """Remove and delete every widget/layout inside a layout."""
@@ -4134,7 +4398,8 @@ class MainWindow(QMainWindow):
             plot_widget._img_refresh_timer = rt
 
         page._fig_cards.append(card)
-        self._figure_render(plot_dict, plot_widget, column_transforms=page._fig_column_transforms)
+        self._figure_render(plot_dict, plot_widget, column_transforms=page._fig_column_transforms,
+                task_id=page._fig_task_id)
         self._figure_relayout(page)
         return index
 
@@ -4293,7 +4558,9 @@ class MainWindow(QMainWindow):
         """Append a new plot (scatter or histogram) and select it."""
         records = self._imported_files()
         rec = records[0] if records else None
-        columns = self._columns_for(rec.get("parquet")) if rec else []
+        columns = self._columns_for(
+            rec.get("parquet"), page._fig_task_id
+        ) if rec else []
         x = columns[0] if columns else None
         y = columns[1] if len(columns) > 1 else x
         count = sum(1 for p in page._fig_plots if p.get("type") == ptype)
@@ -4381,16 +4648,19 @@ class MainWindow(QMainWindow):
         rec = self._figure_record(plot_dict.get("file"))
         if rec is None:
             return None, "No data file"
-        existing = set(self._columns_for(rec.get("parquet")))
+        filter_task = f.get("task_id")
+        existing = set(self._columns_for(rec.get("parquet"), filter_task))
         missing = needed - existing
         if missing:
             return None, "Filter parameter not in this file: " + ", ".join(
                 sorted(str(m) for m in missing)
             )
-        transforms = self._upstream_scale_transforms(f.get("task_id"))
+        transforms = self._upstream_scale_transforms(filter_task)
         try:
             mask = _compute_gate_filter_mask(
-                gates, f.get("gate_id"), rec["parquet"], transforms
+                gates, f.get("gate_id"), rec["parquet"], transforms,
+                existing=existing,
+                extra=self._unmix_extras(filter_task, rec["parquet"]),
             )
         except Exception:
             return None, "Filter could not be applied"
@@ -4455,16 +4725,27 @@ class MainWindow(QMainWindow):
                     break
         return lv
 
-    def _image_raster_raw(self, parquet_path, manifest, bbox, channel, mask_ent=None):
-        """Rasterise raw pixels inside a bbox (deep zoom beyond the finest level)."""
+    def _image_raster_raw(self, parquet_path, manifest, bbox, channel,
+                          mask_ent=None, weights=None):
+        """Rasterise raw pixels inside a bbox (deep zoom beyond the finest level).
+
+        `weights` renders a linear combination of channels (an unmixed
+        parameter) instead of a single channel.
+        """
         import math
         import numpy as np
         import pyarrow.parquet as pq
         color_cols = manifest.get("color_cols", [])
-        if channel is None or channel not in color_cols:
-            channel = color_cols[0] if color_cols else None
+        if weights is not None:
+            wanted = list(weights)
+        else:
+            if channel is None or channel not in color_cols:
+                channel = color_cols[0] if color_cols else None
+            wanted = ["x", "y"] if channel in ("x", "y") else (
+                ["x", "y"] + ([channel] if channel else [])
+            )
         x0, x1, y0, y1 = bbox
-        cols = ["x", "y"] if channel in ("x", "y") else ["x", "y"] + ([channel] if channel else [])
+        cols = list(dict.fromkeys(["x", "y"] + [c for c in wanted if c not in ("x", "y")]))
         filters = [("y", ">=", y0), ("y", "<=", y1), ("x", ">=", x0), ("x", "<=", x1)]
         try:
             df = pq.read_table(parquet_path, columns=cols, filters=filters).to_pandas()
@@ -4474,7 +4755,19 @@ class MainWindow(QMainWindow):
             return None, None, None
         x = df["x"].to_numpy(dtype="float64")
         y = df["y"].to_numpy(dtype="float64")
-        if channel == "x":
+        if weights is not None:
+            v = np.zeros(len(df))
+            for name, weight in weights.items():
+                if name == "x":
+                    col = x
+                elif name == "y":
+                    col = y
+                elif name in df.columns:
+                    col = df[name].to_numpy(dtype="float64")
+                else:
+                    return None, None, None
+                v = v + float(weight) * col
+        elif channel == "x":
             v = x
         elif channel == "y":
             v = y
@@ -4506,12 +4799,24 @@ class MainWindow(QMainWindow):
         rect = QRectF(x0, y0, x1 - x0, y1 - y0)
         return chan, rect, frac
 
-    def _image_raster(self, parquet_path, manifest, bbox, spacing, channel, mask_ent=None):
-        """Return (channel_2d_array, data_rect, mask_fraction) for the visible bbox."""
+    def _image_raster(self, parquet_path, manifest, bbox, spacing, channel,
+                      mask_ent=None, weights=None):
+        """Return (channel_2d_array, data_rect, mask_fraction) for the visible bbox.
+
+        `weights` renders a linear combination of channels (an unmixed
+        parameter) instead of a single channel. Because block levels store
+        channel means, the combination is exact at every zoom level.
+        """
         import math
+        import numpy as np
         color_cols = manifest.get("color_cols", [])
         if not color_cols:
             return None, None, None
+        if weights is not None and not all(c in color_cols for c in weights):
+            # Not all inputs are indexed; fall back to raw pixels.
+            return self._image_raster_raw(
+                parquet_path, manifest, bbox, channel, mask_ent, weights
+            )
         if channel is None or channel not in color_cols:
             channel = color_cols[0] if color_cols else None
         cidx = color_cols.index(channel) if channel else 0
@@ -4522,7 +4827,9 @@ class MainWindow(QMainWindow):
         if not levels:
             return None, None, None
         if spacing < levels[0]["block"]:
-            return self._image_raster_raw(parquet_path, manifest, bbox, channel, mask_ent)
+            return self._image_raster_raw(
+                parquet_path, manifest, bbox, channel, mask_ent, weights
+            )
         chosen = levels[-1]
         for info in levels:
             if info["block"] >= spacing:
@@ -4538,7 +4845,12 @@ class MainWindow(QMainWindow):
         j1 = min(arr.shape[0], int(math.ceil((y1 - ymin) / b)))
         if i1 <= i0 or j1 <= j0:
             return None, None, None
-        crop = arr[j0:j1, i0:i1, cidx]
+        if weights is not None:
+            crop = np.zeros((j1 - j0, i1 - i0), dtype="float32")
+            for name, weight in weights.items():
+                crop += float(weight) * arr[j0:j1, i0:i1, color_cols.index(name)]
+        else:
+            crop = arr[j0:j1, i0:i1, cidx]
         rect = QRectF(xmin + i0 * b, ymin + j0 * b, (i1 - i0) * b, (j1 - j0) * b)
         frac = None
         if mask_ent is not None:
@@ -4603,7 +4915,7 @@ class MainWindow(QMainWindow):
         needed = set()
         for g in chain:
             needed |= _gate_needed_columns(g, by_id)
-        existing = set(self._columns_for(parquet_path))
+        existing = set(self._columns_for(parquet_path, f.get("task_id")))
         missing = needed - existing
         if missing:
             return "Filter parameter not in this file: " + ", ".join(
@@ -4611,18 +4923,21 @@ class MainWindow(QMainWindow):
             )
         return None
 
-    def _figure_render_image(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
+    def _figure_render_image(self, plot_dict: dict, plot_widget,
+                             column_transforms=None, task_id=None) -> None:
         """Render an Image plot as a raster (LOD pyramid), ImageJ-style."""
         import numpy as np
         rec = self._figure_record(plot_dict.get("file"))
         if not rec:
             plot_widget.clear()
+            plot_widget._img_fitted = False
             plot_widget.setTitle("No data file", color="#c0392b", size="10pt")
             return
         parquet_path = rec.get("parquet")
         ent = self._ensure_image_index(parquet_path)
         if ent is None or ent.get("manifest") is None:
             plot_widget.clear()
+            plot_widget._img_fitted = False
             plot_widget.setTitle(
                 "No image index — re-import if this is an image",
                 color="#c0392b", size="10pt",
@@ -4630,11 +4945,17 @@ class MainWindow(QMainWindow):
             return
         manifest = ent["manifest"]
         vb = plot_widget.getPlotItem().getViewBox()
-        if not getattr(plot_widget, "_img_fitted", False):
+        # Rebuild the image item when the plot shows a different file (its
+        # extent may differ) or after an error cleared the plot.
+        if (
+            not getattr(plot_widget, "_img_fitted", False)
+            or getattr(plot_widget, "_img_path", None) != parquet_path
+        ):
             plot_widget.clear()
             img = pg.ImageItem(axisOrder="row-major")
             plot_widget.addItem(img)
             plot_widget._img_item = img
+            plot_widget._img_path = parquet_path
             plot_widget._img_extent = (
                 manifest["xmin"], manifest["xmax"],
                 manifest["ymin"], manifest["ymax"],
@@ -4687,6 +5008,10 @@ class MainWindow(QMainWindow):
                     worker.request(
                         key, parquet_path, gates, f.get("gate_id"),
                         transforms, height, width, blocks,
+                        existing=set(self._columns_for(
+                            parquet_path, f.get("task_id")
+                        )),
+                        extra=self._unmix_extras(f.get("task_id"), parquet_path),
                     )
                 plot_widget.setTitle("Applying filter…", color="#b58900", size="10pt")
                 return
@@ -4731,14 +5056,35 @@ class MainWindow(QMainWindow):
             return
 
         channel = plot_dict.get("color_param")
+        color_cols = manifest.get("color_cols", [])
+        weights = None
+        if channel is None:
+            # Nothing selected: default to the first real channel (never x/y).
+            channel = next(
+                (c for c in color_cols if c not in ("x", "y")),
+                color_cols[0] if color_cols else None,
+            )
+        elif channel not in color_cols:
+            # An unmixed parameter: render it as a linear combination of the
+            # indexed image channels. Anything else is not renderable.
+            if task_id:
+                weights = self._unmix_weights_for(task_id, parquet_path, channel)
+            if weights is None:
+                plot_widget.clear()
+                plot_widget._img_fitted = False
+                plot_widget.setTitle(
+                    f"Parameter not available in this file: {channel}",
+                    color="#c0392b", size="10pt",
+                )
+                return
         chan, rect, frac = self._image_raster(
-            parquet_path, manifest, (x0, x1, y0, y1), spacing, channel, mask_ent
+            parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
+            mask_ent, weights,
         )
         if chan is None:
             img.setVisible(False)
             return
-        color_cols = manifest.get("color_cols", [])
-        cname = channel if channel in color_cols else (color_cols[0] if color_cols else None)
+        cname = channel
         ranges = manifest.get("color_ranges", {}) or {}
         lo, hi = ranges.get(cname, (None, None))
         if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -4757,7 +5103,9 @@ class MainWindow(QMainWindow):
 
     def _figure_image_refresh(self, page, plot_dict, plot_widget) -> None:
         self._figure_render_image(
-            plot_dict, plot_widget, column_transforms=page._fig_column_transforms
+            plot_dict, plot_widget,
+            column_transforms=page._fig_column_transforms,
+            task_id=page._fig_task_id,
         )
 
     def _figure_image_filter_on_timer(self, page) -> None:
@@ -4785,12 +5133,16 @@ class MainWindow(QMainWindow):
                 self._figure_render_image(
                     p, page._fig_cards[i].plot_widget(),
                     column_transforms=page._fig_column_transforms,
+                    task_id=page._fig_task_id,
                 )
 
-    def _figure_render(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
+    def _figure_render(self, plot_dict: dict, plot_widget, column_transforms=None,
+                       task_id=None) -> None:
         """(Re)draw a plot widget from its plot_dict."""
         if plot_dict.get("type") == "image":
-            self._figure_render_image(plot_dict, plot_widget, column_transforms)
+            self._figure_render_image(
+                plot_dict, plot_widget, column_transforms, task_id
+            )
             return
         mask, error = self._figure_filter_mask(plot_dict)
         if error:
@@ -4798,12 +5150,16 @@ class MainWindow(QMainWindow):
             plot_widget.setTitle(error, color="#c0392b", size="10pt")
             return
         if plot_dict.get("type") == "histogram":
-            self._figure_render_histogram(plot_dict, plot_widget, column_transforms, mask)
+            self._figure_render_histogram(
+                plot_dict, plot_widget, column_transforms, mask, task_id
+            )
         else:
-            self._figure_render_scatter(plot_dict, plot_widget, column_transforms, mask)
+            self._figure_render_scatter(
+                plot_dict, plot_widget, column_transforms, mask, task_id
+            )
 
     def _figure_render_scatter(self, plot_dict: dict, plot_widget, column_transforms=None,
-                               mask=None) -> None:
+                               mask=None, task_id=None) -> None:
         import numpy as np
         import pandas as pd
 
@@ -4827,8 +5183,13 @@ class MainWindow(QMainWindow):
             columns.append(color_param)
 
         try:
-            df = pd.read_parquet(rec["parquet"], columns=columns)
+            df = self._read_columns(rec["parquet"], columns, task_id)
         except Exception:
+            return
+        if x_name not in df.columns or y_name not in df.columns:
+            plot_widget.setTitle(
+                "Parameter not in this file", color="#c0392b", size="10pt"
+            )
             return
 
         x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
@@ -4915,7 +5276,8 @@ class MainWindow(QMainWindow):
             pg.ScatterPlotItem(x=x, y=y, symbol="o", size=size, pen=None, brush=brushes, pxMode=px_mode)
         )
 
-    def _figure_render_histogram(self, plot_dict: dict, plot_widget, column_transforms=None, mask=None) -> None:
+    def _figure_render_histogram(self, plot_dict: dict, plot_widget, column_transforms=None,
+                                 mask=None, task_id=None) -> None:
         import numpy as np
         import pandas as pd
         import pyqtgraph as pg
@@ -4930,8 +5292,13 @@ class MainWindow(QMainWindow):
             plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
             return
         try:
-            df = pd.read_parquet(rec["parquet"], columns=[x_name])
+            df = self._read_columns(rec["parquet"], [x_name], task_id)
         except Exception:
+            return
+        if x_name not in df.columns:
+            plot_widget.setTitle(
+                "Parameter not in this file", color="#c0392b", size="10pt"
+            )
             return
         x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
         x = _apply_scale_transforms(x, (column_transforms or {}).get(x_name))
@@ -5077,6 +5444,7 @@ class MainWindow(QMainWindow):
             self._figure_render(
                 plot_dict, page._fig_cards[index].plot_widget(),
                 column_transforms=page._fig_column_transforms,
+                task_id=page._fig_task_id,
             )
         self._figure_mark_dirty(page)
 
@@ -5087,6 +5455,7 @@ class MainWindow(QMainWindow):
                 self._figure_render(
                     page._fig_plots[i], page._fig_cards[i].plot_widget(),
                     column_transforms=page._fig_column_transforms,
+                    task_id=page._fig_task_id,
                 )
         self._figure_mark_dirty(page)
 
@@ -5104,6 +5473,7 @@ class MainWindow(QMainWindow):
                 self._figure_render(
                     page._fig_plots[i], plot_widget,
                     column_transforms=page._fig_column_transforms,
+                    task_id=page._fig_task_id,
                 )
                 # Keep the view range; only the data (and gate) changed.
                 vb.disableAutoRange()
@@ -5276,7 +5646,9 @@ class MainWindow(QMainWindow):
 
         records = self._imported_files()
         rec = self._figure_record(plot_dict.get("file"))
-        columns = self._columns_for(rec.get("parquet")) if rec else []
+        columns = self._columns_for(
+            rec.get("parquet"), page._fig_task_id
+        ) if rec else []
 
         # File.
         layout.addWidget(QLabel("File"))
@@ -5461,7 +5833,9 @@ class MainWindow(QMainWindow):
             plot_dict["file"] = file_combo.currentData()
             plot_dict["file_name"] = file_combo.currentText()
             new_rec = self._figure_record(plot_dict["file"])
-            new_cols = self._columns_for(new_rec.get("parquet")) if new_rec else []
+            new_cols = self._columns_for(
+                new_rec.get("parquet"), page._fig_task_id
+            ) if new_rec else []
             # Keep the last-used x/y; blank them if this file lacks them.
             plot_dict["x"] = (
                 plot_dict.get("last_x") if plot_dict.get("last_x") in new_cols else None
@@ -5742,7 +6116,10 @@ class MainWindow(QMainWindow):
         seen = set()
         for p in plots:
             rec = self._figure_record(p.get("file"))
-            for c in self._columns_for(rec.get("parquet")) if rec else []:
+            for c in (
+                self._columns_for(rec.get("parquet"), page._fig_task_id)
+                if rec else []
+            ):
                 if c not in seen:
                     seen.add(c)
                     col_set.append(c)
@@ -5763,7 +6140,9 @@ class MainWindow(QMainWindow):
                 p["file"] = f
                 p["file_name"] = file_combo.currentText()
                 rec = self._figure_record(f)
-                cols = self._columns_for(rec.get("parquet")) if rec else []
+                cols = self._columns_for(
+                    rec.get("parquet"), page._fig_task_id
+                ) if rec else []
                 p["x"] = p.get("last_x") if p.get("last_x") in cols else None
                 if _is_scatter_plot(p.get("type")):
                     p["y"] = p.get("last_y") if p.get("last_y") in cols else None
@@ -5834,6 +6213,7 @@ class MainWindow(QMainWindow):
                     self._figure_render(
                         page._fig_plots[i], page._fig_cards[i].plot_widget(),
                         column_transforms=page._fig_column_transforms,
+                        task_id=page._fig_task_id,
                     )
                     vb.disableAutoRange()
                     vb.setRange(xRange=(xr[0], xr[1]), yRange=(yr[0], yr[1]), padding=0)
@@ -6315,17 +6695,17 @@ class MainWindow(QMainWindow):
         return row
 
     # ----- scaling module (map) -------------------------------------
-    def _scaling_column_set(self) -> list:
+    def _scaling_column_set(self, task_id=None) -> list:
         """Return the sorted, de-duplicated set of input column names."""
         cols = set()
         for rec in self._imported_files():
-            for c in self._columns_for(rec.get("parquet")):
+            for c in self._columns_for(rec.get("parquet"), task_id):
                 cols.add(c)
         return sorted(cols)
 
     def _scaling_load_config(self, task_def: dict) -> list:
         """Return the per-column scaling config, merged with the current columns."""
-        cols = self._scaling_column_set()
+        cols = self._scaling_column_set(task_def.get("id"))
         params = task_def.setdefault("params", {})
         existing = params.get("columns") or []
         by_name = {c.get("name"): c for c in existing}
@@ -6409,7 +6789,9 @@ class MainWindow(QMainWindow):
         # bind to it (same dict object is mutated in place later).
         records = self._imported_files()
         rec = records[0] if records else None
-        cols = self._columns_for(rec.get("parquet")) if rec else []
+        cols = self._columns_for(
+            rec.get("parquet"), task_def.get("id")
+        ) if rec else []
         page._scaling_preview = {
             "type": "scatter",
             "file": rec.get("parquet") if rec else None,
@@ -6678,7 +7060,9 @@ class MainWindow(QMainWindow):
     def _scaling_render_preview(self, page) -> None:
         preview = page._scaling_preview
         rec = self._figure_record(preview.get("file"))
-        cols = self._columns_for(rec.get("parquet")) if rec else []
+        cols = self._columns_for(
+            rec.get("parquet"), page._scaling_task_id
+        ) if rec else []
         missing = [
             str(n) for n in (preview.get("x"), preview.get("y"))
             if n and n not in cols
@@ -6703,7 +7087,10 @@ class MainWindow(QMainWindow):
         for c in page._scaling_columns:
             if c.get("name"):
                 transforms.setdefault(c["name"], []).append(c)
-        self._figure_render_scatter(preview, page._scaling_plot_widget, column_transforms=transforms)
+        self._figure_render_scatter(
+            preview, page._scaling_plot_widget,
+            column_transforms=transforms, task_id=page._scaling_task_id,
+        )
 
     def _scaling_rebuild_settings(self, page) -> None:
         layout = page._scaling_settings_layout
@@ -6714,7 +7101,9 @@ class MainWindow(QMainWindow):
 
         records = self._imported_files()
         rec = self._figure_record(preview.get("file"))
-        columns = self._columns_for(rec.get("parquet")) if rec else []
+        columns = self._columns_for(
+            rec.get("parquet"), page._scaling_task_id
+        ) if rec else []
 
         layout.addWidget(QLabel("File"))
         file_combo = _NoWheelComboBox()
@@ -6759,7 +7148,9 @@ class MainWindow(QMainWindow):
             preview["file"] = file_combo.currentData()
             preview["file_name"] = file_combo.currentText()
             new_rec = self._figure_record(preview["file"])
-            new_cols = self._columns_for(new_rec.get("parquet")) if new_rec else []
+            new_cols = self._columns_for(
+                new_rec.get("parquet"), page._scaling_task_id
+            ) if new_rec else []
             preview["x"] = new_cols[0] if new_cols else None
             preview["y"] = new_cols[1] if len(new_cols) > 1 else (new_cols[0] if new_cols else None)
             preview["color_param"] = preview["x"]
@@ -6807,6 +7198,9 @@ class MainWindow(QMainWindow):
 
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""
+        # Any saved change can alter on-the-fly unmixing downstream.
+        self._unmix_flow_cache = {}
+        self._unmix_value_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
         task_id = page.property("task_id")
         for dtid in self._module_descendant_ids(task_id):
@@ -6824,6 +7218,7 @@ class MainWindow(QMainWindow):
             self._scaling_render_preview(page)
         elif task_type == "gating":
             self._gating_render(page)
+            self._gating_rebuild_settings(page)
         # Other module types have no live visualization to refresh yet.
 
     # ----- unmix module (map) -----------------------------------------
@@ -7496,38 +7891,60 @@ class MainWindow(QMainWindow):
         self._unmix_mark_dirty(page)
 
     def _unmix_spectrum_arrays(self, page, spectrum):
-        """Return (names, arrays, error) for a spectrum's gated subset.
+        """Return (names, arrays, error) for a spectrum's gated subset."""
+        cfg = page._unmix_spectrum_cfg
+        ordered = self._unmix_sync_spectrum_params(page)
+        enabled = set(cfg.get("enabled") or [])
+        columns = [p for p in ordered if p in enabled]
+        live_trees = [
+            {"id": t["id"], "params": t["store"].get("params", {})}
+            for t in page._unmix_trees
+        ]
+        return self._unmix_spectrum_arrays_for(
+            page._unmix_task_id, page._unmix_params, spectrum, columns,
+            trees=live_trees,
+        )
+
+    def _unmix_spectrum_arrays_for(self, task_id, params, spectrum, columns,
+                                   trees=None):
+        """Return (names, arrays, error) for a spectrum from task parameters.
 
         Each array holds the transformed, finite values of one parameter inside
-        the source gate, in the module-wide parameter order.
+        the source gate, in `columns` order (parameters missing from the gate
+        tree's file are skipped). `trees` overrides the saved tree list when
+        the module is open and has unsaved edits.
         """
         import numpy as np
 
-        tree = self._unmix_tree_by_id(page, spectrum.get("tree_id"))
+        if trees is None:
+            trees = params.get("trees") or []
+        tree = next((t for t in trees if t.get("id") == spectrum.get("tree_id")), None)
         if tree is None:
             return None, None, "The gate tree for this spectrum no longer exists."
-        params = tree["store"].get("params") or {}
-        gates = params.get("gates") or []
-        preview = params.get("preview") or {}
+        tree_params = tree.get("params") or {}
+        gates = tree_params.get("gates") or []
+        preview = tree_params.get("preview") or {}
         gate = next((g for g in gates if g.get("id") == spectrum.get("gate_id")), None)
         if gate is None:
             return None, None, "The source gate no longer exists."
         parquet = preview.get("file")
         if not parquet:
             return None, None, "The gate tree has no data file."
-        transforms = self._upstream_scale_transforms(page._unmix_task_id)
+        transforms = self._upstream_scale_transforms(task_id)
+        extra = self._unmix_extras(task_id, parquet)
         try:
-            mask = _compute_gate_filter_mask(gates, gate["id"], parquet, transforms)
+            mask = _compute_gate_filter_mask(
+                gates, gate["id"], parquet, transforms,
+                existing=set(self._columns_for(parquet, task_id)),
+                extra=extra,
+            )
         except Exception as exc:  # noqa: BLE001
             return None, None, f"Could not compute the gate: {exc}"
         if mask is None:
             return None, None, "Could not compute the gate (missing parameters)."
 
-        cfg = page._unmix_spectrum_cfg
-        ordered = self._unmix_sync_spectrum_params(page)
-        enabled = set(cfg.get("enabled") or [])
         file_columns = set(self._columns_for(parquet))
-        names = [p for p in ordered if p in enabled and p in file_columns]
+        names = [p for p in columns if p in file_columns]
         if not names:
             return None, None, "No parameters selected."
         try:
@@ -8810,7 +9227,9 @@ class MainWindow(QMainWindow):
         """
         records = self._imported_files()
         rec = records[0] if records else None
-        cols = self._columns_for(rec.get("parquet")) if rec else []
+        cols = self._columns_for(
+            rec.get("parquet"), task_def.get("id")
+        ) if rec else []
         params = task_def.setdefault("params", {})
         preview = params.get("preview")
         valid = isinstance(preview, dict) and (
@@ -9828,7 +10247,9 @@ class MainWindow(QMainWindow):
         transforms = self._upstream_scale_transforms(page._gating_task_id)
         try:
             return _compute_gate_filter_mask(
-                page._gating_gates, gate_id, parquet_path, transforms
+                page._gating_gates, gate_id, parquet_path, transforms,
+                existing=set(self._columns_for(parquet_path, page._gating_task_id)),
+                extra=self._unmix_extras(page._gating_task_id, parquet_path),
             )
         except Exception:
             return None
@@ -10093,11 +10514,12 @@ class MainWindow(QMainWindow):
         transforms = copy.deepcopy(
             self._upstream_scale_transforms(page._gating_task_id)
         )
-        existing = set(self._columns_for(parquet_path))
+        existing = set(self._columns_for(parquet_path, page._gating_task_id))
+        extra = self._unmix_extras(page._gating_task_id, parquet_path)
         page._gating_stat_generation += 1
         worker.request(
             page._gating_stat_generation,
-            parquet_path, gates, transforms, existing, affected,
+            parquet_path, gates, transforms, existing, affected, extra,
         )
 
     def _gating_apply_stats(self, page, stats) -> None:
@@ -10212,7 +10634,9 @@ class MainWindow(QMainWindow):
         preview = page._gating_preview
 
         # Show a gray overlay when the current file lacks x/y parameters.
-        cols = self._columns_for(rec.get("parquet")) if rec else []
+        cols = self._columns_for(
+            rec.get("parquet"), page._gating_task_id
+        ) if rec else []
         missing = [
             str(n) for n in (preview.get("x"), preview.get("y"))
             if n and n not in cols
@@ -10243,6 +10667,7 @@ class MainWindow(QMainWindow):
         self._figure_render_scatter(
             page._gating_preview, page._gating_plot_widget,
             column_transforms=transforms, mask=mask,
+            task_id=page._gating_task_id,
         )
         if preserved is not None:
             xr, yr = preserved
@@ -10267,7 +10692,9 @@ class MainWindow(QMainWindow):
 
         records = self._imported_files()
         rec = self._figure_record(preview.get("file"))
-        columns = self._columns_for(rec.get("parquet")) if rec else []
+        columns = self._columns_for(
+            rec.get("parquet"), page._gating_task_id
+        ) if rec else []
 
         layout.addWidget(QLabel("File"))
         file_combo = _NoWheelComboBox()
@@ -10368,7 +10795,9 @@ class MainWindow(QMainWindow):
             page._gating_parent_id = None
             # Keep the last-used x/y; blank them if this file lacks them.
             new_rec = self._figure_record(preview["file"])
-            new_cols = self._columns_for(new_rec.get("parquet")) if new_rec else []
+            new_cols = self._columns_for(
+                new_rec.get("parquet"), page._gating_task_id
+            ) if new_rec else []
             preview["x"] = (
                 preview.get("last_x") if preview.get("last_x") in new_cols else None
             )
