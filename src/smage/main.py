@@ -26,7 +26,10 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QCursor,
+    QFont,
+    QFontMetrics,
     QIcon,
+    QImage,
     QPainter,
     QPainterPath,
     QPen,
@@ -62,6 +65,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
+    QStackedWidget,
     QTabBar,
     QTabWidget,
     QTableWidget,
@@ -85,6 +90,14 @@ APP_NAME = "Smage"
 class _NoWheelComboBox(QComboBox):
     """A combo box that ignores the mouse wheel, so scrolling the page never
     accidentally changes the selection. Options are changed only by clicking."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class _NoWheelSpinBox(QSpinBox):
+    """A number field that ignores the mouse wheel, so scrolling a page never
+    accidentally changes a value. It is still edited by typing or the arrows."""
 
     def wheelEvent(self, event) -> None:
         event.ignore()
@@ -165,6 +178,20 @@ def _dot_pixmap(color: str) -> QPixmap:
     return pixmap
 
 
+def _drag_handle_pixmap(color: str = "#8a94a6", size: int = 14) -> QPixmap:
+    """Build the grip icon shown before a draggable list item."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    pen = QPen(QColor(color))
+    pen.setWidth(1)
+    painter.setPen(pen)
+    for y in (4, 7, 10):
+        painter.drawLine(3, y, size - 4, y)
+    painter.end()
+    return pixmap
+
+
 def _lock_pixmap(color: str = "#b58900", size: int = 14) -> QPixmap:
     """Build a small padlock pixmap for locked modules."""
     pixmap = QPixmap(size, size)
@@ -197,7 +224,6 @@ TASK_TYPES = {
     "unmix": ("Unmix", "#7b61ff"),
     "segmentation": ("Segmentation", "#00acc1"),
     "compensation": ("Compensation", "#fb8c00"),
-    "spectrum": ("Spectrum", "#e91e63"),
 }
 
 ADDABLE_TYPES = [
@@ -208,7 +234,6 @@ ADDABLE_TYPES = [
     "unmix",
     "segmentation",
     "compensation",
-    "spectrum",
 ]
 
 ROOT_COLOR = "#5f6368"
@@ -542,6 +567,51 @@ def _gate_label_position(gate):
         d = max(dx, dy) * 1.5
         return (cx + bx / lb2 * d, cy + by / lb2 * d)
     return ((xr[0] + xr[1]) / 2.0, (yr[0] + yr[1]) / 2.0)
+
+
+def _default_gating_preview(rec, cols) -> dict:
+    """A fresh scatter preview config for the gating tree (first file + axes)."""
+    return {
+        "type": "scatter",
+        "file": rec.get("parquet") if rec else None,
+        "file_name": rec.get("name") if rec else None,
+        "x": cols[0] if cols else None,
+        "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
+        "last_x": cols[0] if cols else None,
+        "last_y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
+        "color_mode": "density",
+        "color_param": None,
+        "palette": "viridis",
+        "xmin": None,
+        "xmax": None,
+        "ymin": None,
+        "ymax": None,
+        "point_size": 4,
+        "fixed_point_size": False,
+        "solid_color": (0, 0, 200),
+        "show_axes": True,
+        "show_axis_names": True,
+        "show_indices": True,
+        "show_sample_name": True,
+        "label_font_size": 20,
+        "label_bold": False,
+        "label_bg_opacity": 50,
+        "show_gate_labels": True,
+        "label_show_percent": True,
+    }
+
+
+class _GatingState:
+    """Attribute bag holding one gate tree's state.
+
+    Every gating method addresses its state as ``page._gating_*`` and only uses
+    the page for those attributes, so passing one of these instead of the page
+    lets the Unmix module embed several independent gate trees that reuse the
+    same drawing, tree and settings code.
+    """
+
+    def __init__(self) -> None:
+        self._gating_dirty = False
 
 
 class _GateLabel(pg.TextItem):
@@ -1061,6 +1131,43 @@ def _make_sci_axis(orientation: str):
 
     ax = _SciAxis(orientation)
     ax.setStyle(tickLength=5)  # positive -> outward
+    return ax
+
+
+def _make_rotated_axis(orientation: str = "bottom"):
+    """Return an axis whose tick labels are rotated 90° (long names)."""
+    import pyqtgraph as pg
+
+    class _RotatedAxis(pg.AxisItem):
+        def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
+            p.setRenderHint(p.RenderHint.Antialiasing, False)
+            p.setRenderHint(p.RenderHint.TextAntialiasing, True)
+            pen, p1, p2 = axisSpec
+            p.setPen(pen)
+            p.drawLine(p1, p2)
+            for pen, p1, p2 in tickSpecs:
+                p.setPen(pen)
+                p.drawLine(p1, p2)
+            if self.style['tickFont'] is not None:
+                p.setFont(self.style['tickFont'])
+            p.setPen(self.textPen())
+            p.setClipRect(self.boundingRect().toAlignedRect())
+            fm = p.fontMetrics()
+            shift = (fm.ascent() - fm.descent()) / 2.0
+            for rect, _flags, text in textSpecs:
+                p.save()
+                # Rotate counter-clockwise (-90°): the label reads bottom-to-top
+                # and hangs below the axis, centred on its tick.
+                p.translate(
+                    rect.center().x() + shift,
+                    rect.top() + rect.width(),
+                )
+                p.rotate(-90)
+                p.drawText(QPointF(0, 0), text)
+                p.restore()
+
+    ax = _RotatedAxis(orientation)
+    ax.setStyle(tickLength=5)
     return ax
 
 
@@ -2149,7 +2256,6 @@ MODULE_KINDS = {
     "unmix": "map",
     "segmentation": "generate",
     "figure": "visualize",
-    "spectrum": "visualize",
 }
 
 
@@ -2902,7 +3008,7 @@ class MainWindow(QMainWindow):
         self.sample_combo.addItem("Partial random sampling", "partial")
         row.addWidget(self.sample_combo)
 
-        self.sample_percent_spin = QSpinBox()
+        self.sample_percent_spin = _NoWheelSpinBox()
         self.sample_percent_spin.setRange(1, 100)
         self.sample_percent_spin.setValue(10)
         self.sample_percent_spin.setSuffix(" %")
@@ -5234,7 +5340,7 @@ class MainWindow(QMainWindow):
         if plot_dict.get("type") == "histogram":
             # Number of bins for the histogram.
             layout.addWidget(QLabel("Bins"))
-            bins_spin = QSpinBox()
+            bins_spin = _NoWheelSpinBox()
             bins_spin.setRange(2, 2000)
             bins_spin.setValue(int(plot_dict.get("bins", 20)))
             bins_spin.setKeyboardTracking(False)
@@ -6720,6 +6826,1938 @@ class MainWindow(QMainWindow):
             self._gating_render(page)
         # Other module types have no live visualization to refresh yet.
 
+    # ----- unmix module (map) -----------------------------------------
+    def _build_unmix_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Unmix page: two fixed sub-pages (extraction / matrix)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Toolbar with Save/Close.
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._unmix_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        page._unmix_task_def = task_def
+        page._unmix_task_id = task_def.get("id")
+        page._unmix_params = task_def.setdefault("params", {})
+        page._unmix_params.setdefault("spectra", [])
+        page._unmix_params.setdefault("matrix", [])
+        page._unmix_params.setdefault("method", "ols")
+        page._unmix_params.setdefault("trees", [])
+        page._unmix_params.setdefault("next_spectrum_no", 1)
+        spectrum_cfg = page._unmix_params.setdefault("spectrum_settings", {})
+        spectrum_cfg.setdefault("params", [])
+        spectrum_cfg.setdefault("enabled", None)
+        spectrum_cfg.setdefault("stat", "median")
+        spectrum_cfg.setdefault("colormap", "viridis")
+        spectrum_cfg.setdefault("line_color", "#2b6cb0")
+        spectrum_cfg.setdefault("decimals", 2)
+        page._unmix_spectrum_cfg = spectrum_cfg
+        page._unmix_snapshot = copy.deepcopy(page._unmix_params)
+        page._unmix_locked = locked
+        page._unmix_save_btn = save_btn
+        page._unmix_dirty = False
+        page._unmix_spectra = page._unmix_params["spectra"]
+        page._unmix_active_spectrum = None
+        # One embedded gate tree per spectrum (each is a full Gating pane).
+        page._unmix_trees = []
+        page._unmix_active_tree = None
+        # Debounced recompute of the displayed spectrum after gate edits.
+        page._unmix_spectrum_timer = QTimer(self)
+        page._unmix_spectrum_timer.setSingleShot(True)
+        page._unmix_spectrum_timer.timeout.connect(
+            lambda: self._unmix_refresh_outputs(page)
+        )
+        # Debounced apply of a signature-table row drag.
+        page._unmix_sig_order_timer = QTimer(self)
+        page._unmix_sig_order_timer.setSingleShot(True)
+        page._unmix_sig_order_timer.setInterval(200)
+        page._unmix_sig_order_timer.timeout.connect(
+            lambda: self._unmix_signature_reordered(page)
+        )
+        page._unmix_matrix = page._unmix_params["matrix"]
+        if "samples" not in page._unmix_params:
+            page._unmix_params["samples"] = [
+                r.get("parquet") for r in self._imported_files() if r.get("parquet")
+            ]
+        # Per-spectrum value cache, cleared whenever anything changes.
+        page._unmix_spectrum_cache = {}
+
+        tabs = QTabWidget()
+        tabs.addTab(self._unmix_extraction_subpage(page), "Spectrum Extraction")
+        tabs.addTab(self._unmix_matrix_subpage(page), "Matrix & Unmixing")
+        layout.addWidget(tabs, 1)
+
+        save_btn.clicked.connect(lambda _=False: self._unmix_save_now(page))
+        self._unmix_restore_trees(page)
+        self._unmix_rebuild_spectrum_list(page)
+        self._unmix_rebuild_spectrum_settings(page)
+        self._unmix_rebuild_signature_table(page)
+        self._unmix_rebuild_sample_list(page)
+        self._unmix_render_matrix(page)
+        active_spectrum = page._unmix_params.get("active_spectrum")
+        if any(s["id"] == active_spectrum for s in page._unmix_spectra):
+            self._unmix_select_spectrum(page, active_spectrum)
+        self._unmix_update_save_btn(page)
+        return page
+
+    # ----- unmix: gate trees (reusing the Gating module) ----------------
+    def _unmix_extraction_subpage(self, page) -> QWidget:
+        """Sub-page 1: spectrum area (1) above the embedded gate tree (2)."""
+        w = QWidget()
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._unmix_spectrum_area(page))
+        page._unmix_tree_stack = QStackedWidget()
+        page._unmix_tree_stack.addWidget(self._unmix_tree_placeholder())
+        split.addWidget(page._unmix_tree_stack)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        split.setSizes([380, 380])
+        outer.addWidget(split, 1)
+        return w
+
+    def _unmix_spectrum_area(self, page) -> QWidget:
+        """Spectrum settings (left) | spectra list (middle) | plot (right)."""
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QHBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(12)
+
+        # Left: settings shared by every spectrum in this module.
+        settings_panel = self._build_panel_frame()
+        settings_lay = QVBoxLayout(settings_panel)
+        settings_lay.setContentsMargins(10, 10, 10, 10)
+        settings_lay.setSpacing(6)
+        settings_lay.addWidget(QLabel("<b>Spectrum settings</b>"))
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        settings_scroll.setStyleSheet("background: transparent;")
+        settings_host = QWidget()
+        settings_host.setStyleSheet("background: transparent;")
+        settings_layout = QVBoxLayout(settings_host)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(6)
+        settings_scroll.setWidget(settings_host)
+        settings_lay.addWidget(settings_scroll, 1)
+        page._unmix_spectrum_settings_layout = settings_layout
+
+        # Middle: extracted spectra + the "New gate tree" entry point.
+        list_panel = self._build_panel_frame()
+        list_lay = QVBoxLayout(list_panel)
+        list_lay.setContentsMargins(10, 10, 10, 10)
+        list_lay.setSpacing(6)
+        list_lay.addWidget(QLabel("<b>Spectra</b>"))
+        spectra_list = QListWidget()
+        spectra_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: none; }"
+            "QListWidget::item:selected { background: #dbeafa; }"
+        )
+        list_lay.addWidget(spectra_list, 1)
+        spectra_list.itemClicked.connect(
+            lambda item: self._unmix_select_spectrum(
+                page, item.data(Qt.ItemDataRole.UserRole)
+            )
+        )
+        spectra_list.itemDoubleClicked.connect(
+            lambda item: self._unmix_select_spectrum(
+                page, item.data(Qt.ItemDataRole.UserRole), open_tree=True
+            )
+        )
+        spectra_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        spectra_list.customContextMenuRequested.connect(
+            lambda pos: self._unmix_spectrum_context_menu(page, pos)
+        )
+        new_tree_btn = QPushButton("New gate tree")
+        new_tree_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_tree_btn.setEnabled(not page._unmix_locked)
+        new_tree_btn.clicked.connect(lambda _=False: self._unmix_new_gate_tree(page))
+        list_lay.addWidget(new_tree_btn)
+        page._unmix_spectra_list = spectra_list
+        page._unmix_new_tree_btn = new_tree_btn
+
+        # Middle: spectrum curve (empty until a spectrum is extracted).
+        plot_panel = self._build_panel_frame()
+        plot_lay = QVBoxLayout(plot_panel)
+        plot_lay.setContentsMargins(10, 10, 10, 10)
+        plot_lay.setSpacing(6)
+        plot_lay.addWidget(QLabel("<b>Spectrum</b>"))
+        spectrum_plot = pg.PlotWidget()
+        spectrum_plot.setBackground("w")
+        spectrum_plot.showGrid(x=True, y=True, alpha=0.2)
+        spectrum_plot.getPlotItem().setAxisItems({
+            "bottom": _make_rotated_axis("bottom"),
+            "left": _make_sci_axis("left"),
+        })
+        plot_lay.addWidget(spectrum_plot, 1)
+        page._unmix_spectrum_plot = spectrum_plot
+
+        row.addWidget(settings_panel, 1)
+        row.addWidget(list_panel, 1)
+        row.addWidget(plot_panel, 2)
+        return content
+
+    def _unmix_tree_placeholder(self) -> QWidget:
+        """Shown in the gate-tree area until the first tree is created."""
+        w = QWidget()
+        l = QVBoxLayout(w)
+        hint = QLabel('Click "New gate tree" to start drawing gates.')
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setStyleSheet("color: #888888;")
+        l.addStretch()
+        l.addWidget(hint)
+        l.addStretch()
+        return w
+
+    def _unmix_make_tree(self, page, store: dict, spectrum_id=None) -> dict:
+        """Register one gate tree; its widgets are built lazily when opened."""
+        tree = {
+            "id": store["id"],
+            "store": store,
+            "holder": None,
+            "content": None,
+            "spectrum_id": spectrum_id,
+        }
+        page._unmix_trees.append(tree)
+        return tree
+
+    def _unmix_build_tree_widgets(self, page, tree: dict) -> None:
+        """Create the embedded Gating pane for a tree (once)."""
+        if tree.get("holder") is not None:
+            return
+        holder = _GatingState()
+        holder._module_page = page
+        holder._gating_on_dirty = lambda: self._unmix_on_gating_dirty(page, holder)
+        holder._gating_spectrum_menu = (
+            lambda menu, h, idx: self._unmix_spectrum_menu(page, h, idx, menu)
+        )
+        self._gating_state_init(holder, tree["store"], page._unmix_locked)
+        holder._gating_task_id = page._unmix_task_id
+        holder._gating_save_btn = None
+        spectrum = self._unmix_spectrum_for_tree(page, tree)
+        holder._gating_protected_gate_id = spectrum["gate_id"] if spectrum else None
+        content = self._gating_build_content(holder, page._unmix_locked)
+        tree["holder"] = holder
+        tree["content"] = content
+        page._unmix_tree_stack.addWidget(content)
+
+    def _unmix_activate_tree(self, page, tree: dict) -> None:
+        """Show a gate tree and refresh its scatter (it may have been hidden)."""
+        self._unmix_build_tree_widgets(page, tree)
+        page._unmix_active_tree = tree
+        page._unmix_tree_stack.setCurrentWidget(tree["content"])
+        self._gating_render(tree["holder"])
+        self._gating_rebuild_settings(tree["holder"])
+
+    def _unmix_destroy_tree(self, page, tree: dict) -> None:
+        """Tear down a gate tree (worker, timer and plot items)."""
+        if tree.get("holder") is not None:
+            self._gating_cleanup(tree["holder"])
+        if tree.get("content") is not None:
+            page._unmix_tree_stack.removeWidget(tree["content"])
+            tree["content"].deleteLater()
+        if tree in page._unmix_trees:
+            page._unmix_trees.remove(tree)
+        if page._unmix_active_tree is tree:
+            page._unmix_active_tree = None
+        if not page._unmix_trees:
+            page._unmix_tree_stack.setCurrentIndex(0)
+
+    def _unmix_new_gate_tree(self, page) -> None:
+        """Start a fresh gate tree (discarding an unused scratch tree)."""
+        active = page._unmix_active_tree
+        if active is not None and active["spectrum_id"] is None:
+            gates = active["store"].get("params", {}).get("gates", [])
+            if gates:
+                reply = QMessageBox.question(
+                    self,
+                    "New gate tree",
+                    "The current gate tree is not used by any spectrum.\n"
+                    "Discard it and start a new one?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            self._unmix_destroy_tree(page, active)
+        tree = self._unmix_make_tree(page, {"id": uuid4().hex[:8], "params": {}})
+        self._unmix_activate_tree(page, tree)
+        self._unmix_clear_spectrum_selection(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_restore_trees(self, page) -> None:
+        """Recreate the gate trees stored in the project file."""
+        for rec in page._unmix_params.get("trees", []):
+            store = {
+                "id": rec.get("id") or uuid4().hex[:8],
+                "params": rec.get("params") or {},
+            }
+            self._unmix_make_tree(page, store, rec.get("spectrum_id"))
+        active_id = page._unmix_params.get("active_tree")
+        tree = next((t for t in page._unmix_trees if t["id"] == active_id), None)
+        if tree is None and page._unmix_trees:
+            tree = page._unmix_trees[0]
+        if tree is not None:
+            self._unmix_activate_tree(page, tree)
+
+    def _unmix_on_gating_dirty(self, page, holder) -> None:
+        """A gate tree changed: mark the module dirty and refresh its spectrum."""
+        if page._unmix_locked:
+            return
+        self._unmix_mark_dirty(page)
+        # If the displayed spectrum comes from this tree, recompute it soon.
+        spectrum = page._unmix_active_spectrum
+        if spectrum is None:
+            return
+        tree = self._unmix_tree_for_holder(page, holder)
+        if tree is not None and tree["id"] == spectrum.get("tree_id"):
+            page._unmix_spectrum_timer.start(250)
+
+    def _unmix_cleanup(self, page) -> None:
+        """Stop every embedded gate tree (workers and timers)."""
+        for name in ("_unmix_spectrum_timer", "_unmix_sig_order_timer"):
+            timer = getattr(page, name, None)
+            if timer is not None:
+                timer.stop()
+        for tree in list(page._unmix_trees):
+            if tree.get("holder") is not None:
+                self._gating_cleanup(tree["holder"])
+        page._unmix_trees = []
+        page._unmix_active_tree = None
+
+    # ----- unmix: spectra ----------------------------------------------
+    def _unmix_tree_by_id(self, page, tree_id):
+        return next((t for t in page._unmix_trees if t["id"] == tree_id), None)
+
+    def _unmix_tree_for_holder(self, page, holder):
+        return next((t for t in page._unmix_trees if t.get("holder") is holder), None)
+
+    def _unmix_spectrum_for_tree(self, page, tree):
+        if tree is None or not tree.get("spectrum_id"):
+            return None
+        return next(
+            (s for s in page._unmix_spectra if s["id"] == tree["spectrum_id"]),
+            None,
+        )
+
+    def _unmix_spectrum_parameters(self, page) -> list:
+        """Every parameter available in the module (union of imported files).
+
+        The settings are set up before any spectrum exists, so they cannot be
+        tied to one gate tree's file.
+        """
+        columns = []
+        for rec in self._imported_files():
+            for name in self._columns_for(rec.get("parquet")):
+                if name not in columns:
+                    columns.append(name)
+        return columns
+
+    def _unmix_selected_parameters(self, page) -> list:
+        """The parameters a spectrum contains, in left-to-right plot order."""
+        cfg = page._unmix_spectrum_cfg
+        enabled = set(cfg.get("enabled") or [])
+        return [p for p in cfg.get("params", []) if p in enabled]
+
+    def _unmix_apply_parameter_order(self, page, new_order) -> None:
+        """Apply a drag-reordered selection without moving unselected items."""
+        cfg = page._unmix_spectrum_cfg
+        current = list(cfg.get("params") or [])
+        chosen = set(new_order)
+        slots = [i for i, name in enumerate(current) if name in chosen]
+        if len(slots) != len(new_order):
+            return
+        for slot, name in zip(slots, new_order):
+            current[slot] = name
+        cfg["params"] = current
+        self._unmix_render_spectrum_plot(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_sync_spectrum_params(self, page) -> list:
+        """Keep the module-wide parameter order and selection in sync."""
+        cfg = page._unmix_spectrum_cfg
+        columns = self._unmix_spectrum_parameters(page)
+        stored = [p for p in cfg.get("params", []) if p in columns]
+        for col in columns:
+            if col not in stored:
+                stored.append(col)
+        cfg["params"] = stored
+        enabled = cfg.get("enabled")
+        if not isinstance(enabled, list):
+            # Unset: default to every parameter except the image coordinates.
+            enabled = [c for c in columns if c not in ("x", "y")]
+        cfg["enabled"] = [c for c in enabled if c in stored]
+        return stored
+
+    def _unmix_next_spectrum_name(self, page) -> str:
+        """Spectrum N — numbering keeps increasing and never reuses gaps."""
+        while True:
+            n = int(page._unmix_params.get("next_spectrum_no", 1))
+            page._unmix_params["next_spectrum_no"] = n + 1
+            name = f"Spectrum {n}"
+            if not any(s["name"] == name for s in page._unmix_spectra):
+                return name
+
+    def _unmix_rebuild_spectrum_list(self, page) -> None:
+        lst = page._unmix_spectra_list
+        active = page._unmix_active_spectrum
+        lst.blockSignals(True)
+        lst.clear()
+        for spectrum in page._unmix_spectra:
+            item = QListWidgetItem(spectrum["name"])
+            item.setData(Qt.ItemDataRole.UserRole, spectrum["id"])
+            lst.addItem(item)
+        lst.blockSignals(False)
+        if active is not None:
+            self._unmix_highlight_spectrum(page, active["id"])
+
+    def _unmix_highlight_spectrum(self, page, spectrum_id) -> None:
+        lst = page._unmix_spectra_list
+        lst.blockSignals(True)
+        lst.clearSelection()
+        for i in range(lst.count()):
+            item = lst.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == spectrum_id:
+                lst.setCurrentItem(item)
+                break
+        lst.blockSignals(False)
+
+    def _unmix_select_spectrum(self, page, spectrum_id, open_tree=False) -> None:
+        spectrum = next(
+            (s for s in page._unmix_spectra if s["id"] == spectrum_id), None
+        )
+        page._unmix_active_spectrum = spectrum
+        if spectrum is None:
+            lst = page._unmix_spectra_list
+            lst.blockSignals(True)
+            lst.clearSelection()
+            lst.setCurrentItem(None)
+            lst.blockSignals(False)
+        else:
+            self._unmix_highlight_spectrum(page, spectrum["id"])
+        self._unmix_render_spectrum_plot(page)
+        if open_tree and spectrum is not None:
+            tree = self._unmix_tree_by_id(page, spectrum.get("tree_id"))
+            if tree is not None:
+                self._unmix_activate_tree(page, tree)
+
+    def _unmix_clear_spectrum_selection(self, page) -> None:
+        self._unmix_select_spectrum(page, None, open_tree=False)
+
+    def _unmix_spectrum_context_menu(self, page, pos) -> None:
+        lst = page._unmix_spectra_list
+        item = lst.itemAt(pos)
+        if item is None:
+            return
+        spectrum = next(
+            (s for s in page._unmix_spectra
+             if s["id"] == item.data(Qt.ItemDataRole.UserRole)),
+            None,
+        )
+        if spectrum is None:
+            return
+        enabled = not page._unmix_locked
+        menu = QMenu(lst)
+        ren_act = QAction("Rename", menu)
+        ren_act.setEnabled(enabled)
+        ren_act.triggered.connect(lambda: self._unmix_rename_spectrum(page, spectrum))
+        menu.addAction(ren_act)
+        copy_act = QAction("Duplicate", menu)
+        copy_act.setEnabled(enabled)
+        copy_act.triggered.connect(lambda: self._unmix_copy_spectrum(page, spectrum))
+        menu.addAction(copy_act)
+        menu.addSeparator()
+        del_act = QAction("Delete", menu)
+        del_act.setEnabled(enabled)
+        del_act.triggered.connect(lambda: self._unmix_delete_spectrum(page, spectrum))
+        menu.addAction(del_act)
+        menu.exec(lst.viewport().mapToGlobal(pos))
+
+    def _unmix_set_spectrum(self, page, tree, gate_id) -> None:
+        """Bind a gate tree to a new spectrum (a tree can only be set once)."""
+        if tree.get("spectrum_id"):
+            return
+        cfg = page._unmix_spectrum_cfg
+        enabled = list(cfg.get("enabled") or [])
+        if not enabled:
+            QMessageBox.information(
+                self,
+                "Set as spectrum",
+                "No spectrum parameters are selected.\n"
+                'Choose them with "Set" in Spectrum settings first.',
+            )
+            return
+        preview = tree["store"].get("params", {}).get("preview") or {}
+        if not preview.get("file"):
+            QMessageBox.warning(
+                self,
+                "Set as spectrum",
+                "This gate tree has no data file selected.",
+            )
+            return
+        columns = set(self._columns_for(preview.get("file")))
+        missing = [p for p in enabled if p not in columns]
+        if missing:
+            shown = ", ".join(str(m) for m in missing[:12])
+            if len(missing) > 12:
+                shown += ", ..."
+            QMessageBox.warning(
+                self,
+                "Set as spectrum",
+                f"The data file of this gate tree is missing "
+                f"{len(missing)} selected spectrum parameter(s):\n\n{shown}"
+                "\n\nChoose a data file that contains these parameters.",
+            )
+            return
+        spectrum = {
+            "id": uuid4().hex[:8],
+            "name": self._unmix_next_spectrum_name(page),
+            "tree_id": tree["id"],
+            "gate_id": gate_id,
+        }
+        page._unmix_spectra.append(spectrum)
+        tree["spectrum_id"] = spectrum["id"]
+        if tree.get("holder") is not None:
+            tree["holder"]._gating_protected_gate_id = gate_id
+        self._unmix_rebuild_spectrum_list(page)
+        self._unmix_select_spectrum(page, spectrum["id"], open_tree=False)
+        self._unmix_rebuild_signature_table(page)
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_reset_spectrum_source(self, page, tree) -> None:
+        """Move a spectrum's source to another gate of its bound tree."""
+        holder = tree.get("holder")
+        spectrum = self._unmix_spectrum_for_tree(page, tree)
+        if holder is None or spectrum is None:
+            return
+        others = [
+            g for g in holder._gating_gates if g["id"] != spectrum.get("gate_id")
+        ]
+        if not others:
+            QMessageBox.information(
+                self,
+                "Re-set spectrum source",
+                "This gate tree has no other gates.",
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Re-set spectrum source")
+        dlg = QVBoxLayout(dialog)
+        dlg.addWidget(QLabel("Use another gate as the source of this spectrum:"))
+        combo = QComboBox()
+        for gate in others:
+            combo.addItem(gate.get("name", gate["id"]), gate["id"])
+        dlg.addWidget(combo)
+        row = QHBoxLayout()
+        row.addStretch()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        row.addWidget(ok_btn)
+        row.addWidget(cancel_btn)
+        dlg.addLayout(row)
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        gate_id = combo.currentData()
+        if not gate_id:
+            return
+        spectrum["gate_id"] = gate_id
+        holder._gating_protected_gate_id = gate_id
+        self._unmix_select_spectrum(page, spectrum["id"], open_tree=False)
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_spectrum_menu(self, page, holder, idx, menu) -> None:
+        """Add Unmix actions to a gate tree's context menu."""
+        if idx is None or idx < 0 or idx >= len(holder._gating_gates):
+            return
+        tree = self._unmix_tree_for_holder(page, holder)
+        if tree is None:
+            return
+        gate_id = holder._gating_gates[idx]["id"]
+        spectrum = self._unmix_spectrum_for_tree(page, tree)
+        if spectrum is None and not page._unmix_locked:
+            act = QAction("Set as spectrum", menu)
+            act.triggered.connect(
+                lambda _=False: self._unmix_set_spectrum(page, tree, gate_id)
+            )
+            menu.addAction(act)
+        elif spectrum is not None and spectrum.get("gate_id") == gate_id:
+            act = QAction("Re-set as spectrum...", menu)
+            act.setEnabled(not page._unmix_locked)
+            act.triggered.connect(
+                lambda _=False: self._unmix_reset_spectrum_source(page, tree)
+            )
+            menu.addAction(act)
+
+    def _unmix_rename_spectrum(self, page, spectrum) -> None:
+        text, ok = QInputDialog.getText(
+            self, "Rename spectrum", "Name:", QLineEdit.EchoMode.Normal,
+            spectrum.get("name", ""),
+        )
+        if not ok:
+            return
+        name = text.strip()
+        if not name:
+            return
+        if any(s is not spectrum and s["name"] == name for s in page._unmix_spectra):
+            QMessageBox.information(
+                self, "Rename spectrum", "A spectrum with this name already exists."
+            )
+            return
+        spectrum["name"] = name
+        self._unmix_rebuild_spectrum_list(page)
+        self._unmix_render_spectrum_plot(page)
+        self._unmix_rebuild_signature_table(page)
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_copy_spectrum(self, page, spectrum) -> None:
+        """Duplicate a spectrum, including an independent copy of its gate tree."""
+        name = spectrum["name"] + " copy"
+        while any(s["name"] == name for s in page._unmix_spectra):
+            name += " copy"
+        new_spectrum = copy.deepcopy(spectrum)
+        new_spectrum["id"] = uuid4().hex[:8]
+        new_spectrum["name"] = name
+        source_tree = self._unmix_tree_by_id(page, spectrum.get("tree_id"))
+        if source_tree is not None:
+            store = {
+                "id": uuid4().hex[:8],
+                "params": copy.deepcopy(source_tree["store"].get("params") or {}),
+            }
+            new_tree = self._unmix_make_tree(page, store, new_spectrum["id"])
+            new_spectrum["tree_id"] = new_tree["id"]
+        page._unmix_spectra.append(new_spectrum)
+        self._unmix_rebuild_spectrum_list(page)
+        self._unmix_select_spectrum(page, new_spectrum["id"], open_tree=False)
+        self._unmix_rebuild_signature_table(page)
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_delete_spectrum(self, page, spectrum) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Delete spectrum",
+            f'Delete "{spectrum["name"]}"?\n'
+            "Its bound gate tree will be destroyed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        tree = self._unmix_tree_by_id(page, spectrum.get("tree_id"))
+        if tree is not None:
+            self._unmix_destroy_tree(page, tree)
+        if spectrum in page._unmix_spectra:
+            page._unmix_spectra.remove(spectrum)
+        if page._unmix_active_spectrum is spectrum:
+            page._unmix_active_spectrum = None
+        self._unmix_rebuild_spectrum_list(page)
+        self._unmix_select_spectrum(
+            page,
+            page._unmix_active_spectrum["id"] if page._unmix_active_spectrum else None,
+            open_tree=False,
+        )
+        self._unmix_rebuild_signature_table(page)
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_spectrum_arrays(self, page, spectrum):
+        """Return (names, arrays, error) for a spectrum's gated subset.
+
+        Each array holds the transformed, finite values of one parameter inside
+        the source gate, in the module-wide parameter order.
+        """
+        import numpy as np
+
+        tree = self._unmix_tree_by_id(page, spectrum.get("tree_id"))
+        if tree is None:
+            return None, None, "The gate tree for this spectrum no longer exists."
+        params = tree["store"].get("params") or {}
+        gates = params.get("gates") or []
+        preview = params.get("preview") or {}
+        gate = next((g for g in gates if g.get("id") == spectrum.get("gate_id")), None)
+        if gate is None:
+            return None, None, "The source gate no longer exists."
+        parquet = preview.get("file")
+        if not parquet:
+            return None, None, "The gate tree has no data file."
+        transforms = self._upstream_scale_transforms(page._unmix_task_id)
+        try:
+            mask = _compute_gate_filter_mask(gates, gate["id"], parquet, transforms)
+        except Exception as exc:  # noqa: BLE001
+            return None, None, f"Could not compute the gate: {exc}"
+        if mask is None:
+            return None, None, "Could not compute the gate (missing parameters)."
+
+        cfg = page._unmix_spectrum_cfg
+        ordered = self._unmix_sync_spectrum_params(page)
+        enabled = set(cfg.get("enabled") or [])
+        file_columns = set(self._columns_for(parquet))
+        names = [p for p in ordered if p in enabled and p in file_columns]
+        if not names:
+            return None, None, "No parameters selected."
+        try:
+            import pandas as pd
+            df = pd.read_parquet(parquet, columns=names)
+        except Exception as exc:  # noqa: BLE001
+            return None, None, f"Could not read the data: {exc}"
+        mask = np.asarray(mask, dtype=bool)
+        if mask.size != len(df):
+            return None, None, "Gate mask size mismatch."
+        arrays = []
+        for name in names:
+            arr = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype="float64")
+            arr = _apply_scale_transforms(arr, transforms.get(name))
+            arr = arr[mask]
+            arr = arr[np.isfinite(arr)]
+            arrays.append(arr)
+        return names, arrays, None
+
+    def _unmix_spectrum_values(self, page, spectrum):
+        """Compute a spectrum from its source gate.
+
+        Returns ``(names, values, hist, y_range, error)`` where `values` is the
+        median/mean per parameter, `hist` is a (bins, parameters) density
+        heatmap of the gated subset and `y_range` is the raw value range the
+        heatmap spans.
+        """
+        import numpy as np
+
+        names, arrays, error = self._unmix_spectrum_arrays(page, spectrum)
+        if error:
+            return None, None, None, None, error
+        stat = page._unmix_spectrum_cfg.get("stat", "median")
+        values = []
+        for arr in arrays:
+            if arr.size == 0:
+                values.append(float("nan"))
+            elif stat == "mean":
+                values.append(float(arr.mean()))
+            else:
+                values.append(float(np.median(arr)))
+
+        # Distribution heatmap: one column per parameter, shared raw value axis.
+        bins = 128
+        pooled = (
+            np.concatenate([a for a in arrays if a.size])
+            if any(a.size for a in arrays) else np.array([])
+        )
+        if pooled.size:
+            lo, hi = np.percentile(pooled, [0.5, 99.5])
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = float(pooled.min()), float(pooled.max())
+            if hi <= lo:
+                hi = lo + 1.0
+        else:
+            lo, hi = 0.0, 1.0
+        hist = np.zeros((bins, len(names)), dtype="float32")
+        for i, arr in enumerate(arrays):
+            if arr.size == 0:
+                continue
+            counts, _ = np.histogram(
+                np.clip(arr, lo, hi), bins=bins, range=(lo, hi)
+            )
+            peak = counts.max()
+            if peak > 0:
+                hist[:, i] = (counts / float(peak)).astype("float32")
+        return names, values, hist, (lo, hi), None
+
+    def _unmix_render_spectrum_plot(self, page) -> None:
+        import numpy as np
+
+        plot_widget = page._unmix_spectrum_plot
+        plot_item = plot_widget.getPlotItem()
+        plot_item.clear()
+        axis = plot_item.getAxis("bottom")
+        spectrum = page._unmix_active_spectrum
+        if spectrum is None:
+            axis.setTicks(None)
+            axis.setHeight(None)
+            plot_item.setTitle("")
+            return
+        names, values, hist, y_range, error = self._unmix_spectrum_values(
+            page, spectrum
+        )
+        if error:
+            axis.setTicks(None)
+            axis.setHeight(None)
+            plot_item.setTitle(f"<span style='color:#b00000'>{error}</span>")
+            return
+        cfg = page._unmix_spectrum_cfg
+        plot_item.setTitle(spectrum.get("name", ""))
+        xs = list(range(len(names)))
+
+        lo, hi = y_range
+        finite = [v for v in values if np.isfinite(v)]
+        y0 = min([lo] + finite)
+        y1 = max([hi] + finite)
+        if y1 <= y0:
+            y1 = y0 + 1.0
+
+        # Distribution heatmap drawn behind the spectrum line. Empty bins stay
+        # transparent so the plot background shows through.
+        cmap = _figure_colormap(cfg.get("colormap", "viridis"))
+        rgb = np.array(cmap.getLookupTable(0.0, 1.0, 256), dtype="ubyte")
+        lut = np.zeros((256, 4), dtype="ubyte")
+        lut[:, :3] = rgb[:, :3]
+        ramp = np.linspace(0.0, 1.0, 256) ** 0.45
+        lut[:, 3] = np.clip(ramp * 255.0, 0, 255).astype("ubyte")
+        lut[0, 3] = 0
+        img = pg.ImageItem(axisOrder="row-major")
+        img.setImage(hist, autoLevels=False, levels=(0.0, 1.0), lut=lut)
+        img.setRect(QRectF(-0.5, lo, max(1, len(names)), hi - lo))
+        img.setZValue(-10)
+        plot_item.addItem(img)
+
+        line_color = cfg.get("line_color", "#2b6cb0")
+        plot_item.plot(
+            xs, values,
+            pen=pg.mkPen(line_color, width=2),
+            symbol="o", symbolSize=6,
+            symbolBrush=line_color, symbolPen=None,
+        )
+        axis.setTicks([[(i, name) for i, name in enumerate(names)]])
+        # Rotated labels need as much height as the widest parameter name.
+        font = axis.style.get("tickFont") or axis.font()
+        metrics = QFontMetrics(font)
+        widest = max((metrics.horizontalAdvance(str(n)) for n in names), default=0)
+        axis.setHeight(int(widest) + 26)
+        plot_item.setXRange(-0.5, max(0.5, len(names) - 0.5), padding=0)
+        plot_item.setYRange(y0, y1, padding=0.02)
+
+    def _unmix_rebuild_spectrum_settings(self, page) -> None:
+        """Build the module-wide spectrum settings (one set for all spectra)."""
+        layout = page._unmix_spectrum_settings_layout
+        self._clear_layout(layout)
+        enabled = not page._unmix_locked
+        cfg = page._unmix_spectrum_cfg
+        self._unmix_sync_spectrum_params(page)
+
+        layout.addWidget(QLabel("Statistic"))
+        stat_combo = QComboBox()
+        stat_combo.addItem("Median", "median")
+        stat_combo.addItem("Mean", "mean")
+        stat_index = stat_combo.findData(cfg.get("stat", "median"))
+        stat_combo.setCurrentIndex(stat_index if stat_index >= 0 else 0)
+        stat_combo.setEnabled(enabled)
+        layout.addWidget(stat_combo)
+
+        layout.addWidget(QLabel("Distribution colormap"))
+        cmap_combo = _NoWheelComboBox()
+        for name in ("viridis", "plasma", "inferno", "magma", "cividis", "turbo"):
+            cmap_combo.addItem(name, name)
+        cmap_index = cmap_combo.findData(cfg.get("colormap", "viridis"))
+        cmap_combo.setCurrentIndex(cmap_index if cmap_index >= 0 else 0)
+        cmap_combo.setEnabled(enabled)
+        layout.addWidget(cmap_combo)
+
+        params_row = QHBoxLayout()
+        params_row.addWidget(QLabel("Parameters"))
+        params_row.addStretch()
+        selected_count = len(self._unmix_selected_parameters(page))
+        count_label = QLabel(f"{selected_count} selected")
+        count_label.setStyleSheet("color: #5b6b82;")
+        params_row.addWidget(count_label)
+        layout.addLayout(params_row)
+        params_btn = QPushButton("Set")
+        params_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        params_btn.setEnabled(enabled)
+        layout.addWidget(params_btn)
+
+        def update_params_button():
+            params_btn.setToolTip(
+                f"{len(cfg.get('enabled') or [])}/{len(cfg.get('params') or [])}"
+            )
+
+        update_params_button()
+        page._unmix_params_btn = params_btn
+        params_btn.clicked.connect(
+            lambda _=False: self._unmix_edit_spectrum_parameters(page)
+        )
+
+        # The selected parameters, in plotting order; drag a row to reorder.
+        selected_names = self._unmix_selected_parameters(page)
+        if selected_names:
+            order_list = QListWidget()
+            order_list.setDragDropMode(
+                QAbstractItemView.DragDropMode.InternalMove
+            )
+            order_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+            order_list.setDropIndicatorShown(True)
+            order_list.setSelectionMode(
+                QAbstractItemView.SelectionMode.SingleSelection
+            )
+            order_list.setStyleSheet(
+                "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+            )
+            handle_icon = QIcon(_drag_handle_pixmap())
+            for name in selected_names:
+                item = QListWidgetItem(handle_icon, name)
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                item.setToolTip("Drag to reorder")
+                order_list.addItem(item)
+            order_list.setEnabled(enabled)
+
+            def on_rows_moved(*_args):
+                order = [
+                    order_list.item(i).data(Qt.ItemDataRole.UserRole)
+                    for i in range(order_list.count())
+                ]
+                self._unmix_apply_parameter_order(page, order)
+
+            order_list.model().rowsMoved.connect(on_rows_moved)
+            layout.addWidget(order_list, 1)
+        else:
+            hint = QLabel("No parameters selected. Click Set to choose.")
+            hint.setStyleSheet("color: gray;")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            layout.addStretch(1)
+
+        layout.addWidget(QLabel("Spectrum line color"))
+        color_btn = QPushButton()
+        color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        color_btn.setEnabled(enabled)
+        color_btn.setFixedHeight(26)
+        layout.addWidget(color_btn)
+
+        layout.addWidget(QLabel("Matrix decimal places"))
+        decimals_spin = _NoWheelSpinBox()
+        decimals_spin.setRange(0, 6)
+        decimals_spin.setValue(int(cfg.get("decimals", 2)))
+        decimals_spin.setEnabled(enabled)
+        layout.addWidget(decimals_spin)
+
+        def refresh():
+            self._unmix_refresh_outputs(page)
+            self._unmix_mark_dirty(page)
+
+        def update_color_button():
+            color = QColor(cfg.get("line_color", "#2b6cb0"))
+            text_color = "#ffffff" if color.lightness() < 128 else "#000000"
+            color_btn.setText(color.name())
+            color_btn.setStyleSheet(
+                f"QPushButton {{ background-color: {color.name()}; "
+                f"color: {text_color}; border: 1px solid #999; }}"
+            )
+
+        def pick_line_color():
+            color = QColorDialog.getColor(
+                QColor(cfg.get("line_color", "#2b6cb0")), self,
+                "Spectrum line color",
+            )
+            if color.isValid():
+                cfg["line_color"] = color.name()
+                update_color_button()
+                refresh()
+
+        def on_stat_changed():
+            cfg["stat"] = stat_combo.currentData()
+            refresh()
+
+        def on_colormap_changed():
+            cfg["colormap"] = cmap_combo.currentData()
+            refresh()
+
+        def on_decimals_changed(value):
+            cfg["decimals"] = int(value)
+            self._unmix_render_matrix(page)
+            self._unmix_mark_dirty(page)
+
+        update_color_button()
+        stat_combo.currentIndexChanged.connect(lambda _=0: on_stat_changed())
+        cmap_combo.currentIndexChanged.connect(lambda _=0: on_colormap_changed())
+        color_btn.clicked.connect(lambda _=False: pick_line_color())
+        decimals_spin.valueChanged.connect(on_decimals_changed)
+
+    def _unmix_edit_spectrum_parameters(self, page) -> None:
+        """Pick a spectrum's parameters and their order in a fixed-size dialog.
+
+        The dialog has a filter box, a tri-state "Select all" that applies to
+        the rows currently shown, checkable rows with Shift-range toggling, and
+        a "<selected>/<available>" counter.
+        """
+        cfg = page._unmix_spectrum_cfg
+        ordered = self._unmix_sync_spectrum_params(page)
+        selected = set(cfg.get("enabled") or [])
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Spectrum parameters")
+        dialog.setMinimumSize(340, 420)
+        dialog.resize(380, 560)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        filter_edit = QLineEdit()
+        filter_edit.setPlaceholderText("Filter parameters...")
+        layout.addWidget(filter_edit)
+
+        select_all = QCheckBox("Select all")
+        select_all.setTristate(True)
+        layout.addWidget(select_all)
+
+        params_list = QListWidget()
+        params_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        params_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        for name in ordered:
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if name in selected else Qt.CheckState.Unchecked
+            )
+            params_list.addItem(item)
+        layout.addWidget(params_list, 1)
+
+        count_label = QLabel("")
+        layout.addWidget(count_label)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        ok_btn = QPushButton("OK")
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        footer.addWidget(cancel_btn)
+        footer.addWidget(ok_btn)
+        layout.addLayout(footer)
+
+        anchor = {"row": None}
+
+        def visible_items():
+            return [
+                params_list.item(i)
+                for i in range(params_list.count())
+                if not params_list.item(i).isHidden()
+            ]
+
+        def update_counts() -> None:
+            visible = visible_items()
+            checked = sum(
+                1 for item in visible
+                if item.checkState() == Qt.CheckState.Checked
+            )
+            count_label.setText(f"{checked}/{len(visible)}")
+            if not visible or checked == 0:
+                state = Qt.CheckState.Unchecked
+            elif checked == len(visible):
+                state = Qt.CheckState.Checked
+            else:
+                state = Qt.CheckState.PartiallyChecked
+            select_all.blockSignals(True)
+            select_all.setCheckState(state)
+            select_all.blockSignals(False)
+
+        def set_visible_checked(checked: bool) -> None:
+            target = (
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+            params_list.blockSignals(True)
+            for item in visible_items():
+                item.setCheckState(target)
+            params_list.blockSignals(False)
+            update_counts()
+
+        def on_select_all(_checked=False) -> None:
+            visible = visible_items()
+            if not visible:
+                return
+            all_checked = all(
+                item.checkState() == Qt.CheckState.Checked for item in visible
+            )
+            set_visible_checked(not all_checked)
+
+        def apply_filter(text: str) -> None:
+            needle = text.strip().lower()
+            params_list.blockSignals(True)
+            for i in range(params_list.count()):
+                item = params_list.item(i)
+                item.setHidden(
+                    bool(needle) and needle not in item.text().lower()
+                )
+            params_list.blockSignals(False)
+            update_counts()
+
+        def on_item_clicked(item) -> None:
+            row = params_list.row(item)
+            modifiers = QApplication.keyboardModifiers()
+            if (
+                modifiers & Qt.KeyboardModifier.ShiftModifier
+                and anchor["row"] is not None
+            ):
+                lo, hi = sorted((anchor["row"], row))
+                state = item.checkState()
+                params_list.blockSignals(True)
+                for r in range(lo, hi + 1):
+                    other = params_list.item(r)
+                    if not other.isHidden():
+                        other.setCheckState(state)
+                params_list.blockSignals(False)
+            anchor["row"] = row
+            update_counts()
+
+        def on_accept() -> None:
+            order = []
+            enabled = []
+            for i in range(params_list.count()):
+                item = params_list.item(i)
+                name = item.data(Qt.ItemDataRole.UserRole)
+                order.append(name)
+                if item.checkState() == Qt.CheckState.Checked:
+                    enabled.append(name)
+            cfg["params"] = order
+            cfg["enabled"] = enabled
+            dialog.accept()
+
+        filter_edit.textChanged.connect(apply_filter)
+        select_all.clicked.connect(on_select_all)
+        params_list.itemClicked.connect(on_item_clicked)
+        params_list.itemChanged.connect(lambda _item: update_counts())
+        cancel_btn.clicked.connect(dialog.reject)
+        ok_btn.clicked.connect(on_accept)
+
+        update_counts()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        # Rebuild the panel so the ordered list of selected parameters updates.
+        self._unmix_rebuild_spectrum_settings(page)
+        self._unmix_render_spectrum_plot(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_matrix_subpage(self, page) -> QWidget:
+        """Sub-page 2: signatures + samples (left) | matrix image + settings (right)."""
+        w = QWidget()
+        w.setStyleSheet("background: #f5f8fb;")
+        row = QHBoxLayout(w)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(12)
+
+        left = QSplitter(Qt.Orientation.Vertical)
+        left.setChildrenCollapsible(False)
+        left.addWidget(self._unmix_signature_panel(page))
+        left.addWidget(self._unmix_sample_panel(page))
+        left.setStretchFactor(0, 3)
+        left.setStretchFactor(1, 2)
+        left.setSizes([420, 240])
+
+        right = QSplitter(Qt.Orientation.Vertical)
+        right.setChildrenCollapsible(False)
+        right.addWidget(self._unmix_matrix_panel(page))
+        right.addWidget(self._unmix_matrix_settings_panel(page))
+        right.setStretchFactor(0, 3)
+        right.setStretchFactor(1, 1)
+        right.setSizes([560, 220])
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([400, 800])
+        row.addWidget(splitter, 1)
+        return w
+
+    def _unmix_matrix_panel(self, page) -> QWidget:
+        """The matrix heatmap itself (rendered to an image)."""
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Spectral matrix</b>"))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll.setStyleSheet("background: #ffffff; border: none;")
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("background: #ffffff; color: #888888;")
+        label.setText("Add a signature to build the matrix.")
+        scroll.setWidget(label)
+        lay.addWidget(scroll, 1)
+        page._unmix_matrix_label = label
+        page._unmix_matrix_image = None
+        return panel
+
+    def _unmix_matrix_settings_panel(self, page) -> QWidget:
+        """Cell geometry, colours, number display and clipboard export."""
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Matrix settings</b>"))
+
+        cfg = self._unmix_matrix_cfg(page)
+        editable = not page._unmix_locked
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        grid.addWidget(QLabel("Cell width"), 0, 0)
+        width_spin = _NoWheelSpinBox()
+        width_spin.setRange(12, 400)
+        width_spin.setValue(int(cfg["cell_width"]))
+        width_spin.setEnabled(editable)
+        grid.addWidget(width_spin, 0, 1)
+
+        grid.addWidget(QLabel("Cell height"), 0, 2)
+        height_spin = _NoWheelSpinBox()
+        height_spin.setRange(12, 200)
+        height_spin.setValue(int(cfg["cell_height"]))
+        height_spin.setEnabled(editable)
+        grid.addWidget(height_spin, 0, 3)
+
+        grid.addWidget(QLabel("Colormap"), 1, 0)
+        cmap_combo = _NoWheelComboBox()
+        for name in ("viridis", "plasma", "inferno", "magma", "cividis", "turbo"):
+            cmap_combo.addItem(name, name)
+        cmap_index = cmap_combo.findData(cfg["colormap"])
+        cmap_combo.setCurrentIndex(cmap_index if cmap_index >= 0 else 0)
+        cmap_combo.setEnabled(editable)
+        grid.addWidget(cmap_combo, 1, 1, 1, 3)
+
+        show_numbers = QCheckBox("Show numbers")
+        show_numbers.setChecked(bool(cfg["show_numbers"]))
+        show_numbers.setEnabled(editable)
+        grid.addWidget(show_numbers, 2, 0, 1, 2)
+
+        auto_color = QCheckBox("Auto number color")
+        auto_color.setChecked(bool(cfg["auto_text_color"]))
+        auto_color.setEnabled(editable)
+        grid.addWidget(auto_color, 2, 2, 1, 2)
+
+        grid.addWidget(QLabel("Number color"), 3, 0)
+        color_btn = QPushButton()
+        color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        color_btn.setFixedHeight(26)
+        color_btn.setEnabled(editable and not auto_color.isChecked())
+        grid.addWidget(color_btn, 3, 1)
+
+        copy_btn = QPushButton("Copy matrix to clipboard")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        grid.addWidget(copy_btn, 3, 2, 1, 2)
+        lay.addLayout(grid)
+        lay.addStretch(1)
+
+        def update_color_button():
+            color = QColor(cfg["text_color"])
+            text_color = "#ffffff" if color.lightness() < 128 else "#000000"
+            color_btn.setText(color.name())
+            color_btn.setStyleSheet(
+                f"QPushButton {{ background-color: {color.name()}; "
+                f"color: {text_color}; border: 1px solid #999; }}"
+            )
+
+        def refresh():
+            self._unmix_render_matrix(page)
+            self._unmix_mark_dirty(page)
+
+        def on_width(value):
+            cfg["cell_width"] = int(value)
+            refresh()
+
+        def on_height(value):
+            cfg["cell_height"] = int(value)
+            refresh()
+
+        def on_colormap():
+            cfg["colormap"] = cmap_combo.currentData()
+            refresh()
+
+        def on_show_numbers(checked):
+            cfg["show_numbers"] = bool(checked)
+            refresh()
+
+        def on_auto_color(checked):
+            cfg["auto_text_color"] = bool(checked)
+            color_btn.setEnabled(editable and not checked)
+            refresh()
+
+        def pick_color():
+            color = QColorDialog.getColor(
+                QColor(cfg["text_color"]), self, "Matrix number color"
+            )
+            if color.isValid():
+                cfg["text_color"] = color.name()
+                update_color_button()
+                refresh()
+
+        width_spin.valueChanged.connect(on_width)
+        height_spin.valueChanged.connect(on_height)
+        cmap_combo.currentIndexChanged.connect(lambda _=0: on_colormap())
+        show_numbers.toggled.connect(on_show_numbers)
+        auto_color.toggled.connect(on_auto_color)
+        color_btn.clicked.connect(lambda _=False: pick_color())
+        copy_btn.clicked.connect(lambda _=False: self._unmix_copy_matrix(page))
+
+        update_color_button()
+        return panel
+
+    def _unmix_matrix_cfg(self, page) -> dict:
+        cfg = page._unmix_params.setdefault("matrix_settings", {})
+        cfg.setdefault("cell_width", 35)
+        cfg.setdefault("cell_height", 28)
+        cfg.setdefault("colormap", "viridis")
+        cfg.setdefault("show_numbers", True)
+        cfg.setdefault("auto_text_color", True)
+        cfg.setdefault("text_color", "#5b6b82")
+        return cfg
+
+    def _unmix_copy_matrix(self, page) -> None:
+        """Copy the matrix as tab-separated text (pasteable into Excel)."""
+        import numpy as np
+
+        columns, rows = self._unmix_matrix_table_values(page)
+        if not rows or not columns:
+            QMessageBox.information(
+                self, "Copy matrix", "There is no matrix to copy."
+            )
+            return
+        lines = ["\t".join(["Signature"] + list(columns))]
+        for row, values in rows:
+            cells = [str(row.get("name", ""))]
+            cells += [
+                f"{v:.4f}" if np.isfinite(v) else "" for v in values
+            ]
+            lines.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Matrix copied to clipboard")
+
+    def _unmix_signature_panel(self, page) -> QWidget:
+        """Positive/negative/normalize/name rows that define the matrix."""
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Signatures</b>"))
+
+        add_btn = QPushButton("Add signature")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setEnabled(not page._unmix_locked)
+        add_btn.clicked.connect(lambda _=False: self._unmix_add_signature(page))
+        add_row = QHBoxLayout()
+        add_row.addWidget(add_btn)
+        add_row.addStretch()
+        lay.addLayout(add_row)
+
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(
+            ["Positive signature", "Negative signature", "Normalize", "Name"]
+        )
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: none; }"
+        )
+        table.verticalHeader().setDefaultSectionSize(30)
+        table.verticalHeader().setSectionsMovable(True)
+        table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
+        )
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos: self._unmix_signature_menu(page, pos)
+        )
+        header = table.verticalHeader()
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(
+            lambda pos: self._unmix_signature_header_menu(page, pos)
+        )
+        header.sectionMoved.connect(
+            lambda *_: page._unmix_sig_order_timer.start()
+        )
+        page._unmix_signature_table = table
+        lay.addWidget(table, 1)
+        return panel
+
+    def _unmix_sample_panel(self, page) -> QWidget:
+        """Which imported samples this matrix is applied to."""
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.addWidget(QLabel("<b>Samples</b>"))
+        head.addStretch()
+        all_btn = QPushButton("All")
+        none_btn = QPushButton("None")
+        for btn in (all_btn, none_btn):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedWidth(56)
+            btn.setEnabled(not page._unmix_locked)
+        all_btn.clicked.connect(lambda _=False: self._unmix_set_all_samples(page, True))
+        none_btn.clicked.connect(
+            lambda _=False: self._unmix_set_all_samples(page, False)
+        )
+        head.addWidget(all_btn)
+        head.addWidget(none_btn)
+        lay.addLayout(head)
+
+        samples_list = QListWidget()
+        samples_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: none; }"
+        )
+        samples_list.setEnabled(not page._unmix_locked)
+        samples_list.itemChanged.connect(
+            lambda _item: self._unmix_on_samples_changed(page)
+        )
+        page._unmix_samples_list = samples_list
+        lay.addWidget(samples_list, 1)
+
+        method_row = QHBoxLayout()
+        method_row.addWidget(QLabel("Unmixing method"))
+        method_combo = _NoWheelComboBox()
+        method_combo.addItem("OLS (ordinary least squares)", "ols")
+        method_index = method_combo.findData(
+            page._unmix_params.get("method", "ols")
+        )
+        method_combo.setCurrentIndex(method_index if method_index >= 0 else 0)
+        method_combo.setEnabled(not page._unmix_locked)
+        method_combo.currentIndexChanged.connect(
+            lambda _=0: self._unmix_on_method_changed(page, method_combo)
+        )
+        method_row.addWidget(method_combo, 1)
+        lay.addLayout(method_row)
+        return panel
+
+    # ----- unmix: signature table --------------------------------------
+    def _unmix_rebuild_signature_table(self, page) -> None:
+        """(Re)build the four-column signature editor from the data model."""
+        table = page._unmix_signature_table
+        spectra = page._unmix_spectra
+        rows = page._unmix_matrix
+        editable = not page._unmix_locked
+        table.setRowCount(0)
+        table.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            pos_combo = _NoWheelComboBox()
+            for spectrum in spectra:
+                pos_combo.addItem(spectrum["name"], spectrum["id"])
+            index = pos_combo.findData(row.get("positive"))
+            pos_combo.setCurrentIndex(index if index >= 0 else 0)
+            pos_combo.setEnabled(editable)
+
+            neg_combo = _NoWheelComboBox()
+            neg_combo.addItem("NA", None)
+            for spectrum in spectra:
+                neg_combo.addItem(spectrum["name"], spectrum["id"])
+            index = neg_combo.findData(row.get("negative"))
+            neg_combo.setCurrentIndex(index if index >= 0 else 0)
+            neg_combo.setEnabled(editable)
+
+            norm_box = QCheckBox()
+            norm_box.setChecked(bool(row.get("normalize", True)))
+            norm_box.setEnabled(editable)
+            norm_host = QWidget()
+            norm_lay = QHBoxLayout(norm_host)
+            norm_lay.setContentsMargins(0, 0, 0, 0)
+            norm_lay.addStretch()
+            norm_lay.addWidget(norm_box)
+            norm_lay.addStretch()
+
+            name_edit = QLineEdit(row.get("name", ""))
+            name_edit.setEnabled(editable)
+
+            pos_combo.currentIndexChanged.connect(
+                lambda _=0, r=row, c=pos_combo: self._unmix_on_signature_field(
+                    page, r, "positive", c.currentData()
+                )
+            )
+            neg_combo.currentIndexChanged.connect(
+                lambda _=0, r=row, c=neg_combo: self._unmix_on_signature_field(
+                    page, r, "negative", c.currentData()
+                )
+            )
+            norm_box.toggled.connect(
+                lambda checked, r=row: self._unmix_on_signature_field(
+                    page, r, "normalize", bool(checked)
+                )
+            )
+            name_edit.editingFinished.connect(
+                lambda r=row, e=name_edit: self._unmix_set_signature_name(
+                    page, r, e
+                )
+            )
+            # Cell widgets swallow the table's context menu, so each one gets
+            # its own "Remove signature" entry.
+            for widget in (pos_combo, neg_combo, norm_box, norm_host, name_edit):
+                widget.setContextMenuPolicy(
+                    Qt.ContextMenuPolicy.CustomContextMenu
+                )
+                widget.customContextMenuRequested.connect(
+                    lambda pos, w=widget, r=row: self._unmix_signature_widget_menu(
+                        page, r, w, pos
+                    )
+                )
+
+            table.setCellWidget(i, 0, pos_combo)
+            table.setCellWidget(i, 1, neg_combo)
+            table.setCellWidget(i, 2, norm_host)
+            table.setCellWidget(i, 3, name_edit)
+        table.setVerticalHeaderLabels([r.get("name", "") for r in rows])
+        table.resizeRowsToContents()
+
+    def _unmix_signature_reordered(self, page) -> None:
+        """Apply the visual row order (from dragging the header) to the model."""
+        table = page._unmix_signature_table
+        header = table.verticalHeader()
+        count = len(page._unmix_matrix)
+        order = sorted(range(count), key=lambda i: header.visualIndex(i))
+        if order == list(range(count)):
+            return
+        page._unmix_matrix[:] = [page._unmix_matrix[i] for i in order]
+        self._unmix_rebuild_signature_table(page)
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_signature_menu(self, page, pos) -> None:
+        table = page._unmix_signature_table
+        index = table.rowAt(pos.y())
+        if index < 0 or index >= len(page._unmix_matrix):
+            return
+        menu = QMenu(table)
+        act = QAction("Remove signature", menu)
+        act.setEnabled(not page._unmix_locked)
+        act.triggered.connect(
+            lambda _=False: self._unmix_remove_signature(page, index)
+        )
+        menu.addAction(act)
+        menu.exec(table.viewport().mapToGlobal(pos))
+
+    def _unmix_signature_header_menu(self, page, pos) -> None:
+        """Right-click on a row header: remove that signature."""
+        header = page._unmix_signature_table.verticalHeader()
+        index = header.logicalIndexAt(pos)
+        if index < 0 or index >= len(page._unmix_matrix):
+            return
+        menu = QMenu(header)
+        act = QAction("Remove signature", menu)
+        act.setEnabled(not page._unmix_locked)
+        act.triggered.connect(
+            lambda _=False: self._unmix_remove_signature(page, index)
+        )
+        menu.addAction(act)
+        menu.exec(header.mapToGlobal(pos))
+
+    def _unmix_signature_widget_menu(self, page, row, widget, pos) -> None:
+        """Right-click inside a signature row's cell widgets."""
+        index = next(
+            (
+                i
+                for i, other in enumerate(page._unmix_matrix)
+                if other is row
+            ),
+            -1,
+        )
+        if index < 0:
+            return
+        if isinstance(widget, QLineEdit):
+            menu = widget.createStandardContextMenu()
+            menu.addSeparator()
+        else:
+            menu = QMenu(widget)
+        act = QAction("Remove signature", menu)
+        act.setEnabled(not page._unmix_locked)
+        act.triggered.connect(
+            lambda _=False: self._unmix_remove_signature(page, index)
+        )
+        menu.addAction(act)
+        menu.exec(widget.mapToGlobal(pos))
+        menu.deleteLater()
+
+    def _unmix_add_signature(self, page) -> None:
+        if not page._unmix_spectra:
+            QMessageBox.information(
+                self,
+                "Add signature",
+                "Create a spectrum first on the Spectrum Extraction tab.",
+            )
+            return
+        spectrum = page._unmix_spectra[0]
+        row = {
+            "id": uuid4().hex[:8],
+            "positive": spectrum["id"],
+            "negative": None,
+            "normalize": True,
+            "name": self._unmix_unique_signature_name(page, spectrum["name"]),
+        }
+        page._unmix_matrix.append(row)
+        self._unmix_rebuild_signature_table(page)
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_remove_signature(self, page, index: int) -> None:
+        if 0 <= index < len(page._unmix_matrix):
+            del page._unmix_matrix[index]
+            self._unmix_rebuild_signature_table(page)
+            self._unmix_render_matrix(page)
+            self._unmix_mark_dirty(page)
+
+    def _unmix_unique_signature_name(self, page, base: str) -> str:
+        """A name that avoids other signatures and every data parameter name."""
+        taken = {r.get("name") for r in page._unmix_matrix}
+        taken |= set(self._unmix_spectrum_parameters(page))
+        if base not in taken:
+            return base
+        n = 2
+        while f"{base} {n}" in taken:
+            n += 1
+        return f"{base} {n}"
+
+    def _unmix_on_signature_field(self, page, row, key: str, value) -> None:
+        if row.get(key) == value:
+            return
+        row[key] = value
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    def _unmix_set_signature_name(self, page, row, edit) -> None:
+        name = edit.text().strip()
+        current = row.get("name", "")
+        if name == current:
+            return
+        if not name:
+            QMessageBox.information(
+                self, "Signature name", "The name cannot be empty."
+            )
+            edit.setText(current)
+            return
+        if any(
+            other is not row and other.get("name") == name
+            for other in page._unmix_matrix
+        ):
+            QMessageBox.information(
+                self,
+                "Signature name",
+                "Another signature already uses this name.",
+            )
+            edit.setText(current)
+            return
+        if name in set(self._unmix_spectrum_parameters(page)):
+            QMessageBox.information(
+                self,
+                "Signature name",
+                "The name cannot match a parameter name of the sample data.",
+            )
+            edit.setText(current)
+            return
+        row["name"] = name
+        try:
+            index = page._unmix_matrix.index(row)
+            page._unmix_signature_table.setVerticalHeaderItem(
+                index, QTableWidgetItem(name)
+            )
+        except ValueError:
+            pass
+        self._unmix_render_matrix(page)
+        self._unmix_mark_dirty(page)
+
+    # ----- unmix: samples ----------------------------------------------
+    def _unmix_rebuild_sample_list(self, page) -> None:
+        samples_list = page._unmix_samples_list
+        selected = set(page._unmix_params.get("samples") or [])
+        samples_list.blockSignals(True)
+        samples_list.clear()
+        for rec in self._imported_files():
+            path = rec.get("parquet")
+            item = QListWidgetItem(rec.get("name", ""))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if path in selected
+                else Qt.CheckState.Unchecked
+            )
+            samples_list.addItem(item)
+        samples_list.blockSignals(False)
+
+    def _unmix_on_samples_changed(self, page) -> None:
+        samples_list = page._unmix_samples_list
+        page._unmix_params["samples"] = [
+            samples_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(samples_list.count())
+            if samples_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        self._unmix_mark_dirty(page)
+
+    def _unmix_set_all_samples(self, page, checked: bool) -> None:
+        samples_list = page._unmix_samples_list
+        samples_list.blockSignals(True)
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for i in range(samples_list.count()):
+            samples_list.item(i).setCheckState(state)
+        samples_list.blockSignals(False)
+        self._unmix_on_samples_changed(page)
+
+    def _unmix_on_method_changed(self, page, combo) -> None:
+        page._unmix_params["method"] = combo.currentData()
+        self._unmix_mark_dirty(page)
+
+    # ----- unmix: matrix heatmap ---------------------------------------
+    def _unmix_matrix_table_values(self, page):
+        """Return (columns, [(row, values)]) for the signature matrix."""
+        import numpy as np
+
+        columns = self._unmix_selected_parameters(page)
+        by_id = {s["id"]: s for s in page._unmix_spectra}
+        result = []
+        for row in page._unmix_matrix:
+            positive = by_id.get(row.get("positive"))
+            negative = by_id.get(row.get("negative"))
+            if positive is None:
+                result.append((row, [float("nan")] * len(columns)))
+                continue
+            pos_values, _err = self._unmix_spectrum_vector(page, positive)
+            if pos_values is None:
+                result.append((row, [float("nan")] * len(columns)))
+                continue
+            neg_values = {}
+            if negative is not None:
+                neg_values = self._unmix_spectrum_vector(page, negative)[0] or {}
+            values = []
+            for column in columns:
+                p = pos_values.get(column, float("nan"))
+                n = neg_values.get(column, 0.0) if negative is not None else 0.0
+                values.append(p - n if np.isfinite(p) else float("nan"))
+            if row.get("normalize", True):
+                finite = [v for v in values if np.isfinite(v)]
+                peak = max(finite) if finite else None
+                if peak is not None and peak > 0:
+                    values = [
+                        (v / peak) if np.isfinite(v) else v for v in values
+                    ]
+            result.append((row, values))
+        return columns, result
+
+    def _unmix_render_matrix(self, page) -> None:
+        """Paint the matrix as an image with rotated column names."""
+        import numpy as np
+
+        label = page._unmix_matrix_label
+        columns, rows = self._unmix_matrix_table_values(page)
+        if not rows or not columns:
+            page._unmix_matrix_image = None
+            label.clear()
+            label.setText(
+                "Add a signature to build the matrix."
+                if not rows
+                else "No parameters selected."
+            )
+            return
+
+        cfg = self._unmix_matrix_cfg(page)
+        cell_w = max(12, int(cfg["cell_width"]))
+        cell_h = max(12, int(cfg["cell_height"]))
+        font = QFont(label.font())
+        font.setPixelSize(max(9, min(13, cell_h // 2 + 2)))
+        metrics = QFontMetrics(font)
+
+        row_names = [row.get("name", "") for row, _ in rows]
+        left = max((metrics.horizontalAdvance(n) for n in row_names), default=0)
+        bottom = max((metrics.horizontalAdvance(c) for c in columns), default=0)
+        left += 12
+        bottom += 12
+        top = 8
+        right = 8
+        width = left + cell_w * len(columns) + right
+        height = top + cell_h * len(rows) + bottom
+
+        image = QImage(width, height, QImage.Format.Format_ARGB32)
+        image.fill(QColor("#ffffff"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setFont(font)
+
+        finite = [v for _r, values in rows for v in values if np.isfinite(v)]
+        lo = min(finite) if finite else 0.0
+        hi = max(finite) if finite else 0.0
+        lut = _figure_colormap(cfg["colormap"]).getLookupTable(0.0, 1.0, 256)
+        show_numbers = bool(cfg["show_numbers"])
+        decimals = int(page._unmix_spectrum_cfg.get("decimals", 2))
+        auto_color = bool(cfg["auto_text_color"])
+        fixed_text = QColor(cfg["text_color"])
+        grid_pen = QPen(QColor(255, 255, 255, 140))
+        grid_pen.setWidth(1)
+
+        for i, (_row, values) in enumerate(rows):
+            y = top + i * cell_h
+            for j, value in enumerate(values):
+                x = left + j * cell_w
+                if np.isfinite(value):
+                    frac = 0.5 if hi <= lo else (value - lo) / (hi - lo)
+                    frac = min(1.0, max(0.0, frac))
+                    r, g, b = (int(c) for c in lut[int(frac * 255)])
+                    painter.fillRect(x, y, cell_w, cell_h, QColor(r, g, b))
+                    luma = 0.299 * r + 0.587 * g + 0.114 * b
+                    text_color = (
+                        QColor("#ffffff") if luma < 140 else QColor("#111111")
+                    ) if auto_color else fixed_text
+                else:
+                    painter.fillRect(x, y, cell_w, cell_h, QColor("#f2f4f7"))
+                    text_color = QColor("#9aa4b2")
+                painter.setPen(grid_pen)
+                painter.drawRect(x, y, cell_w, cell_h)
+                if show_numbers:
+                    painter.setPen(text_color)
+                    painter.drawText(
+                        QRect(x, y, cell_w, cell_h),
+                        Qt.AlignmentFlag.AlignCenter,
+                        f"{value:.{decimals}f}" if np.isfinite(value) else "—",
+                    )
+            painter.setPen(QColor("#333333"))
+            painter.drawText(
+                QRect(0, y, left - 10, cell_h),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                row_names[i],
+            )
+
+        # Column names rotated -90°, ending just below the grid.
+        grid_bottom = top + cell_h * len(rows)
+        shift = (metrics.ascent() - metrics.descent()) / 2.0
+        for j, name in enumerate(columns):
+            text_width = metrics.horizontalAdvance(name)
+            cx = left + j * cell_w + cell_w / 2.0
+            painter.save()
+            painter.translate(cx + shift, grid_bottom + 6 + text_width)
+            painter.rotate(-90)
+            painter.setPen(QColor("#333333"))
+            painter.drawText(0, 0, name)
+            painter.restore()
+        painter.end()
+
+        page._unmix_matrix_image = image
+        label.setText("")
+        label.setPixmap(QPixmap.fromImage(image))
+        label.resize(image.size())
+
+    def _unmix_refresh_outputs(self, page) -> None:
+        """Recompute everything derived from the spectra."""
+        self._unmix_render_spectrum_plot(page)
+        self._unmix_render_matrix(page)
+
+    def _unmix_spectrum_vector(self, page, spectrum):
+        """Return ({parameter: statistic}, error) for one spectrum, cached."""
+        import numpy as np
+
+        cache = getattr(page, "_unmix_spectrum_cache", None)
+        if cache is None:
+            cache = {}
+            page._unmix_spectrum_cache = cache
+        cached = cache.get(spectrum["id"])
+        if cached is not None:
+            return cached, None
+        names, arrays, error = self._unmix_spectrum_arrays(page, spectrum)
+        if error:
+            return None, error
+        stat = page._unmix_spectrum_cfg.get("stat", "median")
+        values = {}
+        for name, arr in zip(names, arrays):
+            if arr.size == 0:
+                values[name] = float("nan")
+            elif stat == "mean":
+                values[name] = float(arr.mean())
+            else:
+                values[name] = float(np.median(arr))
+        cache[spectrum["id"]] = values
+        return values, None
+
+    def _unmix_mark_dirty(self, page) -> None:
+        page._unmix_dirty = True
+        page._unmix_spectrum_cache = {}
+        self._unmix_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _unmix_save_now(self, page) -> None:
+        page._unmix_params["trees"] = [
+            {
+                "id": tree["id"],
+                "params": tree["store"].get("params", {}),
+                "spectrum_id": tree["spectrum_id"],
+            }
+            for tree in page._unmix_trees
+        ]
+        active = page._unmix_active_tree
+        page._unmix_params["active_tree"] = active["id"] if active else None
+        active_spectrum = page._unmix_active_spectrum
+        page._unmix_params["active_spectrum"] = (
+            active_spectrum["id"] if active_spectrum else None
+        )
+        page._unmix_task_def["params"] = page._unmix_params
+        if self.project is not None:
+            self.project.save()
+        page._unmix_snapshot = copy.deepcopy(page._unmix_params)
+        page._unmix_dirty = False
+        self._unmix_update_save_btn(page)
+        self.statusBar().showMessage("Unmix saved")
+        self._module_saved(page)
+
+    def _unmix_update_save_btn(self, page) -> None:
+        page._unmix_save_btn.setEnabled(page._unmix_dirty and not page._unmix_locked)
+
+    def _unmix_close(self, page) -> None:
+        """Close the page, prompting first if there are unsaved changes."""
+        if page._unmix_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Close Unmix",
+                "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._unmix_task_def["params"] = page._unmix_snapshot
+        self._unmix_cleanup(page)
+        self._close_module_page(page)
+
     # ----- gating module (map) -----------------------------------------
     def _build_gating_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
         """Build the Gating page: gate tree (1) | gate area (3) | settings (2)."""
@@ -6756,47 +8794,31 @@ class MainWindow(QMainWindow):
         layout.addWidget(bar)
 
         # Per-page state (preview config first so the plot widget can bind A/F).
+        self._gating_state_init(page, task_def, locked)
+        page._gating_save_btn = save_btn
+        save_btn.clicked.connect(lambda _=False: self._gating_save_now(page))
+        self._gating_update_save_btn(page)
+
+        layout.addWidget(self._gating_build_content(page, locked), 1)
+        return page
+
+    def _gating_state_init(self, page, task_def: dict, locked: bool) -> None:
+        """Initialize the ``_gating_*`` state attributes on `page`.
+
+        `page` is either a module page (a QWidget) or a `_GatingState` bag, so
+        the same methods can drive several gate trees in the Unmix module.
+        """
         records = self._imported_files()
         rec = records[0] if records else None
         cols = self._columns_for(rec.get("parquet")) if rec else []
-
-        def _default_preview():
-            return {
-                "type": "scatter",
-                "file": rec.get("parquet") if rec else None,
-                "file_name": rec.get("name") if rec else None,
-                "x": cols[0] if cols else None,
-                "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
-                "last_x": cols[0] if cols else None,
-                "last_y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
-                "color_mode": "density",
-                "color_param": None,
-                "palette": "viridis",
-                "xmin": None,
-                "xmax": None,
-                "ymin": None,
-                "ymax": None,
-                "point_size": 4,
-                "fixed_point_size": False,
-                "solid_color": (0, 0, 200),
-                "show_axes": True,
-                "show_axis_names": True,
-                "show_indices": True,
-                "show_sample_name": True,
-                "label_font_size": 20,
-                "label_bold": False,
-                "label_bg_opacity": 50,
-                "show_gate_labels": True,
-                "label_show_percent": True,
-            }
-
         params = task_def.setdefault("params", {})
         preview = params.get("preview")
-        valid = isinstance(preview, dict) and any(
-            r.get("parquet") == preview.get("file") for r in records
+        valid = isinstance(preview, dict) and (
+            preview.get("file") is None
+            or any(r.get("parquet") == preview.get("file") for r in records)
         )
         if not valid:
-            preview = _default_preview()
+            preview = _default_gating_preview(rec, cols)
             params["preview"] = preview
         else:
             # Backfill last-used axis parameters for older projects.
@@ -6805,7 +8827,7 @@ class MainWindow(QMainWindow):
         page._gating_preview = preview
         page._gating_task_def = task_def
         page._gating_task_id = task_def.get("id")
-        page._gating_gates = task_def.setdefault("params", {}).setdefault("gates", [])
+        page._gating_gates = params.setdefault("gates", [])
         page._gating_rois = []
         page._gating_labels = []
         page._gating_crosshairs = {}
@@ -6830,12 +8852,12 @@ class MainWindow(QMainWindow):
         page._gating_render_timer = None
         page._gating_locked = locked
         page._gating_parent_id = None
-        page._gating_save_btn = save_btn
+        page._gating_save_btn = None
         page._gating_dirty = False
-        page._gating_snapshot = copy.deepcopy(task_def.get("params", {}))
-        save_btn.clicked.connect(lambda _=False: self._gating_save_now(page))
-        self._gating_update_save_btn(page)
+        page._gating_snapshot = copy.deepcopy(params)
 
+    def _gating_build_content(self, page, locked: bool) -> QWidget:
+        """Build the gate tree | scatter | plot settings pane for `page`."""
         content = QWidget()
         content.setStyleSheet("background: #f5f8fb;")
         cl = QHBoxLayout(content)
@@ -6962,7 +8984,6 @@ class MainWindow(QMainWindow):
         cl.addWidget(tree_panel, 1)
         cl.addWidget(mid_panel, 2)
         cl.addWidget(settings_panel, 1)
-        layout.addWidget(content, 1)
 
         tree.itemClicked.connect(lambda item, col=0: self._gating_on_tree_selection(page, item, col))
         tree.itemDoubleClicked.connect(lambda item, col=0: self._gating_on_tree_double_clicked(page, item, col))
@@ -6972,7 +8993,7 @@ class MainWindow(QMainWindow):
         self._gating_rebuild_tree(page)
         self._gating_render(page)
         self._gating_rebuild_settings(page)
-        return page
+        return content
 
     def _gating_make_plot(self, page):
         """Create the gating scatter plot (sci axes + A/F buttons + gate ViewBox)."""
@@ -7727,7 +9748,18 @@ class MainWindow(QMainWindow):
                     if g.get("parent") in to_delete and g["id"] not in to_delete:
                         to_delete.add(g["id"])
                         changed = True
-        else:
+        # A gate used as a spectrum's source (Unmix) must be re-set first.
+        protected = getattr(page, "_gating_protected_gate_id", None)
+        if protected and protected in to_delete:
+            QMessageBox.information(
+                self,
+                "Delete gate",
+                "This gate is the source of a spectrum.\n"
+                'Use "Re-set as spectrum..." to move the source to another '
+                "gate before deleting it.",
+            )
+            return
+        if not cascade:
             # Keep children; re-parent them to this gate's parent.
             for g in page._gating_gates:
                 if g.get("parent") in to_delete:
@@ -7842,6 +9874,11 @@ class MainWindow(QMainWindow):
         ren_act.triggered.connect(lambda: self._gating_rename_gate(page, idx))
         menu.addAction(ren_act)
 
+        # Unmix extends this menu with "Set as spectrum" (and re-set).
+        extra_menu = getattr(page, "_gating_spectrum_menu", None)
+        if extra_menu is not None:
+            extra_menu(menu, page, idx)
+
         # Boolean gating.
         bool_menu = QMenu("Boolean gating", menu)
         not_act = QAction("NOT", bool_menu)
@@ -7859,10 +9896,16 @@ class MainWindow(QMainWindow):
         bool_menu.addAction(or_act)
         menu.addMenu(bool_menu)
 
+        # A gate that is a spectrum's source (Unmix) cannot be deleted.
+        protected = getattr(page, "_gating_protected_gate_id", None)
+        is_protected = bool(protected) and page._gating_gates[idx]["id"] == protected
+
         del_one = QAction("Delete this gate", menu)
+        del_one.setEnabled(not is_protected)
         del_one.triggered.connect(lambda: self._gating_delete_gate(page, idx, cascade=False))
         menu.addAction(del_one)
         del_all = QAction("Delete gate and all children", menu)
+        del_all.setEnabled(not is_protected)
         del_all.triggered.connect(lambda: self._gating_delete_gate(page, idx, cascade=True))
         menu.addAction(del_all)
         menu.exec(tree.viewport().mapToGlobal(pos))
@@ -8281,7 +10324,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(show_percent_cb)
 
         layout.addWidget(QLabel("Gate label font size"))
-        font_spin = QSpinBox()
+        font_spin = _NoWheelSpinBox()
         font_spin.setRange(6, 48)
         font_spin.setValue(int(preview.get("label_font_size", 20)))
         font_spin.setEnabled(enabled)
@@ -8293,7 +10336,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(bold_cb)
 
         layout.addWidget(QLabel("Gate label background opacity (%)"))
-        opacity_spin = QSpinBox()
+        opacity_spin = _NoWheelSpinBox()
         opacity_spin.setRange(0, 100)
         opacity_spin.setValue(int(preview.get("label_bg_opacity", 50)))
         opacity_spin.setEnabled(enabled)
@@ -8368,7 +10411,8 @@ class MainWindow(QMainWindow):
     def _gating_mark_dirty(self, page) -> None:
         page._gating_dirty = True
         self._gating_update_save_btn(page)
-        self._module_set_state(page, MODULE_STATE_MODIFIED)
+        # `page` may be a _GatingState embedded in another module (Unmix).
+        self._module_set_state(getattr(page, "_module_page", page), MODULE_STATE_MODIFIED)
 
     def _gating_save_now(self, page) -> None:
         params = page._gating_task_def.setdefault("params", {})
@@ -8383,7 +10427,12 @@ class MainWindow(QMainWindow):
         self._module_saved(page)
 
     def _gating_update_save_btn(self, page) -> None:
-        page._gating_save_btn.setEnabled(page._gating_dirty and not page._gating_locked)
+        btn = getattr(page, "_gating_save_btn", None)
+        if btn is not None:
+            btn.setEnabled(page._gating_dirty and not page._gating_locked)
+        hook = getattr(page, "_gating_on_dirty", None)
+        if hook is not None:
+            hook()
 
     def _gating_cleanup(self, page) -> None:
         """Remove gate items from the ViewBox before the page is torn down."""
@@ -8465,6 +10514,8 @@ class MainWindow(QMainWindow):
             page = self._build_scaling_page(name, task_def, locked)
         elif task_type == "gating":
             page = self._build_gating_page(name, task_def, locked)
+        elif task_type == "unmix":
+            page = self._build_unmix_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
