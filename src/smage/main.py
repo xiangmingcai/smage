@@ -770,6 +770,9 @@ def _image_geometry(parquet_path):
 
     def col_stat(col):
         idx = names.index(col)
+        cmin = float("inf")
+        cmax = float("-inf")
+        found = False
         for rg in range(pf.metadata.num_row_groups):
             st = pf.metadata.row_group(rg).column(idx).statistics
             if (
@@ -777,7 +780,11 @@ def _image_geometry(parquet_path):
                 and getattr(st, "min", None) is not None
                 and getattr(st, "max", None) is not None
             ):
-                return float(st.min), float(st.max)
+                cmin = min(cmin, float(st.min))
+                cmax = max(cmax, float(st.max))
+                found = True
+        if found:
+            return cmin, cmax
         return None
 
     xs = col_stat("x")
@@ -907,6 +914,7 @@ def _build_image_index_files(parquet_path, progress_cb=None):
         ]
 
     manifest = {
+        "version": 2,
         "file_size": int(Path(parquet_path).stat().st_size),
         "file_mtime": float(Path(parquet_path).stat().st_mtime),
         "xmin": float(xmin),
@@ -928,6 +936,92 @@ def _build_image_index_files(parquet_path, progress_cb=None):
 def _image_load_level(parquet_path, info):
     import numpy as np
     return np.load(_image_index_dir(parquet_path) / info["file"])
+
+
+def _pool_mask(mask, target_blocks):
+    """Pool a (H, W) uint8 mask into {block: (nby, nbx) float32 pass-fraction}."""
+    import numpy as np
+    targets = sorted(int(b) for b in target_blocks)
+    if not targets:
+        return {}
+    out = {}
+    m = mask.astype(np.float64)
+    c = np.ones(m.shape, dtype=np.float64)
+    block = 1
+    tset = set(targets)
+    if block in tset:
+        out[block] = (m / np.maximum(c, 1.0)).astype(np.float32)
+    while block < targets[-1]:
+        block *= 2
+        h, w = m.shape
+        nby = (h + 1) // 2
+        nbx = (w + 1) // 2
+        ph, pw = nby * 2, nbx * 2
+        pm = np.zeros((ph, pw), dtype=np.float64)
+        pc = np.zeros((ph, pw), dtype=np.float64)
+        pm[:h, :w] = m
+        pc[:h, :w] = c
+        m = pm.reshape(nby, 2, nbx, 2).sum(axis=(1, 3))
+        c = pc.reshape(nby, 2, nbx, 2).sum(axis=(1, 3))
+        if block in tset:
+            out[block] = (m / np.maximum(c, 1.0)).astype(np.float32)
+    return out
+
+
+class _ImageFilterWorker:
+    """Background worker that computes gate-filter masks for Image plots."""
+
+    def __init__(self):
+        self._req_q = queue.Queue()
+        self._res_q = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def request(self, key, parquet_path, gates, gate_id, transforms, height, width, blocks):
+        self._req_q.put((key, parquet_path, gates, gate_id, transforms, height, width, blocks))
+
+    def poll(self):
+        out = []
+        while True:
+            try:
+                out.append(self._res_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                req = self._req_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                res = self._compute(*req)
+            except Exception as exc:  # noqa: BLE001
+                res = (req[0], f"Filter could not be applied: {exc}")
+            self._res_q.put(res)
+
+    def _compute(self, key, parquet_path, gates, gate_id, transforms, height, width, blocks):
+        import numpy as np
+        try:
+            mask = _compute_gate_filter_mask(gates, gate_id, parquet_path, transforms)
+        except KeyError as exc:
+            return (key, f"Filter parameter not found: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            return (key, f"Filter could not be applied: {exc}")
+        if mask is None:
+            return (key, "Filter could not be computed (gate has no usable parameters)")
+        mask = np.asarray(mask, dtype=np.uint8)
+        total = int(height) * int(width)
+        if mask.size != total:
+            return (key, f"Filter mask size mismatch ({mask.size} vs {total})")
+        mask_2d = mask.reshape(int(height), int(width))
+        levels = _pool_mask(mask_2d, blocks)
+        return (key, {"mask_2d": mask_2d, "levels": levels})
 
 
 _SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
@@ -3820,6 +3914,12 @@ class MainWindow(QMainWindow):
         page._fig_dirty = False
         save_btn.clicked.connect(lambda _=False: self._figure_save_now(page))
         self._figure_update_save_btn(page)
+        page._fig_filter_timer = QTimer(self)
+        page._fig_filter_timer.setInterval(100)
+        page._fig_filter_timer.timeout.connect(
+            lambda: self._figure_image_filter_on_timer(page)
+        )
+        page._fig_filter_timer.start()
         canvas_view.enter_callback = lambda: self._figure_toggle_break(page, page._fig_selected)
         canvas_view.delete_callback = lambda: self._figure_delete_selected(page)
         canvas_view.unfocus_callback = lambda: self._figure_unfocus(page)
@@ -4207,7 +4307,8 @@ class MainWindow(QMainWindow):
         try:
             st = Path(parquet_path).stat()
             return (
-                manifest.get("file_size") == int(st.st_size)
+                manifest.get("version") == 2
+                and manifest.get("file_size") == int(st.st_size)
                 and abs(manifest.get("file_mtime", 0.0) - st.st_mtime) < 1e-6
             )
         except Exception:
@@ -4248,7 +4349,7 @@ class MainWindow(QMainWindow):
                     break
         return lv
 
-    def _image_raster_raw(self, parquet_path, manifest, bbox, channel):
+    def _image_raster_raw(self, parquet_path, manifest, bbox, channel, mask_ent=None):
         """Rasterise raw pixels inside a bbox (deep zoom beyond the finest level)."""
         import math
         import numpy as np
@@ -4262,9 +4363,9 @@ class MainWindow(QMainWindow):
         try:
             df = pq.read_table(parquet_path, columns=cols, filters=filters).to_pandas()
         except Exception:
-            return None, None
+            return None, None, None
         if len(df) == 0:
-            return None, None
+            return None, None, None
         x = df["x"].to_numpy(dtype="float64")
         y = df["y"].to_numpy(dtype="float64")
         if channel == "x":
@@ -4281,17 +4382,30 @@ class MainWindow(QMainWindow):
         bj = np.clip((y - y0).astype(np.int64), 0, nby - 1)
         bidx = bj * nbx + bi
         cnt = np.bincount(bidx, minlength=nbx * nby).reshape(nby, nbx)
-        ssum = np.bincount(bidx, weights=v, minlength=nbx * nby).reshape(nby, nbx)
-        chan = np.divide(ssum, cnt, out=np.zeros_like(ssum), where=cnt > 0)
+        frac = None
+        if mask_ent is not None and mask_ent.get("mask_2d") is not None:
+            mask2d = mask_ent["mask_2d"]
+            xmin = int(manifest["xmin"])
+            ymin = int(manifest["ymin"])
+            mi = np.clip((x - xmin).astype(np.int64), 0, mask2d.shape[1] - 1)
+            mj = np.clip((y - ymin).astype(np.int64), 0, mask2d.shape[0] - 1)
+            pix_mask = mask2d[mj, mi].astype(np.float64)
+            ssum = np.bincount(bidx, weights=v * pix_mask, minlength=nbx * nby).reshape(nby, nbx)
+            cnt_pass = np.bincount(bidx, weights=pix_mask, minlength=nbx * nby).reshape(nby, nbx)
+            chan = np.divide(ssum, cnt_pass, out=np.zeros_like(ssum), where=cnt_pass > 0)
+            frac = np.divide(cnt_pass, cnt, out=np.zeros_like(cnt_pass), where=cnt > 0)
+        else:
+            ssum = np.bincount(bidx, weights=v, minlength=nbx * nby).reshape(nby, nbx)
+            chan = np.divide(ssum, cnt, out=np.zeros_like(ssum), where=cnt > 0)
         rect = QRectF(x0, y0, x1 - x0, y1 - y0)
-        return chan, rect
+        return chan, rect, frac
 
-    def _image_raster(self, parquet_path, manifest, bbox, spacing, channel):
-        """Return (channel_2d_array, data_rect) for the visible bbox."""
+    def _image_raster(self, parquet_path, manifest, bbox, spacing, channel, mask_ent=None):
+        """Return (channel_2d_array, data_rect, mask_fraction) for the visible bbox."""
         import math
         color_cols = manifest.get("color_cols", [])
         if not color_cols:
-            return None, None
+            return None, None, None
         if channel is None or channel not in color_cols:
             channel = color_cols[0] if color_cols else None
         cidx = color_cols.index(channel) if channel else 0
@@ -4300,9 +4414,9 @@ class MainWindow(QMainWindow):
         ymin = manifest["ymin"]
         levels = manifest.get("levels", [])
         if not levels:
-            return None, None
+            return None, None, None
         if spacing < levels[0]["block"]:
-            return self._image_raster_raw(parquet_path, manifest, bbox, channel)
+            return self._image_raster_raw(parquet_path, manifest, bbox, channel, mask_ent)
         chosen = levels[-1]
         for info in levels:
             if info["block"] >= spacing:
@@ -4310,17 +4424,86 @@ class MainWindow(QMainWindow):
                 break
         arr = self._image_level_2d(parquet_path, chosen["block"])
         if arr is None:
-            return None, None
+            return None, None, None
         b = chosen["block"]
         i0 = max(0, int(math.floor((x0 - xmin) / b)))
         i1 = min(arr.shape[1], int(math.ceil((x1 - xmin) / b)))
         j0 = max(0, int(math.floor((y0 - ymin) / b)))
         j1 = min(arr.shape[0], int(math.ceil((y1 - ymin) / b)))
         if i1 <= i0 or j1 <= j0:
-            return None, None
+            return None, None, None
         crop = arr[j0:j1, i0:i1, cidx]
         rect = QRectF(xmin + i0 * b, ymin + j0 * b, (i1 - i0) * b, (j1 - j0) * b)
-        return crop, rect
+        frac = None
+        if mask_ent is not None:
+            frac_level = mask_ent.get("levels", {}).get(b)
+            if frac_level is not None:
+                frac = frac_level[j0:j1, i0:i1]
+        return crop, rect, frac
+
+    def _image_mask_crop(self, manifest, bbox, spacing, mask_ent):
+        """Return (mask_fraction_2d, data_rect) for the visible bbox (level path)."""
+        import math
+        if mask_ent is None:
+            return None, None
+        levels = manifest.get("levels", [])
+        if not levels:
+            return None, None
+        x0, x1, y0, y1 = bbox
+        xmin = manifest["xmin"]
+        ymin = manifest["ymin"]
+        chosen = levels[-1]
+        for info in levels:
+            if info["block"] >= spacing:
+                chosen = info
+                break
+        frac_level = mask_ent.get("levels", {}).get(chosen["block"])
+        if frac_level is None:
+            return None, None
+        b = chosen["block"]
+        i0 = max(0, int(math.floor((x0 - xmin) / b)))
+        i1 = min(frac_level.shape[1], int(math.ceil((x1 - xmin) / b)))
+        j0 = max(0, int(math.floor((y0 - ymin) / b)))
+        j1 = min(frac_level.shape[0], int(math.ceil((y1 - ymin) / b)))
+        if i1 <= i0 or j1 <= j0:
+            return None, None
+        frac = frac_level[j0:j1, i0:i1]
+        rect = QRectF(xmin + i0 * b, ymin + j0 * b, (i1 - i0) * b, (j1 - j0) * b)
+        return frac, rect
+
+    def _image_filter_worker(self):
+        worker = getattr(self, "_image_filter_worker_obj", None)
+        if worker is None:
+            worker = _ImageFilterWorker()
+            self._image_filter_worker_obj = worker
+            self._image_filter_cache = {}
+            self._image_filter_pending = {}
+        return worker
+
+    def _figure_image_filter_error(self, f, parquet_path):
+        """Return an error string for an invalid filter, or None if it is valid."""
+        gating_task = self._find_task_by_id(f.get("task_id"))
+        if gating_task is None:
+            return "Filter module not found"
+        gates = gating_task.get("params", {}).get("gates", [])
+        by_id = {g["id"]: g for g in gates}
+        chain = []
+        cur = by_id.get(f.get("gate_id"))
+        while cur is not None:
+            chain.append(cur)
+            cur = by_id.get(cur.get("parent"))
+        if not chain:
+            return "Filter gate not found"
+        needed = set()
+        for g in chain:
+            needed |= _gate_needed_columns(g, by_id)
+        existing = set(self._columns_for(parquet_path))
+        missing = needed - existing
+        if missing:
+            return "Filter parameter not in this file: " + ", ".join(
+                sorted(str(m) for m in missing)
+            )
+        return None
 
     def _figure_render_image(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
         """Render an Image plot as a raster (LOD pyramid), ImageJ-style."""
@@ -4343,17 +4526,20 @@ class MainWindow(QMainWindow):
         vb = plot_widget.getPlotItem().getViewBox()
         if not getattr(plot_widget, "_img_fitted", False):
             plot_widget.clear()
-            img = pg.ImageItem()
+            img = pg.ImageItem(axisOrder="row-major")
             plot_widget.addItem(img)
             plot_widget._img_item = img
             plot_widget._img_extent = (
                 manifest["xmin"], manifest["xmax"],
                 manifest["ymin"], manifest["ymax"],
             )
-            vb.invertY(True)
+            vb.setAspectLocked(True)
             vb.disableAutoRange()
-            vb.setXRange(manifest["xmin"], manifest["xmax"], padding=0)
-            vb.setYRange(manifest["ymin"], manifest["ymax"], padding=0)
+            vb.setRange(
+                xRange=(manifest["xmin"], manifest["xmax"]),
+                yRange=(manifest["ymin"], manifest["ymax"]),
+                padding=0,
+            )
             plot_widget._img_fitted = True
         img = plot_widget._img_item
         xr = vb.viewRange()[0]
@@ -4367,7 +4553,63 @@ class MainWindow(QMainWindow):
         spacing = max(1e-12, min((x1 - x0) / wpx, (y1 - y0) / hpx))
 
         mode = plot_dict.get("color_mode", "parameter")
+
+        # Resolve the filter mask (computed in a background worker, cached).
+        mask_ent = None
+        f = plot_dict.get("filter")
+        if f:
+            sig = (f.get("task_id"), f.get("gate_id"))
+            key = (parquet_path, sig)
+            cache = getattr(self, "_image_filter_cache", {})
+            if key not in cache:
+                err = self._figure_image_filter_error(f, parquet_path)
+                if err:
+                    plot_widget.setTitle(err, color="#c0392b", size="10pt")
+                    return
+                worker = self._image_filter_worker()
+                pending = getattr(self, "_image_filter_pending", {})
+                if key not in pending:
+                    pending[key] = True
+                    gating_task = self._find_task_by_id(f.get("task_id"))
+                    gates = copy.deepcopy(gating_task.get("params", {}).get("gates", []))
+                    transforms = copy.deepcopy(
+                        self._upstream_scale_transforms(f.get("task_id"))
+                    )
+                    height = int(round(manifest["ymax"] - manifest["ymin"] + 1))
+                    width = int(round(manifest["xmax"] - manifest["xmin"] + 1))
+                    blocks = [info["block"] for info in manifest.get("levels", [])]
+                    worker.request(
+                        key, parquet_path, gates, f.get("gate_id"),
+                        transforms, height, width, blocks,
+                    )
+                plot_widget.setTitle("Applying filter…", color="#b58900", size="10pt")
+                return
+            mask_ent = cache[key]
+            if isinstance(mask_ent, str):
+                plot_widget.setTitle(mask_ent, color="#c0392b", size="10pt")
+                return
+            if mask_ent is None:
+                plot_widget.setTitle(
+                    "Filter could not be applied", color="#c0392b", size="10pt"
+                )
+                return
+
         if mode == "solid":
+            if mask_ent is not None:
+                frac, rect = self._image_mask_crop(
+                    manifest, (x0, x1, y0, y1), spacing, mask_ent
+                )
+                if frac is None:
+                    img.setVisible(False)
+                    return
+                solid_chan = np.where(frac >= 0.5, 0.0, np.nan).astype("float32")
+                rgb = plot_dict.get("solid_color", (0, 0, 200))
+                lut = np.tile(np.array(rgb, dtype=np.uint8), (256, 1))
+                img.setImage(solid_chan, autoLevels=False, levels=(0.0, 1.0), lut=lut)
+                img.setRect(rect)
+                img.setVisible(True)
+                self._figure_apply_display_options(plot_dict, plot_widget)
+                return
             rgb = plot_dict.get("solid_color", (0, 0, 200))
             lut = np.tile(np.array(rgb, dtype=np.uint8), (256, 1))
             img.setImage(
@@ -4383,8 +4625,8 @@ class MainWindow(QMainWindow):
             return
 
         channel = plot_dict.get("color_param")
-        chan, rect = self._image_raster(
-            parquet_path, manifest, (x0, x1, y0, y1), spacing, channel
+        chan, rect, frac = self._image_raster(
+            parquet_path, manifest, (x0, x1, y0, y1), spacing, channel, mask_ent
         )
         if chan is None:
             img.setVisible(False)
@@ -4400,6 +4642,8 @@ class MainWindow(QMainWindow):
             lo, hi = 0.0, 1.0
         cmap = _figure_colormap(plot_dict.get("palette", "viridis"))
         lut = cmap.getLookupTable(0.0, 1.0, 256)
+        if frac is not None:
+            chan = np.where(frac >= 0.5, chan, np.nan)
         img.setImage(chan, autoLevels=False, levels=(lo, hi), lut=lut)
         img.setRect(rect)
         img.setVisible(True)
@@ -4409,6 +4653,33 @@ class MainWindow(QMainWindow):
         self._figure_render_image(
             plot_dict, plot_widget, column_transforms=page._fig_column_transforms
         )
+
+    def _figure_image_filter_on_timer(self, page) -> None:
+        """Poll the filter worker: cache finished masks and re-render matching plots."""
+        worker = getattr(self, "_image_filter_worker_obj", None)
+        if worker is None or not hasattr(page, "_fig_plots"):
+            return
+        completed = []
+        for key, result in worker.poll():
+            getattr(self, "_image_filter_cache", {})[key] = result
+            getattr(self, "_image_filter_pending", {}).pop(key, None)
+            completed.append(key)
+        if not completed:
+            return
+        for i, p in enumerate(page._fig_plots):
+            if p.get("type") != "image" or i >= len(page._fig_cards):
+                continue
+            rec = self._figure_record(p.get("file"))
+            path = rec.get("parquet") if rec else None
+            f = p.get("filter")
+            if not f or not path:
+                continue
+            key = (path, (f.get("task_id"), f.get("gate_id")))
+            if key in completed:
+                self._figure_render_image(
+                    p, page._fig_cards[i].plot_widget(),
+                    column_transforms=page._fig_column_transforms,
+                )
 
     def _figure_render(self, plot_dict: dict, plot_widget, column_transforms=None) -> None:
         """(Re)draw a plot widget from its plot_dict."""
@@ -4623,10 +4894,15 @@ class MainWindow(QMainWindow):
                 ymin, ymax = extent[2], extent[3]
             vb = plot_widget.getPlotItem().getViewBox()
             vb.disableAutoRange()
-            if xmin is not None and xmax is not None and xmax > xmin:
-                vb.setXRange(float(xmin), float(xmax), padding=0)
-            if ymin is not None and ymax is not None and ymax > ymin:
-                vb.setYRange(float(ymin), float(ymax), padding=0)
+            if (
+                xmin is not None and xmax is not None and xmax > xmin
+                and ymin is not None and ymax is not None and ymax > ymin
+            ):
+                vb.setRange(
+                    xRange=(float(xmin), float(xmax)),
+                    yRange=(float(ymin), float(ymax)),
+                    padding=0,
+                )
             return
         xmin, xmax = plot_dict.get("xmin"), plot_dict.get("xmax")
         if xmin is not None and xmax is not None and xmax > xmin:
@@ -4646,8 +4922,11 @@ class MainWindow(QMainWindow):
             extent = getattr(plot_widget, "_img_extent", None)
             if extent:
                 vb.disableAutoRange()
-                vb.setXRange(extent[0], extent[1], padding=0)
-                vb.setYRange(extent[2], extent[3], padding=0)
+                vb.setRange(
+                    xRange=(extent[0], extent[1]),
+                    yRange=(extent[2], extent[3]),
+                    padding=0,
+                )
             return
         xmin = getattr(plot_widget, "_data_xmin", None)
         xmax = getattr(plot_widget, "_data_xmax", None)
@@ -4708,12 +4987,21 @@ class MainWindow(QMainWindow):
     def _figure_refresh_all(self, page) -> None:
         """Re-render every plot card (used when an upstream module saved)."""
         page._fig_column_transforms = self._upstream_scale_transforms(page._fig_task_id)
+        # Gate definitions may have changed upstream; drop cached image filters.
+        self._image_filter_cache = {}
+        self._image_filter_pending = {}
         for i, card in enumerate(page._fig_cards):
             if i < len(page._fig_plots):
+                plot_widget = card.plot_widget()
+                vb = plot_widget.getPlotItem().getViewBox()
+                xr, yr = vb.viewRange()
                 self._figure_render(
-                    page._fig_plots[i], card.plot_widget(),
+                    page._fig_plots[i], plot_widget,
                     column_transforms=page._fig_column_transforms,
                 )
+                # Keep the view range; only the data (and gate) changed.
+                vb.disableAutoRange()
+                vb.setRange(xRange=(xr[0], xr[1]), yRange=(yr[0], yr[1]), padding=0)
 
     def _figure_set_selection(self, page, indices) -> None:
         """Set the selected plot set (a list of indices) and refresh settings."""
@@ -4835,8 +5123,13 @@ class MainWindow(QMainWindow):
         d = scene_pos - page._fig_pan_scene
         x_scale = (xr[1] - xr[0]) / rect.width() if rect.width() else 1.0
         y_scale = (yr[1] - yr[0]) / plot_h if plot_h else 1.0
-        vb.setXRange(xr[0] - d.x() * x_scale, xr[1] - d.x() * x_scale, padding=0)
-        vb.setYRange(yr[0] + d.y() * y_scale, yr[1] + d.y() * y_scale, padding=0)
+        dx = -d.x() * x_scale
+        dy = d.y() * y_scale
+        vb.setRange(
+            xRange=(xr[0] + dx, xr[1] + dx),
+            yRange=(yr[0] + dy, yr[1] + dy),
+            padding=0,
+        )
         return True
 
     def _figure_plot_pan_end(self, page) -> bool:
@@ -4997,11 +5290,11 @@ class MainWindow(QMainWindow):
             plot_dict, "x", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
         ))
 
-        if _is_scatter_plot(plot_dict.get("type")):
-            layout.addWidget(QLabel("Y range"))
-            layout.addWidget(self._figure_range_row(
-                plot_dict, "y", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
-            ))
+        # Y range (scatter/histogram/image: histograms show the Count axis).
+        layout.addWidget(QLabel("Y range"))
+        layout.addWidget(self._figure_range_row(
+            plot_dict, "y", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
+        ))
 
         # Size (width/height in canvas units).
         layout.addWidget(QLabel("Size (px)"))
@@ -5087,8 +5380,8 @@ class MainWindow(QMainWindow):
             vb = plot_widget.getPlotItem().getViewBox()
             xr, yr = vb.viewRange()
             self._figure_apply_change(page, index, plot_dict)
-            vb.setXRange(xr[0], xr[1], padding=0)
-            vb.setYRange(yr[0], yr[1], padding=0)
+            vb.disableAutoRange()
+            vb.setRange(xRange=(xr[0], xr[1]), yRange=(yr[0], yr[1]), padding=0)
 
         filter_combo.currentIndexChanged.connect(lambda _=0: on_filter_changed())
 
@@ -5436,8 +5729,8 @@ class MainWindow(QMainWindow):
                         page._fig_plots[i], page._fig_cards[i].plot_widget(),
                         column_transforms=page._fig_column_transforms,
                     )
-                    vb.setXRange(xr[0], xr[1], padding=0)
-                    vb.setYRange(yr[0], yr[1], padding=0)
+                    vb.disableAutoRange()
+                    vb.setRange(xRange=(xr[0], xr[1]), yRange=(yr[0], yr[1]), padding=0)
             self._figure_mark_dirty(page)
 
         filter_combo.currentIndexChanged.connect(on_filter_changed)
