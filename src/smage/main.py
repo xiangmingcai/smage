@@ -192,6 +192,19 @@ def _drag_handle_pixmap(color: str = "#8a94a6", size: int = 14) -> QPixmap:
     return pixmap
 
 
+def _comp_cell_color(value, max_positive, min_negative) -> QColor:
+    """Compensation-matrix cell colour: positive red, negative blue, 0 white."""
+    if value > 0 and max_positive > 0:
+        frac = min(1.0, float(value) / float(max_positive))
+        shade = int(255 - 190 * frac)
+        return QColor(255, shade, shade)
+    if value < 0 and min_negative < 0:
+        frac = min(1.0, float(value) / float(min_negative))
+        shade = int(255 - 190 * frac)
+        return QColor(shade, shade, 255)
+    return QColor(255, 255, 255)
+
+
 def _lock_pixmap(color: str = "#b58900", size: int = 14) -> QPixmap:
     """Build a small padlock pixmap for locked modules."""
     pixmap = QPixmap(size, size)
@@ -317,6 +330,102 @@ def _apply_scale_transforms(x, configs):
     for config in (configs or []):
         x = _apply_scale_transform(x, config)
     return x
+
+
+# --- Ordered map-module pipeline (Scale / Compensation / Unmix) -----------
+
+def _pipeline_touches(stages, name) -> bool:
+    """Whether any map stage changes or produces `name`."""
+    for kind, stage in stages:
+        if kind == "scale" and name in stage["columns"]:
+            return True
+        if kind in ("compensation", "unmix") and name in stage["names"]:
+            return True
+    return False
+
+
+def _pipeline_dependencies(stages, names) -> set:
+    """Columns needed before the stages to obtain `names` after them."""
+    needed = set(names)
+    for kind, stage in reversed(stages):
+        if kind == "compensation":
+            if needed & set(stage["names"]):
+                needed |= set(stage["names"])
+        elif kind == "unmix":
+            if needed & set(stage["names"]):
+                needed |= set(stage["columns"])
+    return needed
+
+
+def _linear_combine(sources, weights):
+    """Combine arrays with a (outputs × sources) weight matrix.
+
+    Works for 1D arrays and for 2D arrays (image rasters).
+    """
+    import numpy as np
+
+    if not sources:
+        return []
+    if sources[0].ndim == 1:
+        matrix = np.column_stack(sources)
+        return [matrix @ weights[i] for i in range(weights.shape[0])]
+    stacked = np.stack(sources, axis=0)
+    combined = np.tensordot(weights, stacked, axes=(1, 0))
+    return [combined[i] for i in range(combined.shape[0])]
+
+
+def _evaluate_stages(stages, values, names, parquet_path=None, cache=None):
+    """Apply map-module stages in order to a {column: array} mapping."""
+    import numpy as np
+
+    values = dict(values)
+    for kind, stage in stages:
+        if kind == "scale":
+            for column, config in stage["columns"].items():
+                if column in values:
+                    values[column] = _apply_scale_transform(
+                        values[column], config
+                    )
+            continue
+        if kind == "compensation":
+            if parquet_path is not None and parquet_path not in stage["files"]:
+                continue
+            sources = stage["names"]
+            if not all(name in values for name in sources):
+                continue
+            key = ("comp", stage.get("id"), parquet_path)
+            out = cache.get(key) if cache is not None else None
+            if out is None:
+                combined = _linear_combine(
+                    [values[name] for name in sources], stage["matrix"]
+                )
+                out = dict(zip(sources, combined))
+                if cache is not None:
+                    cache[key] = out
+            values.update(out)
+            continue
+        if kind == "unmix":
+            if parquet_path is not None and parquet_path not in stage["samples"]:
+                continue
+            sources = stage["columns"]
+            if not all(name in values for name in sources):
+                continue
+            key = ("unmix", stage.get("task_id"), parquet_path)
+            out = cache.get(key) if cache is not None else None
+            if out is None:
+                pinv = stage.get("_pinv")
+                if pinv is None:
+                    pinv = np.linalg.pinv(stage["matrix"])
+                    stage["_pinv"] = pinv
+                # C = X · pinv(M): output k = Σ_i X_i · pinv[i, k]
+                combined = _linear_combine(
+                    [values[name] for name in sources], pinv.T
+                )
+                out = dict(zip(stage["names"], combined))
+                if cache is not None:
+                    cache[key] = out
+            values.update(out)
+    return {name: values[name] for name in names if name in values}
 
 
 def _point_in_polygon(x, y, points):
@@ -696,11 +805,11 @@ class _GatingStatsWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def request(self, generation, parquet_path, gates, transforms, existing,
-                affected, extra=None):
+    def request(self, generation, parquet_path, gates, stages, base_columns,
+                affected):
         self._req_q.put(
-            (generation, parquet_path, gates, transforms, existing, affected,
-             extra or {})
+            (generation, parquet_path, gates, stages, set(base_columns),
+             affected)
         )
 
     def poll(self):
@@ -728,11 +837,10 @@ class _GatingStatsWorker:
                 res = None
             self._res_q.put(res)
 
-    def _compute(self, generation, parquet_path, gates, transforms, existing,
-                 affected, extra=None):
+    def _compute(self, generation, parquet_path, gates, stages, base_columns,
+                 affected):
         import numpy as np
         import pandas as pd
-        extra = extra or {}
         if not parquet_path or not gates:
             return (generation, {})
         if self._current_path != parquet_path:
@@ -747,13 +855,12 @@ class _GatingStatsWorker:
         by_id = {g["id"]: g for g in gates}
         needed = set()
         for g in gates:
-            for col in _gate_needed_columns(g, by_id):
-                if col in existing:
-                    needed.add(col)
+            needed |= _gate_needed_columns(g, by_id)
         if not needed:
             return (generation, {})
+        dependencies = _pipeline_dependencies(stages, needed)
+        base_needed = [c for c in dependencies if c in base_columns]
         cols = self._columns
-        base_needed = [c for c in needed if c not in extra]
         missing = set(base_needed) - set(cols)
         if missing:
             try:
@@ -766,17 +873,18 @@ class _GatingStatsWorker:
                 ).to_numpy(dtype="float64")
             self._columns = cols
         arrays = {name: cols[name] for name in base_needed if name in cols}
-        for name in needed:
-            if name in extra:
-                arrays[name] = np.asarray(extra[name], dtype="float64")
-        n_total = len(next(iter(arrays.values()))) if arrays else 0
+        arrays = _evaluate_stages(stages, arrays, needed, parquet_path)
+        existing = set(arrays)
+        if not arrays:
+            return (generation, {})
+        n_total = len(next(iter(arrays.values())))
         by_parent = {}
         for g in gates:
             by_parent.setdefault(g.get("parent"), []).append(g)
 
         def own_mask(g):
             return _gate_own_mask(
-                g, by_id, lambda name: arrays[name], transforms, existing
+                g, by_id, lambda name: arrays[name], {}, existing
             )
 
         def compute_subtree(gid):
@@ -1076,11 +1184,11 @@ class _ImageFilterWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def request(self, key, parquet_path, gates, gate_id, transforms, height,
-                width, blocks, existing=None, extra=None):
+    def request(self, key, parquet_path, gates, gate_id, stages, base_columns,
+                height, width, blocks):
         self._req_q.put((
-            key, parquet_path, gates, gate_id, transforms, height, width,
-            blocks, existing, extra or {},
+            key, parquet_path, gates, gate_id, stages, set(base_columns),
+            height, width, blocks,
         ))
 
     def poll(self):
@@ -1107,13 +1215,31 @@ class _ImageFilterWorker:
                 res = (req[0], f"Filter could not be applied: {exc}")
             self._res_q.put(res)
 
-    def _compute(self, key, parquet_path, gates, gate_id, transforms, height,
-                 width, blocks, existing=None, extra=None):
+    def _compute(self, key, parquet_path, gates, gate_id, stages, base_columns,
+                 height, width, blocks):
         import numpy as np
+        import pandas as pd
+        by_id = {g["id"]: g for g in gates}
+        needed = set()
+        for g in gates:
+            needed |= _gate_needed_columns(g, by_id)
+        dependencies = _pipeline_dependencies(stages, needed)
+        base = [c for c in dependencies if c in base_columns]
+        values = {}
+        if base:
+            try:
+                df = pd.read_parquet(parquet_path, columns=base)
+            except Exception as exc:  # noqa: BLE001
+                return (key, f"Filter could not be applied: {exc}")
+            for name in base:
+                values[name] = pd.to_numeric(
+                    df[name], errors="coerce"
+                ).to_numpy(dtype="float64")
+        values = _evaluate_stages(stages, values, needed, parquet_path)
         try:
             mask = _compute_gate_filter_mask(
-                gates, gate_id, parquet_path, transforms,
-                existing=existing, extra=extra or {},
+                gates, gate_id, parquet_path, {},
+                existing=set(values), extra=values,
             )
         except KeyError as exc:
             return (key, f"Filter parameter not found: {exc}")
@@ -1814,6 +1940,19 @@ class _SkewedQuadrantROI(pg.ROI):
         return path
 
 
+class _ReleaseFilter(QObject):
+    """Run a callback after a mouse button is released."""
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._callback = callback
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            QTimer.singleShot(0, self._callback)
+        return False
+
+
 class _ClickFilter(QObject):
     """Select a plot card when its widget (or embedded plot) is clicked."""
 
@@ -2334,9 +2473,10 @@ class MainWindow(QMainWindow):
         self._updating_sample = False
         self._current_entry = None
         self._module_registry = {}
-        # On-the-fly Unmix outputs: per-task matrix configs and per-file values.
+        # On-the-fly Unmix configs and computed map-stage outputs.
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
+        self._stage_cache = {}
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 800)
         self._build_menu_bar()
@@ -2365,6 +2505,7 @@ class MainWindow(QMainWindow):
                 or getattr(widget, "_scaling_dirty", False)
                 or getattr(widget, "_gating_dirty", False)
                 or getattr(widget, "_unmix_dirty", False)
+                or getattr(widget, "_comp_dirty", False)
             ):
                 return True
         return False
@@ -2473,6 +2614,7 @@ class MainWindow(QMainWindow):
             self.tabs.removeTab(self.tabs.count() - 1)
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
+        self._stage_cache = {}
 
     def _import_task(self):
         """Return the fixed 'import' task, or None."""
@@ -3880,9 +4022,12 @@ class MainWindow(QMainWindow):
     def _rel_data_key(self, parquet_path) -> str:
         """Return the parquet path relative to the data dir (index key)."""
         try:
-            return Path(parquet_path).relative_to(self.project.data_dir).as_posix()
-        except ValueError:
-            return Path(parquet_path).name
+            data_dir = self.project.data_dir if self.project is not None else None
+            if data_dir is not None:
+                return Path(parquet_path).relative_to(data_dir).as_posix()
+        except (ValueError, AttributeError):
+            pass
+        return Path(parquet_path).name
 
     def _columns_for(self, parquet_path, task_id=None) -> list:
         """Return the column names for a parquet file from the column index.
@@ -4047,6 +4192,7 @@ class MainWindow(QMainWindow):
             "columns": columns,
             "matrix": np.asarray(rows, dtype="float64"),
             "method": params.get("method", "ols"),
+            "samples": set(params.get("samples") or []),
         }
         self._unmix_flow_cache[task_id] = config
         return config
@@ -4070,100 +4216,93 @@ class MainWindow(QMainWindow):
                 values[name] = float(np.median(arr))
         return values
 
-    def _unmix_file_values(self, config, parquet_path) -> dict:
-        """Compute ``C = X · pinv(M)`` for one file; return {name: array}."""
-        import numpy as np
-        import pandas as pd
+    def _map_stages(self, task_id) -> list:
+        """Ordered Scale / Compensation / Unmix stages upstream of a task.
 
-        key = (config["task_id"], parquet_path)
-        cached = self._unmix_value_cache.get(key)
-        if cached is not None:
-            return cached
-        base = set(self._column_index.get(self._rel_data_key(parquet_path), []))
-        columns = list(config["columns"])
-        if any(c not in base for c in columns):
-            return {}
-        transforms = self._upstream_scale_transforms(config["task_id"])
-        try:
-            df = pd.read_parquet(parquet_path, columns=columns)
-        except Exception:  # noqa: BLE001
-            return {}
-        arrays = []
-        for column in columns:
-            arr = pd.to_numeric(df[column], errors="coerce").to_numpy(
-                dtype="float64"
-            )
-            arr = _apply_scale_transforms(arr, transforms.get(column))
-            arrays.append(np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0))
-        matrix = np.column_stack(arrays) if arrays else np.empty((len(df), 0))
-        pseudo_inverse = config.get("_pinv")
-        if pseudo_inverse is None:
-            pseudo_inverse = np.linalg.pinv(config["matrix"])
-            config["_pinv"] = pseudo_inverse
-        coefficients = matrix @ pseudo_inverse
-        result = {
-            name: coefficients[:, i]
-            for i, name in enumerate(config["names"])
-        }
-        self._unmix_value_cache[key] = result
-        return result
-
-    def _unmix_column_values(self, task_id, parquet_path, name):
-        """Values of one unmixed parameter, or None if it does not apply."""
-        for config in self._upstream_unmix_configs(task_id, parquet_path):
-            if name in config["names"]:
-                values = self._unmix_file_values(config, parquet_path)
-                return values.get(name)
-        return None
-
-    def _unmix_weights_for(self, task_id, parquet_path, name):
-        """Linear channel weights that produce an unmixed parameter.
-
-        An unmixed coefficient is ``sum_j pinv(M)[j, k] * channel_j``, so an
-        image raster can be built from per-channel means (or raw pixels).
+        Each module only declares its own input→output rule; this list is the
+        workflow order the data flows through.
         """
         import numpy as np
 
-        for config in self._upstream_unmix_configs(task_id, parquet_path):
-            if name not in config["names"]:
+        stages = []
+        if not task_id:
+            return stages
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id:
                 continue
-            pseudo_inverse = config.get("_pinv")
-            if pseudo_inverse is None:
-                pseudo_inverse = np.linalg.pinv(config["matrix"])
-                config["_pinv"] = pseudo_inverse
-            k = config["names"].index(name)
-            return {
-                column: float(pseudo_inverse[i, k])
-                for i, column in enumerate(config["columns"])
-            }
-        return None
+            task_type = task.get("type")
+            params = task.get("params") or {}
+            if task_type == "scale":
+                columns = {
+                    c["name"]: c
+                    for c in params.get("columns", [])
+                    if c.get("name")
+                }
+                if columns:
+                    stages.append(("scale", {"columns": columns}))
+            elif task_type == "compensation":
+                names = list(params.get("params") or [])
+                matrix = params.get("matrix") or []
+                files = set(params.get("files") or [])
+                if names and files and len(matrix) == len(names):
+                    stages.append(("compensation", {
+                        "id": task.get("id"),
+                        "files": files,
+                        "names": names,
+                        "matrix": np.asarray(matrix, dtype="float64") / 100.0,
+                    }))
+            elif task_type == "unmix":
+                config = self._unmix_flow_config(task)
+                if config is not None:
+                    stages.append(("unmix", config))
+        return stages
 
-    def _unmix_extras(self, task_id, parquet_path, names=None) -> dict:
-        """Unmixed parameters of a file as {name: array}, for gate masks."""
-        extras = {}
-        for config in self._upstream_unmix_configs(task_id, parquet_path):
-            values = self._unmix_file_values(config, parquet_path)
-            for name, array in values.items():
-                if names is None or name in names:
-                    extras[name] = array
-        return extras
-
-    def _read_columns(self, parquet_path, columns, task_id=None):
-        """Read columns from a parquet, computing unmixed ones on the fly."""
+    def _column_data(self, task_id, parquet_path, names) -> dict:
+        """Column values as seen at `task_id`, with upstream map stages applied."""
         import pandas as pd
 
+        if not parquet_path or not names:
+            return {}
+        names = list(names)
+        stages = self._map_stages(task_id) if task_id else []
         base = set(self._column_index.get(self._rel_data_key(parquet_path), []))
-        base_cols = [c for c in columns if c in base]
-        virtual = [c for c in columns if c not in base]
-        df = pd.read_parquet(parquet_path, columns=base_cols) if base_cols else pd.DataFrame()
-        for name in virtual:
-            values = self._unmix_column_values(task_id, parquet_path, name)
-            if values is None:
-                continue
-            if len(df) not in (0, len(values)):
-                continue
-            df[name] = values
-        return df
+        if not base:
+            try:
+                import pyarrow.parquet as pq
+                base = set(pq.ParquetFile(parquet_path).schema.names)
+            except Exception:  # noqa: BLE001
+                base = set()
+        needed = _pipeline_dependencies(stages, names) if stages else set(names)
+        base_cols = [c for c in needed if c in base]
+        values = {}
+        if base_cols:
+            try:
+                df = pd.read_parquet(parquet_path, columns=base_cols)
+            except Exception:  # noqa: BLE001
+                df = None
+            if df is not None:
+                for column in base_cols:
+                    values[column] = pd.to_numeric(
+                        df[column], errors="coerce"
+                    ).to_numpy(dtype="float64")
+        if not stages:
+            return {n: values[n] for n in names if n in values}
+        evaluated = _evaluate_stages(
+            stages, values, needed, parquet_path=parquet_path,
+            cache=self._stage_cache,
+        )
+        return {n: evaluated[n] for n in names if n in evaluated}
+
+    def _read_columns(self, parquet_path, columns, task_id=None):
+        """Read columns from a parquet with upstream map stages applied."""
+        import pandas as pd
+
+        values = self._column_data(task_id, parquet_path, list(columns))
+        if not values:
+            return pd.DataFrame()
+        return pd.DataFrame({
+            name: values[name] for name in columns if name in values
+        })
 
     def _clear_layout(self, layout) -> None:
         """Remove and delete every widget/layout inside a layout."""
@@ -4264,7 +4403,7 @@ class MainWindow(QMainWindow):
         page._fig_snapshot = copy.deepcopy(task_def.get("params", {}))
         page._fig_task_def = task_def
         page._fig_task_id = task_def.get("id")
-        page._fig_column_transforms = self._upstream_scale_transforms(page._fig_task_id)
+        page._fig_column_transforms = {}  # upstream axes are applied by _column_data
         page._fig_plots = task_def.setdefault("params", {}).setdefault("plots", [])
         # Backfill last-used axis parameters for older projects.
         for pd_ in page._fig_plots:
@@ -4649,18 +4788,18 @@ class MainWindow(QMainWindow):
         if rec is None:
             return None, "No data file"
         filter_task = f.get("task_id")
-        existing = set(self._columns_for(rec.get("parquet"), filter_task))
-        missing = needed - existing
+        values = self._column_data(
+            filter_task, rec["parquet"], list(needed)
+        )
+        missing = needed - set(values)
         if missing:
             return None, "Filter parameter not in this file: " + ", ".join(
                 sorted(str(m) for m in missing)
             )
-        transforms = self._upstream_scale_transforms(filter_task)
         try:
             mask = _compute_gate_filter_mask(
-                gates, f.get("gate_id"), rec["parquet"], transforms,
-                existing=existing,
-                extra=self._unmix_extras(filter_task, rec["parquet"]),
+                gates, f.get("gate_id"), rec["parquet"], {},
+                existing=set(values), extra=values,
             )
         except Exception:
             return None, "Filter could not be applied"
@@ -4726,26 +4865,26 @@ class MainWindow(QMainWindow):
         return lv
 
     def _image_raster_raw(self, parquet_path, manifest, bbox, channel,
-                          mask_ent=None, weights=None):
+                          mask_ent=None, stages=None):
         """Rasterise raw pixels inside a bbox (deep zoom beyond the finest level).
 
-        `weights` renders a linear combination of channels (an unmixed
-        parameter) instead of a single channel.
+        `stages` evaluates the ordered map pipeline (Scale / Compensation /
+        Unmix) per pixel instead of reading one channel.
         """
         import math
         import numpy as np
         import pyarrow.parquet as pq
         color_cols = manifest.get("color_cols", [])
-        if weights is not None:
-            wanted = list(weights)
+        if stages is not None:
+            needed = _pipeline_dependencies(stages, [channel])
+            wanted = [c for c in needed if c not in ("x", "y")]
         else:
+            needed = {channel}
             if channel is None or channel not in color_cols:
                 channel = color_cols[0] if color_cols else None
-            wanted = ["x", "y"] if channel in ("x", "y") else (
-                ["x", "y"] + ([channel] if channel else [])
-            )
+            wanted = [channel] if channel else []
         x0, x1, y0, y1 = bbox
-        cols = list(dict.fromkeys(["x", "y"] + [c for c in wanted if c not in ("x", "y")]))
+        cols = list(dict.fromkeys(["x", "y"] + wanted))
         filters = [("y", ">=", y0), ("y", "<=", y1), ("x", ">=", x0), ("x", "<=", x1)]
         try:
             df = pq.read_table(parquet_path, columns=cols, filters=filters).to_pandas()
@@ -4755,18 +4894,23 @@ class MainWindow(QMainWindow):
             return None, None, None
         x = df["x"].to_numpy(dtype="float64")
         y = df["y"].to_numpy(dtype="float64")
-        if weights is not None:
-            v = np.zeros(len(df))
-            for name, weight in weights.items():
-                if name == "x":
-                    col = x
-                elif name == "y":
-                    col = y
-                elif name in df.columns:
-                    col = df[name].to_numpy(dtype="float64")
+        if stages is not None:
+            values = {}
+            if "x" in needed:
+                values["x"] = x
+            if "y" in needed:
+                values["y"] = y
+            for name in wanted:
+                if name in df.columns:
+                    values[name] = df[name].to_numpy(dtype="float64")
                 else:
                     return None, None, None
-                v = v + float(weight) * col
+            evaluated = _evaluate_stages(
+                stages, values, [channel], parquet_path
+            )
+            if channel not in evaluated:
+                return None, None, None
+            v = evaluated[channel]
         elif channel == "x":
             v = x
         elif channel == "y":
@@ -4800,23 +4944,66 @@ class MainWindow(QMainWindow):
         return chan, rect, frac
 
     def _image_raster(self, parquet_path, manifest, bbox, spacing, channel,
-                      mask_ent=None, weights=None):
+                      mask_ent=None, stages=None):
         """Return (channel_2d_array, data_rect, mask_fraction) for the visible bbox.
 
-        `weights` renders a linear combination of channels (an unmixed
-        parameter) instead of a single channel. Because block levels store
-        channel means, the combination is exact at every zoom level.
+        `stages` evaluates the ordered map pipeline (Scale / Compensation /
+        Unmix). Linear stages are exact on the block means; Scale stages are
+        applied to the aggregated values.
         """
         import math
         import numpy as np
         color_cols = manifest.get("color_cols", [])
         if not color_cols:
             return None, None, None
-        if weights is not None and not all(c in color_cols for c in weights):
-            # Not all inputs are indexed; fall back to raw pixels.
-            return self._image_raster_raw(
-                parquet_path, manifest, bbox, channel, mask_ent, weights
+        if stages is not None:
+            needed = _pipeline_dependencies(stages, [channel])
+            if not all(c in color_cols for c in needed):
+                # Not all inputs are indexed; fall back to raw pixels.
+                return self._image_raster_raw(
+                    parquet_path, manifest, bbox, channel, mask_ent, stages
+                )
+            levels = manifest.get("levels", [])
+            if not levels or spacing < levels[0]["block"]:
+                return self._image_raster_raw(
+                    parquet_path, manifest, bbox, channel, mask_ent, stages
+                )
+            chosen = levels[-1]
+            for info in levels:
+                if info["block"] >= spacing:
+                    chosen = info
+                    break
+            arr = self._image_level_2d(parquet_path, chosen["block"])
+            if arr is None:
+                return None, None, None
+            x0, x1, y0, y1 = bbox
+            xmin = manifest["xmin"]
+            ymin = manifest["ymin"]
+            b = chosen["block"]
+            i0 = max(0, int(math.floor((x0 - xmin) / b)))
+            i1 = min(arr.shape[1], int(math.ceil((x1 - xmin) / b)))
+            j0 = max(0, int(math.floor((y0 - ymin) / b)))
+            j1 = min(arr.shape[0], int(math.ceil((y1 - ymin) / b)))
+            if i1 <= i0 or j1 <= j0:
+                return None, None, None
+            values = {
+                name: arr[j0:j1, i0:i1, color_cols.index(name)]
+                for name in needed if name in color_cols
+            }
+            evaluated = _evaluate_stages(
+                stages, values, [channel], parquet_path
             )
+            if channel not in evaluated:
+                return None, None, None
+            rect = QRectF(
+                xmin + i0 * b, ymin + j0 * b, (i1 - i0) * b, (j1 - j0) * b
+            )
+            frac = None
+            if mask_ent is not None:
+                frac_level = mask_ent.get("levels", {}).get(b)
+                if frac_level is not None:
+                    frac = frac_level[j0:j1, i0:i1]
+            return evaluated[channel], rect, frac
         if channel is None or channel not in color_cols:
             channel = color_cols[0] if color_cols else None
         cidx = color_cols.index(channel) if channel else 0
@@ -4828,7 +5015,7 @@ class MainWindow(QMainWindow):
             return None, None, None
         if spacing < levels[0]["block"]:
             return self._image_raster_raw(
-                parquet_path, manifest, bbox, channel, mask_ent, weights
+                parquet_path, manifest, bbox, channel, mask_ent, None
             )
         chosen = levels[-1]
         for info in levels:
@@ -4845,12 +5032,7 @@ class MainWindow(QMainWindow):
         j1 = min(arr.shape[0], int(math.ceil((y1 - ymin) / b)))
         if i1 <= i0 or j1 <= j0:
             return None, None, None
-        if weights is not None:
-            crop = np.zeros((j1 - j0, i1 - i0), dtype="float32")
-            for name, weight in weights.items():
-                crop += float(weight) * arr[j0:j1, i0:i1, color_cols.index(name)]
-        else:
-            crop = arr[j0:j1, i0:i1, cidx]
+        crop = arr[j0:j1, i0:i1, cidx]
         rect = QRectF(xmin + i0 * b, ymin + j0 * b, (i1 - i0) * b, (j1 - j0) * b)
         frac = None
         if mask_ent is not None:
@@ -4915,8 +5097,8 @@ class MainWindow(QMainWindow):
         needed = set()
         for g in chain:
             needed |= _gate_needed_columns(g, by_id)
-        existing = set(self._columns_for(parquet_path, f.get("task_id")))
-        missing = needed - existing
+        values = self._column_data(f.get("task_id"), parquet_path, list(needed))
+        missing = needed - set(values)
         if missing:
             return "Filter parameter not in this file: " + ", ".join(
                 sorted(str(m) for m in missing)
@@ -4999,19 +5181,18 @@ class MainWindow(QMainWindow):
                     pending[key] = True
                     gating_task = self._find_task_by_id(f.get("task_id"))
                     gates = copy.deepcopy(gating_task.get("params", {}).get("gates", []))
-                    transforms = copy.deepcopy(
-                        self._upstream_scale_transforms(f.get("task_id"))
+                    stages = self._map_stages(f.get("task_id"))
+                    base_columns = set(
+                        self._column_index.get(
+                            self._rel_data_key(parquet_path), []
+                        )
                     )
                     height = int(round(manifest["ymax"] - manifest["ymin"] + 1))
                     width = int(round(manifest["xmax"] - manifest["xmin"] + 1))
                     blocks = [info["block"] for info in manifest.get("levels", [])]
                     worker.request(
                         key, parquet_path, gates, f.get("gate_id"),
-                        transforms, height, width, blocks,
-                        existing=set(self._columns_for(
-                            parquet_path, f.get("task_id")
-                        )),
-                        extra=self._unmix_extras(f.get("task_id"), parquet_path),
+                        stages, base_columns, height, width, blocks,
                     )
                 plot_widget.setTitle("Applying filter…", color="#b58900", size="10pt")
                 return
@@ -5057,19 +5238,20 @@ class MainWindow(QMainWindow):
 
         channel = plot_dict.get("color_param")
         color_cols = manifest.get("color_cols", [])
-        weights = None
         if channel is None:
             # Nothing selected: default to the first real channel (never x/y).
             channel = next(
                 (c for c in color_cols if c not in ("x", "y")),
                 color_cols[0] if color_cols else None,
             )
-        elif channel not in color_cols:
-            # An unmixed parameter: render it as a linear combination of the
-            # indexed image channels. Anything else is not renderable.
-            if task_id:
-                weights = self._unmix_weights_for(task_id, parquet_path, channel)
-            if weights is None:
+        stages = self._map_stages(task_id) if task_id else []
+        if channel is not None and channel not in color_cols:
+            # Only parameters produced by an Unmix module can be rendered here.
+            produced = any(
+                kind == "unmix" and channel in stage["names"]
+                for kind, stage in stages
+            )
+            if not produced:
                 plot_widget.clear()
                 plot_widget._img_fitted = False
                 plot_widget.setTitle(
@@ -5077,14 +5259,15 @@ class MainWindow(QMainWindow):
                     color="#c0392b", size="10pt",
                 )
                 return
+        raster_stages = stages if _pipeline_touches(stages, channel) else None
         chan, rect, frac = self._image_raster(
             parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
-            mask_ent, weights,
+            mask_ent, raster_stages,
         )
         if chan is None:
             img.setVisible(False)
             return
-        cname = channel
+        cname = channel if raster_stages is None else None
         ranges = manifest.get("color_ranges", {}) or {}
         lo, hi = ranges.get(cname, (None, None))
         if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -5461,7 +5644,7 @@ class MainWindow(QMainWindow):
 
     def _figure_refresh_all(self, page) -> None:
         """Re-render every plot card (used when an upstream module saved)."""
-        page._fig_column_transforms = self._upstream_scale_transforms(page._fig_task_id)
+        page._fig_column_transforms = {}  # upstream axes are applied by _column_data
         # Gate definitions may have changed upstream; drop cached image filters.
         self._image_filter_cache = {}
         self._image_filter_pending = {}
@@ -7081,9 +7264,9 @@ class MainWindow(QMainWindow):
         preview["xmax"] = x_cfg.get("max") if x_cfg else None
         preview["ymin"] = y_cfg.get("min") if y_cfg else None
         preview["ymax"] = y_cfg.get("max") if y_cfg else None
-        # Compose transforms: upstream scale modules (chain order), then this
-        # module's own current (possibly unsaved) config on top.
-        transforms = self._upstream_scale_transforms(page._scaling_task_id)
+        # Upstream stages are applied by the data pipeline; this module's own
+        # current (possibly unsaved) config goes on top for the preview.
+        transforms = {}
         for c in page._scaling_columns:
             if c.get("name"):
                 transforms.setdefault(c["name"], []).append(c)
@@ -7198,9 +7381,10 @@ class MainWindow(QMainWindow):
 
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""
-        # Any saved change can alter on-the-fly unmixing downstream.
+        # Any saved change can alter the data flowing downstream.
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
+        self._stage_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
         task_id = page.property("task_id")
         for dtid in self._module_descendant_ids(task_id):
@@ -7930,35 +8114,33 @@ class MainWindow(QMainWindow):
         parquet = preview.get("file")
         if not parquet:
             return None, None, "The gate tree has no data file."
-        transforms = self._upstream_scale_transforms(task_id)
-        extra = self._unmix_extras(task_id, parquet)
+        # Gate columns and spectrum columns are evaluated through the same
+        # ordered pipeline, so upstream Scale/Compensation modules apply.
+        by_id = {g["id"]: g for g in gates}
+        needed = set()
+        for g in gates:
+            needed |= _gate_needed_columns(g, by_id)
+        gate_values = self._column_data(task_id, parquet, list(needed))
         try:
             mask = _compute_gate_filter_mask(
-                gates, gate["id"], parquet, transforms,
-                existing=set(self._columns_for(parquet, task_id)),
-                extra=extra,
+                gates, gate["id"], parquet, {},
+                existing=set(gate_values), extra=gate_values,
             )
         except Exception as exc:  # noqa: BLE001
             return None, None, f"Could not compute the gate: {exc}"
         if mask is None:
             return None, None, "Could not compute the gate (missing parameters)."
 
-        file_columns = set(self._columns_for(parquet))
-        names = [p for p in columns if p in file_columns]
+        data = self._column_data(task_id, parquet, columns)
+        names = [p for p in columns if p in data]
         if not names:
             return None, None, "No parameters selected."
-        try:
-            import pandas as pd
-            df = pd.read_parquet(parquet, columns=names)
-        except Exception as exc:  # noqa: BLE001
-            return None, None, f"Could not read the data: {exc}"
         mask = np.asarray(mask, dtype=bool)
-        if mask.size != len(df):
-            return None, None, "Gate mask size mismatch."
         arrays = []
         for name in names:
-            arr = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype="float64")
-            arr = _apply_scale_transforms(arr, transforms.get(name))
+            arr = np.asarray(data[name], dtype="float64")
+            if arr.size != mask.size:
+                return None, None, "Gate mask size mismatch."
             arr = arr[mask]
             arr = arr[np.isfinite(arr)]
             arrays.append(arr)
@@ -8221,19 +8403,20 @@ class MainWindow(QMainWindow):
         color_btn.clicked.connect(lambda _=False: pick_line_color())
         decimals_spin.valueChanged.connect(on_decimals_changed)
 
-    def _unmix_edit_spectrum_parameters(self, page) -> None:
-        """Pick a spectrum's parameters and their order in a fixed-size dialog.
+    def _pick_items_dialog(self, title, items, selected,
+                           placeholder="Filter...") -> list | None:
+        """Reusable multi-select dialog.
 
-        The dialog has a filter box, a tri-state "Select all" that applies to
-        the rows currently shown, checkable rows with Shift-range toggling, and
-        a "<selected>/<available>" counter.
+        Filter box, tri-state "Select all" over the currently visible rows,
+        checkable rows with Shift-range toggling and a
+        "<selected>/<available>" counter. Returns the checked labels in `items`
+        order, or None when the dialog is cancelled.
         """
-        cfg = page._unmix_spectrum_cfg
-        ordered = self._unmix_sync_spectrum_params(page)
-        selected = set(cfg.get("enabled") or [])
+        selected = set(selected or [])
+        result = {"value": None}
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Spectrum parameters")
+        dialog.setWindowTitle(title)
         dialog.setMinimumSize(340, 420)
         dialog.resize(380, 560)
         layout = QVBoxLayout(dialog)
@@ -8241,29 +8424,29 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         filter_edit = QLineEdit()
-        filter_edit.setPlaceholderText("Filter parameters...")
+        filter_edit.setPlaceholderText(placeholder)
         layout.addWidget(filter_edit)
 
         select_all = QCheckBox("Select all")
         select_all.setTristate(True)
         layout.addWidget(select_all)
 
-        params_list = QListWidget()
-        params_list.setSelectionMode(
+        item_list = QListWidget()
+        item_list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        params_list.setStyleSheet(
+        item_list.setStyleSheet(
             "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
         )
-        for name in ordered:
+        for name in items:
             item = QListWidgetItem(name)
             item.setData(Qt.ItemDataRole.UserRole, name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
                 Qt.CheckState.Checked if name in selected else Qt.CheckState.Unchecked
             )
-            params_list.addItem(item)
-        layout.addWidget(params_list, 1)
+            item_list.addItem(item)
+        layout.addWidget(item_list, 1)
 
         count_label = QLabel("")
         layout.addWidget(count_label)
@@ -8282,9 +8465,9 @@ class MainWindow(QMainWindow):
 
         def visible_items():
             return [
-                params_list.item(i)
-                for i in range(params_list.count())
-                if not params_list.item(i).isHidden()
+                item_list.item(i)
+                for i in range(item_list.count())
+                if not item_list.item(i).isHidden()
             ]
 
         def update_counts() -> None:
@@ -8308,10 +8491,10 @@ class MainWindow(QMainWindow):
             target = (
                 Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
             )
-            params_list.blockSignals(True)
+            item_list.blockSignals(True)
             for item in visible_items():
                 item.setCheckState(target)
-            params_list.blockSignals(False)
+            item_list.blockSignals(False)
             update_counts()
 
         def on_select_all(_checked=False) -> None:
@@ -8325,17 +8508,17 @@ class MainWindow(QMainWindow):
 
         def apply_filter(text: str) -> None:
             needle = text.strip().lower()
-            params_list.blockSignals(True)
-            for i in range(params_list.count()):
-                item = params_list.item(i)
+            item_list.blockSignals(True)
+            for i in range(item_list.count()):
+                item = item_list.item(i)
                 item.setHidden(
                     bool(needle) and needle not in item.text().lower()
                 )
-            params_list.blockSignals(False)
+            item_list.blockSignals(False)
             update_counts()
 
         def on_item_clicked(item) -> None:
-            row = params_list.row(item)
+            row = item_list.row(item)
             modifiers = QApplication.keyboardModifiers()
             if (
                 modifiers & Qt.KeyboardModifier.ShiftModifier
@@ -8343,39 +8526,47 @@ class MainWindow(QMainWindow):
             ):
                 lo, hi = sorted((anchor["row"], row))
                 state = item.checkState()
-                params_list.blockSignals(True)
+                item_list.blockSignals(True)
                 for r in range(lo, hi + 1):
-                    other = params_list.item(r)
+                    other = item_list.item(r)
                     if not other.isHidden():
                         other.setCheckState(state)
-                params_list.blockSignals(False)
+                item_list.blockSignals(False)
             anchor["row"] = row
             update_counts()
 
         def on_accept() -> None:
-            order = []
-            enabled = []
-            for i in range(params_list.count()):
-                item = params_list.item(i)
-                name = item.data(Qt.ItemDataRole.UserRole)
-                order.append(name)
-                if item.checkState() == Qt.CheckState.Checked:
-                    enabled.append(name)
-            cfg["params"] = order
-            cfg["enabled"] = enabled
+            result["value"] = [
+                item_list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(item_list.count())
+                if item_list.item(i).checkState() == Qt.CheckState.Checked
+            ]
             dialog.accept()
 
         filter_edit.textChanged.connect(apply_filter)
         select_all.clicked.connect(on_select_all)
-        params_list.itemClicked.connect(on_item_clicked)
-        params_list.itemChanged.connect(lambda _item: update_counts())
+        item_list.itemClicked.connect(on_item_clicked)
+        item_list.itemChanged.connect(lambda _item: update_counts())
         cancel_btn.clicked.connect(dialog.reject)
         ok_btn.clicked.connect(on_accept)
 
         update_counts()
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return result["value"]
+
+    def _unmix_edit_spectrum_parameters(self, page) -> None:
+        """Pick which parameters a spectrum contains (shared picker dialog)."""
+        cfg = page._unmix_spectrum_cfg
+        ordered = self._unmix_sync_spectrum_params(page)
+        chosen = self._pick_items_dialog(
+            "Spectrum parameters", ordered, set(cfg.get("enabled") or []),
+            "Filter parameters...",
+        )
+        if chosen is None:
             return
-        # Rebuild the panel so the ordered list of selected parameters updates.
+        chosen_set = set(chosen)
+        cfg["enabled"] = [p for p in cfg.get("params", []) if p in chosen_set]
         self._unmix_rebuild_spectrum_settings(page)
         self._unmix_render_spectrum_plot(page)
         self._unmix_mark_dirty(page)
@@ -9173,6 +9364,517 @@ class MainWindow(QMainWindow):
                 return
             page._unmix_task_def["params"] = page._unmix_snapshot
         self._unmix_cleanup(page)
+        self._close_module_page(page)
+
+    # ----- compensation module (map) -----------------------------------
+    def _build_compensation_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Compensation page: files (1) | matrix (5)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Toolbar with Save/Close.
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._comp_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("files", [])
+        params.setdefault("params", [])
+        params.setdefault("matrix", [])
+        page._comp_task_def = task_def
+        page._comp_task_id = task_def.get("id")
+        page._comp_params = params
+        page._comp_files = params["files"]
+        page._comp_names = params["params"]
+        page._comp_matrix = params["matrix"]
+        page._comp_locked = locked
+        page._comp_save_btn = save_btn
+        page._comp_dirty = False
+        page._comp_snapshot = copy.deepcopy(params)
+        page._comp_order_timer = QTimer(self)
+        page._comp_order_timer.setSingleShot(True)
+        page._comp_order_timer.setInterval(400)
+        page._comp_order_timer.timeout.connect(
+            lambda: self._comp_reordered(page)
+        )
+        save_btn.clicked.connect(lambda _=False: self._comp_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QHBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(12)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._comp_files_panel(page))
+        splitter.addWidget(self._comp_matrix_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 5)
+        splitter.setSizes([220, 1100])
+        row.addWidget(splitter, 1)
+        layout.addWidget(content, 1)
+
+        self._comp_refresh(page)
+        self._comp_update_save_btn(page)
+        return page
+
+    def _comp_files_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        set_btn = QPushButton("Set Files")
+        set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        set_btn.setEnabled(not page._comp_locked and bool(page._comp_names))
+        set_btn.clicked.connect(lambda _=False: self._comp_set_files(page))
+        lay.addWidget(set_btn)
+        files_list = QListWidget()
+        files_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: none; }"
+        )
+        lay.addWidget(files_list, 1)
+        page._comp_files_list = files_list
+        page._comp_setfiles_btn = set_btn
+        return panel
+
+    def _comp_matrix_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        set_btn = QPushButton("Set Compensation Matrix")
+        set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        set_btn.setEnabled(not page._comp_locked)
+        set_btn.clicked.connect(lambda _=False: self._comp_set_params(page))
+        top.addWidget(set_btn)
+        top.addStretch()
+        copy_btn = QPushButton("Copy Matrix")
+        paste_btn = QPushButton("Paste Matrix")
+        for btn in (copy_btn, paste_btn):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.clicked.connect(lambda _=False: self._comp_copy_matrix(page))
+        paste_btn.clicked.connect(lambda _=False: self._comp_paste_matrix(page))
+        top.addWidget(copy_btn)
+        top.addWidget(paste_btn)
+        lay.addLayout(top)
+
+        table = QTableWidget()
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: none; }"
+            "QTableWidget::item:selected { background: #dbeafa; }"
+        )
+        table.verticalHeader().setDefaultSectionSize(26)
+        table.verticalHeader().setSectionsMovable(True)
+        table.verticalHeader().sectionMoved.connect(
+            lambda *_: page._comp_order_timer.start()
+        )
+        # Apply the new order as soon as the drag is released (the timer above
+        # is only a fallback), so a mid-drag rebuild cannot misplace rows.
+        release_filter = _ReleaseFilter(lambda: self._comp_reordered(page))
+        table.verticalHeader().viewport().installEventFilter(release_filter)
+        page._comp_release_filter = release_filter
+        table.horizontalHeader().setDefaultSectionSize(66)
+        table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.AnyKeyPressed
+        )
+        table.itemChanged.connect(lambda item: self._comp_item_changed(page, item))
+        lay.addWidget(table, 1)
+
+        hint = QLabel(
+            "No parameters selected.\n"
+            'Click "Set Compensation Matrix" to choose the parameters.'
+        )
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setStyleSheet("color: #888888;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint, 1)
+
+        page._comp_table = table
+        page._comp_hint = hint
+        page._comp_setparams_btn = set_btn
+        page._comp_copy_btn = copy_btn
+        page._comp_paste_btn = paste_btn
+        return panel
+
+    # --- compensation helpers
+    def _comp_file_name(self, path) -> str:
+        for rec in self._imported_files():
+            if rec.get("parquet") == path:
+                return rec.get("name", "")
+        return Path(str(path)).name
+
+    def _comp_columns_for(self, page, path) -> list:
+        return self._columns_for(path, page._comp_task_id)
+
+    def _comp_all_columns(self, page) -> list:
+        columns = []
+        for rec in self._imported_files():
+            for name in self._comp_columns_for(page, rec.get("parquet")):
+                if name not in columns:
+                    columns.append(name)
+        return columns
+
+    def _comp_refresh(self, page) -> None:
+        files_list = page._comp_files_list
+        files_list.blockSignals(True)
+        files_list.clear()
+        for path in page._comp_files:
+            item = QListWidgetItem(self._comp_file_name(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            files_list.addItem(item)
+        files_list.blockSignals(False)
+        editable = not page._comp_locked
+        page._comp_setfiles_btn.setEnabled(editable and bool(page._comp_names))
+        page._comp_setfiles_btn.setToolTip(
+            "" if page._comp_names
+            else "Set the compensation matrix parameters first"
+        )
+        page._comp_copy_btn.setEnabled(bool(page._comp_names))
+        page._comp_paste_btn.setEnabled(editable and bool(page._comp_names))
+        self._comp_rebuild_table(page)
+
+    def _comp_rebuild_table(self, page) -> None:
+        table = page._comp_table
+        names = page._comp_names
+        matrix = page._comp_matrix
+        table.blockSignals(True)
+        table.clear()
+        # Resetting the count clears the header's visual section order too;
+        # otherwise the moved rows stay offset after a reorder.
+        table.setRowCount(0)
+        table.setColumnCount(0)
+        table.setRowCount(len(names))
+        table.setColumnCount(len(names))
+        table.setHorizontalHeaderLabels(names)
+        grip = QIcon(_drag_handle_pixmap())
+        for i, name in enumerate(names):
+            header_item = QTableWidgetItem(name)
+            header_item.setIcon(grip)
+            header_item.setToolTip("Drag to reorder rows (columns follow)")
+            table.setVerticalHeaderItem(i, header_item)
+        for i in range(len(names)):
+            for j in range(len(names)):
+                if i == j:
+                    item = QTableWidgetItem("100")
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    item.setBackground(QColor("#e4e7ec"))
+                    item.setForeground(QColor("#5b6b82"))
+                else:
+                    value = (
+                        matrix[i][j]
+                        if i < len(matrix) and j < len(matrix[i]) else 0
+                    )
+                    item = QTableWidgetItem(str(int(value)))
+                    item.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled
+                        | Qt.ItemFlag.ItemIsSelectable
+                        | Qt.ItemFlag.ItemIsEditable
+                    )
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(i, j, item)
+        table.blockSignals(False)
+        table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+            if page._comp_locked
+            else (
+                QAbstractItemView.EditTrigger.DoubleClicked
+                | QAbstractItemView.EditTrigger.EditKeyPressed
+                | QAbstractItemView.EditTrigger.AnyKeyPressed
+            )
+        )
+        self._comp_refresh_colors(page)
+        has_names = bool(names)
+        table.setVisible(has_names)
+        page._comp_hint.setVisible(not has_names)
+        table.resizeColumnsToContents()
+        for j in range(table.columnCount()):
+            if table.columnWidth(j) < 56:
+                table.setColumnWidth(j, 56)
+
+    def _comp_refresh_colors(self, page) -> None:
+        table = page._comp_table
+        matrix = page._comp_matrix
+        positives = [
+            v for i, row in enumerate(matrix)
+            for j, v in enumerate(row) if i != j and v > 0
+        ]
+        negatives = [
+            v for i, row in enumerate(matrix)
+            for j, v in enumerate(row) if i != j and v < 0
+        ]
+        max_pos = max(positives) if positives else 0
+        min_neg = min(negatives) if negatives else 0
+        table.blockSignals(True)
+        for i in range(min(table.rowCount(), len(matrix))):
+            for j in range(min(table.columnCount(), len(matrix[i]))):
+                if i == j:
+                    continue
+                item = table.item(i, j)
+                if item is None:
+                    continue
+                item.setBackground(_comp_cell_color(matrix[i][j], max_pos, min_neg))
+        table.blockSignals(False)
+
+    def _comp_item_changed(self, page, item) -> None:
+        table = page._comp_table
+        i, j = table.row(item), table.column(item)
+        if page._comp_locked or i < 0 or j < 0 or i == j:
+            return
+        if i >= len(page._comp_matrix) or j >= len(page._comp_matrix[i]):
+            return
+        text = item.text().strip()
+        try:
+            value = int(float(text))
+        except (TypeError, ValueError):
+            table.blockSignals(True)
+            item.setText(str(int(page._comp_matrix[i][j])))
+            table.blockSignals(False)
+            return
+        if value == page._comp_matrix[i][j]:
+            return
+        page._comp_matrix[i][j] = value
+        self._comp_refresh_colors(page)
+        self._comp_mark_dirty(page)
+
+    def _comp_set_files(self, page) -> None:
+        if not page._comp_names:
+            QMessageBox.information(
+                self,
+                "Set Files",
+                "Set the compensation matrix parameters first.",
+            )
+            return
+        records = self._imported_files()
+        names = [rec.get("name", "") for rec in records]
+        current = [self._comp_file_name(path) for path in page._comp_files]
+        chosen = self._pick_items_dialog(
+            "Select files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        chosen_set = set(chosen)
+        paths = [
+            rec.get("parquet") for rec in records
+            if rec.get("name", "") in chosen_set
+        ]
+        problems = []
+        for path in paths:
+            columns = set(self._comp_columns_for(page, path))
+            missing = [name for name in page._comp_names if name not in columns]
+            if missing:
+                problems.append((self._comp_file_name(path), missing))
+        if problems:
+            self._comp_show_missing(problems)
+            return
+        page._comp_files[:] = paths
+        self._comp_refresh(page)
+        self._comp_mark_dirty(page)
+
+    def _comp_set_params(self, page) -> None:
+        all_columns = self._comp_all_columns(page)
+        current = list(page._comp_names)
+        chosen = self._pick_items_dialog(
+            "Compensation parameters", all_columns, current,
+            "Filter parameters...",
+        )
+        if chosen is None:
+            return
+        chosen_set = set(chosen)
+        new_names = [name for name in all_columns if name in chosen_set]
+        added = [name for name in new_names if name not in current]
+        problems = []
+        for path in page._comp_files:
+            columns = set(self._comp_columns_for(page, path))
+            missing = [name for name in added if name not in columns]
+            if missing:
+                problems.append((self._comp_file_name(path), missing))
+        if problems:
+            self._comp_show_missing(problems)
+            return
+        self._comp_apply_params(page, new_names)
+        self._comp_mark_dirty(page)
+
+    def _comp_show_missing(self, problems) -> None:
+        lines = ["These parameters are missing from the selected files:", ""]
+        for name, missing in problems:
+            lines.append(f"{name}: {', '.join(missing)}")
+        QMessageBox.warning(self, "Compensation", "\n".join(lines))
+
+    def _comp_apply_params(self, page, new_names) -> None:
+        """Add/remove/reorder parameters, keeping the numbers by name."""
+        old_names = list(page._comp_names)
+        old_matrix = page._comp_matrix
+        by_name = {}
+        for i, row_name in enumerate(old_names):
+            for j, col_name in enumerate(old_names):
+                if i < len(old_matrix) and j < len(old_matrix[i]):
+                    by_name[(row_name, col_name)] = old_matrix[i][j]
+        matrix = []
+        for i, row_name in enumerate(new_names):
+            row = []
+            for j, col_name in enumerate(new_names):
+                if i == j:
+                    row.append(100)
+                else:
+                    row.append(by_name.get((row_name, col_name), 0))
+            matrix.append(row)
+        page._comp_names[:] = list(new_names)
+        page._comp_matrix[:] = matrix
+        self._comp_refresh(page)
+
+    def _comp_reordered(self, page) -> None:
+        table = page._comp_table
+        header = table.verticalHeader()
+        count = len(page._comp_names)
+        order = sorted(range(count), key=lambda i: header.visualIndex(i))
+        if order == list(range(count)):
+            return
+        page._comp_names[:] = [page._comp_names[i] for i in order]
+        page._comp_matrix[:] = [
+            [page._comp_matrix[i][j] for j in order] for i in order
+        ]
+        self._comp_rebuild_table(page)
+        self._comp_mark_dirty(page)
+
+    def _comp_copy_matrix(self, page) -> None:
+        names = list(page._comp_names)
+        if not names:
+            return
+        lines = ["\t".join([""] + names)]
+        for i, name in enumerate(names):
+            values = [
+                str(int(page._comp_matrix[i][j]))
+                for j in range(len(names))
+            ]
+            lines.append("\t".join([name] + values))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Compensation matrix copied")
+
+    def _comp_paste_matrix(self, page) -> None:
+        names = list(page._comp_names)
+        if not names:
+            return
+        text = QApplication.clipboard().text()
+        raw_lines = [
+            line for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            if line.strip()
+        ]
+        if not raw_lines:
+            QMessageBox.warning(
+                self, "Paste Matrix", "The clipboard does not contain a matrix."
+            )
+            return
+        header = [cell.strip() for cell in raw_lines[0].split("\t")]
+        if header and not header[0]:
+            header = header[1:]
+        values = {}
+        row_names = []
+        for line in raw_lines[1:]:
+            cells = [cell.strip() for cell in line.split("\t")]
+            if not cells or not cells[0]:
+                continue
+            row_name = cells[0]
+            row_names.append(row_name)
+            numbers = cells[1:]
+            if len(numbers) != len(header):
+                QMessageBox.warning(
+                    self,
+                    "Paste Matrix",
+                    "The pasted matrix has the wrong number of columns.",
+                )
+                return
+            for col_name, raw in zip(header, numbers):
+                try:
+                    values[(row_name, col_name)] = int(float(raw))
+                except (TypeError, ValueError):
+                    QMessageBox.warning(
+                        self,
+                        "Paste Matrix",
+                        f'"{raw}" is not an integer percentage.',
+                    )
+                    return
+        if set(header) != set(names) or set(row_names) != set(names):
+            QMessageBox.warning(
+                self,
+                "Paste Matrix",
+                "The pasted matrix uses different parameter names.\n"
+                "It was not applied.",
+            )
+            return
+        matrix = []
+        for i, row_name in enumerate(names):
+            row = []
+            for j, col_name in enumerate(names):
+                if i == j:
+                    row.append(100)
+                else:
+                    row.append(values.get((row_name, col_name), 0))
+            matrix.append(row)
+        page._comp_matrix[:] = matrix
+        self._comp_rebuild_table(page)
+        self._comp_mark_dirty(page)
+
+    def _comp_mark_dirty(self, page) -> None:
+        page._comp_dirty = True
+        self._comp_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _comp_save_now(self, page) -> None:
+        page._comp_task_def["params"] = page._comp_params
+        if self.project is not None:
+            self.project.save()
+        page._comp_snapshot = copy.deepcopy(page._comp_params)
+        page._comp_dirty = False
+        self._comp_update_save_btn(page)
+        self.statusBar().showMessage("Compensation saved")
+        self._module_saved(page)
+
+    def _comp_update_save_btn(self, page) -> None:
+        page._comp_save_btn.setEnabled(page._comp_dirty and not page._comp_locked)
+
+    def _comp_close(self, page) -> None:
+        if page._comp_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Close Compensation",
+                "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._comp_task_def["params"] = page._comp_snapshot
+        timer = getattr(page, "_comp_order_timer", None)
+        if timer is not None:
+            timer.stop()
         self._close_module_page(page)
 
     # ----- gating module (map) -----------------------------------------
@@ -10244,12 +10946,17 @@ class MainWindow(QMainWindow):
 
     def _gating_compute_mask(self, page, gate_id, parquet_path):
         """Return the AND mask of a gate and all its ancestors (on transformed data)."""
-        transforms = self._upstream_scale_transforms(page._gating_task_id)
+        by_id = {g["id"]: g for g in page._gating_gates}
+        needed = set()
+        for g in page._gating_gates:
+            needed |= _gate_needed_columns(g, by_id)
+        values = self._column_data(
+            page._gating_task_id, parquet_path, list(needed)
+        )
         try:
             return _compute_gate_filter_mask(
-                page._gating_gates, gate_id, parquet_path, transforms,
-                existing=set(self._columns_for(parquet_path, page._gating_task_id)),
-                extra=self._unmix_extras(page._gating_task_id, parquet_path),
+                page._gating_gates, gate_id, parquet_path, {},
+                existing=set(values), extra=values,
             )
         except Exception:
             return None
@@ -10511,15 +11218,14 @@ class MainWindow(QMainWindow):
             page._gating_last_stats = {}
             return
         gates = copy.deepcopy(page._gating_gates)
-        transforms = copy.deepcopy(
-            self._upstream_scale_transforms(page._gating_task_id)
+        stages = self._map_stages(page._gating_task_id)
+        base_columns = set(
+            self._column_index.get(self._rel_data_key(parquet_path), [])
         )
-        existing = set(self._columns_for(parquet_path, page._gating_task_id))
-        extra = self._unmix_extras(page._gating_task_id, parquet_path)
         page._gating_stat_generation += 1
         worker.request(
             page._gating_stat_generation,
-            parquet_path, gates, transforms, existing, affected, extra,
+            parquet_path, gates, stages, base_columns, affected,
         )
 
     def _gating_apply_stats(self, page, stats) -> None:
@@ -10629,7 +11335,7 @@ class MainWindow(QMainWindow):
 
     def _gating_render(self, page) -> None:
         """Render the gating scatter for the current view mode."""
-        transforms = self._upstream_scale_transforms(page._gating_task_id)
+        transforms = {}
         rec = self._figure_record(page._gating_preview.get("file"))
         preview = page._gating_preview
 
@@ -10945,6 +11651,8 @@ class MainWindow(QMainWindow):
             page = self._build_gating_page(name, task_def, locked)
         elif task_type == "unmix":
             page = self._build_unmix_page(name, task_def, locked)
+        elif task_type == "compensation":
+            page = self._build_compensation_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
