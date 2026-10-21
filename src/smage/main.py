@@ -284,6 +284,18 @@ FIGURE_PALETTES = [
     "turbo", "jet", "coolwarm", "grayscale",
 ]
 
+# Distinct colours auto-assigned to image channels as they are overlaid.
+IMAGE_LAYER_COLORS = [
+    (0, 0, 255),      # blue
+    (0, 255, 0),      # green
+    (255, 0, 0),      # red
+    (255, 0, 255),    # magenta
+    (0, 255, 255),    # cyan
+    (255, 255, 0),    # yellow
+    (255, 128, 0),    # orange
+    (128, 0, 255),    # violet
+]
+
 # Figure module histogram display modes.
 FIGURE_HISTOGRAM_MODES = [
     ("Histogram", "histogram"),
@@ -997,6 +1009,38 @@ def _figure_colormap(name: str):
         return pg.colormap.get(name)
     except Exception:
         return pg.ColorMap([0.0, 1.0], [(0, 0, 255), (255, 0, 0)])
+
+
+def _figure_image_layers(plot_dict: dict) -> list:
+    """Return the normalized image colour layers of a plot dict.
+
+    Each layer is ``{"parameter": str, "color": (r, g, b), "name": str}``.
+    Legacy single-parameter image plots (``color_param``) are migrated in place.
+    """
+    layers = plot_dict.get("layers")
+    if layers:
+        out = []
+        for layer in layers:
+            if not layer or not layer.get("parameter"):
+                continue
+            param = layer.get("parameter")
+            out.append({
+                "parameter": param,
+                "color": tuple(layer.get("color", (255, 255, 255))),
+                "name": str(layer.get("name") or param),
+                "visible": bool(layer.get("visible", True)),
+            })
+        return out
+    param = plot_dict.get("color_param")
+    if not param:
+        return []
+    color = plot_dict.get("image_color", (255, 255, 255))
+    return [{
+        "parameter": param,
+        "color": tuple(color),
+        "name": str(param),
+        "visible": True,
+    }]
 
 
 def _is_scatter_plot(ptype: str) -> bool:
@@ -2448,7 +2492,8 @@ class _FigureCard(QFrame):
     _SELECTED = "#plotCard { background: #ffffff; border: 2px solid #4285f4; border-radius: 6px; }"
     _FOCUSED = "#plotCard { background: #ffffff; border: 2px solid #34a853; border-radius: 6px; }"
 
-    def __init__(self, title: str, plot_widget, index: int, select_callback) -> None:
+    def __init__(self, title: str, plot_widget, index: int, select_callback,
+                 side_widget=None) -> None:
         super().__init__()
         self._index = index
         self._select_callback = select_callback
@@ -2464,7 +2509,16 @@ class _FigureCard(QFrame):
         lay.setSpacing(4)
         self._title_bar = _PlotDragHandle(title)
         lay.addWidget(self._title_bar)
-        lay.addWidget(plot_widget, 1)
+        if side_widget is not None:
+            body = QWidget()
+            bh = QHBoxLayout(body)
+            bh.setContentsMargins(0, 0, 0, 0)
+            bh.setSpacing(4)
+            bh.addWidget(plot_widget, 1)
+            bh.addWidget(side_widget, 0)
+            lay.addWidget(body, 1)
+        else:
+            lay.addWidget(plot_widget, 1)
         self._apply_style()
 
     def _apply_style(self) -> None:
@@ -2497,6 +2551,49 @@ class _FigureCard(QFrame):
     def set_focused(self, focused: bool) -> None:
         self._focused = focused
         self._apply_style()
+
+
+class _FigureLegendWidget(QFrame):
+    """A compact colour legend shown beside an image plot."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("imageLegend")
+        self.setStyleSheet(
+            "#imageLegend { background: #ffffff; border: 1px solid #c9d5e2; "
+            "border-radius: 4px; }"
+        )
+        self.setMinimumWidth(80)
+        self.setMaximumWidth(180)
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(6, 6, 6, 6)
+        self._lay.setSpacing(4)
+
+    def set_layers(self, layers) -> None:
+        while self._lay.count():
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for layer in layers:
+            color = tuple(layer.get("color", (255, 255, 255)))
+            name = str(layer.get("name") or layer.get("parameter") or "")
+            row = QWidget()
+            rh = QHBoxLayout(row)
+            rh.setContentsMargins(0, 0, 0, 0)
+            rh.setSpacing(4)
+            swatch = QLabel()
+            swatch.setFixedSize(12, 12)
+            swatch.setStyleSheet(
+                f"background-color: rgb({color[0]},{color[1]},{color[2]}); "
+                "border: 1px solid #888;"
+            )
+            label = QLabel(name)
+            label.setStyleSheet("color: #333;")
+            rh.addWidget(swatch)
+            rh.addWidget(label, 1)
+            self._lay.addWidget(row)
+        self._lay.addStretch(1)
 
 
 def _format_number(value) -> str:
@@ -4791,6 +4888,13 @@ class MainWindow(QMainWindow):
         plot_item._on_fit = lambda: self._figure_fit_all(plot_dict, plot_widget)
         return plot_widget
 
+    def _figure_attach_legend(self, plot_widget):
+        """Create and attach the side legend widget for an image plot."""
+        widget = _FigureLegendWidget()
+        widget.setVisible(False)
+        plot_widget._legend_widget = widget
+        return widget
+
     def _figure_new_card(self, page, plot_dict) -> int:
         """Create a plot card for one plot, wrap it in a proxy, and render."""
         plot_widget = self._figure_make_plot_widget(plot_dict)
@@ -4806,6 +4910,10 @@ class MainWindow(QMainWindow):
         card = _FigureCard(
             title, plot_widget, index,
             select_callback=lambda i: self._figure_select(page, i),
+            side_widget=(
+                self._figure_attach_legend(plot_widget)
+                if plot_dict.get("type") == "image" else None
+            ),
         )
         proxy = _CardProxy(
             on_select=lambda ctrl: self._figure_card_clicked(page, card.index(), ctrl),
@@ -5031,6 +5139,10 @@ class MainWindow(QMainWindow):
             "color_param": color_param,
             "last_color_param": color_param,
             "palette": "viridis",
+            "layers": (
+                [{"parameter": color_param, "color": (255, 255, 255), "name": str(color_param), "visible": True}]
+                if ptype == "image" and color_param else []
+            ),
             "xmin": None,
             "xmax": None,
             "ymin": None,
@@ -5422,6 +5534,7 @@ class MainWindow(QMainWindow):
                              extra_stages=None) -> None:
         """Render an Image plot as a raster (LOD pyramid), ImageJ-style."""
         import numpy as np
+        self._figure_update_image_legend(plot_widget, [])
         rec = self._figure_record(plot_dict.get("file"))
         if not rec:
             plot_widget.clear()
@@ -5474,8 +5587,6 @@ class MainWindow(QMainWindow):
         hpx = max(1, plot_widget.height())
         spacing = max(1e-12, min((x1 - x0) / wpx, (y1 - y0) / hpx))
 
-        mode = plot_dict.get("color_mode", "parameter")
-
         # Resolve the filter mask (computed in a background worker, cached).
         mask_ent = None
         f = plot_dict.get("filter")
@@ -5519,85 +5630,134 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-        if mode == "solid":
-            if mask_ent is not None:
-                frac, rect = self._image_mask_crop(
-                    manifest, (x0, x1, y0, y1), spacing, mask_ent
-                )
-                if frac is None:
-                    img.setVisible(False)
-                    return
-                solid_chan = np.where(frac >= 0.5, 0.0, np.nan).astype("float32")
-                rgb = plot_dict.get("solid_color", (0, 0, 200))
-                lut = np.tile(np.array(rgb, dtype=np.uint8), (256, 1))
-                img.setImage(solid_chan, autoLevels=False, levels=(0.0, 1.0), lut=lut)
-                img.setRect(rect)
-                img.setVisible(True)
-                self._figure_apply_display_options(plot_dict, plot_widget)
-                return
-            rgb = plot_dict.get("solid_color", (0, 0, 200))
-            lut = np.tile(np.array(rgb, dtype=np.uint8), (256, 1))
-            img.setImage(
-                np.zeros((2, 2), dtype="float32"),
-                autoLevels=False, levels=(0.0, 1.0), lut=lut,
-            )
-            img.setRect(QRectF(
-                manifest["xmin"], manifest["ymin"],
-                manifest["xmax"] - manifest["xmin"], manifest["ymax"] - manifest["ymin"],
-            ))
-            img.setVisible(True)
-            self._figure_apply_display_options(plot_dict, plot_widget)
-            return
-
-        channel = plot_dict.get("color_param")
-        color_cols = manifest.get("color_cols", [])
-        if channel is None:
-            # Nothing selected: default to the first real channel (never x/y).
-            channel = next(
-                (c for c in color_cols if c not in ("x", "y")),
-                color_cols[0] if color_cols else None,
-            )
         stages = self._map_stages(task_id) if task_id else []
         if extra_stages:
             stages = stages + list(extra_stages)
-        if channel is not None and channel not in color_cols:
-            # Only parameters produced by an Unmix module can be rendered here.
-            produced = any(
-                kind == "unmix" and channel in stage["names"]
-                for kind, stage in stages
+        color_cols = manifest.get("color_cols", [])
+
+        layers = _figure_image_layers(plot_dict)
+        if not layers:
+            # Nothing selected: default to the first real channel (never x/y).
+            default_channel = next(
+                (c for c in color_cols if c not in ("x", "y")),
+                color_cols[0] if color_cols else None,
             )
-            if not produced:
+            if default_channel is None:
                 plot_widget.clear()
                 plot_widget._img_fitted = False
                 plot_widget.setTitle(
-                    f"Parameter not available in this file: {channel}",
+                    "No channels available", color="#c0392b", size="10pt",
+                )
+                self._figure_update_image_legend(plot_widget, [])
+                return
+            layers = [{
+                "parameter": default_channel,
+                "color": (255, 255, 255),
+                "name": str(default_channel),
+            }]
+
+        rasters = []
+        rendered_layers = []
+        ref_shape = None
+        ref_rect = None
+        has_mask = False
+        mask_accum = None
+        unavailable = []
+        for layer in layers:
+            if layer.get("visible") is False:
+                continue
+            channel = layer.get("parameter")
+            if not channel:
+                continue
+            if channel not in color_cols:
+                # Only parameters produced by an Unmix module can be rendered.
+                produced = any(
+                    kind == "unmix" and channel in stage["names"]
+                    for kind, stage in stages
+                )
+                if not produced:
+                    unavailable.append(channel)
+                    continue
+            raster_stages = stages if _pipeline_touches(stages, channel) else None
+            chan, rect, frac = self._image_raster(
+                parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
+                mask_ent, raster_stages,
+            )
+            if chan is None:
+                continue
+            cname = channel if raster_stages is None else None
+            ranges = manifest.get("color_ranges", {}) or {}
+            lo, hi = ranges.get(cname, (None, None))
+            if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo = float(np.nanmin(chan))
+                hi = float(np.nanmax(chan))
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = 0.0, 1.0
+            if hi > lo:
+                norm = (chan.astype("float64") - lo) / (hi - lo)
+            else:
+                norm = np.zeros(chan.shape, dtype="float64")
+            norm = np.clip(norm, 0.0, 1.0)
+            if frac is not None:
+                cov = (frac >= 0.5).astype("float64")
+                norm = norm * cov
+                has_mask = True
+                if mask_accum is None:
+                    mask_accum = cov
+                elif cov.shape == mask_accum.shape:
+                    mask_accum = np.maximum(mask_accum, cov)
+            color = tuple(layer.get("color", (255, 255, 255)))
+            rasters.append((norm, color, rect))
+            rendered_layers.append({
+                "parameter": channel,
+                "color": color,
+                "name": str(layer.get("name") or channel),
+            })
+            if ref_shape is None:
+                ref_shape = norm.shape
+                ref_rect = rect
+
+        if not rasters or ref_shape is None:
+            img.setVisible(False)
+            self._figure_update_image_legend(plot_widget, [])
+            if unavailable:
+                plot_widget.setTitle(
+                    "Parameter not available in this file: " + ", ".join(unavailable),
                     color="#c0392b", size="10pt",
                 )
-                return
-        raster_stages = stages if _pipeline_touches(stages, channel) else None
-        chan, rect, frac = self._image_raster(
-            parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
-            mask_ent, raster_stages,
-        )
-        if chan is None:
-            img.setVisible(False)
             return
-        cname = channel if raster_stages is None else None
-        ranges = manifest.get("color_ranges", {}) or {}
-        lo, hi = ranges.get(cname, (None, None))
-        if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            lo = float(np.nanmin(chan))
-            hi = float(np.nanmax(chan))
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            lo, hi = 0.0, 1.0
-        cmap = _figure_colormap(plot_dict.get("palette", "viridis"))
-        lut = cmap.getLookupTable(0.0, 1.0, 256)
-        if frac is not None:
-            chan = np.where(frac >= 0.5, chan, np.nan)
-        img.setImage(chan, autoLevels=False, levels=(lo, hi), lut=lut)
-        img.setRect(rect)
+
+        height, width = ref_shape
+        canvas = np.zeros((height, width, 3), dtype="float64")
+        for norm, color, _rect in rasters:
+            if norm.shape != ref_shape:
+                continue
+            canvas += norm[..., None] * np.asarray(color, dtype="float64")[None, None, :]
+        rgba = np.empty((height, width, 4), dtype=np.uint8)
+        rgba[..., 0:3] = np.clip(canvas, 0.0, 255.0).astype(np.uint8)
+        if has_mask and mask_accum is not None and mask_accum.shape == ref_shape:
+            rgba[..., 3] = (mask_accum * 255.0).astype(np.uint8)
+        else:
+            rgba[..., 3] = 255
+        img.setImage(rgba, autoLevels=False)
+        img.setRect(ref_rect)
         img.setVisible(True)
         self._figure_apply_display_options(plot_dict, plot_widget)
+        self._figure_update_image_legend(
+            plot_widget, rendered_layers,
+            show=plot_dict.get("show_legend", True),
+        )
+
+    def _figure_update_image_legend(self, plot_widget, layers, show=True) -> None:
+        """Update the colour legend shown beside an image plot."""
+        widget = getattr(plot_widget, "_legend_widget", None)
+        if widget is None:
+            return
+        if not show or not layers:
+            widget.setVisible(False)
+            return
+        widget.set_layers(layers)
+        widget.setVisible(True)
 
     def _figure_image_refresh(self, page, plot_dict, plot_widget) -> None:
         self._figure_render_image(
@@ -6447,6 +6607,13 @@ class MainWindow(QMainWindow):
             self._figure_resize_card(page, index, w_new, h_new)
             self._figure_mark_dirty(page)
 
+        def _legend_extra():
+            # Extra card width consumed by the side legend (and its spacing).
+            lg = getattr(plot_widget, "_legend_widget", None)
+            if lg is not None and lg.isVisible():
+                return lg.width() + 4
+            return 0
+
         def on_origin():
             # Match the original image's aspect ratio, keeping H unchanged.
             extent = getattr(plot_widget, "_img_extent", None)
@@ -6457,7 +6624,7 @@ class MainWindow(QMainWindow):
             h = height_field.value()
             if not h or img_w <= 0 or img_h <= 0:
                 return
-            w_new = int(round(h * img_h / img_w))
+            w_new = int(round(h * img_h / img_w)) + _legend_extra()
             w_new = max(200, min(4000, w_new))
             plot_dict["size"] = [w_new, int(h)]
             width_field.set_value(w_new)
@@ -6469,7 +6636,7 @@ class MainWindow(QMainWindow):
             h = height_field.value()
             if h is None:
                 return
-            w_new = int(h)
+            w_new = int(h) + _legend_extra()
             plot_dict["size"] = [w_new, int(h)]
             width_field.set_value(w_new)
             resolution_field.set_value(int(round(w_new / 10.0)))
@@ -6506,7 +6673,7 @@ class MainWindow(QMainWindow):
             note.setWordWrap(True)
             layout.addWidget(note)
 
-        scatter_plots = [p for p in plots if _is_scatter_plot(p.get("type"))]
+        scatter_plots = [p for p in plots if p.get("type") == "scatter"]
         hist_plots = [p for p in plots if p.get("type") == "histogram"]
 
         def common(ps, key, default=None):
@@ -7009,17 +7176,17 @@ class MainWindow(QMainWindow):
 
         Shared by the Figure and Scaling scatter settings panels.
         """
+        if plot_dict.get("type") == "image":
+            self._figure_image_layer_settings(
+                layout, plot_dict, columns, enabled, on_change, on_rebuild
+            )
+            return
+
         layout.addWidget(QLabel("Color mode"))
         mode_combo = _NoWheelComboBox()
-        modes = (
-            [("Parameter", "parameter"), ("Solid", "solid")]
-            if plot_dict.get("type") == "image"
-            else FIGURE_COLOR_MODES
-        )
-        for text, val in modes:
+        for text, val in FIGURE_COLOR_MODES:
             mode_combo.addItem(text, val)
-        default_mode = "parameter" if plot_dict.get("type") == "image" else "density"
-        idx = mode_combo.findData(plot_dict.get("color_mode", default_mode))
+        idx = mode_combo.findData(plot_dict.get("color_mode", "density"))
         mode_combo.setCurrentIndex(max(0, idx))
         mode_combo.setEnabled(enabled)
         layout.addWidget(mode_combo)
@@ -7124,6 +7291,189 @@ class MainWindow(QMainWindow):
                 plot_dict["palette"] = palette_combo.currentText()
                 on_change()
             palette_combo.currentIndexChanged.connect(on_palette)
+
+    def _figure_image_layer_settings(self, layout, plot_dict, columns, enabled,
+                                     on_change, on_rebuild) -> None:
+        """Build the image channel table (show / parameter / colour / name)."""
+        layout.addWidget(QLabel("Channels"))
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Show", "Parameter", "Color", "Name"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        table.setColumnWidth(0, 44)
+        table.setColumnWidth(2, 48)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(30)
+        table.setMinimumHeight(120)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: none; }"
+            "QTableWidget::item:selected { background: #dbeafa; }"
+        )
+        layout.addWidget(table, 1)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setEnabled(enabled)
+        remove_btn = QPushButton("Remove")
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setEnabled(enabled)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        show_legend = QCheckBox("Show legend")
+        show_legend.setChecked(plot_dict.get("show_legend", True))
+        show_legend.setEnabled(enabled)
+        layout.addWidget(show_legend)
+
+        def on_param_changed(row):
+            layers = _figure_image_layers(plot_dict)
+            if row >= len(layers):
+                return
+            combo = table.cellWidget(row, 1)
+            new_param = combo.currentText() or None
+            old_param = layers[row].get("parameter")
+            if not new_param or new_param == old_param:
+                return
+            layers[row]["parameter"] = new_param
+            if layers[row].get("name") in (None, "", str(old_param)):
+                layers[row]["name"] = new_param
+            plot_dict["layers"] = layers
+            on_rebuild()
+
+        def on_pick_color(row):
+            layers = _figure_image_layers(plot_dict)
+            if row >= len(layers):
+                return
+            cur = tuple(layers[row].get("color", (255, 255, 255)))
+            chosen = QColorDialog.getColor(
+                QColor(cur[0], cur[1], cur[2]), self, "Choose color"
+            )
+            if chosen.isValid():
+                layers[row]["color"] = (chosen.red(), chosen.green(), chosen.blue())
+                plot_dict["layers"] = layers
+                on_change()
+
+        def on_item_changed(item):
+            row = table.row(item)
+            col = table.column(item)
+            layers = _figure_image_layers(plot_dict)
+            if row >= len(layers):
+                return
+            if col == 0:
+                layers[row]["visible"] = (
+                    item.checkState() == Qt.CheckState.Checked
+                )
+            elif col == 3:
+                layers[row]["name"] = item.text()
+            else:
+                return
+            plot_dict["layers"] = layers
+            on_change()
+
+        def on_add(_=False):
+            existing = {l.get("parameter") for l in _figure_image_layers(plot_dict)}
+            available = [c for c in columns if c not in existing]
+            chosen = self._pick_items_dialog(
+                "Add channels", available, [], "Filter parameters..."
+            )
+            if chosen is None:
+                return
+            layers = _figure_image_layers(plot_dict)
+            used = {tuple(l.get("color", (255, 255, 255))) for l in layers}
+            for c in chosen:
+                color = next(
+                    (col for col in IMAGE_LAYER_COLORS if col not in used),
+                    IMAGE_LAYER_COLORS[len(layers) % len(IMAGE_LAYER_COLORS)],
+                )
+                used.add(color)
+                layers.append({
+                    "parameter": c, "color": color, "name": str(c), "visible": True,
+                })
+            plot_dict["layers"] = layers
+            on_rebuild()
+
+        def on_remove(_=False):
+            rows = sorted(
+                {idx.row() for idx in table.selectionModel().selectedRows()},
+                reverse=True,
+            )
+            if not rows:
+                return
+            layers = _figure_image_layers(plot_dict)
+            for row in rows:
+                if 0 <= row < len(layers):
+                    layers.pop(row)
+            plot_dict["layers"] = layers
+            on_rebuild()
+
+        def on_show_legend(checked):
+            plot_dict["show_legend"] = bool(checked)
+            on_change()
+
+        def populate():
+            layers = _figure_image_layers(plot_dict)
+            table.blockSignals(True)
+            table.setRowCount(len(layers))
+            for i, layer in enumerate(layers):
+                chk_item = QTableWidgetItem()
+                chk_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                chk_item.setCheckState(
+                    Qt.CheckState.Checked if layer.get("visible", True)
+                    else Qt.CheckState.Unchecked
+                )
+                table.setItem(i, 0, chk_item)
+
+                combo = _NoWheelComboBox()
+                for c in columns:
+                    combo.addItem(str(c))
+                param = layer.get("parameter")
+                idx = combo.findText(str(param)) if param is not None else -1
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                combo.setEnabled(enabled)
+                combo.currentIndexChanged.connect(
+                    lambda _=0, row=i: on_param_changed(row)
+                )
+                table.setCellWidget(i, 1, combo)
+
+                color = tuple(layer.get("color", (255, 255, 255)))
+                cbtn = QPushButton()
+                cbtn.setFixedSize(40, 20)
+                cbtn.setCursor(Qt.CursorShape.PointingHandCursor)
+                cbtn.setEnabled(enabled)
+                cbtn.setStyleSheet(
+                    f"background-color: rgb({color[0]},{color[1]},{color[2]}); "
+                    "border: 1px solid #555;"
+                )
+                cbtn.clicked.connect(lambda _=False, row=i: on_pick_color(row))
+                table.setCellWidget(i, 2, cbtn)
+
+                name_item = QTableWidgetItem(str(layer.get("name") or param or ""))
+                name_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEditable
+                )
+                table.setItem(i, 3, name_item)
+            table.blockSignals(False)
+            table.resizeRowsToContents()
+
+        table.itemChanged.connect(on_item_changed)
+        add_btn.clicked.connect(on_add)
+        remove_btn.clicked.connect(on_remove)
+        show_legend.toggled.connect(on_show_legend)
+
+        populate()
 
     def _figure_display_toggles(self, layout, plot_dict, enabled, on_change) -> None:
         """Build + wire the show axes/names/indices/sample-name checkboxes."""
