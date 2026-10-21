@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGraphicsProxyWidget,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
     QGridLayout,
@@ -2338,18 +2339,25 @@ class _CardProxy(QGraphicsProxyWidget):
     """A card proxy that supports dragging the card by its title bar."""
 
     TITLE_HEIGHT = 30
+    # Pixels the pointer must travel before a title-bar click becomes a drag,
+    # so a plain click never reorders the cards.
+    DRAG_THRESHOLD = 6
 
-    def __init__(self, on_select, on_drop) -> None:
+    def __init__(self, on_select, on_drop, on_drag=None, on_drag_end=None) -> None:
         super().__init__()
         self._on_select = on_select
         self._on_drop = on_drop
+        self._on_drag = on_drag
+        self._on_drag_end = on_drag_end
         self._dragging = False
+        self._moved = False
         self._press_scene = None
         self._start_pos = None
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and event.pos().y() <= self.TITLE_HEIGHT:
             self._dragging = True
+            self._moved = False
             self._press_scene = event.scenePos()
             self._start_pos = self.pos()
             self.setZValue(1)
@@ -2360,7 +2368,18 @@ class _CardProxy(QGraphicsProxyWidget):
 
     def mouseMoveEvent(self, event) -> None:
         if self._dragging and event.buttons() & Qt.MouseButton.LeftButton:
-            self.setPos(self._start_pos + (event.scenePos() - self._press_scene))
+            delta = event.scenePos() - self._press_scene
+            if not self._moved:
+                if (
+                    abs(delta.x()) < self.DRAG_THRESHOLD
+                    and abs(delta.y()) < self.DRAG_THRESHOLD
+                ):
+                    event.accept()
+                    return
+                self._moved = True
+            self.setPos(self._start_pos + delta)
+            if self._on_drag is not None:
+                self._on_drag(event.scenePos())
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -2369,7 +2388,15 @@ class _CardProxy(QGraphicsProxyWidget):
         if self._dragging:
             self._dragging = False
             self.setZValue(0)
-            self._on_drop(event.scenePos())
+            moved = self._moved
+            self._moved = False
+            if moved:
+                self._on_drop(event.scenePos())
+            else:
+                # A plain click selects only: never move the card.
+                self.setPos(self._start_pos)
+                if self._on_drag_end is not None:
+                    self._on_drag_end()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -4918,6 +4945,8 @@ class MainWindow(QMainWindow):
         proxy = _CardProxy(
             on_select=lambda ctrl: self._figure_card_clicked(page, card.index(), ctrl),
             on_drop=lambda pos: self._figure_reorder(page, card.index(), pos),
+            on_drag=lambda pos: self._figure_drag_preview(page, card.index(), pos),
+            on_drag_end=lambda: self._figure_clear_drop_marker(page),
         )
         proxy.setWidget(card)
         proxy.resize(w, h)
@@ -5001,12 +5030,17 @@ class MainWindow(QMainWindow):
     def _figure_reorder(self, page, index: int, scene_pos) -> None:
         plots = page._fig_plots
         cards = page._fig_cards
+        self._figure_clear_drop_marker(page)
         if not (0 <= index < len(plots)):
             return
         new_index = self._figure_drop_index(page, index, scene_pos)
         if new_index == index:
             self._figure_relayout(page)
             return
+        # A dragged card joins the row it is dropped into: a manual line break
+        # it carried must not follow it, or it would stay on a row of its own.
+        # Press Enter afterwards to start a new row at that card.
+        plots[index]["break_before"] = False
         plots.insert(new_index, plots.pop(index))
         cards.insert(new_index, cards.pop(index))
         for i, card in enumerate(cards):
@@ -5014,6 +5048,53 @@ class MainWindow(QMainWindow):
         page._fig_selected = [new_index]
         self._figure_relayout(page)
         self._figure_mark_dirty(page)
+
+    def _figure_drop_marker_pos(self, page, index: int, scene_pos):
+        """Return (x, y, w, h) of the slot the dragged card would land in."""
+        if not page._fig_cards:
+            return None
+        new_index = self._figure_drop_index(page, index, scene_pos)
+        # Simulate the drop (the dragged card loses its line break, exactly as
+        # _figure_reorder does) and read back its final flow position.
+        plots = [dict(p) for p in page._fig_plots]
+        cards = list(page._fig_cards)
+        if not (0 <= index < len(plots)) or not (0 <= index < len(cards)):
+            return None
+        dragged_plot = plots.pop(index)
+        dragged_card = cards.pop(index)
+        dragged_plot["break_before"] = False
+        new_index = max(0, min(new_index, len(plots)))
+        plots.insert(new_index, dragged_plot)
+        cards.insert(new_index, dragged_card)
+        positions = self._figure_flow_positions(cards, plots)
+        if not (0 <= new_index < len(positions)):
+            return None
+        return positions[new_index]
+
+    def _figure_drag_preview(self, page, index: int, scene_pos) -> None:
+        """Show the insertion slot while a card is being dragged."""
+        marker = getattr(page, "_fig_drop_marker", None)
+        where = self._figure_drop_marker_pos(page, index, scene_pos)
+        if where is None:
+            return
+        x, y, w, h = where
+        if marker is None:
+            marker = QGraphicsRectItem()
+            pen = QPen(QColor("#4285f4"), 2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            marker.setPen(pen)
+            marker.setBrush(QColor(66, 133, 244, 40))
+            marker.setZValue(2)
+            page._fig_scene.addItem(marker)
+            page._fig_drop_marker = marker
+        marker.setRect(QRectF(x, y, w, h))
+        marker.show()
+
+    def _figure_clear_drop_marker(self, page) -> None:
+        marker = getattr(page, "_fig_drop_marker", None)
+        if marker is not None:
+            page._fig_scene.removeItem(marker)
+            page._fig_drop_marker = None
 
     def _figure_flow_positions(self, cards, plots) -> list:
         """Compute (x, y, w, h) flow positions, wrapping on explicit line breaks."""
@@ -10829,6 +10910,15 @@ class MainWindow(QMainWindow):
         self._illum_rebuild_right(page)
         self._illum_mark_dirty(page)
 
+    def _illum_drop_mask_file(self, sub) -> None:
+        """Delete a submodule's illumination mask file, if any."""
+        if self.project is None:
+            return
+        try:
+            self.project._mask_path(str(sub["id"])).unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _illum_delete_submodule(self, page, sub) -> None:
         reply = QMessageBox.question(
             self,
@@ -10839,6 +10929,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._illum_submodules.remove(sub)
+        self._illum_drop_mask_file(sub)
         if page._illum_selected == sub["id"]:
             page._illum_selected = (
                 page._illum_submodules[0]["id"]
@@ -11152,6 +11243,7 @@ class MainWindow(QMainWindow):
             if sub.get("mask"):
                 sub["mask"] = None
                 sub["mask_source"] = None
+                self._illum_drop_mask_file(sub)
                 status.setText("Parameters changed — recalculate the mask.")
             self._illum_mark_dirty(page)
 
@@ -11164,6 +11256,7 @@ class MainWindow(QMainWindow):
             if sub.get("mask"):
                 sub["mask"] = None
                 sub["mask_source"] = None
+                self._illum_drop_mask_file(sub)
                 status.setText("Parameters changed — recalculate the mask.")
             self._illum_mark_dirty(page)
 
@@ -11172,6 +11265,7 @@ class MainWindow(QMainWindow):
             if sub.get("mask"):
                 sub["mask"] = None
                 sub["mask_source"] = None
+                self._illum_drop_mask_file(sub)
                 status.setText("Parameters changed — recalculate the mask.")
             self._illum_mark_dirty(page)
 

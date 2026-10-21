@@ -16,9 +16,14 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 PROJECT_VERSION = "0.1.0"
 DATA_DIRNAME = "data"
 MANIFEST_FILENAME = "project.json"
+# Illumination masks are large 2-D float arrays; they are stored as compact
+# float32 .npy files in this folder rather than inside project.json.
+MASK_DIRNAME = "illumination"
 
 
 class Project:
@@ -64,10 +69,16 @@ class Project:
         project = cls(path, manifest["name"], manifest.get("created"))
         project.samples = manifest.get("samples", [])
         project.workflow = manifest.get("workflow", {"tasks": []})
+        project._hydrate_masks(project.workflow)
         return project
 
     def save(self) -> None:
-        """Write the project manifest to ``project.json``."""
+        """Write the project manifest to ``project.json``.
+
+        Illumination masks are written to compact float32 ``.npy`` files and
+        only a relative ``mask_file`` path is kept in the manifest, so the JSON
+        stays small even for large workflows. The manifest is written compactly.
+        """
         manifest = {
             "name": self.name,
             "version": PROJECT_VERSION,
@@ -75,9 +86,64 @@ class Project:
             "samples": self.samples,
             "workflow": self.workflow,
         }
+        serializable = self._externalize_masks(manifest)
         (self.path / MANIFEST_FILENAME).write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
+            json.dumps(serializable, separators=(",", ":")), encoding="utf-8"
         )
+
+    def _mask_path(self, sub_id: str) -> Path:
+        """Absolute path of a submodule's illumination mask file."""
+        return self.path / MASK_DIRNAME / f"{sub_id}.npy"
+
+    def _externalize_masks(self, node):
+        """Return a JSON-safe copy of `node` with illumination masks externalized.
+
+        An illumination submodule carries a 2-D ``mask`` (a list of lists, or a
+        numpy array). It is written to a float32 ``.npy`` file and replaced by a
+        relative ``mask_file`` path so it never lands in the JSON. The input
+        `node` is not modified.
+        """
+        if isinstance(node, dict):
+            mask = node.get("mask")
+            if mask is not None and (
+                isinstance(mask, (list, tuple)) or hasattr(mask, "dtype")
+            ):
+                sub_id = node.get("id")
+                if sub_id is not None:
+                    rel = f"{MASK_DIRNAME}/{sub_id}.npy"
+                    path = self._mask_path(str(sub_id))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(path, np.asarray(mask, dtype="float32"))
+                    out = {}
+                    for key, value in node.items():
+                        if key != "mask":
+                            out[key] = self._externalize_masks(value)
+                    out["mask_file"] = rel
+                    return out
+            return {k: self._externalize_masks(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [self._externalize_masks(v) for v in node]
+        return node
+
+    def _hydrate_masks(self, node) -> None:
+        """Load ``mask_file`` entries back into in-memory ``mask`` lists."""
+        if isinstance(node, dict):
+            mask_file = node.get("mask_file")
+            if mask_file:
+                path = self.path / mask_file
+                mask = None
+                if path.is_file():
+                    try:
+                        mask = np.load(path).tolist()
+                    except (OSError, ValueError):
+                        mask = None
+                node["mask"] = mask
+                node.pop("mask_file", None)
+            for value in node.values():
+                self._hydrate_masks(value)
+        elif isinstance(node, list):
+            for value in node:
+                self._hydrate_masks(value)
 
     @property
     def columns_path(self) -> Path:
