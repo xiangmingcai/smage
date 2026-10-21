@@ -237,6 +237,7 @@ TASK_TYPES = {
     "unmix": ("Unmix", "#7b61ff"),
     "segmentation": ("Segmentation", "#00acc1"),
     "compensation": ("Compensation", "#fb8c00"),
+    "illumination": ("Illumination Correction", "#8d6e63"),
 }
 
 ADDABLE_TYPES = [
@@ -247,6 +248,7 @@ ADDABLE_TYPES = [
     "unmix",
     "segmentation",
     "compensation",
+    "illumination",
 ]
 
 ROOT_COLOR = "#5f6368"
@@ -341,6 +343,10 @@ def _pipeline_touches(stages, name) -> bool:
             return True
         if kind in ("compensation", "unmix") and name in stage["names"]:
             return True
+        if kind == "illumination":
+            for sub in stage.get("submodules", []):
+                if sub.get("channel") == name:
+                    return True
     return False
 
 
@@ -354,6 +360,14 @@ def _pipeline_dependencies(stages, names) -> set:
         elif kind == "unmix":
             if needed & set(stage["names"]):
                 needed |= set(stage["columns"])
+        elif kind == "illumination":
+            for sub in stage.get("submodules", []):
+                if sub.get("channel") in needed:
+                    if sub.get("x"):
+                        needed.add(sub["x"])
+                    if sub.get("y"):
+                        needed.add(sub["y"])
+    needed.discard(None)
     return needed
 
 
@@ -374,7 +388,8 @@ def _linear_combine(sources, weights):
     return [combined[i] for i in range(combined.shape[0])]
 
 
-def _evaluate_stages(stages, values, names, parquet_path=None, cache=None):
+def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
+                     origin=None):
     """Apply map-module stages in order to a {column: array} mapping."""
     import numpy as np
 
@@ -425,6 +440,45 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None):
                 if cache is not None:
                     cache[key] = out
             values.update(out)
+            continue
+        if kind == "illumination":
+            for sub in stage.get("submodules", []):
+                if parquet_path is not None and parquet_path not in sub["files"]:
+                    continue
+                channel = sub.get("channel")
+                if channel not in values:
+                    continue
+                x_values = values.get(sub.get("x"))
+                y_values = values.get(sub.get("y"))
+                mask = sub.get("mask")
+                if x_values is None or y_values is None or mask is None:
+                    continue
+                if origin is not None:
+                    x_origin, y_origin = origin
+                else:
+                    try:
+                        x_origin = float(np.nanmin(x_values))
+                        y_origin = float(np.nanmin(y_values))
+                    except (TypeError, ValueError):
+                        continue
+                xi = np.mod(
+                    np.rint(np.asarray(x_values, dtype="float64") - x_origin)
+                    .astype(np.int64),
+                    int(sub["tile_w"]),
+                )
+                yi = np.mod(
+                    np.rint(np.asarray(y_values, dtype="float64") - y_origin)
+                    .astype(np.int64),
+                    int(sub["tile_h"]),
+                )
+                factor_map = mask[yi, xi]
+                threshold = float(sub.get("T") or 0.0)
+                factor = np.where(
+                    factor_map > 0,
+                    threshold / np.where(factor_map > 0, factor_map, 1.0),
+                    1.0,
+                )
+                values[channel] = values[channel] * factor
     return {name: values[name] for name in names if name in values}
 
 
@@ -1174,6 +1228,230 @@ def _pool_mask(mask, target_blocks):
     return out
 
 
+def _illumination_stage_item(sub):
+    """Convert one Illumination submodule into a pipeline stage entry."""
+    import numpy as np
+
+    channel = sub.get("channel")
+    mask_data = sub.get("mask")
+    if not channel or not mask_data:
+        return None
+    try:
+        mask = np.asarray(mask_data, dtype="float64")
+    except (TypeError, ValueError):
+        return None
+    if mask.ndim != 2 or mask.size == 0:
+        return None
+    finite = mask[np.isfinite(mask)]
+    if finite.size == 0:
+        return None
+    method = sub.get("method", "median")
+    if method == "down":
+        threshold = float(finite.min())
+    elif method == "up":
+        threshold = float(finite.max())
+    else:
+        threshold = float(np.median(finite))
+    return {
+        "channel": channel,
+        "x": sub.get("x"),
+        "y": sub.get("y"),
+        "files": set(sub.get("files") or []),
+        "tile_w": int(sub.get("tile_w", 256)),
+        "tile_h": int(sub.get("tile_h", 256)),
+        "mask": mask,
+        "T": threshold,
+    }
+
+
+class _FlowArrowBand(QWidget):
+    """Narrow vertical strip with downward arrows (data-flow hint)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(22)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#9aa4b2"))
+        pen.setWidthF(1.4)
+        painter.setPen(pen)
+        center = self.width() / 2.0
+        y = 10
+        while y + 13 < self.height():
+            painter.drawLine(int(center), y, int(center), y + 9)
+            painter.drawPolyline(QPolygonF([
+                QPointF(center - 4, y + 8),
+                QPointF(center, y + 13),
+                QPointF(center + 4, y + 8),
+            ]))
+            y += 30
+        painter.end()
+
+
+class _IlluminationWorker:
+    """Background worker that estimates an illumination mask from tiles."""
+
+    def __init__(self):
+        self._req_q = queue.Queue()
+        self._res_q = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def request(self, key, stages, base_columns, files, channel, x_name,
+                y_name, tile_w, tile_h, bins, resolution):
+        self._req_q.put((
+            key, stages, base_columns, list(files), channel, x_name, y_name,
+            int(tile_w), int(tile_h), int(bins), int(resolution),
+        ))
+
+    def poll(self):
+        out = []
+        while True:
+            try:
+                out.append(self._res_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                req = self._req_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                res = self._compute(*req)
+            except Exception as exc:  # noqa: BLE001
+                res = (req[0], None, f"Could not calculate the mask: {exc}")
+            self._res_q.put(res)
+
+    def _compute(self, key, stages, base_columns, files, channel, x_name,
+                 y_name, tile_w, tile_h, bins, resolution):
+        import numpy as np
+        import pandas as pd
+        from scipy.interpolate import RectBivariateSpline, griddata
+
+        if not files:
+            return (key, None, "No files selected for the calculation.")
+        n_blocks = bins * bins
+        sums = np.zeros(n_blocks, dtype="float64")
+        counts = np.zeros(n_blocks, dtype="float64")
+        used_files = 0
+        for path in files:
+            needed = {x_name, y_name, channel}
+            dependencies = _pipeline_dependencies(stages, needed)
+            base = base_columns.get(path) or set()
+            if not base:
+                try:
+                    import pyarrow.parquet as pq
+                    base = set(pq.ParquetFile(path).schema.names)
+                except Exception:  # noqa: BLE001
+                    continue
+            base = [c for c in dependencies if c in base]
+            values = {}
+            if base:
+                try:
+                    df = pd.read_parquet(path, columns=base)
+                except Exception:  # noqa: BLE001
+                    continue
+                for name in base:
+                    values[name] = pd.to_numeric(
+                        df[name], errors="coerce"
+                    ).to_numpy(dtype="float64")
+            values = _evaluate_stages(stages, values, needed, path)
+            if not all(name in values for name in needed):
+                continue
+            x = np.asarray(values[x_name], dtype="float64")
+            y = np.asarray(values[y_name], dtype="float64")
+            v = np.asarray(values[channel], dtype="float64")
+            finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
+            x, y, v = x[finite], y[finite], v[finite]
+            if v.size == 0:
+                continue
+            x0 = float(x.min())
+            y0 = float(y.min())
+            width = float(x.max() - x0) + 1.0
+            height = float(y.max() - y0) + 1.0
+            ntx = int(width // tile_w)
+            nty = int(height // tile_h)
+            if ntx < 1 or nty < 1:
+                continue
+            ti = np.floor((x - x0) / tile_w).astype(np.int64)
+            tj = np.floor((y - y0) / tile_h).astype(np.int64)
+            keep = (ti >= 0) & (ti < ntx) & (tj >= 0) & (tj < nty)
+            if not keep.any():
+                continue
+            x, y, v = x[keep], y[keep], v[keep]
+            ti, tj = ti[keep], tj[keep]
+            tile_id = tj * ntx + ti
+            wx = (x - x0) - ti * tile_w
+            wy = (y - y0) - tj * tile_h
+            bx = np.clip((wx * bins / tile_w).astype(np.int64), 0, bins - 1)
+            by = np.clip((wy * bins / tile_h).astype(np.int64), 0, bins - 1)
+            block = by * bins + bx
+            frame = pd.DataFrame({"tile": tile_id, "block": block, "v": v})
+            # 10th percentile threshold per tile; darker points are background.
+            thresholds = frame.groupby("tile")["v"].quantile(0.1)
+            frame["thr"] = frame["tile"].map(thresholds)
+            frame = frame[frame["v"] >= frame["thr"]]
+            if frame.empty:
+                continue
+            # Median per block within each tile, then mean over tiles.
+            medians = frame.groupby(["tile", "block"])["v"].median()
+            per_block = medians.groupby(level="block").mean()
+            indices = per_block.index.to_numpy(dtype=np.int64)
+            sums[indices] += per_block.to_numpy()
+            counts[indices] += 1.0
+            used_files += 1
+
+        if used_files == 0 or not (counts > 0).any():
+            return (key, None, "No tile data was found for the selected parameters.")
+
+        grid = np.full(n_blocks, np.nan)
+        valid = counts > 0
+        grid[valid] = sums[valid] / counts[valid]
+        grid = grid.reshape(bins, bins)
+
+        # Smooth the bin x bin fields to resolution x resolution, then to a
+        # full tile-sized mask.
+        gy, gx = np.mgrid[0:bins, 0:bins]
+        flat_valid = valid.reshape(-1)
+        points = np.column_stack([gx.ravel()[flat_valid],
+                                  gy.ravel()[flat_valid]])
+        values_grid = grid.reshape(-1)[flat_valid]
+        target_x = np.linspace(0, bins - 1, resolution)
+        target_y = np.linspace(0, bins - 1, resolution)
+        tx, ty = np.meshgrid(target_x, target_y)
+        smooth = griddata(points, values_grid, (tx, ty), method="linear")
+        if np.isnan(smooth).any():
+            nearest = griddata(points, values_grid, (tx, ty), method="nearest")
+            smooth = np.where(np.isnan(smooth), nearest, smooth)
+        spline = RectBivariateSpline(
+            np.arange(resolution), np.arange(resolution), smooth, kx=1, ky=1
+        )
+        mask = spline(
+            np.linspace(0, resolution - 1, tile_h),
+            np.linspace(0, resolution - 1, tile_w),
+        )
+        mask = np.asarray(mask, dtype="float64")
+        if mask.shape != (tile_h, tile_w):
+            return (key, None, "Could not build the mask at the requested size.")
+        return (key, {
+            "mask": mask.tolist(),
+            "tile_w": int(tile_w),
+            "tile_h": int(tile_h),
+            "bin": int(bins),
+            "resolution": int(resolution),
+            "files": list(files),
+        }, None)
+
+
 class _ImageFilterWorker:
     """Background worker that computes gate-filter masks for Image plots."""
 
@@ -1443,6 +1721,18 @@ def _gate_roi_pens() -> dict:
         handlePen=pg.mkPen(_GATE_PEN, width=1),
         handleHoverPen=pg.mkPen(_GATE_HOVER_PEN, width=2),
     )
+
+
+class _NoClickScatter(pg.ScatterPlotItem):
+    """Scatter points that never consume mouse clicks.
+
+    pyqtgraph delivers clicks to the topmost item that handles them, so a
+    scatter point under the cursor would otherwise swallow the click that
+    starts single-click gating tools (quadrant, split, range, polygon).
+    """
+
+    def mouseClickEvent(self, ev) -> None:
+        ev.ignore()
 
 
 class _GateViewBox(pg.ViewBox):
@@ -2428,6 +2718,7 @@ MODULE_KINDS = {
     "scale": "map",
     "rename": "map",
     "compensation": "map",
+    "illumination": "map",
     "unmix": "map",
     "segmentation": "generate",
     "figure": "visualize",
@@ -2506,6 +2797,7 @@ class MainWindow(QMainWindow):
                 or getattr(widget, "_gating_dirty", False)
                 or getattr(widget, "_unmix_dirty", False)
                 or getattr(widget, "_comp_dirty", False)
+                or getattr(widget, "_illum_dirty", False)
             ):
                 return True
         return False
@@ -4255,9 +4547,21 @@ class MainWindow(QMainWindow):
                 config = self._unmix_flow_config(task)
                 if config is not None:
                     stages.append(("unmix", config))
+            elif task_type == "illumination":
+                submodules = [
+                    item for item in (
+                        _illumination_stage_item(sub)
+                        for sub in params.get("submodules", [])
+                    ) if item is not None
+                ]
+                if submodules:
+                    stages.append(("illumination", {
+                        "task_id": task.get("id"),
+                        "submodules": submodules,
+                    }))
         return stages
 
-    def _column_data(self, task_id, parquet_path, names) -> dict:
+    def _column_data(self, task_id, parquet_path, names, extra_stages=None) -> dict:
         """Column values as seen at `task_id`, with upstream map stages applied."""
         import pandas as pd
 
@@ -4265,6 +4569,8 @@ class MainWindow(QMainWindow):
             return {}
         names = list(names)
         stages = self._map_stages(task_id) if task_id else []
+        if extra_stages:
+            stages = stages + list(extra_stages)
         base = set(self._column_index.get(self._rel_data_key(parquet_path), []))
         if not base:
             try:
@@ -4293,11 +4599,13 @@ class MainWindow(QMainWindow):
         )
         return {n: evaluated[n] for n in names if n in evaluated}
 
-    def _read_columns(self, parquet_path, columns, task_id=None):
+    def _read_columns(self, parquet_path, columns, task_id=None, extra_stages=None):
         """Read columns from a parquet with upstream map stages applied."""
         import pandas as pd
 
-        values = self._column_data(task_id, parquet_path, list(columns))
+        values = self._column_data(
+            task_id, parquet_path, list(columns), extra_stages=extra_stages
+        )
         if not values:
             return pd.DataFrame()
         return pd.DataFrame({
@@ -4906,7 +5214,8 @@ class MainWindow(QMainWindow):
                 else:
                     return None, None, None
             evaluated = _evaluate_stages(
-                stages, values, [channel], parquet_path
+                stages, values, [channel], parquet_path,
+                origin=(float(manifest["xmin"]), float(manifest["ymin"])),
             )
             if channel not in evaluated:
                 return None, None, None
@@ -4964,7 +5273,9 @@ class MainWindow(QMainWindow):
                     parquet_path, manifest, bbox, channel, mask_ent, stages
                 )
             levels = manifest.get("levels", [])
-            if not levels or spacing < levels[0]["block"]:
+            if not levels or (
+                spacing < levels[0]["block"] and levels[0]["block"] > 1
+            ):
                 return self._image_raster_raw(
                     parquet_path, manifest, bbox, channel, mask_ent, stages
                 )
@@ -4991,7 +5302,8 @@ class MainWindow(QMainWindow):
                 for name in needed if name in color_cols
             }
             evaluated = _evaluate_stages(
-                stages, values, [channel], parquet_path
+                stages, values, [channel], parquet_path,
+                origin=(float(manifest["xmin"]), float(manifest["ymin"])),
             )
             if channel not in evaluated:
                 return None, None, None
@@ -5013,7 +5325,7 @@ class MainWindow(QMainWindow):
         levels = manifest.get("levels", [])
         if not levels:
             return None, None, None
-        if spacing < levels[0]["block"]:
+        if spacing < levels[0]["block"] and levels[0]["block"] > 1:
             return self._image_raster_raw(
                 parquet_path, manifest, bbox, channel, mask_ent, None
             )
@@ -5106,7 +5418,8 @@ class MainWindow(QMainWindow):
         return None
 
     def _figure_render_image(self, plot_dict: dict, plot_widget,
-                             column_transforms=None, task_id=None) -> None:
+                             column_transforms=None, task_id=None,
+                             extra_stages=None) -> None:
         """Render an Image plot as a raster (LOD pyramid), ImageJ-style."""
         import numpy as np
         rec = self._figure_record(plot_dict.get("file"))
@@ -5245,6 +5558,8 @@ class MainWindow(QMainWindow):
                 color_cols[0] if color_cols else None,
             )
         stages = self._map_stages(task_id) if task_id else []
+        if extra_stages:
+            stages = stages + list(extra_stages)
         if channel is not None and channel not in color_cols:
             # Only parameters produced by an Unmix module can be rendered here.
             produced = any(
@@ -5320,11 +5635,11 @@ class MainWindow(QMainWindow):
                 )
 
     def _figure_render(self, plot_dict: dict, plot_widget, column_transforms=None,
-                       task_id=None) -> None:
+                       task_id=None, extra_stages=None) -> None:
         """(Re)draw a plot widget from its plot_dict."""
         if plot_dict.get("type") == "image":
             self._figure_render_image(
-                plot_dict, plot_widget, column_transforms, task_id
+                plot_dict, plot_widget, column_transforms, task_id, extra_stages
             )
             return
         mask, error = self._figure_filter_mask(plot_dict)
@@ -5334,15 +5649,17 @@ class MainWindow(QMainWindow):
             return
         if plot_dict.get("type") == "histogram":
             self._figure_render_histogram(
-                plot_dict, plot_widget, column_transforms, mask, task_id
+                plot_dict, plot_widget, column_transforms, mask, task_id,
+                extra_stages,
             )
         else:
             self._figure_render_scatter(
-                plot_dict, plot_widget, column_transforms, mask, task_id
+                plot_dict, plot_widget, column_transforms, mask, task_id,
+                extra_stages,
             )
 
     def _figure_render_scatter(self, plot_dict: dict, plot_widget, column_transforms=None,
-                               mask=None, task_id=None) -> None:
+                               mask=None, task_id=None, extra_stages=None) -> None:
         import numpy as np
         import pandas as pd
 
@@ -5366,7 +5683,9 @@ class MainWindow(QMainWindow):
             columns.append(color_param)
 
         try:
-            df = self._read_columns(rec["parquet"], columns, task_id)
+            df = self._read_columns(
+                rec["parquet"], columns, task_id, extra_stages=extra_stages
+            )
         except Exception:
             return
         if x_name not in df.columns or y_name not in df.columns:
@@ -5455,12 +5774,19 @@ class MainWindow(QMainWindow):
             rgba = cmap.map(norm, mode="byte")
             brushes = [pg.mkBrush(int(r), int(g), int(b), 200) for r, g, b, _ in rgba]
 
-        plot_widget.addItem(
-            pg.ScatterPlotItem(x=x, y=y, symbol="o", size=size, pen=None, brush=brushes, pxMode=px_mode)
+        scatter = _NoClickScatter(
+            x=x, y=y, symbol="o", size=size, pen=None, brush=brushes,
+            pxMode=px_mode,
         )
+        # Scatter points must never swallow clicks: gating tools (quadrant,
+        # split, range, polygon) start from a click on the plot, which would
+        # otherwise be consumed by the point under the cursor.
+        scatter.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        scatter.setAcceptHoverEvents(False)
+        plot_widget.addItem(scatter)
 
     def _figure_render_histogram(self, plot_dict: dict, plot_widget, column_transforms=None,
-                                 mask=None, task_id=None) -> None:
+                                 mask=None, task_id=None, extra_stages=None) -> None:
         import numpy as np
         import pandas as pd
         import pyqtgraph as pg
@@ -5475,7 +5801,9 @@ class MainWindow(QMainWindow):
             plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
             return
         try:
-            df = self._read_columns(rec["parquet"], [x_name], task_id)
+            df = self._read_columns(
+                rec["parquet"], [x_name], task_id, extra_stages=extra_stages
+            )
         except Exception:
             return
         if x_name not in df.columns:
@@ -9877,6 +10205,1128 @@ class MainWindow(QMainWindow):
             timer.stop()
         self._close_module_page(page)
 
+    # ----- illumination correction module (map) -------------------------
+    def _build_illumination_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Illumination Correction page."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._illum_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("submodules", [])
+        page._illum_task_def = task_def
+        page._illum_task_id = task_def.get("id")
+        page._illum_params = params
+        page._illum_submodules = params["submodules"]
+        page._illum_selected = None
+        page._illum_plot = None
+        page._illum_locked = locked
+        page._illum_save_btn = save_btn
+        page._illum_dirty = False
+        page._illum_snapshot = copy.deepcopy(params)
+        page._illum_worker = _IlluminationWorker()
+        page._illum_request_key = None
+        page._illum_poll_timer = QTimer(self)
+        page._illum_poll_timer.setInterval(120)
+        page._illum_poll_timer.timeout.connect(
+            lambda: self._illum_on_poll(page)
+        )
+        page._illum_poll_timer.start()
+        page._illum_order_timer = QTimer(self)
+        page._illum_order_timer.setSingleShot(True)
+        page._illum_order_timer.setInterval(200)
+        page._illum_order_timer.timeout.connect(
+            lambda: self._illum_reordered(page)
+        )
+        save_btn.clicked.connect(lambda _=False: self._illum_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QHBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(12)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._illum_list_panel(page))
+        right_host = QWidget()
+        right_lay = QVBoxLayout(right_host)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(0)
+        splitter.addWidget(right_host)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 5)
+        splitter.setSizes([220, 1100])
+        row.addWidget(splitter, 1)
+        layout.addWidget(content, 1)
+        page._illum_right_host = right_host
+
+        self._illum_refresh_list(page)
+        self._illum_rebuild_right(page)
+        self._illum_update_save_btn(page)
+        return page
+
+    def _illum_list_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        outer = QHBoxLayout(panel)
+        outer.setContentsMargins(6, 10, 10, 10)
+        outer.setSpacing(4)
+        outer.addWidget(_FlowArrowBand())
+        inner = QVBoxLayout()
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(6)
+        add_btn = QPushButton("Add Submodule")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setEnabled(not page._illum_locked)
+        add_btn.clicked.connect(lambda _=False: self._illum_add_submodule(page))
+        inner.addWidget(add_btn)
+        sub_list = QListWidget()
+        sub_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: none; }"
+            "QListWidget::item:selected { background: #dbeafa; }"
+        )
+        sub_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        sub_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        sub_list.itemDoubleClicked.connect(
+            lambda item: self._illum_select_submodule(
+                page, item.data(Qt.ItemDataRole.UserRole)
+            )
+        )
+        sub_list.itemClicked.connect(
+            lambda item: self._illum_select_submodule(
+                page, item.data(Qt.ItemDataRole.UserRole)
+            )
+        )
+        sub_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        sub_list.customContextMenuRequested.connect(
+            lambda pos: self._illum_list_menu(page, pos)
+        )
+        sub_list.model().rowsMoved.connect(
+            lambda *_: page._illum_order_timer.start()
+        )
+        inner.addWidget(sub_list, 1)
+        note = QLabel(
+            "Data passes through the submodules above, top to bottom, "
+            "and leaves the module after the last one."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #6b7785;")
+        inner.addWidget(note)
+        outer.addLayout(inner, 1)
+        page._illum_list = sub_list
+        page._illum_add_btn = add_btn
+        return panel
+
+    def _illum_refresh_list(self, page) -> None:
+        sub_list = page._illum_list
+        sub_list.blockSignals(True)
+        sub_list.clear()
+        for sub in page._illum_submodules:
+            item = QListWidgetItem(sub.get("name", ""))
+            item.setData(Qt.ItemDataRole.UserRole, sub.get("id"))
+            if sub.get("mask") is None:
+                item.setToolTip("Mask not calculated yet")
+            sub_list.addItem(item)
+        sub_list.blockSignals(False)
+        if page._illum_selected:
+            for i in range(sub_list.count()):
+                if sub_list.item(i).data(Qt.ItemDataRole.UserRole) == page._illum_selected:
+                    sub_list.setCurrentItem(sub_list.item(i))
+                    break
+
+    def _illum_selected_sub(self, page):
+        for sub in page._illum_submodules:
+            if sub.get("id") == page._illum_selected:
+                return sub
+        return None
+
+    def _illum_next_name(self, page) -> str:
+        taken = {sub.get("name") for sub in page._illum_submodules}
+        n = 1
+        while f"Channel{n}" in taken:
+            n += 1
+        return f"Channel{n}"
+
+    def _illum_unique_name(self, page, base: str) -> str:
+        taken = {sub.get("name") for sub in page._illum_submodules}
+        if base not in taken:
+            return base
+        n = 2
+        while f"{base} {n}" in taken:
+            n += 1
+        return f"{base} {n}"
+
+    def _illum_default_axes(self):
+        columns = []
+        for rec in self._imported_files():
+            for name in self._columns_for(rec.get("parquet")):
+                if name not in columns:
+                    columns.append(name)
+        return (
+            "x" if "x" in columns else None,
+            "y" if "y" in columns else None,
+        )
+
+    def _illum_add_submodule(self, page) -> None:
+        x_default, y_default = self._illum_default_axes()
+        sub = {
+            "id": uuid4().hex[:8],
+            "name": self._illum_next_name(page),
+            "files": [],
+            "channel": None,
+            "x": x_default,
+            "y": y_default,
+            "tile_w": 256,
+            "tile_h": 256,
+            "bin": 5,
+            "resolution": 10,
+            "method": "median",
+            "calc_files": [],
+            "mask": None,
+            "mask_source": None,
+        }
+        page._illum_submodules.append(sub)
+        page._illum_selected = sub["id"]
+        self._illum_refresh_list(page)
+        self._illum_rebuild_right(page)
+        self._illum_mark_dirty(page)
+
+    def _illum_list_menu(self, page, pos) -> None:
+        sub_list = page._illum_list
+        item = sub_list.itemAt(pos)
+        if item is None:
+            return
+        sub_id = item.data(Qt.ItemDataRole.UserRole)
+        sub = next((s for s in page._illum_submodules if s["id"] == sub_id), None)
+        if sub is None:
+            return
+        menu = QMenu(sub_list)
+        ren = QAction("Rename", menu)
+        ren.setEnabled(not page._illum_locked)
+        ren.triggered.connect(lambda: self._illum_rename_submodule(page, sub))
+        menu.addAction(ren)
+        dup = QAction("Duplicate", menu)
+        dup.setEnabled(not page._illum_locked)
+        dup.triggered.connect(lambda: self._illum_duplicate_submodule(page, sub))
+        menu.addAction(dup)
+        menu.addSeparator()
+        delete = QAction("Delete", menu)
+        delete.setEnabled(not page._illum_locked)
+        delete.triggered.connect(lambda: self._illum_delete_submodule(page, sub))
+        menu.addAction(delete)
+        menu.exec(sub_list.viewport().mapToGlobal(pos))
+
+    def _illum_rename_submodule(self, page, sub) -> None:
+        text, ok = QInputDialog.getText(
+            self, "Rename submodule", "Name:", QLineEdit.EchoMode.Normal,
+            sub.get("name", ""),
+        )
+        if not ok:
+            return
+        name = text.strip()
+        if not name:
+            return
+        if any(
+            other is not sub and other.get("name") == name
+            for other in page._illum_submodules
+        ):
+            QMessageBox.information(
+                self, "Rename submodule", "A submodule with this name already exists."
+            )
+            return
+        sub["name"] = name
+        self._illum_refresh_list(page)
+        self._illum_mark_dirty(page)
+
+    def _illum_duplicate_submodule(self, page, sub) -> None:
+        name = sub.get("name", "Channel") + " copy"
+        while any(s.get("name") == name for s in page._illum_submodules):
+            name += " copy"
+        new_sub = copy.deepcopy(sub)
+        new_sub["id"] = uuid4().hex[:8]
+        new_sub["name"] = name
+        new_sub["mask"] = None
+        new_sub["mask_source"] = None
+        page._illum_submodules.append(new_sub)
+        page._illum_selected = new_sub["id"]
+        self._illum_refresh_list(page)
+        self._illum_rebuild_right(page)
+        self._illum_mark_dirty(page)
+
+    def _illum_delete_submodule(self, page, sub) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Delete submodule",
+            f'Delete "{sub.get("name", "")}"?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        page._illum_submodules.remove(sub)
+        if page._illum_selected == sub["id"]:
+            page._illum_selected = (
+                page._illum_submodules[0]["id"]
+                if page._illum_submodules else None
+            )
+        self._illum_refresh_list(page)
+        self._illum_rebuild_right(page)
+        self._illum_mark_dirty(page)
+
+    def _illum_select_submodule(self, page, sub_id) -> None:
+        if page._illum_selected == sub_id:
+            return
+        page._illum_selected = sub_id
+        self._illum_rebuild_right(page)
+
+    def _illum_reordered(self, page) -> None:
+        sub_list = page._illum_list
+        order = [
+            sub_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(sub_list.count())
+        ]
+        by_id = {sub["id"]: sub for sub in page._illum_submodules}
+        reordered = [by_id[sid] for sid in order if sid in by_id]
+        if len(reordered) != len(page._illum_submodules):
+            return
+        if [s["id"] for s in reordered] == [s["id"] for s in page._illum_submodules]:
+            return
+        page._illum_submodules[:] = reordered
+        self._illum_refresh_list(page)
+        self._illum_render_preview(page)
+        self._illum_mark_dirty(page)
+
+    # --- right side
+    def _illum_rebuild_right(self, page) -> None:
+        host = page._illum_right_host
+        self._clear_layout(host.layout())
+        sub = self._illum_selected_sub(page)
+        page._illum_plot = None
+        if sub is None:
+            hint = QLabel(
+                "Add a submodule on the left, then double-click it to edit."
+            )
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hint.setStyleSheet("color: #888888;")
+            host.layout().addWidget(hint)
+            return
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+        top = QWidget()
+        top_lay = QHBoxLayout(top)
+        top_lay.setContentsMargins(0, 0, 0, 0)
+        top_lay.setSpacing(12)
+        top_lay.addWidget(self._illum_channel_panel(page, sub), 1)
+        top_lay.addWidget(self._illum_params_panel(page, sub), 2)
+        top_lay.addWidget(self._illum_mask_panel(page, sub), 2)
+        bottom = QWidget()
+        bottom_lay = QHBoxLayout(bottom)
+        bottom_lay.setContentsMargins(0, 0, 0, 0)
+        bottom_lay.setSpacing(12)
+        bottom_lay.addWidget(self._illum_plot_panel(page, sub, "Before"), 2)
+        bottom_lay.addWidget(self._illum_plot_panel(page, sub, "After"), 2)
+        bottom_lay.addWidget(self._illum_plot_settings(page, sub), 1)
+        splitter.addWidget(top)
+        splitter.addWidget(bottom)
+        splitter.setSizes([320, 520])
+        host.layout().addWidget(splitter, 1)
+        self._illum_render_preview(page)
+        self._illum_render_mask(page, sub)
+
+    def _illum_channel_panel(self, page, sub) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        editable = not page._illum_locked
+        columns = self._illum_all_columns()
+
+        top = QWidget()
+        top_lay = QVBoxLayout(top)
+        top_lay.setContentsMargins(0, 0, 0, 0)
+        top_lay.setSpacing(4)
+        top_lay.addWidget(QLabel("<b>Channel &amp; axes</b>"))
+        channel_combo = _NoWheelComboBox()
+        channel_combo.addItem("", None)
+        for name in columns:
+            channel_combo.addItem(name, name)
+        index = channel_combo.findData(sub.get("channel"))
+        channel_combo.setCurrentIndex(index if index >= 0 else 0)
+        channel_combo.setEnabled(editable)
+        top_lay.addWidget(QLabel("Channel"))
+        top_lay.addWidget(channel_combo)
+        axes_row = QHBoxLayout()
+        x_combo = _NoWheelComboBox()
+        y_combo = _NoWheelComboBox()
+        for combo, value in ((x_combo, sub.get("x")), (y_combo, sub.get("y"))):
+            combo.addItem("", None)
+            for name in columns:
+                combo.addItem(name, name)
+            idx = combo.findData(value)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.setEnabled(editable)
+        axes_row.addWidget(QLabel("X"))
+        axes_row.addWidget(x_combo, 1)
+        axes_row.addWidget(QLabel("Y"))
+        axes_row.addWidget(y_combo, 1)
+        top_lay.addLayout(axes_row)
+
+        files_host = QWidget()
+        files_lay = QVBoxLayout(files_host)
+        files_lay.setContentsMargins(0, 0, 0, 0)
+        files_lay.setSpacing(4)
+        set_btn = QPushButton("Set Files")
+        set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        set_btn.setEnabled(editable and bool(sub.get("channel")))
+        set_btn.setToolTip(
+            "" if sub.get("channel") else "Select the channel first"
+        )
+        set_btn.clicked.connect(lambda _=False: self._illum_set_files(page, sub))
+        files_lay.addWidget(set_btn)
+        files_list = QListWidget()
+        files_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: none; }"
+        )
+        for path in sub.get("files") or []:
+            files_list.addItem(QListWidgetItem(self._comp_file_name(path)))
+        page._illum_files_list = files_list
+        files_lay.addWidget(files_list, 1)
+
+        lay.addWidget(top, 1)
+        lay.addWidget(files_host, 3)
+
+        def on_channel():
+            new_channel = channel_combo.currentData()
+            if new_channel == sub.get("channel"):
+                return
+            files = sub.get("files") or []
+            missing = [
+                self._comp_file_name(path) for path in files
+                if new_channel and new_channel not in set(self._columns_for(path))
+            ]
+            if missing:
+                self._comp_show_missing(
+                    [(name, [new_channel]) for name in missing]
+                )
+                channel_combo.blockSignals(True)
+                idx = channel_combo.findData(sub.get("channel"))
+                channel_combo.setCurrentIndex(idx if idx >= 0 else 0)
+                channel_combo.blockSignals(False)
+                return
+            sub["channel"] = new_channel
+            set_btn.setEnabled(editable and bool(new_channel))
+            set_btn.setToolTip("" if new_channel else "Select the channel first")
+            self._illum_reset_plot_defaults(page, sub)
+            self._illum_render_preview(page)
+            self._illum_mark_dirty(page)
+
+        def on_axis(key, combo):
+            def handler():
+                sub[key] = combo.currentData()
+                self._illum_reset_plot_defaults(page, sub)
+                self._illum_render_preview(page)
+                self._illum_mark_dirty(page)
+            return handler
+
+        channel_combo.currentIndexChanged.connect(lambda _=0: on_channel())
+        x_combo.currentIndexChanged.connect(lambda _=0: on_axis("x", x_combo)())
+        y_combo.currentIndexChanged.connect(lambda _=0: on_axis("y", y_combo)())
+        return panel
+
+    def _illum_all_columns(self) -> list:
+        columns = []
+        for rec in self._imported_files():
+            for name in self._columns_for(rec.get("parquet")):
+                if name not in columns:
+                    columns.append(name)
+        return columns
+
+    def _illum_set_files(self, page, sub) -> None:
+        channel = sub.get("channel")
+        if not channel:
+            QMessageBox.information(
+                self, "Set Files", "Select the channel first."
+            )
+            return
+        records = self._imported_files()
+        names = [rec.get("name", "") for rec in records]
+        current = [
+            self._comp_file_name(path) for path in (sub.get("files") or [])
+        ]
+        chosen = self._pick_items_dialog(
+            "Select files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        chosen_set = set(chosen)
+        paths = [
+            rec.get("parquet") for rec in records
+            if rec.get("name", "") in chosen_set
+        ]
+        problems = []
+        for path in paths:
+            columns = set(self._columns_for(path))
+            if channel not in columns:
+                problems.append((self._comp_file_name(path), [channel]))
+        if problems:
+            self._comp_show_missing(problems)
+            return
+        sub["files"] = paths
+        sub["calc_files"] = [
+            path for path in (sub.get("calc_files") or []) if path in paths
+        ]
+        self._illum_rebuild_right(page)
+        self._illum_mark_dirty(page)
+
+    def _illum_params_panel(self, page, sub) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Correction parameters</b>"))
+        editable = not page._illum_locked
+
+        sizes = QHBoxLayout()
+        sizes.addWidget(QLabel("Tile W"))
+        tile_w = _NoWheelSpinBox()
+        tile_w.setRange(1, 1_000_000)
+        tile_w.setValue(int(sub.get("tile_w", 256)))
+        tile_w.setEnabled(editable)
+        sizes.addWidget(tile_w)
+        sizes.addWidget(QLabel("Tile H"))
+        tile_h = _NoWheelSpinBox()
+        tile_h.setRange(1, 1_000_000)
+        tile_h.setValue(int(sub.get("tile_h", 256)))
+        tile_h.setEnabled(editable)
+        sizes.addWidget(tile_h)
+        sizes.addStretch()
+        lay.addLayout(sizes)
+
+        hint = QLabel(self._illum_divisibility_hint(sub))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #b58900;")
+        lay.addWidget(hint)
+
+        bins_row = QHBoxLayout()
+        bins_row.addWidget(QLabel("Bin"))
+        bin_spin = _NoWheelSpinBox()
+        bin_spin.setRange(3, 10)
+        bin_spin.setValue(int(sub.get("bin", 5)))
+        bin_spin.setEnabled(editable)
+        bins_row.addWidget(bin_spin)
+        bins_row.addWidget(QLabel("Resolution"))
+        res_spin = _NoWheelSpinBox()
+        res_spin.setRange(max(3, int(sub.get("bin", 5))), 20)
+        res_spin.setValue(max(int(sub.get("bin", 5)), int(sub.get("resolution", 10))))
+        res_spin.setEnabled(editable)
+        bins_row.addWidget(res_spin)
+        bins_row.addStretch()
+        lay.addLayout(bins_row)
+
+        lay.addWidget(QLabel("Correction method"))
+        method_combo = _NoWheelComboBox()
+        method_combo.addItem("Down (darkest unchanged)", "down")
+        method_combo.addItem("Up (brightest unchanged)", "up")
+        method_combo.addItem("Median (default)", "median")
+        idx = method_combo.findData(sub.get("method", "median"))
+        method_combo.setCurrentIndex(idx if idx >= 0 else 2)
+        method_combo.setEnabled(editable)
+        lay.addWidget(method_combo)
+
+        lay.addWidget(QLabel("Files for the calculation"))
+        calc_list = QListWidget()
+        calc_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: none; }"
+        )
+        calc_list.setEnabled(editable)
+        selected = set(sub.get("calc_files") or [])
+        files = sub.get("files") or []
+        calc_list.blockSignals(True)
+        for path in files:
+            item = QListWidgetItem(self._comp_file_name(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if path in selected
+                else Qt.CheckState.Unchecked
+            )
+            calc_list.addItem(item)
+        calc_list.blockSignals(False)
+        lay.addWidget(calc_list, 1)
+        page._illum_calc_list = calc_list
+
+        calc_row = QHBoxLayout()
+        calc_btn = QPushButton("Calculate Illumination")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setEnabled(editable and bool(sub.get("channel")))
+        calc_btn.clicked.connect(
+            lambda _=False: self._illum_calculate(page, sub, calc_btn)
+        )
+        calc_row.addWidget(calc_btn)
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        calc_row.addWidget(status, 1)
+        lay.addLayout(calc_row)
+        page._illum_calc_btn = calc_btn
+        page._illum_calc_status = status
+
+        def on_sizes():
+            sub["tile_w"] = int(tile_w.value())
+            sub["tile_h"] = int(tile_h.value())
+            hint.setText(self._illum_divisibility_hint(sub))
+            if sub.get("mask"):
+                sub["mask"] = None
+                sub["mask_source"] = None
+                status.setText("Parameters changed — recalculate the mask.")
+            self._illum_mark_dirty(page)
+
+        def on_bin(value):
+            sub["bin"] = int(value)
+            res_spin.setMinimum(int(value))
+            if res_spin.value() < int(value):
+                res_spin.setValue(int(value))
+            sub["resolution"] = int(res_spin.value())
+            if sub.get("mask"):
+                sub["mask"] = None
+                sub["mask_source"] = None
+                status.setText("Parameters changed — recalculate the mask.")
+            self._illum_mark_dirty(page)
+
+        def on_resolution(value):
+            sub["resolution"] = int(value)
+            if sub.get("mask"):
+                sub["mask"] = None
+                sub["mask_source"] = None
+                status.setText("Parameters changed — recalculate the mask.")
+            self._illum_mark_dirty(page)
+
+        def on_method():
+            sub["method"] = method_combo.currentData()
+            self._illum_mark_dirty(page)
+            self._illum_render_mask(page, sub)
+            self._illum_render_preview(page)
+
+        def on_calc_files(_item=None):
+            sub["calc_files"] = [
+                calc_list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(calc_list.count())
+                if calc_list.item(i).checkState() == Qt.CheckState.Checked
+            ]
+            self._illum_mark_dirty(page)
+
+        tile_w.valueChanged.connect(lambda _=0: on_sizes())
+        tile_h.valueChanged.connect(lambda _=0: on_sizes())
+        bin_spin.valueChanged.connect(on_bin)
+        res_spin.valueChanged.connect(on_resolution)
+        method_combo.currentIndexChanged.connect(lambda _=0: on_method())
+        calc_list.itemChanged.connect(on_calc_files)
+        return panel
+
+    def _illum_divisibility_hint(self, sub) -> str:
+        files = sub.get("files") or []
+        tile_w = int(sub.get("tile_w", 256))
+        tile_h = int(sub.get("tile_h", 256))
+        if not files or tile_w <= 0 or tile_h <= 0:
+            return ""
+        try:
+            geom = _image_geometry(files[0])
+        except Exception:  # noqa: BLE001
+            return ""
+        width = int(round(geom[1] - geom[0] + 1))
+        height = int(round(geom[3] - geom[2] + 1))
+        messages = []
+        if width % tile_w:
+            messages.append(
+                f"Width {width} is not divisible by tile width {tile_w}: "
+                "the edge strip is excluded from the mask calculation."
+            )
+        if height % tile_h:
+            messages.append(
+                f"Height {height} is not divisible by tile height {tile_h}: "
+                "the edge strip is excluded from the mask calculation."
+            )
+        return "\n".join(messages)
+
+    def _illum_mask_panel(self, page, sub) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Illumination mask</b>"))
+        plot = pg.PlotWidget(background="w")
+        plot.getPlotItem().hideAxis("bottom")
+        plot.getPlotItem().hideAxis("left")
+        plot.getPlotItem().getViewBox().setAspectLocked(True)
+        image_item = pg.ImageItem(axisOrder="row-major")
+        plot.addItem(image_item)
+        lay.addWidget(plot, 1)
+        source = QLabel("")
+        source.setWordWrap(True)
+        source.setStyleSheet("color: #6b7785;")
+        lay.addWidget(source)
+        page._illum_mask_plot = plot
+        page._illum_mask_image = image_item
+        page._illum_mask_source = source
+        return panel
+
+    def _illum_render_mask(self, page, sub) -> None:
+        import numpy as np
+
+        image_item = getattr(page, "_illum_mask_image", None)
+        if image_item is None:
+            return
+        source = getattr(page, "_illum_mask_source", None)
+        mask_data = sub.get("mask")
+        if not mask_data:
+            image_item.clear()
+            if source is not None:
+                source.setText("No mask yet. Click Calculate Illumination.")
+            return
+        mask = np.asarray(mask_data, dtype="float64")
+        finite = mask[np.isfinite(mask)]
+        if finite.size == 0:
+            image_item.clear()
+            return
+        lo = float(finite.min())
+        hi = float(finite.max())
+        if hi <= lo:
+            hi = lo + 1.0
+        lut = _figure_colormap("viridis").getLookupTable(0.0, 1.0, 256)
+        image_item.setImage(mask, autoLevels=False, levels=(lo, hi), lut=lut)
+        image_item.setRect(QRectF(0, 0, mask.shape[1], mask.shape[0]))
+        source_params = sub.get("mask_source") or {}
+        if source is not None:
+            source.setText(
+                f"tile {source_params.get('tile_w', sub.get('tile_w'))}"
+                f" × {source_params.get('tile_h', sub.get('tile_h'))}"
+                f" · bin {source_params.get('bin', sub.get('bin'))}"
+                f" · resolution {source_params.get('resolution', sub.get('resolution'))}\n"
+                f"channel {sub.get('channel')} · method {sub.get('method')}\n"
+                f"mask range {lo:.4g} – {hi:.4g}"
+            )
+
+    def _illum_plot_panel(self, page, sub, title: str) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel(f"<b>{title}</b>"))
+        plot = pg.PlotWidget(background="w")
+        plot.showGrid(x=True, y=True, alpha=0.2)
+        plot.getPlotItem().setAxisItems({
+            "bottom": _make_sci_axis("bottom"),
+            "left": _make_sci_axis("left"),
+        })
+        lay.addWidget(plot, 1)
+        if title == "Before":
+            page._illum_before_plot = plot
+        else:
+            page._illum_after_plot = plot
+        return panel
+
+    def _illum_plot_settings(self, page, sub) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Plot settings</b>"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
+        host = QWidget()
+        host.setStyleSheet("background: transparent;")
+        settings = QVBoxLayout(host)
+        settings.setContentsMargins(0, 0, 0, 0)
+        settings.setSpacing(6)
+        scroll.setWidget(host)
+        lay.addWidget(scroll, 1)
+        page._illum_settings_layout = settings
+
+        plot_dict = {
+            "type": "scatter",
+            "file": (sub.get("files") or [None])[0],
+            "file_name": None,
+            "x": sub.get("x"),
+            "y": sub.get("y"),
+            "color_mode": "parameter",
+            "color_param": sub.get("channel"),
+            "palette": "viridis",
+            "show_axes": True,
+            "show_axis_names": True,
+            "show_indices": True,
+            "show_sample_name": True,
+            "show_tile_grid": True,
+        }
+        page._illum_plot = plot_dict
+        page._illum_plot_settings_built = True
+
+        records = self._imported_files()
+        enabled = not page._illum_locked
+
+        def refresh():
+            self._illum_render_preview(page)
+            self._illum_mark_dirty(page)
+
+        settings.addWidget(QLabel("Plot type"))
+        type_combo = _NoWheelComboBox()
+        type_combo.addItem("Scatter", "scatter")
+        type_combo.addItem("Image", "image")
+        idx = type_combo.findData(plot_dict.get("type"))
+        type_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        type_combo.setEnabled(enabled)
+        settings.addWidget(type_combo)
+
+        settings.addWidget(QLabel("File"))
+        file_combo = _NoWheelComboBox()
+        files = sub.get("files") or []
+        for path in files:
+            file_combo.addItem(self._comp_file_name(path), path)
+        idx = file_combo.findData(plot_dict.get("file"))
+        file_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        file_combo.setEnabled(enabled)
+        settings.addWidget(file_combo)
+        plot_dict["file_name"] = file_combo.currentText()
+
+        columns = []
+        rec = self._figure_record(plot_dict.get("file"))
+        if rec is not None:
+            columns = self._columns_for(rec.get("parquet"), page._illum_task_id)
+
+        settings.addWidget(QLabel("X parameter"))
+        x_combo = self._gating_param_combo(columns, plot_dict.get("x"), enabled)
+        settings.addWidget(x_combo)
+        settings.addWidget(QLabel("Y parameter"))
+        y_combo = self._gating_param_combo(columns, plot_dict.get("y"), enabled)
+        settings.addWidget(y_combo)
+
+        settings.addWidget(QLabel("Color parameter (corrected channel)"))
+        color_label = QLabel(str(plot_dict.get("color_param") or "—"))
+        color_label.setStyleSheet("color: #37474f; font-weight: bold;")
+        settings.addWidget(color_label)
+        page._illum_color_label = color_label
+
+        settings.addWidget(QLabel("Palette"))
+        palette_combo = _NoWheelComboBox()
+        for name in ("viridis", "plasma", "inferno", "magma", "cividis", "turbo"):
+            palette_combo.addItem(name, name)
+        idx = palette_combo.findData(plot_dict.get("palette"))
+        palette_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        palette_combo.setEnabled(enabled)
+        settings.addWidget(palette_combo)
+
+        grid_box = QCheckBox("Show tile grid")
+        grid_box.setChecked(bool(plot_dict.get("show_tile_grid")))
+        grid_box.setEnabled(enabled)
+        settings.addWidget(grid_box)
+        settings.addStretch()
+
+        def on_type():
+            plot_dict["type"] = type_combo.currentData()
+            refresh()
+
+        def on_file():
+            plot_dict["file"] = file_combo.currentData()
+            plot_dict["file_name"] = file_combo.currentText()
+            refresh()
+
+        def on_param(key, combo):
+            def handler(value):
+                plot_dict[key] = value or None
+                refresh()
+            return handler
+
+        def on_palette():
+            plot_dict["palette"] = palette_combo.currentData()
+            refresh()
+
+        def on_grid(checked):
+            plot_dict["show_tile_grid"] = bool(checked)
+            refresh()
+
+        type_combo.currentIndexChanged.connect(lambda _=0: on_type())
+        file_combo.currentIndexChanged.connect(lambda _=0: on_file())
+        x_combo.currentTextChanged.connect(on_param("x", x_combo))
+        y_combo.currentTextChanged.connect(on_param("y", y_combo))
+        palette_combo.currentIndexChanged.connect(lambda _=0: on_palette())
+        grid_box.toggled.connect(on_grid)
+        return panel
+
+    def _illum_sub_stage(self, sub):
+        return _illumination_stage_item(sub)
+
+    def _illum_preview_stages(self, page, subs):
+        items = [
+            item for item in (self._illum_sub_stage(s) for s in subs)
+            if item is not None
+        ]
+        if not items:
+            return None
+        return [("illumination", {
+            "task_id": page._illum_task_id,
+            "submodules": items,
+        })]
+
+    def _illum_render_preview(self, page) -> None:
+        sub = self._illum_selected_sub(page)
+        plot_dict = getattr(page, "_illum_plot", None)
+        before = getattr(page, "_illum_before_plot", None)
+        after = getattr(page, "_illum_after_plot", None)
+        if sub is None or plot_dict is None or before is None or after is None:
+            return
+        try:
+            index = page._illum_submodules.index(sub)
+        except ValueError:
+            return
+        earlier = page._illum_submodules[:index]
+        before_stages = self._illum_preview_stages(page, earlier)
+        after_stages = self._illum_preview_stages(page, earlier + [sub])
+        for plot_widget in (before, after):
+            self._illum_clear_tile_grid(plot_widget)
+        self._figure_render(
+            plot_dict, before, task_id=page._illum_task_id,
+            extra_stages=before_stages,
+        )
+        self._figure_render(
+            plot_dict, after, task_id=page._illum_task_id,
+            extra_stages=after_stages,
+        )
+        if plot_dict.get("show_tile_grid"):
+            before._illum_grid_item = self._illum_draw_tile_grid(
+                before, plot_dict, sub
+            )
+            after._illum_grid_item = self._illum_draw_tile_grid(
+                after, plot_dict, sub
+            )
+
+    def _illum_clear_tile_grid(self, plot_widget) -> None:
+        item = getattr(plot_widget, "_illum_grid_item", None)
+        if item is None:
+            return
+        try:
+            plot_widget.removeItem(item)
+        except Exception:  # noqa: BLE001
+            pass
+        plot_widget._illum_grid_item = None
+
+    def _illum_draw_tile_grid(self, plot_widget, plot_dict, sub):
+        import numpy as np
+
+        tile_w = int(sub.get("tile_w", 0) or 0)
+        tile_h = int(sub.get("tile_h", 0) or 0)
+        if tile_w <= 0 or tile_h <= 0:
+            return None
+        if plot_dict.get("type") == "image":
+            extent = getattr(plot_widget, "_img_extent", None)
+            if not extent:
+                return None
+            xmin, xmax, ymin, ymax = extent
+        else:
+            xmin = getattr(plot_widget, "_data_xmin", None)
+            xmax = getattr(plot_widget, "_data_xmax", None)
+            ymin = getattr(plot_widget, "_data_ymin", None)
+            ymax = getattr(plot_widget, "_data_ymax", None)
+            if None in (xmin, xmax, ymin, ymax):
+                return None
+        xs = []
+        ys = []
+        x = xmin
+        while x <= xmax:
+            xs.extend([x, x, np.nan])
+            ys.extend([ymin, ymax, np.nan])
+            x += tile_w
+            if len(xs) > 20000:
+                break
+        y = ymin
+        while y <= ymax:
+            xs.extend([xmin, xmax, np.nan])
+            ys.extend([y, y, np.nan])
+            y += tile_h
+            if len(xs) > 20000:
+                break
+        if not xs:
+            return None
+        item = pg.PlotDataItem(
+            np.asarray(xs), np.asarray(ys),
+            pen=pg.mkPen((120, 140, 170, 140), width=1),
+            connect="finite",
+        )
+        plot_widget.addItem(item)
+        return item
+
+    def _illum_reset_plot_defaults(self, page, sub) -> None:
+        plot_dict = getattr(page, "_illum_plot", None)
+        if plot_dict is None:
+            return
+        plot_dict["x"] = sub.get("x")
+        plot_dict["y"] = sub.get("y")
+        plot_dict["color_param"] = sub.get("channel")
+        label = getattr(page, "_illum_color_label", None)
+        if label is not None:
+            label.setText(str(sub.get("channel") or "—"))
+
+    def _illum_calculate(self, page, sub, button) -> None:
+        channel = sub.get("channel")
+        x_name = sub.get("x")
+        y_name = sub.get("y")
+        if not channel or not x_name or not y_name:
+            QMessageBox.information(
+                self,
+                "Calculate Illumination",
+                "Select the channel and the X/Y parameters first.",
+            )
+            return
+        files = list(sub.get("calc_files") or [])
+        if not files:
+            QMessageBox.information(
+                self,
+                "Calculate Illumination",
+                "Select at least one file to calculate the mask from.",
+            )
+            return
+        if int(sub.get("resolution", 10)) < int(sub.get("bin", 5)):
+            QMessageBox.information(
+                self,
+                "Calculate Illumination",
+                "Resolution must be greater than or equal to bin.",
+            )
+            return
+        try:
+            index = page._illum_submodules.index(sub)
+        except ValueError:
+            return
+        earlier = page._illum_submodules[:index]
+        stages = self._map_stages(page._illum_task_id) or []
+        stages = list(stages)
+        earlier_items = [
+            item for item in (self._illum_sub_stage(s) for s in earlier)
+            if item is not None
+        ]
+        if earlier_items:
+            stages.append(("illumination", {
+                "task_id": page._illum_task_id,
+                "submodules": earlier_items,
+            }))
+        base_columns = {}
+        for path in files:
+            base_columns[path] = set(
+                self._column_index.get(self._rel_data_key(path), [])
+            )
+        page._illum_request_key = sub["id"]
+        button.setEnabled(False)
+        status = getattr(page, "_illum_calc_status", None)
+        if status is not None:
+            status.setText("Calculating…")
+        page._illum_worker.request(
+            sub["id"], stages, base_columns, files, channel, x_name, y_name,
+            int(sub.get("tile_w", 256)), int(sub.get("tile_h", 256)),
+            int(sub.get("bin", 5)), int(sub.get("resolution", 10)),
+        )
+
+    def _illum_on_poll(self, page) -> None:
+        worker = getattr(page, "_illum_worker", None)
+        if worker is None:
+            return
+        for key, result, error in worker.poll():
+            if key != page._illum_request_key:
+                continue
+            page._illum_request_key = None
+            button = getattr(page, "_illum_calc_btn", None)
+            if button is not None:
+                button.setEnabled(not page._illum_locked)
+            status = getattr(page, "_illum_calc_status", None)
+            if error:
+                if status is not None:
+                    status.setText(error)
+                QMessageBox.warning(self, "Calculate Illumination", error)
+                continue
+            sub = next(
+                (s for s in page._illum_submodules if s["id"] == key), None
+            )
+            if sub is None:
+                continue
+            sub["mask"] = result["mask"]
+            sub["mask_source"] = {
+                "tile_w": result["tile_w"],
+                "tile_h": result["tile_h"],
+                "bin": result["bin"],
+                "resolution": result["resolution"],
+                "files": result["files"],
+                "channel": sub.get("channel"),
+                "x": sub.get("x"),
+                "y": sub.get("y"),
+            }
+            if status is not None:
+                status.setText("Mask calculated.")
+            self._illum_render_mask(page, sub)
+            if sub.get("id") == page._illum_selected:
+                self._illum_render_preview(page)
+            self._illum_refresh_list(page)
+            self._illum_mark_dirty(page)
+
+    def _illum_mark_dirty(self, page) -> None:
+        page._illum_dirty = True
+        self._illum_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _illum_save_now(self, page) -> None:
+        page._illum_task_def["params"] = page._illum_params
+        if self.project is not None:
+            self.project.save()
+        page._illum_snapshot = copy.deepcopy(page._illum_params)
+        page._illum_dirty = False
+        self._illum_update_save_btn(page)
+        self.statusBar().showMessage("Illumination correction saved")
+        self._module_saved(page)
+
+    def _illum_update_save_btn(self, page) -> None:
+        page._illum_save_btn.setEnabled(page._illum_dirty and not page._illum_locked)
+
+    def _illum_close(self, page) -> None:
+        if page._illum_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Close Illumination Correction",
+                "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._illum_task_def["params"] = page._illum_snapshot
+        for name in ("_illum_poll_timer", "_illum_order_timer"):
+            timer = getattr(page, name, None)
+            if timer is not None:
+                timer.stop()
+        worker = getattr(page, "_illum_worker", None)
+        if worker is not None:
+            worker.stop()
+        self._close_module_page(page)
+
     # ----- gating module (map) -----------------------------------------
     def _build_gating_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
         """Build the Gating page: gate tree (1) | gate area (3) | settings (2)."""
@@ -11653,6 +13103,8 @@ class MainWindow(QMainWindow):
             page = self._build_unmix_page(name, task_def, locked)
         elif task_type == "compensation":
             page = self._build_compensation_page(name, task_def, locked)
+        elif task_type == "illumination":
+            page = self._build_illumination_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
