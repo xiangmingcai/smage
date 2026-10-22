@@ -11511,7 +11511,10 @@ class MainWindow(QMainWindow):
 
         def on_grid(checked):
             plot_dict["show_tile_grid"] = bool(checked)
-            refresh()
+            # Only toggle the overlay; re-rendering the data would re-run the
+            # whole correction pipeline and make the checkbox feel sluggish.
+            self._illum_update_tile_grid(page)
+            self._illum_mark_dirty(page)
 
         type_combo.currentIndexChanged.connect(lambda _=0: on_type())
         file_combo.currentIndexChanged.connect(lambda _=0: on_file())
@@ -11622,6 +11625,24 @@ class MainWindow(QMainWindow):
         )
         plot_widget.addItem(item)
         return item
+
+    def _illum_update_tile_grid(self, page) -> None:
+        """Add/remove the tile-grid overlay without re-rendering the data."""
+        sub = self._illum_selected_sub(page)
+        plot_dict = getattr(page, "_illum_plot", None)
+        before = getattr(page, "_illum_before_plot", None)
+        after = getattr(page, "_illum_after_plot", None)
+        if sub is None or plot_dict is None or before is None or after is None:
+            return
+        for plot_widget in (before, after):
+            self._illum_clear_tile_grid(plot_widget)
+        if plot_dict.get("show_tile_grid"):
+            before._illum_grid_item = self._illum_draw_tile_grid(
+                before, plot_dict, sub
+            )
+            after._illum_grid_item = self._illum_draw_tile_grid(
+                after, plot_dict, sub
+            )
 
     def _illum_reset_plot_defaults(self, page, sub) -> None:
         plot_dict = getattr(page, "_illum_plot", None)
