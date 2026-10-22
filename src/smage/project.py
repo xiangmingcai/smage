@@ -5,10 +5,12 @@ A Smage project is a folder named ``<name>.smage`` containing:
 - ``project.json`` — a small manifest holding the project metadata, the sample
   list, and the workflow (the task tree with every module's parameters).
 - ``data/`` — normalized tabular data files (one Parquet per imported sample).
+- ``Module/`` — per-module persisted data (each module gets a folder named by
+  its task id, e.g. ``Module/segmentation-abc123/``).
 
-Only the "Data Import" module persists data. Downstream modules store no files:
-their results are computed on demand from ``data/`` by replaying the workflow
-chain (lazy recomputation).
+Only the "Data Import" module persists tabular data. The Segmentation and
+Illumination modules persist derived artifacts (masks) under ``Module/``; every
+other module computes its results on demand.
 """
 from __future__ import annotations
 
@@ -21,9 +23,8 @@ import numpy as np
 PROJECT_VERSION = "0.1.0"
 DATA_DIRNAME = "data"
 MANIFEST_FILENAME = "project.json"
-# Illumination masks are large 2-D float arrays; they are stored as compact
-# float32 .npy files in this folder rather than inside project.json.
-MASK_DIRNAME = "illumination"
+# Each module's own persisted files live under this folder, keyed by task id.
+MODULE_DIRNAME = "Module"
 
 
 class Project:
@@ -91,38 +92,42 @@ class Project:
             json.dumps(serializable, separators=(",", ":")), encoding="utf-8"
         )
 
-    def _mask_path(self, sub_id: str) -> Path:
-        """Absolute path of a submodule's illumination mask file."""
-        return self.path / MASK_DIRNAME / f"{sub_id}.npy"
+    def _mask_path(self, task_id: str, sub_id: str) -> Path:
+        """Absolute path of an illumination submodule's mask file."""
+        return self.path / MODULE_DIRNAME / str(task_id) / f"{sub_id}.npy"
 
-    def _externalize_masks(self, node):
+    def _externalize_masks(self, node, task_id=None):
         """Return a JSON-safe copy of `node` with illumination masks externalized.
 
         An illumination submodule carries a 2-D ``mask`` (a list of lists, or a
-        numpy array). It is written to a float32 ``.npy`` file and replaced by a
-        relative ``mask_file`` path so it never lands in the JSON. The input
-        `node` is not modified.
+        numpy array). It is written to a float32 ``.npy`` file under its
+        module's own ``Module/<task-id>/`` folder and replaced by a relative
+        ``mask_file`` path so it never lands in the JSON. The input `node` is
+        not modified.
         """
         if isinstance(node, dict):
+            # A workflow task; remember it so masks go under its folder.
+            if "type" in node and "id" in node:
+                task_id = node.get("id")
             mask = node.get("mask")
             if mask is not None and (
                 isinstance(mask, (list, tuple)) or hasattr(mask, "dtype")
             ):
                 sub_id = node.get("id")
-                if sub_id is not None:
-                    rel = f"{MASK_DIRNAME}/{sub_id}.npy"
-                    path = self._mask_path(str(sub_id))
+                if sub_id is not None and task_id:
+                    rel = f"{MODULE_DIRNAME}/{task_id}/{sub_id}.npy"
+                    path = self._mask_path(str(task_id), str(sub_id))
                     path.parent.mkdir(parents=True, exist_ok=True)
                     np.save(path, np.asarray(mask, dtype="float32"))
                     out = {}
                     for key, value in node.items():
                         if key != "mask":
-                            out[key] = self._externalize_masks(value)
+                            out[key] = self._externalize_masks(value, task_id)
                     out["mask_file"] = rel
                     return out
-            return {k: self._externalize_masks(v) for k, v in node.items()}
+            return {k: self._externalize_masks(v, task_id) for k, v in node.items()}
         if isinstance(node, list):
-            return [self._externalize_masks(v) for v in node]
+            return [self._externalize_masks(v, task_id) for v in node]
         return node
 
     def _hydrate_masks(self, node) -> None:

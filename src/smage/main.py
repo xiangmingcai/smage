@@ -311,6 +311,88 @@ _MIXED = object()
 # Scaling (map) module: available transforms.
 SCALING_METHODS = ["linear", "log10", "arcsinh"]
 
+# Segmentation module: methods and mask storage.
+SEG_METHODS = [
+    ("Nuclear Expansion", "nuclear_expansion"),
+    ("Mask Input", "mask_input"),
+]
+# Per-file mask status shown in the file table.
+SEG_STATUS_NO_MASK = "no mask"
+SEG_STATUS_PENDING = "pending"
+SEG_STATUS_APPLIED = "applied"
+# Mask Input import states (shown in the mask-input table).
+SEG_IMPORT_SELECT = "Select a file"
+SEG_IMPORT_WAITING = "Waiting for import"
+SEG_IMPORT_DONE = "Imported"
+SEG_IMPORT_FORMAT = "Format error — choose another file"
+SEG_IMPORT_SIZE = "Size mismatch — choose another file"
+SEG_IMPORT_UNKNOWN = "Unknown error — try again"
+# Default Nuclear Expansion parameters.
+SEG_DEFAULT_PARAMS = {
+    "channel": None,
+    "threshold_mode": "otsu",
+    "threshold": 0.0,
+    "min_area": 30,
+    "expand": 5,
+}
+
+
+def _otsu_threshold(values) -> float:
+    """Return an Otsu threshold for a finite 1-D array (0.0 when undecidable)."""
+    import numpy as np
+
+    v = np.asarray(values, dtype="float64")
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0
+    vmin, vmax = float(v.min()), float(v.max())
+    if not vmax > vmin:
+        return vmin
+    hist, edges = np.histogram(v, bins=256, range=(vmin, vmax))
+    hist = hist.astype("float64")
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    weight = np.cumsum(hist)
+    total = weight[-1]
+    if total <= 0:
+        return vmin
+    mean_bg = np.cumsum(hist * centers)
+    mean_total = mean_bg[-1]
+    # Between-class variance for every split (ignore empty sides).
+    w0 = weight[:-1]
+    w1 = total - w0
+    valid = (w0 > 0) & (w1 > 0)
+    if not valid.any():
+        return vmin
+    m0 = np.zeros_like(w0)
+    m0[valid] = mean_bg[:-1][valid] / w0[valid]
+    m1 = np.zeros_like(w1)
+    m1[valid] = (mean_total - mean_bg[:-1][valid]) / w1[valid]
+    between = np.zeros_like(w0)
+    between[valid] = w0[valid] * w1[valid] * (m0[valid] - m1[valid]) ** 2
+    return float(centers[int(np.argmax(between))])
+
+
+def _relabel_sequential(labels, min_area=1):
+    """Drop labels smaller than `min_area` and renumber them 1..N (0 = background)."""
+    import numpy as np
+    from scipy import ndimage
+
+    if labels.size == 0:
+        return labels
+    counts = np.bincount(labels.ravel())
+    keep = np.zeros(counts.size, dtype=bool)
+    if counts.size > 1:
+        keep[1:] = counts[1:] >= max(1, int(min_area))
+    if not keep.any():
+        return np.zeros_like(labels)
+    # Map old ids to 1..N in ascending order.
+    remap = np.zeros(counts.size, dtype=np.int32)
+    remap[keep] = np.arange(1, int(keep.sum()) + 1, dtype=np.int32)
+    out = remap[labels]
+    # `ndimage.label` already yields contiguous ids, but filtering can leave gaps.
+    return out.astype(np.int32)
+
+
 
 def _apply_scale_transform(x, config):
     """Apply a scaling transform (linear/log10/arcsinh) to a numeric array.
@@ -873,10 +955,10 @@ class _GatingStatsWorker:
         self._thread.start()
 
     def request(self, generation, parquet_path, gates, stages, base_columns,
-                affected):
+                affected, virtual=None):
         self._req_q.put(
             (generation, parquet_path, gates, stages, set(base_columns),
-             affected)
+             affected, dict(virtual or {}))
         )
 
     def poll(self):
@@ -905,7 +987,7 @@ class _GatingStatsWorker:
             self._res_q.put(res)
 
     def _compute(self, generation, parquet_path, gates, stages, base_columns,
-                 affected):
+                 affected, virtual=None):
         import numpy as np
         import pandas as pd
         if not parquet_path or not gates:
@@ -940,6 +1022,8 @@ class _GatingStatsWorker:
                 ).to_numpy(dtype="float64")
             self._columns = cols
         arrays = {name: cols[name] for name in base_needed if name in cols}
+        for name, values_arr in (virtual or {}).items():
+            arrays.setdefault(name, values_arr)
         arrays = _evaluate_stages(stages, arrays, needed, parquet_path)
         existing = set(arrays)
         if not arrays:
@@ -2865,13 +2949,26 @@ MODULE_STATE_SAVED = "saved"
 
 
 def _task_is_locked(task: dict) -> bool:
-    """True if the task (or any descendant) is a generate module with saved data."""
-    if (
-        _task_kind(task.get("type", "")) == "generate"
-        and task.get("output", {}).get("saved")
-    ):
-        return True
-    return any(_task_is_locked(child) for child in task.get("children", []))
+    """True if a descendant generate module has saved data.
+
+    Saved generated output (for example segmentation masks) locks every module
+    *above* it: those modules can still be opened and explored, but their
+    changes cannot be saved. The generate module itself is never locked, and
+    neither is anything below it.
+    """
+
+    def walk(node) -> bool:
+        for child in node.get("children", []):
+            if (
+                _task_kind(child.get("type", "")) == "generate"
+                and child.get("output", {}).get("saved")
+            ):
+                return True
+            if walk(child):
+                return True
+        return False
+
+    return walk(task)
 
 
 class MainWindow(QMainWindow):
@@ -2910,6 +3007,8 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+        # Mask-edge images are temporary: drop this module's cache on exit.
+        self._seg_clear_edge_cache()
         event.accept()
 
     def _has_unsaved_module_changes(self) -> bool:
@@ -2922,6 +3021,7 @@ class MainWindow(QMainWindow):
                 or getattr(widget, "_unmix_dirty", False)
                 or getattr(widget, "_comp_dirty", False)
                 or getattr(widget, "_illum_dirty", False)
+                or getattr(widget, "_seg_dirty", False)
             ):
                 return True
         return False
@@ -3031,6 +3131,9 @@ class MainWindow(QMainWindow):
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
         self._stage_cache = {}
+        self._seg_value_cache = {}
+        self._seg_mask_cache = {}
+        self._seg_clear_edge_cache()
 
     def _import_task(self):
         """Return the fixed 'import' task, or None."""
@@ -3162,7 +3265,6 @@ class MainWindow(QMainWindow):
             add_btn.setFixedWidth(36)
             add_btn.setToolTip("Add child module")
             add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            add_btn.setEnabled(not locked)
             if on_add_child is not None:
                 add_btn.clicked.connect(on_add_child)
             buttons.addWidget(add_btn)
@@ -3186,7 +3288,15 @@ class MainWindow(QMainWindow):
 
     def _show_actions_menu(self, task_def: dict, parent_task_def) -> None:
         """Show the task actions menu."""
-        locked = _task_is_locked(task_def)
+        menu = self._build_actions_menu(task_def, parent_task_def)
+        menu.exec(QCursor.pos())
+
+    def _build_actions_menu(self, task_def: dict, parent_task_def) -> QMenu:
+        """Build the task actions menu without showing it.
+
+        Locking only stops a module from *saving* its changes; the workflow
+        structure can still be edited (delete, paste, add children).
+        """
         menu = QMenu(self)
 
         copy_action = QAction("Copy", self)
@@ -3200,37 +3310,31 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
 
         paste_action = QAction("Paste", self)
-        paste_action.setEnabled(not locked)
         paste_action.triggered.connect(lambda: self._paste_task(task_def, False))
         menu.addAction(paste_action)
 
         paste_branch_action = QAction("Paste branch", self)
-        paste_branch_action.setEnabled(not locked)
         paste_branch_action.triggered.connect(lambda: self._paste_task(task_def, True))
         menu.addAction(paste_branch_action)
 
         menu.addSeparator()
 
         rename_action = QAction("Rename", self)
-        rename_action.setEnabled(not locked)
         rename_action.triggered.connect(lambda: self._rename_task(task_def))
         menu.addAction(rename_action)
 
         delete_action = QAction("Delete", self)
-        delete_action.setEnabled(not locked)
         delete_action.triggered.connect(
             lambda: self._delete_task(task_def, parent_task_def, False)
         )
         menu.addAction(delete_action)
 
         delete_branch_action = QAction("Delete branch", self)
-        delete_branch_action.setEnabled(not locked)
         delete_branch_action.triggered.connect(
             lambda: self._delete_task(task_def, parent_task_def, True)
         )
         menu.addAction(delete_branch_action)
-
-        menu.exec(QCursor.pos())
+        return menu
 
     def _copy_task(self, task_def: dict, with_branch: bool = False) -> None:
         """Copy a single task (or, with_branch, its whole branch) to the clipboard."""
@@ -3271,8 +3375,38 @@ class MainWindow(QMainWindow):
             self.project.save()
         self._refresh_workflow_tree()
 
+    def _collect_task_ids(self, task_def: dict) -> list:
+        """Return the ids of a task and every descendant (pre-order)."""
+        ids = []
+        stack = [task_def]
+        while stack:
+            node = stack.pop()
+            if node.get("id"):
+                ids.append(node.get("id"))
+            stack.extend(node.get("children", []))
+        return ids
+
+    def _cleanup_module_data(self, task_ids) -> None:
+        """Delete the per-module data folders of the given task ids."""
+        if self.project is None:
+            return
+        import shutil
+
+        for tid in task_ids:
+            try:
+                shutil.rmtree(
+                    self.project.path / "Module" / str(tid), ignore_errors=True
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     def _delete_task(self, task_def: dict, parent_task_def, with_branch: bool = False) -> None:
-        """Delete a single task (or, with_branch, its whole branch)."""
+        """Delete a single task (or, with_branch, its whole branch).
+
+        Deleting a generate module releases the lock it placed on the modules
+        above it and removes its persisted data (masks); the workflow tree is
+        rebuilt afterwards, so their Save buttons come back immediately.
+        """
         name = task_def.get("name", "task")
         message = (
             f"Delete branch '{name}' and its sub-modules?"
@@ -3298,14 +3432,43 @@ class MainWindow(QMainWindow):
 
         index = siblings.index(task_def)
         if with_branch:
+            removed_ids = self._collect_task_ids(task_def)
             del siblings[index]
         else:
             # Remove only this task; promote its children into its place.
+            removed_ids = [task_def.get("id")]
             siblings[index:index + 1] = task_def.get("children", [])
 
+        self._cleanup_module_data([i for i in removed_ids if i])
         if self.project is not None:
             self.project.save()
         self._refresh_workflow_tree()
+        self._refresh_locked_pages()
+
+    def _refresh_locked_pages(self) -> None:
+        """Rebuild the open Data Import tab when its lock state changed.
+
+        The Data Import page keeps no unsaved edits, so rebuilding is safe and
+        makes a released lock (e.g. after deleting a Segmentation module)
+        take effect immediately.
+        """
+        task = self._import_task()
+        if task is None or self.project is None:
+            return
+        task_id = task.get("id")
+        for index in range(1, self.tabs.count()):
+            page = self.tabs.widget(index)
+            if page.property("task_id") != task_id:
+                continue
+            if getattr(page, "_import_locked_state", None) == self._import_locked():
+                return
+            fresh = self._build_data_import_page()
+            fresh.setProperty("task_id", task_id)
+            title = self.tabs.tabText(index)
+            self.tabs.removeTab(index)
+            self.tabs.insertTab(index, fresh, title)
+            self.tabs.setCurrentIndex(index)
+            return
 
     def _add_task(self, parent, name: str, color: str, is_root: bool = False,
                   on_add_child=None, on_actions=None, task_type: str | None = None,
@@ -3541,6 +3704,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         locked = self._import_locked()
+        page._import_locked_state = locked
         layout.addWidget(self._build_module_toolbar("Data Import", page, include_save=False, locked=locked))
 
         content = QWidget()
@@ -4448,14 +4612,18 @@ class MainWindow(QMainWindow):
     def _columns_for(self, parquet_path, task_id=None) -> list:
         """Return the column names for a parquet file from the column index.
 
-        When `task_id` is given, the unmixed parameters produced by upstream
-        Unmix modules for this file are appended.
+        When `task_id` is given, the parameters produced by upstream modules
+        for this file are appended: Unmix output names, then any mask column
+        exposed by an upstream Segmentation module.
         """
         if not parquet_path:
             return []
         columns = list(self._column_index.get(self._rel_data_key(parquet_path), []))
         if task_id:
             for name in self._unmix_output_names(task_id, parquet_path):
+                if name not in columns:
+                    columns.append(name)
+            for name in self._seg_applied_columns(task_id, parquet_path):
                 if name not in columns:
                     columns.append(name)
         return columns
@@ -4715,6 +4883,16 @@ class MainWindow(QMainWindow):
                     values[column] = pd.to_numeric(
                         df[column], errors="coerce"
                     ).to_numpy(dtype="float64")
+        if task_id:
+            # Mask columns exposed by an upstream Segmentation module are not
+            # stored in the data file; they are resolved from the mask .npy.
+            for name, mask_path in self._seg_applied_columns(
+                task_id, parquet_path
+            ).items():
+                if name in needed and name not in values:
+                    arr = self._seg_mask_values(parquet_path, mask_path)
+                    if arr is not None:
+                        values[name] = arr
         if not stages:
             return {n: values[n] for n in names if n in values}
         evaluated = _evaluate_stages(
@@ -5744,34 +5922,52 @@ class MainWindow(QMainWindow):
         has_mask = False
         mask_accum = None
         unavailable = []
+        # Mask columns exposed by an upstream Segmentation module are not part
+        # of the image index; they are rasterised straight from the mask file.
+        seg_cols = self._seg_applied_columns(task_id, parquet_path) if task_id else {}
         for layer in layers:
             if layer.get("visible") is False:
                 continue
             channel = layer.get("parameter")
             if not channel:
                 continue
-            if channel not in color_cols:
-                # Only parameters produced by an Unmix module can be rendered.
-                produced = any(
-                    kind == "unmix" and channel in stage["names"]
-                    for kind, stage in stages
+            if channel in seg_cols:
+                chan, rect = self._seg_mask_raster(
+                    manifest, (x0, x1, y0, y1), seg_cols[channel]
                 )
-                if not produced:
+                if chan is None:
                     unavailable.append(channel)
                     continue
-            raster_stages = stages if _pipeline_touches(stages, channel) else None
-            chan, rect, frac = self._image_raster(
-                parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
-                mask_ent, raster_stages,
-            )
-            if chan is None:
-                continue
-            cname = channel if raster_stages is None else None
-            ranges = manifest.get("color_ranges", {}) or {}
-            lo, hi = ranges.get(cname, (None, None))
-            if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                lo = float(np.nanmin(chan))
-                hi = float(np.nanmax(chan))
+                lo = 0.0
+                hi = float(chan.max()) if chan.size else 1.0
+                if hi <= lo:
+                    hi = lo + 1.0
+                frac = None
+                raster_stages = None
+                cname = None
+            else:
+                if channel not in color_cols:
+                    # Only parameters produced by an Unmix module can be rendered.
+                    produced = any(
+                        kind == "unmix" and channel in stage["names"]
+                        for kind, stage in stages
+                    )
+                    if not produced:
+                        unavailable.append(channel)
+                        continue
+                raster_stages = stages if _pipeline_touches(stages, channel) else None
+                chan, rect, frac = self._image_raster(
+                    parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
+                    mask_ent, raster_stages,
+                )
+                if chan is None:
+                    continue
+                cname = channel if raster_stages is None else None
+                ranges = manifest.get("color_ranges", {}) or {}
+                lo, hi = ranges.get(cname, (None, None))
+                if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    lo = float(np.nanmin(chan))
+                    hi = float(np.nanmax(chan))
             if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
                 lo, hi = 0.0, 1.0
             if hi > lo:
@@ -8144,7 +8340,11 @@ class MainWindow(QMainWindow):
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
         self._stage_cache = {}
+        self._seg_value_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
+        # Saved output can lock (or unlock) modules, so refresh the lock badges
+        # and button states in the workflow tree.
+        self._refresh_workflow_tree()
         task_id = page.property("task_id")
         for dtid in self._module_descendant_ids(task_id):
             reg = self._module_registry[dtid]
@@ -10910,12 +11110,12 @@ class MainWindow(QMainWindow):
         self._illum_rebuild_right(page)
         self._illum_mark_dirty(page)
 
-    def _illum_drop_mask_file(self, sub) -> None:
+    def _illum_drop_mask_file(self, task_id, sub) -> None:
         """Delete a submodule's illumination mask file, if any."""
         if self.project is None:
             return
         try:
-            self.project._mask_path(str(sub["id"])).unlink(missing_ok=True)
+            self.project._mask_path(str(task_id), str(sub["id"])).unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -10929,7 +11129,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._illum_submodules.remove(sub)
-        self._illum_drop_mask_file(sub)
+        self._illum_drop_mask_file(page._illum_task_id, sub)
         if page._illum_selected == sub["id"]:
             page._illum_selected = (
                 page._illum_submodules[0]["id"]
@@ -11243,7 +11443,7 @@ class MainWindow(QMainWindow):
             if sub.get("mask"):
                 sub["mask"] = None
                 sub["mask_source"] = None
-                self._illum_drop_mask_file(sub)
+                self._illum_drop_mask_file(page._illum_task_id, sub)
                 status.setText("Parameters changed — recalculate the mask.")
             self._illum_mark_dirty(page)
 
@@ -11256,7 +11456,7 @@ class MainWindow(QMainWindow):
             if sub.get("mask"):
                 sub["mask"] = None
                 sub["mask_source"] = None
-                self._illum_drop_mask_file(sub)
+                self._illum_drop_mask_file(page._illum_task_id, sub)
                 status.setText("Parameters changed — recalculate the mask.")
             self._illum_mark_dirty(page)
 
@@ -11265,7 +11465,7 @@ class MainWindow(QMainWindow):
             if sub.get("mask"):
                 sub["mask"] = None
                 sub["mask_source"] = None
-                self._illum_drop_mask_file(sub)
+                self._illum_drop_mask_file(page._illum_task_id, sub)
                 status.setText("Parameters changed — recalculate the mask.")
             self._illum_mark_dirty(page)
 
@@ -11791,6 +11991,1444 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.stop()
         self._close_module_page(page)
+
+    # ----- segmentation module (generate) -------------------------------
+    def _seg_params_for(self, task_def) -> dict:
+        """Saved params of a segmentation task (its snapshot while open)."""
+        task_id = task_def.get("id")
+        reg = self._module_registry.get(task_id)
+        if reg is not None and reg.get("task_type") == "segmentation":
+            snap = getattr(reg["page"], "_seg_snapshot", None)
+            if isinstance(snap, dict):
+                return snap
+        return task_def.get("params") or {}
+
+    def _seg_mask_record(self, params, parquet_path):
+        """The mask record of one file in a segmentation task's params."""
+        masks = params.get("masks") or {}
+        rec = masks.get(parquet_path)
+        return rec if isinstance(rec, dict) else None
+
+    def _seg_mask_file(self, rec):
+        """Absolute path of a mask record's .npy file, or None if missing."""
+        if not rec or self.project is None:
+            return None
+        rel = rec.get("path")
+        if not rel:
+            return None
+        path = self.project.path / rel
+        return path if path.is_file() else None
+
+    def _seg_signature(self, path) -> str:
+        """A cheap change signature (size + nanosecond mtime) for a mask file."""
+        try:
+            st = Path(path).stat()
+        except OSError:
+            return ""
+        return f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+
+    def _seg_applied_columns(self, task_id, parquet_path) -> dict:
+        """{column_name: mask_path} exposed by upstream Segmentation modules.
+
+        Only masks whose saved signature still matches the file on disk are
+        exposed, so downstream modules always see the saved state.
+        """
+        if not task_id or not parquet_path or self.project is None:
+            return {}
+        out = {}
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id:
+                continue
+            if task.get("type") != "segmentation":
+                continue
+            params = self._seg_params_for(task)
+            applied = params.get("applied") or {}
+            sign = applied.get(parquet_path)
+            if not sign:
+                continue
+            path = self._seg_mask_file(self._seg_mask_record(params, parquet_path))
+            if path is None or self._seg_signature(path) != sign:
+                continue
+            name = params.get("column") or "Mask"
+            out.setdefault(name, path)
+        return out
+
+    def _seg_load_mask(self, mask_path):
+        """Load a mask .npy (cached by path + signature)."""
+        import numpy as np
+
+        cache = getattr(self, "_seg_mask_cache", None)
+        if cache is None:
+            cache = {}
+            self._seg_mask_cache = cache
+        key = str(mask_path)
+        sign = self._seg_signature(mask_path)
+        hit = cache.get(key)
+        if hit is not None and hit[0] == sign:
+            return hit[1]
+        try:
+            mask = np.load(mask_path)
+        except (OSError, ValueError):
+            return None
+        if mask.ndim != 2:
+            return None
+        if len(cache) > 4:
+            cache.clear()
+        cache[key] = (sign, mask)
+        return mask
+
+    def _seg_mask_values(self, parquet_path, mask_path):
+        """Mask labels aligned to a parquet's rows (float64, 0 where unknown)."""
+        import numpy as np
+        import pandas as pd
+
+        ent = self._ensure_image_index(parquet_path)
+        if ent is None or ent.get("manifest") is None:
+            return None
+        man = ent["manifest"]
+        mask = self._seg_load_mask(mask_path)
+        if mask is None:
+            return None
+        cache = getattr(self, "_seg_value_cache", None)
+        if cache is None:
+            cache = {}
+            self._seg_value_cache = cache
+        key = (str(parquet_path), str(mask_path))
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            df = pd.read_parquet(parquet_path, columns=["x", "y"])
+        except Exception:  # noqa: BLE001
+            return None
+        xi = np.rint(
+            df["x"].to_numpy(dtype="float64") - float(man["xmin"])
+        ).astype(np.int64)
+        yi = np.rint(
+            df["y"].to_numpy(dtype="float64") - float(man["ymin"])
+        ).astype(np.int64)
+        ok = (
+            (xi >= 0) & (xi < mask.shape[1])
+            & (yi >= 0) & (yi < mask.shape[0])
+        )
+        out = np.zeros(len(df), dtype="float64")
+        out[ok] = mask[yi[ok], xi[ok]].astype("float64")
+        if len(cache) > 4:
+            cache.clear()
+        cache[key] = out
+        return out
+
+    def _seg_mask_raster(self, manifest, bbox, mask_path):
+        """Return (label_2d, data_rect) for a mask over the visible bbox."""
+        import numpy as np
+
+        mask = self._seg_load_mask(mask_path)
+        if mask is None:
+            return None, None
+        x0, x1, y0, y1 = bbox
+        xmin = float(manifest["xmin"])
+        ymin = float(manifest["ymin"])
+        i0 = max(0, int(np.floor(x0 - xmin)))
+        i1 = min(mask.shape[1], int(np.ceil(x1 - xmin)))
+        j0 = max(0, int(np.floor(y0 - ymin)))
+        j1 = min(mask.shape[0], int(np.ceil(y1 - ymin)))
+        if i1 <= i0 or j1 <= j0:
+            return None, None
+        crop = np.asarray(mask[j0:j1, i0:i1], dtype="float32")
+        rect = QRectF(xmin + i0, ymin + j0, i1 - i0, j1 - j0)
+        return crop, rect
+
+    def _seg_temp_dir(self):
+        """Shared temp folder for this project's segmentation caches."""
+        import hashlib
+        import tempfile
+
+        key = "no-project"
+        if self.project is not None:
+            key = hashlib.md5(
+                str(self.project.path.resolve()).encode("utf-8")
+            ).hexdigest()[:12]
+        return Path(tempfile.gettempdir()) / "smage" / "segmentation" / key
+
+    def _seg_clear_edge_cache(self) -> None:
+        """Drop this project's cached mask-edge images (temp data only)."""
+        import shutil
+
+        cache = getattr(self, "_seg_edge_cache", None)
+        if cache is not None:
+            cache.clear()
+        try:
+            shutil.rmtree(self._seg_temp_dir(), ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _seg_edge_map(self, mask_path):
+        """Return (and disk-cache) the boolean edge map of a mask."""
+        import numpy as np
+
+        mask = self._seg_load_mask(mask_path)
+        if mask is None:
+            return None
+        sign = self._seg_signature(mask_path)
+        cache = getattr(self, "_seg_edge_cache", None)
+        if cache is None:
+            cache = {}
+            self._seg_edge_cache = cache
+        key = str(mask_path)
+        hit = cache.get(key)
+        if hit is not None and hit[0] == sign:
+            return hit[1]
+        path = self._seg_temp_dir() / f"{Path(str(mask_path)).stem}.{sign}.npy"
+        edge = None
+        if path.is_file():
+            try:
+                edge = np.load(path)
+            except (OSError, ValueError):
+                edge = None
+        if edge is None or edge.shape != mask.shape:
+            edge = np.zeros(mask.shape, dtype=bool)
+            if mask.size:
+                edge[1:, :] |= mask[1:, :] != mask[:-1, :]
+                edge[:, 1:] |= mask[:, 1:] != mask[:, :-1]
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(path, edge)
+            except OSError:
+                pass
+        if len(cache) > 4:
+            cache.clear()
+        cache[key] = (sign, edge)
+        return edge
+
+    # --- segmentation page
+    def _build_segmentation_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Segmentation page (files | method | preview | plot settings)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._seg_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("method", "nuclear_expansion")
+        params.setdefault("files", [])
+        params.setdefault("expose", {})
+        params.setdefault("column", "Mask")
+        params.setdefault("method_params", {})
+        params.setdefault("masks", {})
+        params.setdefault("applied", {})
+        params.setdefault("plot", {})
+        page._seg_task_def = task_def
+        page._seg_task_id = task_def.get("id")
+        page._seg_params = params
+        page._seg_locked = locked
+        page._seg_save_btn = save_btn
+        page._seg_dirty = False
+        page._seg_snapshot = copy.deepcopy(params)
+        page._seg_applied_snapshot = dict(params.get("applied") or {})
+        page._seg_overlay_item = None
+        page._seg_mask_cache = {}
+        save_btn.clicked.connect(lambda _=False: self._seg_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QHBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(12)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._seg_files_panel(page))
+        splitter.addWidget(self._seg_method_panel(page))
+        page._seg_preview_panel = self._seg_preview_panel(page)
+        page._seg_settings_panel = self._seg_plot_settings_panel(page)
+        splitter.addWidget(page._seg_preview_panel)
+        splitter.addWidget(page._seg_settings_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 2)
+        splitter.setStretchFactor(3, 1)
+        splitter.setSizes([260, 260, 520, 260])
+        row.addWidget(splitter, 1)
+        layout.addWidget(content, 1)
+        page._seg_splitter = splitter
+
+        self._seg_refresh_files(page)
+        self._seg_update_preview_visibility(page)
+        self._seg_update_save_btn(page)
+        return page
+
+    def _seg_default_plot(self, parquet_path) -> dict:
+        """A fresh image plot config for the preview panel."""
+        columns = []
+        rec = self._figure_record(parquet_path)
+        if rec is not None:
+            columns = self._columns_for(rec.get("parquet"), None)
+        channel = next((c for c in columns if c not in ("x", "y")), None)
+        return {
+            "type": "image",
+            "file": parquet_path,
+            "file_name": rec.get("name") if rec else None,
+            "x": "x",
+            "y": "y",
+            "color_mode": "parameter",
+            "color_param": channel,
+            "last_color_param": channel,
+            "palette": "viridis",
+            "layers": (
+                [{
+                    "parameter": channel,
+                    "color": (255, 255, 255),
+                    "name": str(channel),
+                    "visible": True,
+                }] if channel else []
+            ),
+            "show_legend": True,
+            "show_axes": True,
+            "show_axis_names": True,
+            "show_indices": True,
+            "show_sample_name": True,
+            "mask_mode": "shape",
+            "mask_color": "random",
+            "mask_alpha": 45,
+        }
+
+    def _seg_file_rows(self, page) -> list:
+        return list(page._seg_params.get("files") or [])
+
+    def _seg_file_status(self, page, parquet_path) -> str:
+        """no mask / pending / applied for one file."""
+        params = page._seg_params
+        rec = self._seg_mask_record(params, parquet_path)
+        path = self._seg_mask_file(rec)
+        if path is None:
+            return SEG_STATUS_NO_MASK
+        saved = page._seg_applied_snapshot.get(parquet_path) if hasattr(
+            page, "_seg_applied_snapshot"
+        ) else None
+        if saved and saved == self._seg_signature(path):
+            return SEG_STATUS_APPLIED
+        return SEG_STATUS_PENDING
+
+    def _seg_any_mask(self, page) -> bool:
+        for path in self._seg_file_rows(page):
+            rec = self._seg_mask_record(page._seg_params, path)
+            if self._seg_mask_file(rec) is not None:
+                return True
+        return False
+
+    def _seg_files_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        # Top: method chooser (small), bottom: files (large) — ratio 1:6.
+        top = QWidget()
+        tlay = QVBoxLayout(top)
+        tlay.setContentsMargins(0, 0, 0, 0)
+        tlay.setSpacing(4)
+        tlay.addWidget(QLabel("Method"))
+        method_combo = _NoWheelComboBox()
+        for text, value in SEG_METHODS:
+            method_combo.addItem(text, value)
+        idx = method_combo.findData(page._seg_params.get("method"))
+        method_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        method_combo.setEnabled(not page._seg_locked)
+        method_combo.currentIndexChanged.connect(
+            lambda _=0: self._seg_on_method_changed(page)
+        )
+        tlay.addWidget(method_combo)
+        page._seg_method_combo = method_combo
+
+        bottom = QWidget()
+        blay = QVBoxLayout(bottom)
+        blay.setContentsMargins(0, 0, 0, 0)
+        blay.setSpacing(6)
+        set_btn = QPushButton("Set Files")
+        set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        set_btn.setEnabled(not page._seg_locked)
+        set_btn.clicked.connect(lambda _=False: self._seg_set_files(page))
+        blay.addWidget(set_btn)
+        page._seg_setfiles_btn = set_btn
+
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["File", "Expose", "Status"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(26)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: none; }"
+            "QTableWidget::item:selected { background: #dbeafa; }"
+        )
+        table.itemChanged.connect(lambda item: self._seg_expose_changed(page, item))
+        blay.addWidget(table, 1)
+        page._seg_files_table = table
+
+        blay.addWidget(QLabel("Mask column"))
+        name_edit = QLineEdit(str(page._seg_params.get("column") or "Mask"))
+        name_edit.setEnabled(not page._seg_locked)
+        name_edit.editingFinished.connect(
+            lambda: self._seg_column_edited(page)
+        )
+        blay.addWidget(name_edit)
+        page._seg_column_edit = name_edit
+        hint = QLabel(
+            "Checked files expose their mask as a parameter to downstream modules "
+            "when this module is saved."
+        )
+        hint.setStyleSheet("color: #6b7785;")
+        hint.setWordWrap(True)
+        blay.addWidget(hint)
+
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(top)
+        split.addWidget(bottom)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 6)
+        split.setSizes([90, 540])
+        lay.addWidget(split, 1)
+        return panel
+
+    def _seg_refresh_files(self, page) -> None:
+        """Rebuild the file table and the mask-column status snapshot."""
+        table = page._seg_files_table
+        table.blockSignals(True)
+        rows = self._seg_file_rows(page)
+        table.setRowCount(len(rows))
+        expose = page._seg_params.get("expose") or {}
+        editable = not page._seg_locked
+        for i, path in enumerate(rows):
+            name_item = QTableWidgetItem(self._comp_file_name(path))
+            name_item.setData(Qt.ItemDataRole.UserRole, path)
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(i, 0, name_item)
+
+            has_mask = self._seg_mask_file(
+                self._seg_mask_record(page._seg_params, path)
+            ) is not None
+            chk = QTableWidgetItem()
+            chk.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            chk.setCheckState(
+                Qt.CheckState.Checked if expose.get(path) else Qt.CheckState.Unchecked
+            )
+            chk.setSelected(False)
+            if not has_mask or not editable:
+                chk.setFlags(Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(i, 1, chk)
+
+            status = self._seg_file_status(page, path)
+            sitem = QTableWidgetItem(status)
+            sitem.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            if status == SEG_STATUS_APPLIED:
+                sitem.setForeground(QColor("#1a7f37"))
+            elif status == SEG_STATUS_PENDING:
+                sitem.setForeground(QColor("#b58900"))
+            else:
+                sitem.setForeground(QColor("#9aa0a6"))
+            table.setItem(i, 2, sitem)
+        table.blockSignals(False)
+        self._seg_rebuild_method_panel(page)
+        self._seg_refresh_plot_settings(page)
+        self._seg_update_preview_visibility(page)
+
+    def _seg_expose_changed(self, page, item) -> None:
+        if page._seg_locked or item.column() != 1:
+            return
+        table = page._seg_files_table
+        row = table.row(item)
+        rows = self._seg_file_rows(page)
+        if not (0 <= row < len(rows)):
+            return
+        path = rows[row]
+        expose = page._seg_params.setdefault("expose", {})
+        expose[path] = item.checkState() == Qt.CheckState.Checked
+        self._seg_refresh_status(page)
+        self._seg_mark_dirty(page)
+
+    def _seg_refresh_status(self, page) -> None:
+        """Update only the status cells (no widget rebuild)."""
+        table = page._seg_files_table
+        rows = self._seg_file_rows(page)
+        table.blockSignals(True)
+        for i, path in enumerate(rows):
+            if i >= table.rowCount():
+                break
+            item = table.item(i, 2)
+            if item is None:
+                continue
+            status = self._seg_file_status(page, path)
+            item.setText(status)
+            if status == SEG_STATUS_APPLIED:
+                item.setForeground(QColor("#1a7f37"))
+            elif status == SEG_STATUS_PENDING:
+                item.setForeground(QColor("#b58900"))
+            else:
+                item.setForeground(QColor("#9aa0a6"))
+        table.blockSignals(False)
+
+    def _seg_is_image_file(self, rec) -> bool:
+        """Whether an imported (processed) file holds pixel data.
+
+        Processed records do not carry the original dimensions, so this checks
+        the source file's extension, then any recorded image dimensions, then
+        the presence of an image index (which the importer builds for TIFFs).
+        """
+        dims = rec.get("dimensions") or {}
+        if dims.get("kind") == "image":
+            return True
+        source = str(rec.get("source") or "")
+        if Path(source).suffix.lower() in (".tif", ".tiff"):
+            return True
+        parquet = rec.get("parquet")
+        if parquet and self._image_load_manifest(parquet) is not None:
+            return True
+        return False
+
+    def _seg_set_files(self, page) -> None:
+        records = self._imported_files()
+        names = [rec.get("name", "") for rec in records]
+        current = [self._comp_file_name(p) for p in self._seg_file_rows(page)]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        chosen_set = set(chosen)
+        picks = [rec for rec in records if rec.get("name", "") in chosen_set]
+        bad = [rec.get("name", "") for rec in picks if not self._seg_is_image_file(rec)]
+        if bad:
+            QMessageBox.warning(
+                self,
+                "Segmentation",
+                "Only image files can be used: segmentation works on pixels and "
+                "the mask must line up row by row with the image.\n\n"
+                "Not image files:\n" + "\n".join(f"· {n}" for n in bad),
+            )
+            return
+        page._seg_params["files"] = [rec.get("parquet") for rec in picks]
+        self._seg_refresh_files(page)
+        self._seg_mark_dirty(page)
+
+    def _seg_column_edited(self, page) -> None:
+        name = page._seg_column_edit.text().strip() or "Mask"
+        page._seg_params["column"] = name
+        self._seg_refresh_status(page)
+        self._seg_mark_dirty(page)
+
+    def _seg_on_method_changed(self, page) -> None:
+        page._seg_params["method"] = page._seg_method_combo.currentData()
+        self._seg_rebuild_method_panel(page)
+        self._seg_mark_dirty(page)
+
+    def _seg_rebuild_method_panel(self, page) -> None:
+        """Swap the second panel between method params and the mask-input table."""
+        host = page._seg_method_host
+        self._clear_layout(host.layout())
+        method = page._seg_params.get("method")
+        if method == "mask_input":
+            self._seg_mask_input_panel(page, host)
+        else:
+            self._seg_method_params_panel(page, host)
+
+    def _seg_method_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        host = QWidget()
+        host.setLayout(QVBoxLayout())
+        host.layout().setContentsMargins(0, 0, 0, 0)
+        host.layout().setSpacing(6)
+        lay.addWidget(host, 1)
+        page._seg_method_host = host
+        return panel
+
+    def _seg_map_params(self, page) -> dict:
+        method = page._seg_params.get("method") or "nuclear_expansion"
+        store = page._seg_params.setdefault("method_params", {})
+        params = store.setdefault(method, {})
+        for key, value in SEG_DEFAULT_PARAMS.items():
+            params.setdefault(key, value)
+        return params
+
+    def _seg_otsu_value(self, page, parquet_path, channel):
+        """Otsu threshold of one channel (cached per file + channel)."""
+        import pandas as pd
+
+        cache = getattr(page, "_seg_otsu_cache", None)
+        if cache is None:
+            cache = {}
+            page._seg_otsu_cache = cache
+        key = (str(parquet_path), str(channel))
+        if key in cache:
+            return cache[key]
+        try:
+            df = pd.read_parquet(parquet_path, columns=[channel])
+        except Exception:  # noqa: BLE001
+            return None
+        values = pd.to_numeric(
+            df[channel], errors="coerce"
+        ).to_numpy(dtype="float64")
+        value = _otsu_threshold(values)
+        cache[key] = value
+        return value
+
+    def _seg_method_params_panel(self, page, host) -> None:
+        """Nuclear Expansion parameters + Calculate."""
+        lay = host.layout()
+        params = self._seg_map_params(page)
+        enabled = not page._seg_locked
+
+        lay.addWidget(QLabel("<b>Nuclear Expansion</b>"))
+        lay.addWidget(QLabel("Nucleus channel"))
+        columns = []
+        for path in self._seg_file_rows(page):
+            for name in self._columns_for(path, None):
+                if name not in columns:
+                    columns.append(name)
+        channel_combo = _NoWheelComboBox()
+        channel_combo.addItem("", None)
+        for name in columns:
+            if name in ("x", "y"):
+                continue
+            channel_combo.addItem(name, name)
+        idx = channel_combo.findData(params.get("channel"))
+        if idx >= 0:
+            channel_combo.setCurrentIndex(idx)
+        channel_combo.setEnabled(enabled)
+        lay.addWidget(channel_combo)
+
+        lay.addWidget(QLabel("Threshold"))
+        mode_combo = _NoWheelComboBox()
+        mode_combo.addItem("Otsu (automatic)", "otsu")
+        mode_combo.addItem("Manual value", "manual")
+        idx = mode_combo.findData(params.get("threshold_mode", "otsu"))
+        mode_combo.setCurrentIndex(max(0, idx))
+        mode_combo.setEnabled(enabled)
+        lay.addWidget(mode_combo)
+
+        def otsu_default():
+            """The Otsu value of the chosen channel, used as the default."""
+            channel = params.get("channel")
+            rows = self._seg_file_rows(page)
+            if not channel or not rows:
+                return None
+            return self._seg_otsu_value(page, rows[0], channel)
+
+        initial = float(params.get("threshold", 0.0))
+        if params.get("threshold_mode", "otsu") != "manual":
+            otsu = otsu_default()
+            if otsu is not None:
+                initial = otsu
+        thr_spin = _LogStepSpinBox(initial, lambda v: on_threshold(v))
+        thr_spin.set_enabled(enabled)
+        thr_spin.setToolTip(
+            "Prefilled with the Otsu value of the chosen channel. Editing it "
+            "switches to a manual threshold."
+        )
+        lay.addWidget(thr_spin)
+
+        lay.addWidget(QLabel("Minimum nucleus area (px)"))
+        area_spin = _NoWheelSpinBox()
+        area_spin.setRange(1, 1000000)
+        area_spin.setValue(int(params.get("min_area", 30)))
+        area_spin.setEnabled(enabled)
+        lay.addWidget(area_spin)
+
+        lay.addWidget(QLabel("Expansion radius (px)"))
+        exp_spin = _NoWheelSpinBox()
+        exp_spin.setRange(0, 500)
+        exp_spin.setValue(int(params.get("expand", 5)))
+        exp_spin.setEnabled(enabled)
+        lay.addWidget(exp_spin)
+
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setEnabled(enabled)
+        lay.addWidget(calc_btn)
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        lay.addStretch(1)
+        page._seg_calc_btn = calc_btn
+        page._seg_calc_status = status
+
+        def refresh_otsu():
+            if params.get("threshold_mode") == "manual":
+                return
+            value = otsu_default()
+            if value is not None:
+                thr_spin.set_value(value)
+
+        def on_threshold(value):
+            params["threshold"] = float(value)
+            if params.get("threshold_mode") != "manual":
+                params["threshold_mode"] = "manual"
+                mode_combo.setCurrentIndex(mode_combo.findData("manual"))
+            self._seg_mark_dirty(page)
+
+        def on_channel(_=0):
+            params["channel"] = channel_combo.currentData()
+            refresh_otsu()
+            self._seg_mark_dirty(page)
+
+        def on_mode(_=0):
+            params["threshold_mode"] = mode_combo.currentData()
+            if params["threshold_mode"] == "otsu":
+                refresh_otsu()
+            self._seg_mark_dirty(page)
+
+        def on_area(value):
+            params["min_area"] = int(value)
+            self._seg_mark_dirty(page)
+
+        def on_expand(value):
+            params["expand"] = int(value)
+            self._seg_mark_dirty(page)
+
+        channel_combo.currentIndexChanged.connect(on_channel)
+        mode_combo.currentIndexChanged.connect(on_mode)
+        area_spin.valueChanged.connect(on_area)
+        exp_spin.valueChanged.connect(on_expand)
+        calc_btn.clicked.connect(lambda _=False: self._seg_calculate(page))
+
+    def _seg_mask_input_panel(self, page, host) -> None:
+        """Mask Input: one row per file with a mask-file picker + Import."""
+        lay = host.layout()
+        lay.addWidget(QLabel("<b>Mask Input</b>"))
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["File", "Mask file", "Status"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(28)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: none; }"
+        )
+        lay.addWidget(table, 1)
+        page._seg_input_table = table
+
+        import_btn = QPushButton("Import")
+        import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        import_btn.setEnabled(not page._seg_locked)
+        lay.addWidget(import_btn)
+        hint = QLabel(
+            "Masks must be TIFF images whose width and height match the data file."
+        )
+        hint.setStyleSheet("color: #6b7785;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        page._seg_import_status = status
+        import_btn.clicked.connect(lambda _=False: self._seg_import_masks(page))
+
+        self._seg_refresh_input_table(page)
+
+    def _seg_mask_record_live(self, page, parquet_path, create=False) -> dict:
+        masks = page._seg_params.setdefault("masks", {})
+        rec = masks.get(parquet_path)
+        if not isinstance(rec, dict):
+            if not create:
+                return {}
+            rec = {"path": None, "source": None, "input": None,
+                   "state": SEG_IMPORT_SELECT}
+            masks[parquet_path] = rec
+        return rec
+
+    def _seg_refresh_input_table(self, page) -> None:
+        table = getattr(page, "_seg_input_table", None)
+        if table is None:
+            return
+        rows = self._seg_file_rows(page)
+        table.blockSignals(True)
+        table.setRowCount(len(rows))
+        enabled = not page._seg_locked
+        for i, path in enumerate(rows):
+            name_item = QTableWidgetItem(self._comp_file_name(path))
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            table.setItem(i, 0, name_item)
+
+            rec = self._seg_mask_record(page._seg_params, path) or {}
+            btn = QPushButton(Path(str(rec.get("input") or "")).name or "…")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setEnabled(enabled)
+            btn.setToolTip(rec.get("input") or "Choose a mask file")
+            btn.clicked.connect(
+                lambda _=False, p=path: self._seg_pick_mask_file(page, p)
+            )
+            table.setCellWidget(i, 1, btn)
+
+            state = rec.get("state") or (
+                SEG_IMPORT_DONE if self._seg_mask_file(rec) else SEG_IMPORT_SELECT
+            )
+            sitem = QTableWidgetItem(state)
+            sitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            if state == SEG_IMPORT_DONE:
+                sitem.setForeground(QColor("#1a7f37"))
+            elif state in (SEG_IMPORT_FORMAT, SEG_IMPORT_SIZE, SEG_IMPORT_UNKNOWN):
+                sitem.setForeground(QColor("#c0392b"))
+            else:
+                sitem.setForeground(QColor("#9aa0a6"))
+            table.setItem(i, 2, sitem)
+        table.blockSignals(False)
+
+    def _seg_pick_mask_file(self, page, parquet_path) -> None:
+        rec = self._seg_mask_record_live(page, parquet_path, create=True)
+        already = self._seg_mask_file(rec) is not None
+        if already:
+            reply = QMessageBox.question(
+                self,
+                "Choose mask file",
+                "This file's mask has already been imported.\n"
+                "Choosing another one will delete the imported mask. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        start_dir = getattr(self, "_seg_last_mask_dir", None) or str(Path.home())
+        if rec.get("input"):
+            start_dir = str(Path(str(rec["input"])).parent)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select mask file", start_dir, "All files (*)"
+        )
+        if not path:
+            return
+        self._seg_last_mask_dir = str(Path(path).parent)
+        if already:
+            self._seg_delete_mask(page, parquet_path)
+        rec["input"] = path
+        rec["state"] = SEG_IMPORT_WAITING
+        rec["path"] = rec.get("path") if rec.get("source") == "builtin" else None
+        self._seg_refresh_input_table(page)
+        self._seg_refresh_files(page)
+        self._seg_mark_dirty(page)
+
+    def _seg_delete_mask(self, page, parquet_path) -> None:
+        """Remove a file's mask .npy and its record."""
+        rec = self._seg_mask_record(page._seg_params, parquet_path) or {}
+        rel = rec.get("path")
+        if rel and self.project is not None:
+            try:
+                (self.project.path / rel).unlink(missing_ok=True)
+            except OSError:
+                pass
+        page._seg_mask_cache = {}
+        self._seg_value_cache = {}
+
+    def _seg_import_masks(self, page) -> None:
+        import numpy as np
+        import tifffile
+
+        rows = self._seg_file_rows(page)
+        if not rows:
+            QMessageBox.information(
+                self, "Import", "Select data files first."
+            )
+            return
+        pending = []
+        for path in rows:
+            rec = self._seg_mask_record_live(page, path, create=True)
+            if rec.get("state") == SEG_IMPORT_DONE and self._seg_mask_file(rec):
+                continue
+            if not rec.get("input"):
+                continue
+            pending.append((path, rec))
+        if not pending:
+            QMessageBox.information(
+                self, "Import",
+                "All files have already been imported — nothing new to import.",
+            )
+            return
+
+        done = 0
+        errors = []
+        for parquet_path, rec in pending:
+            ent = self._ensure_image_index(parquet_path)
+            if ent is None or ent.get("manifest") is None:
+                rec["state"] = SEG_IMPORT_UNKNOWN
+                errors.append(f"{self._comp_file_name(parquet_path)}: no image index")
+                continue
+            man = ent["manifest"]
+            height = int(round(man["ymax"] - man["ymin"])) + 1
+            width = int(round(man["xmax"] - man["xmin"])) + 1
+            src = str(rec.get("input") or "")
+            suffix = Path(src).suffix.lower()
+            if suffix not in (".tif", ".tiff", ".ome.tif", ".ome.tiff"):
+                rec["state"] = SEG_IMPORT_FORMAT
+                continue
+            try:
+                arr = tifffile.imread(src)
+            except Exception:  # noqa: BLE001
+                rec["state"] = SEG_IMPORT_FORMAT
+                continue
+            arr = np.asarray(arr)
+            while arr.ndim > 2:
+                arr = arr[0]
+            if arr.ndim != 2:
+                rec["state"] = SEG_IMPORT_FORMAT
+                continue
+            if arr.shape[0] != height or arr.shape[1] != width:
+                rec["state"] = SEG_IMPORT_SIZE
+                continue
+            try:
+                rel = self._seg_write_mask(page._seg_task_id, parquet_path, arr)
+            except Exception:  # noqa: BLE001
+                rec["state"] = SEG_IMPORT_UNKNOWN
+                continue
+            rec["path"] = rel
+            rec["source"] = "import"
+            rec["state"] = SEG_IMPORT_DONE
+            done += 1
+
+        self._seg_after_masks_changed(page)
+        self._seg_refresh_input_table(page)
+        self._seg_refresh_files(page)
+        msg = f"Imported {done} mask(s)."
+        if errors:
+            msg += "\n" + "\n".join(errors)
+        page._seg_import_status.setText(msg)
+        self.statusBar().showMessage(msg.splitlines()[0])
+
+    def _seg_write_mask(self, task_id, parquet_path, array) -> str:
+        """Save a mask array under <project>/Module/<task-id>/; return rel path."""
+        import numpy as np
+
+        if self.project is None:
+            raise RuntimeError("no project")
+        stem = Path(str(parquet_path)).stem
+        rel = f"Module/{task_id}/{stem}.npy"
+        path = self.project.path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, np.asarray(array, dtype=np.int32))
+        self._seg_mask_cache = {}
+        self._seg_value_cache = {}
+        return rel
+
+    def _seg_after_masks_changed(self, page) -> None:
+        """Persist mask records: masks are products, so save right away."""
+        self._seg_mask_cache = {}
+        self._seg_value_cache = {}
+        page._seg_task_def["output"] = {"saved": True}
+        page._seg_task_def["params"] = page._seg_params
+        if self.project is not None:
+            self.project.save()
+        page._seg_snapshot = copy.deepcopy(page._seg_params)
+        page._seg_dirty = False
+        self._seg_update_save_btn(page)
+        self._refresh_workflow_tree()
+        self._module_saved(page)
+
+    def _seg_calculate(self, page) -> None:
+        """Run Nuclear Expansion on every selected file."""
+        import numpy as np
+
+        rows = self._seg_file_rows(page)
+        params = self._seg_map_params(page)
+        status = getattr(page, "_seg_calc_status", None)
+        if not rows:
+            QMessageBox.information(self, "Calculate", "Select data files first.")
+            return
+        if not params.get("channel"):
+            QMessageBox.information(
+                self, "Calculate", "Choose the nucleus channel first."
+            )
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        done = 0
+        cells = 0
+        errors = []
+        try:
+            for i, parquet_path in enumerate(rows):
+                if status is not None:
+                    status.setText(
+                        f"Calculating {i + 1}/{len(rows)}: "
+                        f"{self._comp_file_name(parquet_path)}…"
+                    )
+                    QApplication.processEvents()
+                mask, err = self._seg_nuclear_expansion(parquet_path, params)
+                if mask is None:
+                    errors.append(f"{self._comp_file_name(parquet_path)}: {err}")
+                    continue
+                try:
+                    rel = self._seg_write_mask(page._seg_task_id, parquet_path, mask)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{self._comp_file_name(parquet_path)}: {exc}")
+                    continue
+                rec = self._seg_mask_record_live(page, parquet_path, create=True)
+                rec["path"] = rel
+                rec["source"] = "builtin"
+                rec["state"] = SEG_IMPORT_DONE
+                done += 1
+                cells += int(mask.max())
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._seg_after_masks_changed(page)
+        self._seg_refresh_files(page)
+        # The refresh rebuilds the parameter panel, so re-read its status label.
+        status = getattr(page, "_seg_calc_status", status)
+        if status is not None:
+            msg = f"Calculated {done} mask(s) · {cells} cell(s)."
+            if errors:
+                msg += "\n" + "\n".join(errors)
+            status.setText(msg)
+
+    def _seg_nuclear_expansion(self, parquet_path, params):
+        """Threshold → label → filter → expand. Returns (mask, error)."""
+        import numpy as np
+        import pandas as pd
+        from scipy import ndimage
+
+        ent = self._ensure_image_index(parquet_path)
+        if ent is None or ent.get("manifest") is None:
+            return None, "no image index — re-import this file as an image"
+        man = ent["manifest"]
+        channel = params.get("channel")
+        try:
+            df = pd.read_parquet(parquet_path, columns=["x", "y", channel])
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+        xmin = float(man["xmin"])
+        ymin = float(man["ymin"])
+        width = int(round(float(man["xmax"]) - xmin)) + 1
+        height = int(round(float(man["ymax"]) - ymin)) + 1
+        xi = np.rint(df["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+        yi = np.rint(df["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+        values = pd.to_numeric(df[channel], errors="coerce").to_numpy(dtype="float64")
+        image = np.zeros((height, width), dtype="float64")
+        ok = (
+            (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+            & np.isfinite(values)
+        )
+        image[yi[ok], xi[ok]] = values[ok]
+        if values[ok].size == 0:
+            return None, "no finite pixel values"
+
+        if params.get("threshold_mode") == "manual":
+            threshold = float(params.get("threshold", 0.0))
+        else:
+            threshold = _otsu_threshold(image)
+        binary = image > threshold
+        if not binary.any():
+            return None, "threshold produced an empty mask"
+        binary = ndimage.binary_opening(binary, structure=np.ones((3, 3)))
+        labels, _count = ndimage.label(binary)
+        labels = _relabel_sequential(labels, int(params.get("min_area", 1)))
+        expand = int(params.get("expand", 0))
+        if expand > 0 and labels.any():
+            distance, (iy, ix) = ndimage.distance_transform_edt(
+                labels == 0, return_indices=True
+            )
+            grown = distance <= expand
+            labels = np.where(grown, labels[iy, ix], labels)
+        return labels.astype(np.int32), None
+
+    def _seg_mark_dirty(self, page) -> None:
+        page._seg_dirty = True
+        self._seg_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _seg_update_save_btn(self, page) -> None:
+        page._seg_save_btn.setEnabled(page._seg_dirty and not page._seg_locked)
+
+    def _seg_save_now(self, page) -> None:
+        params = page._seg_params
+        column = (params.get("column") or "Mask").strip() or "Mask"
+        # Column names must not collide with real columns (or other merges).
+        taken = set()
+        for path in self._seg_file_rows(page):
+            for name in self._column_index.get(self._rel_data_key(path), []):
+                taken.add(name)
+        for task in self._task_chain(page._seg_task_id):
+            if task.get("id") == page._seg_task_id:
+                continue
+            if task.get("type") == "segmentation":
+                other = self._seg_params_for(task).get("column")
+                if other:
+                    taken.add(other)
+        if column in taken:
+            QMessageBox.warning(
+                self,
+                "Mask column",
+                f'"{column}" is already a column of the selected files.\n'
+                "Choose another name.",
+            )
+            return
+        params["column"] = column
+        applied = {}
+        expose = params.get("expose") or {}
+        for path in self._seg_file_rows(page):
+            if not expose.get(path):
+                continue
+            rec = self._seg_mask_record(params, path)
+            mask_path = self._seg_mask_file(rec)
+            if mask_path is None:
+                continue
+            applied[path] = self._seg_signature(mask_path)
+        params["applied"] = applied
+        page._seg_applied_snapshot = dict(applied)
+        page._seg_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._seg_snapshot = copy.deepcopy(params)
+        page._seg_dirty = False
+        self._seg_update_save_btn(page)
+        self._seg_refresh_status(page)
+        self._seg_value_cache = {}
+        self.statusBar().showMessage("Segmentation saved")
+        self._module_saved(page)
+
+    def _seg_close(self, page) -> None:
+        if page._seg_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Close Segmentation",
+                "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._seg_task_def["params"] = page._seg_snapshot
+        timer = getattr(page, "_seg_overlay_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._close_module_page(page)
+
+    # --- segmentation preview (part 3) and plot settings (part 4)
+    def _seg_preview_panel(self, page) -> QWidget:
+        import pyqtgraph as pg
+
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Preview</b>"))
+        body = QWidget()
+        bh = QHBoxLayout(body)
+        bh.setContentsMargins(0, 0, 0, 0)
+        bh.setSpacing(4)
+        plot = pg.PlotWidget(background="w")
+        plot.showGrid(x=True, y=True, alpha=0.2)
+        plot.getPlotItem().setAxisItems({
+            "bottom": _make_sci_axis("bottom"),
+            "left": _make_sci_axis("left"),
+        })
+        bh.addWidget(plot, 1)
+        legend = self._figure_attach_legend(plot)
+        bh.addWidget(legend, 0)
+        lay.addWidget(body, 1)
+        page._seg_preview_plot = plot
+        # Re-render both the image (LOD raster for the new view) and the mask
+        # overlay when the user zooms or pans.
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(30)
+        timer.timeout.connect(lambda: self._seg_render_preview(page))
+        page._seg_overlay_timer = timer
+        plot.getPlotItem().getViewBox().sigRangeChanged.connect(
+            lambda *_: timer.start()
+        )
+        return panel
+
+    def _seg_plot_settings_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Plot settings</b>"))
+        host = QWidget()
+        host.setLayout(QVBoxLayout())
+        host.layout().setContentsMargins(0, 0, 0, 0)
+        host.layout().setSpacing(6)
+        lay.addWidget(host, 1)
+        page._seg_settings_host = host
+        return panel
+
+    def _seg_plot_dict(self, page) -> dict:
+        """The preview's plot config, defaulted for the current files."""
+        plot_dict = page._seg_params.setdefault("plot", {})
+        rows = self._seg_file_rows(page)
+        if not rows:
+            return plot_dict
+        if plot_dict.get("file") not in rows:
+            fresh = self._seg_default_plot(rows[0])
+            fresh.update({k: v for k, v in plot_dict.items() if k != "file"})
+            plot_dict.clear()
+            plot_dict.update(fresh)
+        if not plot_dict.get("type"):
+            plot_dict["type"] = "image"
+        if not plot_dict.get("layers") and plot_dict.get("color_param"):
+            channel = plot_dict["color_param"]
+            plot_dict["layers"] = [{
+                "parameter": channel,
+                "color": (255, 255, 255),
+                "name": str(channel),
+                "visible": True,
+            }]
+        plot_dict.setdefault("show_legend", True)
+        return plot_dict
+
+    def _seg_refresh_plot_settings(self, page) -> None:
+        """Rebuild part 4 (file/channel/mask options) from the current files."""
+        host = getattr(page, "_seg_settings_host", None)
+        if host is None:
+            return
+        self._clear_layout(host.layout())
+        lay = host.layout()
+        enabled = not page._seg_locked
+        plot_dict = self._seg_plot_dict(page)
+        rows = [p for p in self._seg_file_rows(page)
+                if self._seg_mask_file(self._seg_mask_record(page._seg_params, p))]
+
+        lay.addWidget(QLabel("File"))
+        file_combo = _NoWheelComboBox()
+        for path in rows:
+            file_combo.addItem(self._comp_file_name(path), path)
+        idx = file_combo.findData(plot_dict.get("file"))
+        if idx >= 0:
+            file_combo.setCurrentIndex(idx)
+        file_combo.setEnabled(enabled and bool(rows))
+        lay.addWidget(file_combo)
+
+        columns = []
+        rec = self._figure_record(plot_dict.get("file"))
+        if rec is not None:
+            columns = self._columns_for(rec.get("parquet"), None)
+
+        self._figure_image_layer_settings(
+            lay, plot_dict, columns, enabled,
+            on_change=lambda: self._seg_render_preview(page),
+            on_rebuild=lambda: (
+                self._seg_refresh_plot_settings(page),
+                self._seg_render_preview(page),
+            ),
+        )
+
+        lay.addWidget(QLabel("Mask display"))
+        mode_combo = _NoWheelComboBox()
+        mode_combo.addItem("Don't show mask", "none")
+        mode_combo.addItem("Show mask as shape", "shape")
+        mode_combo.addItem("Show mask edges", "edges")
+        idx = mode_combo.findData(plot_dict.get("mask_mode", "shape"))
+        mode_combo.setCurrentIndex(max(0, idx))
+        mode_combo.setEnabled(enabled)
+        lay.addWidget(mode_combo)
+
+        color_mode_combo = None
+        alpha_spin = None
+        if plot_dict.get("mask_mode", "shape") != "none":
+            lay.addWidget(QLabel("Mask colors"))
+            color_mode_combo = _NoWheelComboBox()
+            color_mode_combo.addItem("Random colors", "random")
+            color_mode_combo.addItem("Grayscale", "gray")
+            idx = color_mode_combo.findData(plot_dict.get("mask_color", "random"))
+            color_mode_combo.setCurrentIndex(max(0, idx))
+            color_mode_combo.setEnabled(enabled)
+            lay.addWidget(color_mode_combo)
+
+            lay.addWidget(QLabel("Opacity (%)"))
+            alpha_spin = _NoWheelSpinBox()
+            alpha_spin.setRange(5, 100)
+            alpha_spin.setValue(int(plot_dict.get("mask_alpha", 45)))
+            alpha_spin.setEnabled(enabled)
+            lay.addWidget(alpha_spin)
+
+        self._figure_display_toggles(
+            lay, plot_dict, enabled,
+            on_change=lambda: self._seg_render_preview(page),
+        )
+        lay.addStretch(1)
+
+        def on_file(_=0):
+            path = file_combo.currentData()
+            if not path:
+                return
+            plot_dict["file"] = path
+            plot_dict["file_name"] = file_combo.currentText()
+            self._seg_refresh_plot_settings(page)
+            self._seg_render_preview(page)
+            self._seg_mark_dirty(page)
+
+        def on_mode(_=0):
+            plot_dict["mask_mode"] = mode_combo.currentData()
+            self._seg_refresh_plot_settings(page)
+            self._seg_render_preview(page)
+            self._seg_mark_dirty(page)
+
+        def on_color_mode(_=0):
+            plot_dict["mask_color"] = color_mode_combo.currentData()
+            self._seg_render_overlay(page)
+            self._seg_mark_dirty(page)
+
+        def on_alpha(value):
+            plot_dict["mask_alpha"] = int(value)
+            self._seg_render_overlay(page)
+            self._seg_mark_dirty(page)
+
+        file_combo.currentIndexChanged.connect(on_file)
+        mode_combo.currentIndexChanged.connect(on_mode)
+        if color_mode_combo is not None:
+            color_mode_combo.currentIndexChanged.connect(on_color_mode)
+        if alpha_spin is not None:
+            alpha_spin.valueChanged.connect(on_alpha)
+
+    def _seg_update_preview_visibility(self, page) -> None:
+        """Parts 3 and 4 appear once at least one file has a mask."""
+        has_mask = self._seg_any_mask(page)
+        panel3 = getattr(page, "_seg_preview_panel", None)
+        panel4 = getattr(page, "_seg_settings_panel", None)
+        for panel in (panel3, panel4):
+            if panel is not None:
+                panel.setVisible(has_mask)
+        if has_mask:
+            self._seg_render_preview(page)
+
+    def _seg_render_preview(self, page) -> None:
+        plot = getattr(page, "_seg_preview_plot", None)
+        if plot is None:
+            return
+        plot_dict = self._seg_plot_dict(page)
+        rec = self._figure_record(plot_dict.get("file"))
+        if rec is None:
+            return
+        self._figure_render(plot_dict, plot, task_id=page._seg_task_id)
+        self._seg_render_overlay(page)
+
+    def _seg_render_overlay(self, page) -> None:
+        """Draw the mask overlay on top of the preview image."""
+        import numpy as np
+        import pyqtgraph as pg
+
+        plot = getattr(page, "_seg_preview_plot", None)
+        if plot is None:
+            return
+        plot_dict = self._seg_plot_dict(page)
+        old = getattr(page, "_seg_overlay_item", None)
+        if old is not None:
+            try:
+                plot.removeItem(old)
+            except Exception:  # noqa: BLE001
+                pass
+            page._seg_overlay_item = None
+        mode = plot_dict.get("mask_mode", "shape")
+        if mode == "none":
+            return
+        parquet_path = plot_dict.get("file")
+        rec = self._seg_mask_record(page._seg_params, parquet_path)
+        mask_path = self._seg_mask_file(rec)
+        if mask_path is None:
+            return
+        ent = self._ensure_image_index(parquet_path)
+        if ent is None or ent.get("manifest") is None:
+            return
+        man = ent["manifest"]
+        vb = plot.getPlotItem().getViewBox()
+        xr = vb.viewRange()[0]
+        yr = vb.viewRange()[1]
+        x0, x1 = min(xr), max(xr)
+        y0, y1 = min(yr), max(yr)
+        if x1 <= x0 or y1 <= y0:
+            return
+        xmin, ymin = float(man["xmin"]), float(man["ymin"])
+        i0 = max(0, int(np.floor(x0 - xmin)))
+        i1 = min(int(round(float(man["xmax"]) - xmin)) + 1, int(np.ceil(x1 - xmin)))
+        j0 = max(0, int(np.floor(y0 - ymin)))
+        j1 = min(int(round(float(man["ymax"]) - ymin)) + 1, int(np.ceil(y1 - ymin)))
+        if i1 <= i0 or j1 <= j0:
+            return
+        mask = self._seg_load_mask(mask_path)
+        if mask is None:
+            return
+        i1 = min(i1, mask.shape[1])
+        j1 = min(j1, mask.shape[0])
+        step = max(1, int(round((x1 - x0) / max(1, plot.width()))))
+        crop = mask[j0:j1:step, i0:i1:step].astype(np.int64)
+        if crop.size == 0:
+            return
+        max_label = int(crop.max())
+        if max_label <= 0:
+            return
+        # Per-label colors: grayscale or a stable random palette.
+        if plot_dict.get("mask_color") == "random":
+            rng = np.random.default_rng(20240521)
+            lut = rng.integers(60, 256, size=(max_label + 1, 3))
+            lut[0] = 0
+        else:
+            ramp = np.linspace(0.35, 1.0, max(1, max_label + 1))
+            lut = np.stack(
+                [ramp * 255.0, ramp * 255.0, ramp * 255.0], axis=1
+            ).astype(np.int64)
+        if mode == "edges":
+            edges_full = self._seg_edge_map(mask_path)
+            if edges_full is None:
+                return
+            edge = edges_full[j0:j1:step, i0:i1:step]
+            neighbor = np.zeros_like(crop)
+            neighbor[:-1, :] = np.maximum(neighbor[:-1, :], crop[1:, :])
+            neighbor[1:, :] = np.maximum(neighbor[1:, :], crop[:-1, :])
+            neighbor[:, :-1] = np.maximum(neighbor[:, :-1], crop[:, 1:])
+            neighbor[:, 1:] = np.maximum(neighbor[:, 1:], crop[:, :-1])
+            label_for_color = np.where(crop > 0, crop, neighbor)
+            alpha = np.where(edge, 255, 0)
+        else:
+            label_for_color = crop
+            alpha = np.where(crop > 0, 255, 0)
+        opacity = max(0, min(100, int(plot_dict.get("mask_alpha", 45))))
+        rgba = np.zeros((crop.shape[0], crop.shape[1], 4), dtype=np.uint8)
+        clipped = np.clip(label_for_color, 0, max_label)
+        rgba[..., 0:3] = lut[clipped]
+        rgba[..., 3] = (alpha * opacity / 100.0).astype(np.uint8)
+        item = pg.ImageItem(axisOrder="row-major")
+        item.setImage(rgba, autoLevels=False)
+        item.setRect(QRectF(
+            xmin + i0 * step, ymin + j0 * step,
+            crop.shape[1] * step, crop.shape[0] * step,
+        ))
+        item.setZValue(10)
+        plot.addItem(item)
+        page._seg_overlay_item = item
 
     # ----- gating module (map) -----------------------------------------
     def _build_gating_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
@@ -13138,9 +14776,18 @@ class MainWindow(QMainWindow):
             self._column_index.get(self._rel_data_key(parquet_path), [])
         )
         page._gating_stat_generation += 1
+        # Mask columns exposed by an upstream Segmentation module are not in
+        # the data file; resolve them here and hand them to the worker.
+        virtual = {}
+        for name, mask_path in self._seg_applied_columns(
+            page._gating_task_id, parquet_path
+        ).items():
+            arr = self._seg_mask_values(parquet_path, mask_path)
+            if arr is not None:
+                virtual[name] = arr
         worker.request(
             page._gating_stat_generation,
-            parquet_path, gates, stages, base_columns, affected,
+            parquet_path, gates, stages, base_columns, affected, virtual,
         )
 
     def _gating_apply_stats(self, page, stats) -> None:
@@ -13570,6 +15217,8 @@ class MainWindow(QMainWindow):
             page = self._build_compensation_page(name, task_def, locked)
         elif task_type == "illumination":
             page = self._build_illumination_page(name, task_def, locked)
+        elif task_type == "segmentation":
+            page = self._build_segmentation_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
