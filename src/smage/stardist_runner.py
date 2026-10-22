@@ -9,7 +9,8 @@ Usage:
   python stardist_runner.py check
   python stardist_runner.py download-model --model 2D_versatile_fluo
   python stardist_runner.py segment --manifest jobs.json --nucleus 0 \
-      --prob 0.5 --nms 0.3 [--n-tiles 0] [--model 2D_versatile_fluo] [--threads 8]
+      --prob 0.5 --nms 0.3 [--tile-size 0] [--device cpu] \
+      [--model 2D_versatile_fluo] [--threads 8]
 """
 import argparse
 import json
@@ -99,7 +100,11 @@ def download_model(model, threads):
     print("model ready:", model)
 
 
-def segment(manifest_path, nucleus, model, prob, nms, threads, n_tiles=0):
+def segment(manifest_path, nucleus, model, prob, nms, threads, tile_size=0, device="cpu"):
+    if device == "cpu":
+        # Force CPU even if a GPU-capable TensorFlow is installed; the env var
+        # must be set before TensorFlow is imported below.
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     _limit_tensorflow_threads(threads)
     print("phase: importing tensorflow", flush=True)
     from csbdeep.utils import normalize
@@ -118,15 +123,20 @@ def segment(manifest_path, nucleus, model, prob, nms, threads, n_tiles=0):
         img = normalize(img, 1, 99.8).astype("float32")
         # Tile large images (the default n_tiles=None means "no tiling", which
         # processes the whole image in one slow forward pass). Tiling is also
-        # what produces the per-tile progress.
-        if n_tiles > 0:
-            tiles = (n_tiles, n_tiles)
+        # what produces the per-tile progress. n_tiles is a per-axis tuple
+        # (rows, columns). With a target tile_size we split each image into
+        # roughly size×size tiles by deriving the counts from its dimensions;
+        # otherwise we use StarDist's own auto guess.
+        if tile_size > 0:
+            h, w = img.shape[:2]
+            tiles_y = max(1, int(np.ceil(h / tile_size)))
+            tiles_x = max(1, int(np.ceil(w / tile_size)))
         else:
-            tiles = model._guess_n_tiles(img)
+            tiles_y, tiles_x = model._guess_n_tiles(img)
         t0 = time.perf_counter()
         masks, _detail = model.predict_instances(
             img, prob_thresh=prob, nms_thresh=nms,
-            n_tiles=tiles,
+            n_tiles=(tiles_y, tiles_x),
             show_tile_progress=_tile_progress,
         )
         elapsed = time.perf_counter() - t0
@@ -154,7 +164,8 @@ def main(argv):
     seg.add_argument("--model", default="2D_versatile_fluo")
     seg.add_argument("--prob", type=float, default=0.5)
     seg.add_argument("--nms", type=float, default=0.3)
-    seg.add_argument("--n-tiles", type=int, default=0)
+    seg.add_argument("--tile-size", type=int, default=0)
+    seg.add_argument("--device", default="cpu")
     seg.add_argument("--threads", type=int, default=_DEFAULT_THREADS)
 
     args = parser.parse_args(argv)
@@ -165,7 +176,7 @@ def main(argv):
     elif args.command == "segment":
         segment(
             args.manifest, args.nucleus, args.model, args.prob, args.nms,
-            args.threads, args.n_tiles,
+            args.threads, args.tile_size, args.device,
         )
     else:
         parser.print_help()

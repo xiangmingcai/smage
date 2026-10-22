@@ -39,8 +39,8 @@ python -m venv .venv
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Run the app
-python src\smage\main.py
+# 4. Run the app (pythonw keeps the console window hidden)
+pythonw src\smage\main.py
 ```
 
 ## License

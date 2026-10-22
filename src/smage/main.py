@@ -331,8 +331,9 @@ SCALING_METHODS = ["linear", "log10", "arcsinh"]
 SEG_METHODS = [
     ("Nuclear Expansion", "nuclear_expansion"),
     ("Mask Input", "mask_input"),
-    ("Cellpose", "cellpose"),
-    ("StarDist", "stardist"),
+    ("Cellpose-CPU", "cellpose-cpu"),
+    ("Cellpose-GPU", "cellpose-gpu"),
+    ("StarDist-CPU", "stardist-cpu"),
 ]
 # Per-file mask status shown in the file table.
 SEG_STATUS_NO_MASK = "no mask"
@@ -360,22 +361,37 @@ SEG_DEFAULT_PARAMS = {
 # checked by Detect).
 EXTENSION_DEFS = [
     {
-        "id": "cellpose",
-        "name": "Cellpose",
+        "id": "cellpose-cpu",
+        "name": "Cellpose-CPU",
+        "family": "cellpose",
+        "device": "cpu",
         "pip": "cellpose",
         "deps": ["torch", "torchvision"],
         "runner": "cellpose_runner.py",
         "model": "cpsam",
-        "desc": "Cellpose (SAM-based) cell segmentation",
+        "desc": "Cellpose (SAM-based) cell segmentation on CPU",
     },
     {
-        "id": "stardist",
-        "name": "StarDist",
+        "id": "cellpose-gpu",
+        "name": "Cellpose-GPU",
+        "family": "cellpose",
+        "device": "gpu",
+        "pip": "cellpose",
+        "deps": ["torch", "torchvision"],
+        "runner": "cellpose_runner.py",
+        "model": "cpsam",
+        "desc": "Cellpose (SAM-based) cell segmentation on GPU (CUDA)",
+    },
+    {
+        "id": "stardist-cpu",
+        "name": "StarDist-CPU",
+        "family": "stardist",
+        "device": "cpu",
         "pip": "stardist",
         "deps": ["tensorflow"],
         "runner": "stardist_runner.py",
         "model": "2D_versatile_fluo",
-        "desc": "StarDist star-convex cell segmentation",
+        "desc": "StarDist star-convex cell segmentation on CPU",
     },
 ]
 
@@ -385,6 +401,54 @@ def _extension_def(ext_id: str) -> dict | None:
     for entry in EXTENSION_DEFS:
         if entry["id"] == ext_id:
             return entry
+    return None
+
+
+# PyTorch publishes CUDA wheels on a per-CUDA-version index. A machine may use
+# an index only if its NVIDIA driver supports that CUDA version (or newer).
+# Ordered newest-first so the first compatible entry is the "best" choice.
+_PYTORCH_CUDA_INDEXES = [
+    (12.8, "cu128"),
+    (12.6, "cu126"),
+    (12.4, "cu124"),
+    (12.1, "cu121"),
+    (11.8, "cu118"),
+]
+
+
+def _nvidia_cuda_version():
+    """Return the CUDA version (float) the installed NVIDIA driver supports,
+    or None when no NVIDIA driver is found. Queries ``nvidia-smi``."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("nvidia-smi") or "nvidia-smi"
+    try:
+        out = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    for line in out.splitlines():
+        if "CUDA Version:" in line:
+            try:
+                return float(line.split("CUDA Version:")[1].split()[0])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def _pick_cuda_index(driver_cuda):
+    """Return the best cuXXX index dir for a driver's CUDA version, or None."""
+    if driver_cuda is None:
+        return None
+    for minor, dirname in _PYTORCH_CUDA_INDEXES:
+        if minor <= driver_cuda:
+            return dirname
     return None
 
 
@@ -3242,7 +3306,19 @@ class MainWindow(QMainWindow):
             if not isinstance(cache, dict):
                 cache = {}
             self._ext_config_cache = cache
+            self._migrate_ext_config(cache)
         return cache
+
+    def _migrate_ext_config(self, cache) -> None:
+        """Rename legacy extension ids to their new -cpu names.
+
+        Cellpose/StarDist are now CPU methods (``cellpose-cpu`` /
+        ``stardist-cpu``) with GPU variants arriving separately, so re-key any
+        configuration saved under the old ids.
+        """
+        for old, new in (("cellpose", "cellpose-cpu"), ("stardist", "stardist-cpu")):
+            if new not in cache and old in cache:
+                cache[new] = cache.pop(old)
 
     def _ext_save_config(self) -> None:
         path = self._ext_config_path()
@@ -3416,6 +3492,18 @@ class MainWindow(QMainWindow):
             "Runs in a separate Python environment; Smage does not bundle "
             "TensorFlow / PyTorch."
         ))
+        self_note = QLabel(
+            "You don't have to use the buttons below — you can install "
+            "everything yourself in any Python environment, then set that "
+            "environment's python.exe above. This only needs to be done once; "
+            "after it succeeds, it keeps working. If installation proves too "
+            "difficult, you can instead run the cell segmentation in other "
+            "software and import the resulting mask files with the Segmentation "
+            "module's Mask Input."
+        )
+        self_note.setWordWrap(True)
+        self_note.setStyleSheet("color: #6b7785;")
+        lay.addWidget(self_note)
         lay.addWidget(QLabel(""))
         lay.addWidget(QLabel("<b>1. Python environment</b>"))
 
@@ -3480,6 +3568,35 @@ class MainWindow(QMainWindow):
         lay.addWidget(install_btn)
 
         lay.addWidget(QLabel("<b>3. Install dependencies</b>"))
+        if entry.get("device") == "gpu":
+            gpu_note = QLabel(
+                "The GPU build needs an NVIDIA GPU and a matching CUDA version "
+                "of PyTorch, and the right version depends on your graphics "
+                "driver. Smage can auto-detect the driver and pick the right "
+                "version; if that does not work, choose a specific CUDA version "
+                "below, or ask an AI assistant / an experienced colleague to "
+                "install the environment for you. It only needs to succeed once."
+            )
+            gpu_note.setWordWrap(True)
+            gpu_note.setStyleSheet("color: #6b7785;")
+            lay.addWidget(gpu_note)
+            lay.addWidget(QLabel("CUDA version"))
+            cuda_combo = QComboBox()
+            cuda_combo.addItem("Auto-detect (recommended)", "auto")
+            cuda_combo.addItem("CPU only", "cpu")
+            for minor, dirname in _PYTORCH_CUDA_INDEXES:
+                cuda_combo.addItem(f"CUDA {minor:g} ({dirname})", dirname)
+            idx = cuda_combo.findData(e.get("cuda", "auto"))
+            cuda_combo.setCurrentIndex(max(0, idx))
+            lay.addWidget(cuda_combo)
+
+            def on_cuda_changed(value):
+                e["cuda"] = value
+                self._ext_save_config()
+
+            cuda_combo.currentIndexChanged.connect(
+                lambda _=0: on_cuda_changed(cuda_combo.currentData())
+            )
         install_deps_btn = QPushButton("Install dependencies")
         install_deps_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         install_deps_btn.setToolTip(
@@ -3555,6 +3672,24 @@ class MainWindow(QMainWindow):
                 "    except Exception:",
                 "        print(n, 'MISSING')",
             ])
+            # GPU extensions additionally verify that PyTorch/TensorFlow can
+            # actually use CUDA (this imports the framework, so it is slower).
+            if entry.get("device") == "gpu":
+                log.appendPlainText("Also checking CUDA availability…")
+                probe += "\n" + "\n".join([
+                    "try:",
+                    "    import torch",
+                    "    print('gpu-torch-version', torch.__version__)",
+                    "    print('gpu-cuda-version', torch.version.cuda or 'NONE')",
+                    "    print('gpu-cuda-available', "
+                    "'True' if torch.cuda.is_available() else 'False')",
+                    "    if torch.cuda.is_available():",
+                    "        print('gpu-device-name', torch.cuda.get_device_name(0))",
+                    "    else:",
+                    "        print('gpu-device-name', '(none)')",
+                    "except Exception as exc:",
+                    "    print('gpu-check-error', repr(exc))",
+                ])
             worker.run(("detect", ext_id), [python, "-c", probe])
 
         def on_install():
@@ -3589,14 +3724,46 @@ class MainWindow(QMainWindow):
             set_busy(True, show_progress=True)
             log.clear()
             deps = list(entry.get("deps") or [])
+            argv = [python, "-m", "pip", "install", "--force-reinstall"]
+            index_url = None
+            if entry.get("device") == "gpu":
+                choice = e.get("cuda", "auto")
+                if choice == "cpu":
+                    log.appendPlainText(
+                        "CPU only selected — installing the default (CPU) build."
+                    )
+                elif choice.startswith("cu"):
+                    index_url = f"https://download.pytorch.org/whl/{choice}"
+                else:  # auto-detect the driver's supported CUDA version
+                    driver_cuda = _nvidia_cuda_version()
+                    if driver_cuda is None:
+                        log.appendPlainText(
+                            "No NVIDIA driver detected — installing CPU-only "
+                            "build. If you have an NVIDIA GPU, install/update "
+                            "its driver, or choose a specific CUDA version."
+                        )
+                    else:
+                        picked = _pick_cuda_index(driver_cuda)
+                        if picked is None:
+                            log.appendPlainText(
+                                f"Driver CUDA {driver_cuda:g} is too old for any "
+                                "supported CUDA build — installing CPU-only build."
+                            )
+                        else:
+                            index_url = f"https://download.pytorch.org/whl/{picked}"
+                            log.appendPlainText(
+                                f"Detected NVIDIA driver CUDA {driver_cuda:g} → "
+                                f"using {picked}."
+                            )
+            if index_url:
+                argv += ["--index-url", index_url]
+            argv += deps
             log.appendPlainText(
                 f"Reinstalling {' '.join(deps)} into {python}…\n"
-                "This can take several minutes."
+                + (f"Using index: {index_url}\n" if index_url else "")
+                + "This can take several minutes."
             )
-            worker.run(
-                ("deps", ext_id),
-                [python, "-m", "pip", "install", "--force-reinstall"] + deps,
-            )
+            worker.run(("deps", ext_id), argv)
 
         def on_download_model():
             python = current_python()
@@ -3693,16 +3860,23 @@ class MainWindow(QMainWindow):
                 _tag, kind, code, text = item[0], item[1], item[2], item[3]
                 key = kind  # first element of the request key tuple
                 set_busy(False)
-                if text:
+                # Output was already streamed line-by-line above; only surface
+                # the captured text when the subprocess died without streaming
+                # anything (e.g. an OSError before Popen), signalled by code -1.
+                if code < 0 and text:
                     log.appendPlainText(text.rstrip())
                 if isinstance(_tag, tuple) and _tag[0] == "detect":
                     missing = []
                     version = ""
+                    gpu = {}
                     for line in text.strip().splitlines():
                         parts = line.split(None, 1)
                         if len(parts) != 2:
                             continue
                         name, value = parts[0], parts[1]
+                        if name.startswith("gpu-"):
+                            gpu[name] = value
+                            continue
                         if value == "MISSING":
                             missing.append(name)
                         elif name == entry["pip"]:
@@ -3724,6 +3898,43 @@ class MainWindow(QMainWindow):
                             log.appendPlainText(
                                 "Could not check this environment. "
                                 "Verify the Python path and try again."
+                            )
+                    # GPU extensions: report whether CUDA is actually usable.
+                    if entry.get("device") == "gpu":
+                        torch_ver = gpu.get("gpu-torch-version", "")
+                        cuda_ver = gpu.get("gpu-cuda-version", "NONE")
+                        avail = gpu.get("gpu-cuda-available", "False") == "True"
+                        dev = gpu.get("gpu-device-name", "(none)")
+                        err = gpu.get("gpu-check-error")
+                        cpu_build = (cuda_ver == "NONE") or ("+cpu" in torch_ver)
+                        log.appendPlainText("")
+                        log.appendPlainText("GPU check:")
+                        if err is not None:
+                            log.appendPlainText(
+                                f"  ✗ Could not import torch: {err}"
+                            )
+                            e["gpu_ok"] = False
+                        else:
+                            if cpu_build:
+                                log.appendPlainText(
+                                    f"  ✗ PyTorch build: CPU-only ({torch_ver})"
+                                )
+                            else:
+                                log.appendPlainText(
+                                    f"  ✓ PyTorch build: GPU (CUDA {cuda_ver})"
+                                )
+                            if avail:
+                                log.appendPlainText(
+                                    f"  ✓ CUDA available: True ({dev})"
+                                )
+                            else:
+                                log.appendPlainText("  ✗ CUDA available: False")
+                            e["gpu_ok"] = (not cpu_build) and avail
+                        if e.get("gpu_ok"):
+                            log.appendPlainText("  ✓ Ready to run on GPU")
+                        else:
+                            log.appendPlainText(
+                                "  ✗ Not ready for GPU — will fall back to CPU"
                             )
                     self._ext_save_config()
                 elif isinstance(_tag, tuple) and _tag[0] == "install":
@@ -3793,6 +4004,11 @@ class MainWindow(QMainWindow):
             parts.append(f"Model: {entry['model']} ready")
         else:
             parts.append("Model: not downloaded")
+        if entry.get("device") == "gpu" and "gpu_ok" in e:
+            if e["gpu_ok"]:
+                parts.append("✓ GPU: CUDA available")
+            else:
+                parts.append("✗ GPU: CUDA not available (CPU-only build)")
         if self._ext_ready(entry["id"]):
             parts.append("✓ Ready to use")
         return "\n".join(parts)
@@ -12986,6 +13202,11 @@ class MainWindow(QMainWindow):
 
         params = task_def.setdefault("params", {})
         params.setdefault("method", "nuclear_expansion")
+        # Migrate legacy method ids (Cellpose/StarDist) to their -cpu names.
+        if params.get("method") == "cellpose":
+            params["method"] = "cellpose-cpu"
+        elif params.get("method") == "stardist":
+            params["method"] = "stardist-cpu"
         params.setdefault("files", [])
         params.setdefault("expose", {})
         params.setdefault("column", "Mask")
@@ -13313,7 +13534,7 @@ class MainWindow(QMainWindow):
         method = page._seg_params.get("method")
         if method == "mask_input":
             self._seg_mask_input_panel(page, host)
-        elif method in ("cellpose", "stardist"):
+        elif _extension_def(method) is not None:
             self._seg_external_method_panel(page, host)
         else:
             self._seg_method_params_panel(page, host)
@@ -13565,7 +13786,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(channel_combo)
 
         cyto_combo = None
-        if method == "cellpose":
+        if entry["family"] == "cellpose":
             lay.addWidget(param_label(
                 "Cytoplasm channel (optional)", "optional second channel"
             ))
@@ -13581,12 +13802,12 @@ class MainWindow(QMainWindow):
 
         prob_spin = None
         nms_spin = None
-        n_tiles_spin = None
-        if method == "stardist":
+        tile_size_spin = None
+        if entry["family"] == "stardist":
             params.setdefault("model", entry["model"])
             params.setdefault("prob", 0.5)
             params.setdefault("nms", 0.3)
-            params.setdefault("n_tiles", 0)
+            params.setdefault("tile_size", 0)
             lay.addWidget(param_label("Probability threshold", "lower detects more cells"))
             prob_spin = _NoWheelDoubleSpinBox()
             prob_spin.setRange(0.01, 1.0)
@@ -13606,18 +13827,20 @@ class MainWindow(QMainWindow):
             lay.addWidget(nms_spin)
 
             lay.addWidget(param_label(
-                "Tile count (n)", "0 = auto; larger n = smaller tiles"
+                "Tile size (px)", "approximate tile edge; 0 = auto"
             ))
-            n_tiles_spin = _NoWheelSpinBox()
-            n_tiles_spin.setRange(0, 20)
-            n_tiles_spin.setSingleStep(1)
-            n_tiles_spin.setValue(int(params.get("n_tiles", 0)))
-            n_tiles_spin.setEnabled(enabled)
-            n_tiles_spin.setToolTip(
-                "Number of tiles per side (n × n). 0 lets StarDist pick the "
-                "best value for each image; raise it for very large images."
+            tile_size_spin = _NoWheelSpinBox()
+            tile_size_spin.setRange(0, 20000)
+            tile_size_spin.setSingleStep(64)
+            tile_size_spin.setValue(int(params.get("tile_size", 0)))
+            tile_size_spin.setEnabled(enabled)
+            tile_size_spin.setToolTip(
+                "Approximate edge length of each tile in pixels. Smage splits "
+                "each image into roughly this-sized tiles (n × m), so the "
+                "actual counts adapt to the image dimensions. 0 lets StarDist "
+                "pick a good size automatically."
             )
-            lay.addWidget(n_tiles_spin)
+            lay.addWidget(tile_size_spin)
 
         calc_btn = QPushButton("Calculate")
         calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -13657,8 +13880,8 @@ class MainWindow(QMainWindow):
             params["nms"] = float(value)
             self._seg_mark_dirty(page)
 
-        def on_n_tiles(value):
-            params["n_tiles"] = int(value)
+        def on_tile_size(value):
+            params["tile_size"] = int(value)
             self._seg_mark_dirty(page)
 
         channel_combo.currentIndexChanged.connect(on_channel)
@@ -13668,8 +13891,8 @@ class MainWindow(QMainWindow):
             prob_spin.valueChanged.connect(on_prob)
         if nms_spin is not None:
             nms_spin.valueChanged.connect(on_nms)
-        if n_tiles_spin is not None:
-            n_tiles_spin.valueChanged.connect(on_n_tiles)
+        if tile_size_spin is not None:
+            tile_size_spin.valueChanged.connect(on_tile_size)
         calc_btn.clicked.connect(lambda _=False: self._seg_calculate(page))
 
     def _seg_mask_input_panel(self, page, host) -> None:
@@ -13908,7 +14131,7 @@ class MainWindow(QMainWindow):
     def _seg_calculate(self, page) -> None:
         """Run the selected method on every selected file."""
         method = page._seg_params.get("method")
-        if method in ("cellpose", "stardist"):
+        if _extension_def(method) is not None:
             self._seg_calculate_external(page)
             return
         self._seg_calculate_nuclear(page)
@@ -14030,7 +14253,7 @@ class MainWindow(QMainWindow):
         jobs = []
         manifest = []
         nucleus = params.get("channel")
-        cyto = params.get("cyto_channel") if method == "cellpose" else None
+        cyto = params.get("cyto_channel") if entry["family"] == "cellpose" else None
         # Reconstructing the channel image happens in the main app, before the
         # external subprocess starts, so log it (this is the silent phase).
         self._seg_log(page, f"Rasterizing {len(rows)} file(s)…")
@@ -14063,14 +14286,15 @@ class MainWindow(QMainWindow):
             "--manifest", str(manifest_path),
             "--nucleus", str(nucleus_idx),
             "--model", entry["model"],
+            "--device", entry["device"],
         ]
         if cyto_idx is not None:
             argv += ["--cyto", str(cyto_idx)]
-        if method == "stardist":
+        if entry["family"] == "stardist":
             argv += [
                 "--prob", str(params.get("prob", 0.5)),
                 "--nms", str(params.get("nms", 0.3)),
-                "--n-tiles", str(params.get("n_tiles", 0)),
+                "--tile-size", str(params.get("tile_size", 0)),
             ]
 
         page._seg_ext_jobs = jobs
@@ -14379,18 +14603,16 @@ class MainWindow(QMainWindow):
     def _seg_save_now(self, page) -> None:
         params = page._seg_params
         column = (params.get("column") or "Mask").strip() or "Mask"
-        # Column names must not collide with real columns (or other merges).
+        expose = params.get("expose") or {}
+        # The mask column must not collide with a real column name of a file
+        # that is exposed (checked) in this module — unchecked files don't
+        # publish a mask column, so their names don't matter here.
         taken = set()
         for path in self._seg_file_rows(page):
+            if not expose.get(path):
+                continue
             for name in self._column_index.get(self._rel_data_key(path), []):
                 taken.add(name)
-        for task in self._task_chain(page._seg_task_id):
-            if task.get("id") == page._seg_task_id:
-                continue
-            if task.get("type") == "segmentation":
-                other = self._seg_params_for(task).get("column")
-                if other:
-                    taken.add(other)
         if column in taken:
             QMessageBox.warning(
                 self,
@@ -14401,7 +14623,6 @@ class MainWindow(QMainWindow):
             return
         params["column"] = column
         applied = {}
-        expose = params.get("expose") or {}
         for path in self._seg_file_rows(page):
             if not expose.get(path):
                 continue

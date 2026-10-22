@@ -9,7 +9,7 @@ Usage:
   python cellpose_runner.py check
   python cellpose_runner.py download-model --model cpsam
   python cellpose_runner.py segment --manifest jobs.json --nucleus 0 \
-      [--cyto 1] [--model cpsam] [--threads 8]
+      [--cyto 1] [--model cpsam] [--device cpu] [--threads 8]
 """
 import argparse
 import json
@@ -71,13 +71,14 @@ def download_model(model, threads):
     print("model ready:", model)
 
 
-def segment(manifest_path, nucleus, cyto, model, threads):
+def segment(manifest_path, nucleus, cyto, model, threads, device="cpu"):
     import torch
     torch.set_num_threads(max(1, int(threads)))
     from cellpose import models
     with open(manifest_path, "r", encoding="utf-8") as fh:
         jobs = json.load(fh)
-    m = models.CellposeModel(model_type=model)
+    m = models.CellposeModel(model_type=model, gpu=(device == "gpu"))
+    print(f"device: {m.device}", flush=True)
     for job in jobs:
         img = np.load(job["image"])  # (C, H, W) float array
         if cyto is not None:
@@ -110,6 +111,7 @@ def main(argv):
     seg.add_argument("--nucleus", type=int, required=True)
     seg.add_argument("--cyto", type=int, default=None)
     seg.add_argument("--model", default="cpsam")
+    seg.add_argument("--device", default="cpu")
     seg.add_argument("--threads", type=int, default=_DEFAULT_THREADS)
 
     args = parser.parse_args(argv)
@@ -118,7 +120,8 @@ def main(argv):
     elif args.command == "download-model":
         download_model(args.model, args.threads)
     elif args.command == "segment":
-        segment(args.manifest, args.nucleus, args.cyto, args.model, args.threads)
+        segment(args.manifest, args.nucleus, args.cyto, args.model, args.threads,
+                args.device)
     else:
         parser.print_help()
         sys.exit(1)
