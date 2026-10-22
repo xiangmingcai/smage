@@ -12,20 +12,24 @@ import copy
 import math
 import queue
 import shutil
+import json
 import sys
 import threading
+import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 # Make the `smage` package importable when this file is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, QSize, QTimer, Qt
+from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, QSize, QTimer, Qt, QUrl
 from PySide6.QtGui import (
     QAction,
     QColor,
     QCursor,
+    QDesktopServices,
     QFont,
     QFontMetrics,
     QIcon,
@@ -35,6 +39,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QPolygonF,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -43,6 +48,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGraphicsProxyWidget,
@@ -50,6 +56,7 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsView,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -60,6 +67,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QRubberBand,
@@ -99,6 +108,13 @@ class _NoWheelComboBox(QComboBox):
 class _NoWheelSpinBox(QSpinBox):
     """A number field that ignores the mouse wheel, so scrolling a page never
     accidentally changes a value. It is still edited by typing or the arrows."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class _NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """A floating-point field that ignores the mouse wheel."""
 
     def wheelEvent(self, event) -> None:
         event.ignore()
@@ -315,6 +331,8 @@ SCALING_METHODS = ["linear", "log10", "arcsinh"]
 SEG_METHODS = [
     ("Nuclear Expansion", "nuclear_expansion"),
     ("Mask Input", "mask_input"),
+    ("Cellpose", "cellpose"),
+    ("StarDist", "stardist"),
 ]
 # Per-file mask status shown in the file table.
 SEG_STATUS_NO_MASK = "no mask"
@@ -335,6 +353,39 @@ SEG_DEFAULT_PARAMS = {
     "min_area": 30,
     "expand": 5,
 }
+
+# Extensions: external Python environments managed outside the workflow. Each
+# entry describes one optional method plus how to run/install it. `deps` are
+# the heavy framework packages that must also be present (installed first,
+# checked by Detect).
+EXTENSION_DEFS = [
+    {
+        "id": "cellpose",
+        "name": "Cellpose",
+        "pip": "cellpose",
+        "deps": ["torch", "torchvision"],
+        "runner": "cellpose_runner.py",
+        "model": "cpsam",
+        "desc": "Cellpose (SAM-based) cell segmentation",
+    },
+    {
+        "id": "stardist",
+        "name": "StarDist",
+        "pip": "stardist",
+        "deps": ["tensorflow"],
+        "runner": "stardist_runner.py",
+        "model": "2D_versatile_fluo",
+        "desc": "StarDist star-convex cell segmentation",
+    },
+]
+
+
+def _extension_def(ext_id: str) -> dict | None:
+    """Return the registry entry for an extension id, or None."""
+    for entry in EXTENSION_DEFS:
+        if entry["id"] == ext_id:
+            return entry
+    return None
 
 
 def _otsu_threshold(values) -> float:
@@ -1417,6 +1468,122 @@ class _FlowArrowBand(QWidget):
             ]))
             y += 30
         painter.end()
+
+
+class _ProcessWorker:
+    """Background worker that runs one subprocess command to completion.
+
+    Used to run external Python commands (venv creation, pip install, model
+    download, verification and segmentation) without blocking the UI.
+    """
+
+    def __init__(self):
+        self._req_q = queue.Queue()
+        self._res_q = queue.Queue()
+        self._stop = threading.Event()
+        self._proc = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def run(self, key, argv, cwd=None):
+        self._req_q.put((key, list(argv), cwd))
+
+    def poll(self):
+        """Return finished events: ``(key, "line", text)`` for streaming output
+        and ``(key, "done", returncode, text)`` when the command completes."""
+        out = []
+        while True:
+            try:
+                out.append(self._res_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def stop(self):
+        self._stop.set()
+
+    def clear(self):
+        """Drop any unread results (e.g. from a previous, finished operation)."""
+        while True:
+            try:
+                self._res_q.get_nowait()
+            except queue.Empty:
+                break
+
+    def kill(self):
+        """Terminate the in-flight subprocess (if any)."""
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _run(self):
+        import subprocess
+
+        while not self._stop.is_set():
+            try:
+                key, argv, cwd = self._req_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    # Run without a console window (the external python is a
+                    # console app; this hides the flash that would otherwise
+                    # pop up on Windows).
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                self._proc = proc
+                chunks = []
+                for line in proc.stdout:
+                    line = line.rstrip("\r\n")
+                    if line:
+                        chunks.append(line)
+                        self._res_q.put((key, "line", line))
+                proc.wait()
+                self._res_q.put(
+                    (key, "done", int(proc.returncode), "\n".join(chunks))
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._res_q.put((key, "done", -1, str(exc)))
+            finally:
+                self._proc = None
+
+
+class _ExtManagerDialog(QDialog):
+    """Extension Manager dialog that warns before closing mid-operation."""
+
+    def __init__(self, parent, busy_check) -> None:
+        super().__init__(parent)
+        self._busy_check = busy_check
+
+    def closeEvent(self, event) -> None:
+        if self._busy_check():
+            reply = QMessageBox.question(
+                self,
+                "Operation in progress",
+                "An installation is still running.\n"
+                "Closing now will interrupt it and may leave the environment "
+                "incomplete. Really close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        # Reject (not just accept) so the `finished` signal fires, which stops
+        # the poll timer. Otherwise the timer keeps draining the shared worker
+        # queue and steals results from other consumers (e.g. segmentation).
+        self.reject()
+        event.accept()
 
 
 class _IlluminationWorker:
@@ -3044,8 +3211,591 @@ class MainWindow(QMainWindow):
         save_as_action.triggered.connect(self._save_project_as)
         file_menu.addAction(save_as_action)
 
+        ext_menu = bar.addMenu("&Extension")
+        manage_ext_action = QAction("Manage Extension…", self)
+        manage_ext_action.triggered.connect(self._open_extension_manager)
+        ext_menu.addAction(manage_ext_action)
+
         help_menu = bar.addMenu("&Help")
         help_menu.addAction(QAction("About Smage", self))
+
+    # ----- extensions (external Python environments) ------------------
+    def _ext_dir(self) -> Path:
+        """User-level folder holding Smage's global (non-project) settings."""
+        import os
+
+        base = os.environ.get("APPDATA") or str(Path.home())
+        return Path(base) / "Smage"
+
+    def _ext_config_path(self) -> Path:
+        return self._ext_dir() / "extensions.json"
+
+    def _ext_config(self) -> dict:
+        cache = getattr(self, "_ext_config_cache", None)
+        if cache is None:
+            try:
+                cache = json.loads(
+                    self._ext_config_path().read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                cache = {}
+            if not isinstance(cache, dict):
+                cache = {}
+            self._ext_config_cache = cache
+        return cache
+
+    def _ext_save_config(self) -> None:
+        path = self._ext_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self._ext_config(), indent=2), encoding="utf-8"
+        )
+
+    def _ext_entry(self, ext_id: str) -> dict:
+        return self._ext_config().setdefault(ext_id, {})
+
+    def _ext_python(self, ext_id: str) -> str:
+        return str(self._ext_entry(ext_id).get("python") or "")
+
+    def _ext_ready(self, ext_id: str) -> bool:
+        """Whether an extension's environment, library and model are set up."""
+        e = self._ext_entry(ext_id)
+        return bool(
+            e.get("python") and e.get("verified") and e.get("model_ready")
+        )
+
+    def _ext_runner_path(self, ext_id: str) -> Path:
+        entry = _extension_def(ext_id)
+        return Path(__file__).parent / entry["runner"]
+
+    def _detect_python_interpreters(self) -> list:
+        """Scan the system for Python interpreters (Windows).
+
+        Returns a list of ``{"name": str, "path": str}`` entries, de-duplicated
+        by path, ordered most-relevant first.
+        """
+        import glob
+        import os
+        import re
+        import shutil
+        import subprocess
+
+        found = {}  # path -> display name
+
+        def add(name, path):
+            if not path:
+                return
+            path = str(path)
+            # The WindowsApps python.exe/python3.exe are Store stubs, not real
+            # interpreters; skip them so users don't pick a non-working Python.
+            if "\\WindowsApps\\" in path or "/WindowsApps/" in path:
+                return
+            if path not in found and Path(path).is_file():
+                found[path] = name
+
+        # 1. Interpreters reachable on PATH and the `py` launcher.
+        for cmd in ("python", "python3"):
+            p = shutil.which(cmd)
+            if p:
+                add(f"Python on PATH ({cmd})", p)
+        py_launcher = shutil.which("py")
+
+        # 2. The `py` launcher lists every registered interpreter.
+        if py_launcher:
+            add("Python launcher (py)", py_launcher)
+            try:
+                out = subprocess.run(
+                    [py_launcher, "-0p"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                for line in (out.stdout or "").splitlines():
+                    for token in line.split():
+                        if re.match(r"^[A-Za-z]:[\\/].*python.*\.exe$", token):
+                            add("Python (py launcher)", token)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 3. Common install locations (python.org and conda).
+        local = os.environ.get("LOCALAPPDATA")
+        program_files = os.environ.get("PROGRAMFILES")
+        home = str(Path.home())
+
+        if local:
+            add(
+                "Python (python.org)",
+                Path(local) / "Programs" / "Python" / "python.exe",
+            )
+        for pattern in (
+            (local and str(Path(local) / "Programs" / "Python" / "Python*" / "python.exe")),
+            "C:/Python*/python.exe",
+            "C:/Python*/Scripts/python.exe",
+            (program_files and f"{program_files}/Python*/python.exe"),
+        ):
+            if pattern:
+                for path in glob.glob(pattern):
+                    add("Python (python.org)", path)
+
+        for base in {home, local or home}:
+            for name in ("miniconda3", "anaconda3", "Miniconda3", "Anaconda3"):
+                add(name, Path(base) / name / "python.exe")
+                add(name, Path(base) / name / "Scripts" / "python.exe")
+
+        return [
+            {"name": name, "path": path}
+            for path, name in found.items()
+        ]
+
+    def _ext_worker(self):
+        worker = getattr(self, "_ext_worker_obj", None)
+        if worker is None:
+            worker = _ProcessWorker()
+            self._ext_worker_obj = worker
+        return worker
+
+    def _open_extension_manager(self) -> None:
+        """Open the Extension Manager dialog (global, outside the workflow)."""
+        dlg = _ExtManagerDialog(
+            self, lambda: getattr(self, "_ext_busy", False)
+        )
+        dlg.setWindowTitle("Manage Extensions")
+        dlg.resize(720, 460)
+        lay = QHBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(10)
+
+        list_widget = QListWidget()
+        list_widget.setFixedWidth(160)
+        list_widget.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        for entry in EXTENSION_DEFS:
+            list_widget.addItem(entry["name"])
+        lay.addWidget(list_widget)
+
+        host = QWidget()
+        host.setLayout(QVBoxLayout())
+        host.layout().setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(host, 1)
+
+        def stop_timer():
+            timer = getattr(host, "_ext_poll_timer", None)
+            if timer is not None:
+                timer.stop()
+                timer.deleteLater()
+                host._ext_poll_timer = None
+
+        def show(index):
+            stop_timer()
+            self._clear_layout(host.layout())
+            if index < 0:
+                return
+            self._ext_detail_panel(host, EXTENSION_DEFS[index])
+
+        list_widget.currentRowChanged.connect(show)
+        if EXTENSION_DEFS:
+            list_widget.setCurrentRow(0)
+
+        # Stop the poll timer as soon as the manager is closed, so its callback
+        # never touches widgets from a destroyed panel.
+        dlg.finished.connect(lambda _=0: stop_timer())
+        dlg.exec()
+
+    def _ext_detail_panel(self, host, entry) -> None:
+        """Build the detail panel for one extension in the manager."""
+        import os
+
+        ext_id = entry["id"]
+        e = self._ext_entry(ext_id)
+        lay = host.layout()
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel(f"<b>{entry['name']}</b>"))
+        lay.addWidget(QLabel(entry["desc"]))
+        lay.addWidget(QLabel(
+            "Runs in a separate Python environment; Smage does not bundle "
+            "TensorFlow / PyTorch."
+        ))
+        lay.addWidget(QLabel(""))
+        lay.addWidget(QLabel("<b>1. Python environment</b>"))
+
+        detect_python_btn = QPushButton("Detect installed Python…")
+        detect_python_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay.addWidget(detect_python_btn)
+
+        env_row = QWidget()
+        eh = QHBoxLayout(env_row)
+        eh.setContentsMargins(0, 0, 0, 0)
+        eh.setSpacing(4)
+        python_combo = QComboBox()
+        python_combo.setEditable(True)
+        python_combo.setPlaceholderText("Path to python.exe")
+        if e.get("python"):
+            python_combo.addItem(e.get("python"))
+            python_combo.setEditText(e.get("python"))
+        eh.addWidget(python_combo, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        eh.addWidget(browse_btn)
+        lay.addWidget(env_row)
+
+        install_box = QGroupBox("No suitable Python?")
+        ib = QVBoxLayout(install_box)
+        ib.setContentsMargins(8, 8, 8, 8)
+        ib.setSpacing(4)
+        box_hint = QLabel(
+            "If you don't find a suitable python.exe, you can install Python "
+            "or create an environment yourself. Otherwise ignore this box."
+        )
+        box_hint.setWordWrap(True)
+        box_hint.setStyleSheet("color: #6b7785;")
+        ib.addWidget(box_hint)
+        ibtn = QHBoxLayout()
+        install_python_btn = QPushButton("Install Python…")
+        install_python_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        create_btn = QPushButton("Create venv…")
+        create_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ibtn.addWidget(install_python_btn)
+        ibtn.addWidget(create_btn)
+        ibtn.addStretch()
+        ib.addLayout(ibtn)
+        lay.addWidget(install_box)
+
+        detect_btn = QPushButton("Detect library")
+        detect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        detect_btn.setToolTip(
+            f"Check that the chosen Python has the {entry['pip']} library installed"
+        )
+        lay.addWidget(detect_btn)
+
+        status = QLabel(self._ext_status_text(entry, e))
+        status.setWordWrap(True)
+        status.setStyleSheet("color: #37474f;")
+        lay.addWidget(status)
+
+        lay.addWidget(QLabel(""))
+        lay.addWidget(QLabel("<b>2. Install library</b>"))
+        install_btn = QPushButton(f"Install {entry['pip']}")
+        install_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay.addWidget(install_btn)
+
+        lay.addWidget(QLabel("<b>3. Install dependencies</b>"))
+        install_deps_btn = QPushButton("Install dependencies")
+        install_deps_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        install_deps_btn.setToolTip(
+            "Force-reinstall the framework packages ("
+            + ", ".join(entry.get("deps") or []) + ") even if already present"
+        )
+        lay.addWidget(install_deps_btn)
+
+        lay.addWidget(QLabel("<b>4. Download model</b>"))
+        model_btn = QPushButton("Download model")
+        model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay.addWidget(model_btn)
+
+        progress = QProgressBar()
+        progress.setRange(0, 0)  # indeterminate while a command is running
+        progress.setTextVisible(False)
+        progress.setFixedHeight(14)
+        progress.hide()
+        lay.addWidget(progress)
+
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Output appears here…")
+        log.setStyleSheet("background: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace;")
+        lay.addWidget(log, 1)
+
+        worker = self._ext_worker()
+        page_state = {"busy": False}
+
+        def set_busy(busy, show_progress=False):
+            page_state["busy"] = busy
+            self._ext_busy = bool(busy)
+            if busy and show_progress:
+                progress.setRange(0, 0)
+                progress.show()
+            else:
+                progress.hide()
+            for b in (
+                browse_btn, detect_python_btn, install_python_btn, create_btn,
+                detect_btn, install_btn, install_deps_btn, model_btn,
+            ):
+                b.setEnabled(not busy)
+
+        def current_python():
+            p = python_combo.currentText().strip()
+            if not p and e.get("python"):
+                p = e.get("python")
+            return p
+
+        def on_detect():
+            python = current_python()
+            if not python:
+                QMessageBox.information(
+                    self, "Detect", "Choose a Python environment first."
+                )
+                return
+            e["python"] = python
+            self._ext_save_config()
+            set_busy(True)  # detect is quick: no progress bar
+            log.clear()
+            log.appendPlainText(
+                f"Checking {entry['pip']} and its dependencies…"
+            )
+            # Check package metadata only (fast); do not import the library,
+            # since importing TensorFlow / PyTorch can take tens of seconds.
+            modules = list(entry.get("deps") or []) + [entry["pip"]]
+            probe = "\n".join([
+                "import importlib.metadata as md",
+                "mods = " + repr(modules),
+                "for n in mods:",
+                "    try:",
+                "        print(n, md.version(n))",
+                "    except Exception:",
+                "        print(n, 'MISSING')",
+            ])
+            worker.run(("detect", ext_id), [python, "-c", probe])
+
+        def on_install():
+            python = current_python()
+            if not python:
+                QMessageBox.information(
+                    self, "Install", "Choose a Python environment first."
+                )
+                return
+            e["python"] = python
+            self._ext_save_config()
+            set_busy(True, show_progress=True)
+            log.clear()
+            log.appendPlainText(
+                f"Installing {entry['pip']} into {python}…\n"
+                "This can take several minutes."
+            )
+            worker.run(
+                ("install", ext_id),
+                [python, "-m", "pip", "install", entry["pip"]],
+            )
+
+        def on_install_deps():
+            python = current_python()
+            if not python:
+                QMessageBox.information(
+                    self, "Install dependencies", "Choose a Python environment first."
+                )
+                return
+            e["python"] = python
+            self._ext_save_config()
+            set_busy(True, show_progress=True)
+            log.clear()
+            deps = list(entry.get("deps") or [])
+            log.appendPlainText(
+                f"Reinstalling {' '.join(deps)} into {python}…\n"
+                "This can take several minutes."
+            )
+            worker.run(
+                ("deps", ext_id),
+                [python, "-m", "pip", "install", "--force-reinstall"] + deps,
+            )
+
+        def on_download_model():
+            python = current_python()
+            if not python:
+                QMessageBox.information(
+                    self, "Download model", "Choose a Python environment first."
+                )
+                return
+            e["python"] = python
+            self._ext_save_config()
+            set_busy(True, show_progress=True)
+            log.clear()
+            log.appendPlainText(f"Downloading {entry['model']} model…")
+            worker.run(
+                ("model", ext_id),
+                [python, str(self._ext_runner_path(ext_id)),
+                 "download-model", "--model", entry["model"]],
+            )
+
+        def browse():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select python.exe", "",
+                "Python (python.exe);;All files (*)",
+            )
+            if path:
+                python_combo.setEditText(path)
+
+        def detect_python():
+            found = self._detect_python_interpreters()
+            if not found:
+                QMessageBox.information(
+                    self,
+                    "Python not found",
+                    "No Python installation was found on this computer.\n\n"
+                    "Click 'Install Python…' to download and install Python, "
+                    "then come back and click 'Detect installed Python…'.",
+                )
+                return
+            current = python_combo.currentText().strip()
+            python_combo.clear()
+            for item in found:
+                python_combo.addItem(item["path"])
+            if current in [python_combo.itemText(i) for i in range(python_combo.count())]:
+                python_combo.setCurrentText(current)
+            else:
+                python_combo.setCurrentIndex(0)
+
+        def install_python():
+            QDesktopServices.openUrl(QUrl("https://www.python.org/downloads/"))
+            QMessageBox.information(
+                self,
+                "Install Python",
+                "1. Download the installer from python.org.\n"
+                "2. Run it and tick 'Add python.exe to PATH'.\n"
+                "3. After installing, click 'Detect installed Python…' here "
+                "to use the new Python.",
+            )
+
+        def create_venv():
+            base, _ = QFileDialog.getOpenFileName(
+                self, "Select a base python.exe to create a venv", "",
+                "Python (python.exe);;All files (*)",
+            )
+            if not base:
+                return
+            target = QFileDialog.getExistingDirectory(
+                self, "Choose a folder for the new environment"
+            )
+            if not target:
+                return
+            venv = str(Path(target) / f"smage-{ext_id}")
+            log.clear()
+            log.appendPlainText(f"Creating venv at {venv}…")
+            set_busy(True, show_progress=True)
+            worker.run(
+                ("create", ext_id, venv),
+                [base, "-m", "venv", venv],
+            )
+
+        def refresh_status():
+            status.setText(self._ext_status_text(entry, e))
+            if self._ext_ready(entry["id"]):
+                status.setStyleSheet("color: #1a7f37; font-weight: bold;")
+            elif e.get("verified") is False and (e.get("missing") or not e.get("python")):
+                status.setStyleSheet("color: #c0392b; font-weight: bold;")
+            else:
+                status.setStyleSheet("color: #37474f;")
+
+        def on_poll():
+            for item in worker.poll():
+                if item[1] == "line":
+                    log.appendPlainText(item[2])
+                    continue
+                _tag, kind, code, text = item[0], item[1], item[2], item[3]
+                key = kind  # first element of the request key tuple
+                set_busy(False)
+                if text:
+                    log.appendPlainText(text.rstrip())
+                if isinstance(_tag, tuple) and _tag[0] == "detect":
+                    missing = []
+                    version = ""
+                    for line in text.strip().splitlines():
+                        parts = line.split(None, 1)
+                        if len(parts) != 2:
+                            continue
+                        name, value = parts[0], parts[1]
+                        if value == "MISSING":
+                            missing.append(name)
+                        elif name == entry["pip"]:
+                            version = value
+                    if code == 0 and not missing:
+                        e["verified"] = True
+                        e["version"] = version
+                        e["missing"] = []
+                    else:
+                        e["verified"] = False
+                        e["version"] = ""
+                        e["missing"] = missing
+                        if missing:
+                            log.appendPlainText(
+                                "Missing: " + ", ".join(missing) + ".\n"
+                                f"Run 'Install {entry['pip']}' to install them."
+                            )
+                        else:
+                            log.appendPlainText(
+                                "Could not check this environment. "
+                                "Verify the Python path and try again."
+                            )
+                    self._ext_save_config()
+                elif isinstance(_tag, tuple) and _tag[0] == "install":
+                    e["verified"] = code == 0
+                    if code == 0:
+                        log.appendPlainText("Installed. Run Detect library to confirm.")
+                    else:
+                        log.appendPlainText(
+                            "Installation failed. Check the messages above."
+                        )
+                    self._ext_save_config()
+                elif isinstance(_tag, tuple) and _tag[0] == "deps":
+                    if code == 0:
+                        log.appendPlainText(
+                            "Dependencies installed. Run Detect library to confirm."
+                        )
+                    else:
+                        log.appendPlainText(
+                            "Dependency installation failed. Check the messages above."
+                        )
+                elif isinstance(_tag, tuple) and _tag[0] == "model":
+                    e["model_ready"] = code == 0
+                    self._ext_save_config()
+                elif isinstance(_tag, tuple) and _tag[0] == "create":
+                    if code == 0:
+                        venv_python = str(
+                            Path(_tag[2]) / ("Scripts" if os.name == "nt" else "bin")
+                            / ("python.exe" if os.name == "nt" else "python")
+                        )
+                        python_combo.setEditText(venv_python)
+                        e["python"] = venv_python
+                        self._ext_save_config()
+                        log.appendPlainText(f"Environment created: {venv_python}")
+                    else:
+                        log.appendPlainText("Could not create the environment.")
+                refresh_status()
+
+        poll_timer = QTimer(host)
+        poll_timer.setInterval(150)
+        poll_timer.timeout.connect(on_poll)
+        poll_timer.start()
+
+        browse_btn.clicked.connect(browse)
+        detect_python_btn.clicked.connect(detect_python)
+        install_python_btn.clicked.connect(install_python)
+        create_btn.clicked.connect(create_venv)
+        detect_btn.clicked.connect(on_detect)
+        install_btn.clicked.connect(on_install)
+        install_deps_btn.clicked.connect(on_install_deps)
+        model_btn.clicked.connect(on_download_model)
+        host._ext_poll_timer = poll_timer
+        refresh_status()
+
+    def _ext_status_text(self, entry, e) -> str:
+        python = e.get("python") or ""
+        if not python:
+            return "Not configured — no Python environment."
+        parts = [f"Python: {python}"]
+        missing = e.get("missing")
+        if e.get("verified"):
+            parts.append(f"✓ {entry['name']} detected: {e.get('version') or 'ok'}")
+        elif missing:
+            parts.append("✗ Missing packages: " + ", ".join(missing))
+        else:
+            parts.append("Not checked yet — click 'Detect library'.")
+        if e.get("model_ready"):
+            parts.append(f"Model: {entry['model']} ready")
+        else:
+            parts.append("Model: not downloaded")
+        if self._ext_ready(entry["id"]):
+            parts.append("✓ Ready to use")
+        return "\n".join(parts)
 
     # ----- project actions ------------------------------------------
     def _new_project(self) -> None:
@@ -12253,6 +13003,8 @@ class MainWindow(QMainWindow):
         page._seg_applied_snapshot = dict(params.get("applied") or {})
         page._seg_overlay_item = None
         page._seg_mask_cache = {}
+        page._seg_ext_running = False
+        page._seg_log_lines = []
         save_btn.clicked.connect(lambda _=False: self._seg_save_now(page))
 
         content = QWidget()
@@ -12561,6 +13313,8 @@ class MainWindow(QMainWindow):
         method = page._seg_params.get("method")
         if method == "mask_input":
             self._seg_mask_input_panel(page, host)
+        elif method in ("cellpose", "stardist"):
+            self._seg_external_method_panel(page, host)
         else:
             self._seg_method_params_panel(page, host)
 
@@ -12725,6 +13479,197 @@ class MainWindow(QMainWindow):
         mode_combo.currentIndexChanged.connect(on_mode)
         area_spin.valueChanged.connect(on_area)
         exp_spin.valueChanged.connect(on_expand)
+        calc_btn.clicked.connect(lambda _=False: self._seg_calculate(page))
+
+    def _seg_channel_columns(self, page) -> list:
+        """Union of non-coordinate columns across the selected files."""
+        columns = []
+        for path in self._seg_file_rows(page):
+            for name in self._columns_for(path, None):
+                if name in ("x", "y"):
+                    continue
+                if name not in columns:
+                    columns.append(name)
+        return columns
+
+    def _seg_external_method_panel(self, page, host) -> None:
+        """Cellpose / StarDist params: extension status, channel, Calculate."""
+        method = page._seg_params.get("method")
+        entry = _extension_def(method)
+        lay = host.layout()
+        params = self._seg_map_params(page)
+        enabled = not page._seg_locked
+        ready = self._ext_ready(method)
+
+        lay.addWidget(QLabel(f"<b>{entry['name']}</b>"))
+        lay.addWidget(QLabel(entry["desc"]))
+        lay.addWidget(QLabel("Runs in an external Python environment."))
+
+        banner = QLabel()
+        banner.setWordWrap(True)
+        if ready:
+            banner.setText("Extension ready ✓")
+            banner.setStyleSheet("color: #1a7f37; font-weight: bold;")
+        else:
+            banner.setText(
+                f"{entry['name']} extension is not configured.\n"
+                "Open Extension → Manage Extension to set it up first."
+            )
+            banner.setStyleSheet("color: #b58900; font-weight: bold;")
+        lay.addWidget(banner)
+
+        def param_label(title, desc=""):
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            h.addWidget(QLabel(title))
+            if desc:
+                d = QLabel(desc)
+                d.setStyleSheet("color: #6b7785;")
+                h.addWidget(d)
+            h.addStretch()
+            return row
+
+        lay.addWidget(QLabel("Files to calculate"))
+        files_list = QListWidget()
+        files_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        files_list.setMaximumHeight(110)
+        for path in self._seg_file_rows(page):
+            item = QListWidgetItem(self._comp_file_name(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            has_mask = (
+                self._seg_mask_file(self._seg_mask_record(page._seg_params, path))
+                is not None
+            )
+            item.setCheckState(
+                Qt.CheckState.Unchecked if has_mask else Qt.CheckState.Checked
+            )
+            files_list.addItem(item)
+        lay.addWidget(files_list)
+        page._seg_calc_files_list = files_list
+
+        lay.addWidget(param_label("Nucleus channel", "nuclear stain channel"))
+        columns = self._seg_channel_columns(page)
+        channel_combo = _NoWheelComboBox()
+        channel_combo.addItem("", None)
+        for name in columns:
+            channel_combo.addItem(name, name)
+        idx = channel_combo.findData(params.get("channel"))
+        if idx >= 0:
+            channel_combo.setCurrentIndex(idx)
+        channel_combo.setEnabled(enabled)
+        lay.addWidget(channel_combo)
+
+        cyto_combo = None
+        if method == "cellpose":
+            lay.addWidget(param_label(
+                "Cytoplasm channel (optional)", "optional second channel"
+            ))
+            cyto_combo = _NoWheelComboBox()
+            cyto_combo.addItem("(none)", None)
+            for name in columns:
+                cyto_combo.addItem(name, name)
+            idx = cyto_combo.findData(params.get("cyto_channel"))
+            if idx >= 0:
+                cyto_combo.setCurrentIndex(idx)
+            cyto_combo.setEnabled(enabled)
+            lay.addWidget(cyto_combo)
+
+        prob_spin = None
+        nms_spin = None
+        n_tiles_spin = None
+        if method == "stardist":
+            params.setdefault("model", entry["model"])
+            params.setdefault("prob", 0.5)
+            params.setdefault("nms", 0.3)
+            params.setdefault("n_tiles", 0)
+            lay.addWidget(param_label("Probability threshold", "lower detects more cells"))
+            prob_spin = _NoWheelDoubleSpinBox()
+            prob_spin.setRange(0.01, 1.0)
+            prob_spin.setSingleStep(0.05)
+            prob_spin.setDecimals(2)
+            prob_spin.setValue(float(params.get("prob", 0.5)))
+            prob_spin.setEnabled(enabled)
+            lay.addWidget(prob_spin)
+
+            lay.addWidget(param_label("NMS threshold", "overlap suppression"))
+            nms_spin = _NoWheelDoubleSpinBox()
+            nms_spin.setRange(0.0, 1.0)
+            nms_spin.setSingleStep(0.05)
+            nms_spin.setDecimals(2)
+            nms_spin.setValue(float(params.get("nms", 0.3)))
+            nms_spin.setEnabled(enabled)
+            lay.addWidget(nms_spin)
+
+            lay.addWidget(param_label(
+                "Tile count (n)", "0 = auto; larger n = smaller tiles"
+            ))
+            n_tiles_spin = _NoWheelSpinBox()
+            n_tiles_spin.setRange(0, 20)
+            n_tiles_spin.setSingleStep(1)
+            n_tiles_spin.setValue(int(params.get("n_tiles", 0)))
+            n_tiles_spin.setEnabled(enabled)
+            n_tiles_spin.setToolTip(
+                "Number of tiles per side (n × n). 0 lets StarDist pick the "
+                "best value for each image; raise it for very large images."
+            )
+            lay.addWidget(n_tiles_spin)
+
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setEnabled(enabled and ready)
+        lay.addWidget(calc_btn)
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Calculation output appears here…")
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        for line in getattr(page, "_seg_log_lines", []):
+            log.appendPlainText(line)
+        lay.addWidget(log, 1)
+        page._seg_calc_btn = calc_btn
+        page._seg_calc_status = status
+        page._seg_calc_log = log
+
+        def on_channel(_=0):
+            params["channel"] = channel_combo.currentData()
+            self._seg_mark_dirty(page)
+
+        def on_cyto(_=0):
+            params["cyto_channel"] = cyto_combo.currentData()
+            self._seg_mark_dirty(page)
+
+        def on_prob(value):
+            params["prob"] = float(value)
+            self._seg_mark_dirty(page)
+
+        def on_nms(value):
+            params["nms"] = float(value)
+            self._seg_mark_dirty(page)
+
+        def on_n_tiles(value):
+            params["n_tiles"] = int(value)
+            self._seg_mark_dirty(page)
+
+        channel_combo.currentIndexChanged.connect(on_channel)
+        if cyto_combo is not None:
+            cyto_combo.currentIndexChanged.connect(on_cyto)
+        if prob_spin is not None:
+            prob_spin.valueChanged.connect(on_prob)
+        if nms_spin is not None:
+            nms_spin.valueChanged.connect(on_nms)
+        if n_tiles_spin is not None:
+            n_tiles_spin.valueChanged.connect(on_n_tiles)
         calc_btn.clicked.connect(lambda _=False: self._seg_calculate(page))
 
     def _seg_mask_input_panel(self, page, host) -> None:
@@ -12961,9 +13906,15 @@ class MainWindow(QMainWindow):
         self._module_saved(page)
 
     def _seg_calculate(self, page) -> None:
-        """Run Nuclear Expansion on every selected file."""
-        import numpy as np
+        """Run the selected method on every selected file."""
+        method = page._seg_params.get("method")
+        if method in ("cellpose", "stardist"):
+            self._seg_calculate_external(page)
+            return
+        self._seg_calculate_nuclear(page)
 
+    def _seg_calculate_nuclear(self, page) -> None:
+        """Run Nuclear Expansion on every selected file."""
         rows = self._seg_file_rows(page)
         params = self._seg_map_params(page)
         status = getattr(page, "_seg_calc_status", None)
@@ -13015,17 +13966,356 @@ class MainWindow(QMainWindow):
                 msg += "\n" + "\n".join(errors)
             status.setText(msg)
 
-    def _seg_nuclear_expansion(self, parquet_path, params):
-        """Threshold → label → filter → expand. Returns (mask, error)."""
+    def _seg_raster_stack(self, parquet_path, channels):
+        """Reconstruct a (C, H, W) float stack of the given channels."""
+        import numpy as np
+
+        images = []
+        shape = None
+        for channel in channels:
+            image, err = self._seg_raster_channel(parquet_path, channel)
+            if image is None:
+                return None, err
+            if shape is None:
+                shape = image.shape
+            elif image.shape != shape:
+                return None, "channel shapes differ"
+            images.append(image)
+        return np.stack(images, axis=0).astype("float32"), None
+
+    def _seg_calculate_external(self, page) -> None:
+        """Run Cellpose / StarDist on the selected files in one subprocess."""
+        import json
+        import tempfile
+
+        import numpy as np
+
+        method = page._seg_params.get("method")
+        entry = _extension_def(method)
+        params = self._seg_map_params(page)
+        files_list = getattr(page, "_seg_calc_files_list", None)
+        if files_list is not None:
+            rows = []
+            for i in range(files_list.count()):
+                item = files_list.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    rows.append(item.data(Qt.ItemDataRole.UserRole))
+        else:
+            rows = self._seg_file_rows(page)
+        status = getattr(page, "_seg_calc_status", None)
+
+        if not rows:
+            QMessageBox.information(
+                self, "Calculate",
+                "Select at least one file in the list to calculate.",
+            )
+            return
+        if not params.get("channel"):
+            QMessageBox.information(
+                self, "Calculate", "Choose the nucleus channel first."
+            )
+            return
+        if not self._ext_ready(method):
+            QMessageBox.information(
+                self,
+                "Calculate",
+                f"{entry['name']} extension is not configured.\n"
+                "Open Extension → Manage Extension to set it up first.",
+            )
+            return
+
+        python = self._ext_python(method)
+        runner = str(self._ext_runner_path(method))
+        tmpdir = Path(tempfile.mkdtemp(prefix="smage-seg-"))
+        jobs = []
+        manifest = []
+        nucleus = params.get("channel")
+        cyto = params.get("cyto_channel") if method == "cellpose" else None
+        # Reconstructing the channel image happens in the main app, before the
+        # external subprocess starts, so log it (this is the silent phase).
+        self._seg_log(page, f"Rasterizing {len(rows)} file(s)…")
+        for i, parquet_path in enumerate(rows):
+            self._seg_log(
+                page, f"  rasterizing {self._comp_file_name(parquet_path)}…"
+            )
+            if cyto:
+                stack, err = self._seg_raster_stack(parquet_path, [cyto, nucleus])
+                nucleus_idx, cyto_idx = 1, 0
+            else:
+                stack, err = self._seg_raster_stack(parquet_path, [nucleus])
+                nucleus_idx, cyto_idx = 0, None
+            if stack is None:
+                continue
+            image_npy = tmpdir / f"in_{i}.npy"
+            output_npy = tmpdir / f"out_{i}.npy"
+            np.save(image_npy, stack)
+            manifest.append({"image": str(image_npy), "output": str(output_npy)})
+            jobs.append({"parquet": parquet_path, "output": str(output_npy)})
+
+        if not jobs:
+            return
+
+        manifest_path = tmpdir / "jobs.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        argv = [
+            python, runner, "segment",
+            "--manifest", str(manifest_path),
+            "--nucleus", str(nucleus_idx),
+            "--model", entry["model"],
+        ]
+        if cyto_idx is not None:
+            argv += ["--cyto", str(cyto_idx)]
+        if method == "stardist":
+            argv += [
+                "--prob", str(params.get("prob", 0.5)),
+                "--nms", str(params.get("nms", 0.3)),
+                "--n-tiles", str(params.get("n_tiles", 0)),
+            ]
+
+        page._seg_ext_jobs = jobs
+        page._seg_ext_tmpdir = tmpdir
+        page._seg_ext_done = set()
+        page._seg_ext_errors = []
+        page._seg_ext_cells = 0
+        page._seg_ext_report = []
+        page._seg_ext_tile = None
+        page._seg_ext_activity = ""
+        page._seg_ext_finished = False
+        page._seg_ext_running = True
+        page._seg_ext_start_time = time.monotonic()
+        # Keep appending to the existing log so each run's history is preserved.
+        self._seg_log(
+            page,
+            f"===== {entry['name']} run — {len(jobs)} file(s) =====",
+        )
+        worker = self._ext_worker()
+        worker.clear()  # drop any stale results from earlier operations
+        # Stop any previous run's poll timer so it can't steal this run's events.
+        old_timer = getattr(page, "_seg_ext_timer", None)
+        if old_timer is not None:
+            old_timer.stop()
+        worker.run(("seg-batch",), argv)
+        if status is not None:
+            status.setText(f"Running {entry['name']} on {len(jobs)} file(s)…")
+
+        timer = QTimer(self)
+        timer.setInterval(150)
+        timer.timeout.connect(lambda: self._seg_ext_poll(page))
+        timer.start()
+        page._seg_ext_timer = timer
+
+    def _seg_log(self, page, text) -> None:
+        """Append a timestamped line to the segmentation calculation log."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = getattr(page, "_seg_log_lines", None)
+        if lines is None:
+            lines = []
+            page._seg_log_lines = lines
+        for line in text.splitlines():
+            if line.strip():
+                lines.append(f"[{ts}] {line}")
+        box = getattr(page, "_seg_calc_log", None)
+        if box is not None:
+            for line in text.splitlines():
+                if line.strip():
+                    box.appendPlainText(f"[{ts}] {line}")
+        page._seg_log_last_is_tile = False
+
+    def _seg_log_tile(self, page, i, total) -> None:
+        """Update the in-progress tile line in the log (replace in place)."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        text = f"[{ts}] tile {i}/{total}"
+        lines = getattr(page, "_seg_log_lines", None)
+        if lines is None:
+            lines = []
+            page._seg_log_lines = lines
+        if getattr(page, "_seg_log_last_is_tile", False) and lines:
+            lines[-1] = text
+        else:
+            lines.append(text)
+        box = getattr(page, "_seg_calc_log", None)
+        if box is not None:
+            if getattr(page, "_seg_log_last_is_tile", False):
+                cursor = box.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+                cursor.removeSelectedText()
+                cursor.insertText(text)
+            else:
+                box.appendPlainText(text)
+        page._seg_log_last_is_tile = True
+
+    def _seg_ext_poll(self, page) -> None:
+        """Collect finished external segmentations and finalize the masks."""
+        import shutil
+
+        import numpy as np
+
+        worker = self._ext_worker()
+        status = getattr(page, "_seg_calc_status", None)
+        jobs = getattr(page, "_seg_ext_jobs", None) or []
+        done = getattr(page, "_seg_ext_done", None) or set()
+        errors = getattr(page, "_seg_ext_errors", [])
+        cells = getattr(page, "_seg_ext_cells", 0)
+        report = getattr(page, "_seg_ext_report", None) or []
+        tile = getattr(page, "_seg_ext_tile", None)
+        activity = getattr(page, "_seg_ext_activity", "") or ""
+        finished = getattr(page, "_seg_ext_finished", False)
+        out_to_job = {job["output"]: job for job in jobs}
+
+        for item in worker.poll():
+            if item[1] == "line":
+                line = item[2]
+                if line.startswith("tile: "):
+                    info = line[len("tile: "):].strip()
+                    if "/" in info:
+                        try:
+                            cur, tot = info.split("/", 1)
+                            tile = (int(cur), int(tot))
+                            self._seg_log_tile(page, int(cur), int(tot))
+                        except ValueError:
+                            pass
+                elif line.startswith("done:"):
+                    body = line[len("done:"):].strip()
+                    out_path, sep, meta = body.partition("|")
+                    out_path = out_path.strip()
+                    n_cells = 0
+                    seconds = 0.0
+                    for part in meta.split("|"):
+                        if part.startswith("cells="):
+                            try:
+                                n_cells = int(part[len("cells="):])
+                            except ValueError:
+                                pass
+                        elif part.startswith("time="):
+                            try:
+                                seconds = float(part[len("time="):])
+                            except ValueError:
+                                pass
+                    job = out_to_job.get(out_path)
+                    if job is None or out_path in done:
+                        continue
+                    parquet_path = job["parquet"]
+                    try:
+                        arr = np.load(out_path)
+                        if arr.ndim != 2:
+                            raise ValueError("bad mask shape")
+                        rel = self._seg_write_mask(
+                            page._seg_task_id, parquet_path, arr
+                        )
+                        rec = self._seg_mask_record_live(
+                            page, parquet_path, create=True
+                        )
+                        rec["path"] = rel
+                        rec["source"] = "builtin"
+                        rec["state"] = SEG_IMPORT_DONE
+                        cells += int(arr.max())
+                        report.append(
+                            f"{self._comp_file_name(parquet_path)}: "
+                            f"{n_cells} cells, {seconds:.1f}s"
+                        )
+                        self._seg_log(
+                            page,
+                            f"✓ {self._comp_file_name(parquet_path)}: "
+                            f"{n_cells} cells, {seconds:.1f}s",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{self._comp_file_name(parquet_path)}: {exc}")
+                        self._seg_log(page, f"✗ {self._comp_file_name(parquet_path)}: {exc}")
+                    done.add(out_path)
+                else:
+                    # Non-progress output (e.g. TensorFlow/model loading lines):
+                    # remember the latest for the status, and record it in the
+                    # scrollable log so the user can see and copy the details.
+                    if line.strip():
+                        activity = line.strip()[-120:]
+                        self._seg_log(page, line)
+                continue
+            if len(item) != 4 or item[1] != "done":
+                continue
+            key, _tag, code, text = item[0], item[1], item[2], item[3]
+            if not (isinstance(key, tuple) and key[0] == "seg-batch"):
+                continue
+            finished = True
+            for job in jobs:
+                if job["output"] in done:
+                    continue
+                if code != 0:
+                    errors.append(
+                        f"{self._comp_file_name(job['parquet'])}: "
+                        f"{text.strip()[-200:]}"
+                    )
+                else:
+                    errors.append(
+                        f"{self._comp_file_name(job['parquet'])}: no output produced"
+                    )
+                done.add(job["output"])
+            if text and code != 0:
+                self._seg_log(page, text.rstrip())
+
+        page._seg_ext_done = done
+        page._seg_ext_errors = errors
+        page._seg_ext_cells = cells
+        page._seg_ext_report = report
+        page._seg_ext_tile = tile
+        page._seg_ext_activity = activity
+        page._seg_ext_finished = finished
+        if finished:
+            page._seg_ext_running = False
+
+        if not finished:
+            if status is not None:
+                start = getattr(page, "_seg_ext_start_time", None)
+                elapsed = int(time.monotonic() - start) if start else 0
+                minutes, seconds = divmod(elapsed, 60)
+                elapsed_str = (
+                    f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+                )
+                stamp = f"[{datetime.now().strftime('%H:%M:%S')} · {elapsed_str}]"
+                msg = f"{stamp} Running… {len(done)}/{len(jobs)} file(s) done"
+                if tile is not None:
+                    msg += f" — tile {tile[0]}/{tile[1]}"
+                elif activity:
+                    msg += f" — {activity}"
+                status.setText(msg)
+            return
+
+        timer = getattr(page, "_seg_ext_timer", None)
+        if timer is not None:
+            timer.stop()
+        shutil.rmtree(page._seg_ext_tmpdir, ignore_errors=True)
+        ok_count = len(jobs) - len(errors)
+        start = getattr(page, "_seg_ext_start_time", None)
+        elapsed = int(time.monotonic() - start) if start else 0
+        minutes, seconds = divmod(elapsed, 60)
+        elapsed_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+        self._seg_log(
+            page,
+            f"Calculated {ok_count} mask(s) · {cells} cell(s) in {elapsed_str}.",
+        )
+        for err in errors:
+            self._seg_log(page, f"✗ {err}")
+        self._seg_after_masks_changed(page)
+        self._seg_refresh_files(page)
+        status = getattr(page, "_seg_calc_status", None)
+        if status is not None:
+            msg = f"Calculated {ok_count} mask(s) · {cells} cell(s) in {elapsed_str}."
+            if report:
+                msg += "\n" + "\n".join(report)
+            if errors:
+                msg += "\n" + "\n".join(errors)
+            status.setText(msg)
+
+    def _seg_raster_channel(self, parquet_path, channel):
+        """Reconstruct one channel as a 2-D float image (or (None, error))."""
         import numpy as np
         import pandas as pd
-        from scipy import ndimage
 
         ent = self._ensure_image_index(parquet_path)
         if ent is None or ent.get("manifest") is None:
             return None, "no image index — re-import this file as an image"
         man = ent["manifest"]
-        channel = params.get("channel")
         try:
             df = pd.read_parquet(parquet_path, columns=["x", "y", channel])
         except Exception as exc:  # noqa: BLE001
@@ -13045,6 +14335,19 @@ class MainWindow(QMainWindow):
         image[yi[ok], xi[ok]] = values[ok]
         if values[ok].size == 0:
             return None, "no finite pixel values"
+        return image, None
+
+    def _seg_nuclear_expansion(self, parquet_path, params):
+        """Threshold → label → filter → expand. Returns (mask, error)."""
+        import numpy as np
+        from scipy import ndimage
+
+        channel = params.get("channel")
+        if not channel:
+            return None, "no nucleus channel"
+        image, err = self._seg_raster_channel(parquet_path, channel)
+        if image is None:
+            return None, err
 
         if params.get("threshold_mode") == "manual":
             threshold = float(params.get("threshold", 0.0))
@@ -13121,6 +14424,17 @@ class MainWindow(QMainWindow):
         self._module_saved(page)
 
     def _seg_close(self, page) -> None:
+        if getattr(page, "_seg_ext_running", False):
+            reply = QMessageBox.question(
+                self,
+                "Close Segmentation",
+                "A calculation is still running.\n"
+                "Closing the module now will interrupt it. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._ext_worker().kill()
         if page._seg_dirty:
             reply = QMessageBox.question(
                 self,
@@ -13131,9 +14445,10 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
             page._seg_task_def["params"] = page._seg_snapshot
-        timer = getattr(page, "_seg_overlay_timer", None)
-        if timer is not None:
-            timer.stop()
+        for name in ("_seg_overlay_timer", "_seg_ext_timer"):
+            timer = getattr(page, name, None)
+            if timer is not None:
+                timer.stop()
         self._close_module_page(page)
 
     # --- segmentation preview (part 3) and plot settings (part 4)
