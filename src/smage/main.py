@@ -1047,6 +1047,18 @@ def _compute_gate_filter_mask(gates, gate_id, parquet_path, transforms,
     return mask
 
 
+def _gate_chain(gates, gate_id):
+    """Return the gates from root down to `gate_id` (inclusive), in order."""
+    by_id = {g["id"]: g for g in gates}
+    chain = []
+    cur = by_id.get(gate_id)
+    while cur is not None:
+        chain.append(cur)
+        cur = by_id.get(cur.get("parent"))
+    chain.reverse()
+    return chain
+
+
 def _gate_label_position(gate):
     """Return an (x, y) point inside `gate` for placing its name label."""
     t = gate.get("type")
@@ -3411,9 +3423,9 @@ MODULE_KINDS = {
     "segmentation": "generate",
     "figure": "visualize",
     "feature": "generate",
+    "gate2col": "generate",
     # Placeholder modules (no implementation yet).
     "feature_up": "generate",
-    "gate2col": "map",
     "subset": "map",
     "subsample": "map",
     "dimred": "generate",
@@ -5963,14 +5975,23 @@ class MainWindow(QMainWindow):
             return []
         feat = self._feature_output(parquet_path)
         if feat is not None:
-            # Aggregated data: upstream transforms are already baked in.
-            return list(feat.get("columns") or [])
-        columns = list(self._column_index.get(self._rel_data_key(parquet_path), []))
+            # Aggregated data: upstream transforms are already baked in, but
+            # downstream virtual columns (Segmentation mask, Gate2Col 0/1) can
+            # still be layered on top, so keep going past the base column list.
+            columns = list(feat.get("columns") or [])
+        else:
+            columns = list(self._column_index.get(self._rel_data_key(parquet_path), []))
         if task_id:
             for name in self._unmix_output_names(task_id, parquet_path):
                 if name not in columns:
                     columns.append(name)
             for name in self._seg_applied_columns(task_id, parquet_path):
+                if name not in columns:
+                    columns.append(name)
+            for name in self._gate2col_applied_columns(task_id, parquet_path):
+                if name not in columns:
+                    columns.append(name)
+            for name in self._feature_up_applied_columns(task_id, parquet_path):
                 if name not in columns:
                     columns.append(name)
         return columns
@@ -6239,12 +6260,28 @@ class MainWindow(QMainWindow):
                     ).to_numpy(dtype="float64")
         if task_id:
             # Mask columns exposed by an upstream Segmentation module are not
-            # stored in the data file; they are resolved from the mask .npy.
+            # stored in the data file; they are resolved from the mask parquet.
             for name, mask_path in self._seg_applied_columns(
                 task_id, parquet_path
             ).items():
                 if name in needed and name not in values:
                     arr = self._seg_mask_values(parquet_path, mask_path)
+                    if arr is not None:
+                        values[name] = arr
+            # Gate2Col 0/1 columns from upstream Gate2Col modules.
+            for name, rec in self._gate2col_applied_columns(
+                task_id, parquet_path
+            ).items():
+                if name in needed and name not in values:
+                    arr = self._gate2col_column_values(parquet_path, rec, name)
+                    if arr is not None:
+                        values[name] = arr
+            # Feature Up mapped columns from upstream Feature Up modules.
+            for name, rec in self._feature_up_applied_columns(
+                task_id, parquet_path
+            ).items():
+                if name in needed and name not in values:
+                    arr = self._feature_up_column_values(parquet_path, rec, name)
                     if arr is not None:
                         values[name] = arr
         if not stages:
@@ -7286,6 +7323,10 @@ class MainWindow(QMainWindow):
         # Mask columns exposed by an upstream Segmentation module are not part
         # of the image index; they are rasterised straight from the mask file.
         seg_cols = self._seg_applied_columns(task_id, parquet_path) if task_id else {}
+        # Gate2Col 0/1 columns likewise come from their own image parquet.
+        g2c_cols = self._gate2col_applied_columns(task_id, parquet_path) if task_id else {}
+        # Feature Up mapped columns likewise come from their own image parquet.
+        fup_cols = self._feature_up_applied_columns(task_id, parquet_path) if task_id else {}
         for layer in layers:
             if layer.get("visible") is False:
                 continue
@@ -7303,6 +7344,32 @@ class MainWindow(QMainWindow):
                 hi = float(chan.max()) if chan.size else 1.0
                 if hi <= lo:
                     hi = lo + 1.0
+                frac = None
+                raster_stages = None
+                cname = None
+            elif channel in g2c_cols:
+                rec = g2c_cols[channel]
+                chan, rect = self._g2c_raster(rec, (x0, x1, y0, y1), spacing)
+                if chan is None:
+                    unavailable.append(channel)
+                    continue
+                lo = 0.0
+                hi = float(chan.max()) if chan.size else 1.0
+                if hi <= lo:
+                    hi = lo + 1.0
+                frac = None
+                raster_stages = None
+                cname = None
+            elif channel in fup_cols:
+                rec = fup_cols[channel]
+                chan, rect = self._feature_up_raster(rec, (x0, x1, y0, y1), spacing)
+                if chan is None:
+                    unavailable.append(channel)
+                    continue
+                lo = float(np.nanmin(chan)) if chan.size else 0.0
+                hi = float(np.nanmax(chan)) if chan.size else 1.0
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    lo, hi = 0.0, 1.0
                 frac = None
                 raster_stages = None
                 cname = None
@@ -13425,6 +13492,240 @@ class MainWindow(QMainWindow):
             out.setdefault(name, path)
         return out
 
+    # ----- Gate2Col module outputs (generated 0/1 columns) ----------------
+    def _gate2col_params_for(self, task_def) -> dict:
+        """Saved params of a Gate2Col task (its live snapshot while open)."""
+        task_id = task_def.get("id")
+        reg = self._module_registry.get(task_id)
+        if reg is not None and reg.get("task_type") == "gate2col":
+            snap = getattr(reg["page"], "_g2c_snapshot", None)
+            if isinstance(snap, dict):
+                return snap
+        return task_def.get("params") or {}
+
+    def _gate2col_signature(self, params, parquet_path) -> str:
+        """Change signature for one source file's gate columns."""
+        try:
+            st = Path(parquet_path).stat()
+            stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+        except OSError:
+            stat = ""
+        payload = json.dumps(
+            {
+                "rules": params.get("rules") or [],
+                "source": str(parquet_path),
+                "stat": stat,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _gate2col_applied_columns(self, task_id, parquet_path) -> dict:
+        """{column_name: record} exposed by upstream Gate2Col modules.
+
+        Each record is ``{"parquet": abs_path, "channel": name, "kind":
+        "image"|"table"}``. Only outputs whose saved signature still matches
+        are exposed, so downstream always sees the committed state.
+        """
+        if not task_id or not parquet_path or self.project is None:
+            return {}
+        out = {}
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "gate2col":
+                continue
+            params = self._gate2col_params_for(task)
+            rec = (params.get("outputs") or {}).get(parquet_path)
+            if not isinstance(rec, dict) or not rec.get("path"):
+                continue
+            if rec.get("signature") != self._gate2col_signature(params, parquet_path):
+                continue
+            path = self.project.path / rec["path"]
+            if not path.is_file():
+                continue
+            for name in rec.get("columns") or []:
+                out.setdefault(name, {
+                    "parquet": str(path),
+                    "channel": name,
+                    "kind": rec.get("kind", "table"),
+                })
+        return out
+
+    def _gate2col_column_values(self, parquet_path, rec, name):
+        """Row-aligned float64 values of one Gate2Col column (for scatter)."""
+        import numpy as np
+        import pandas as pd
+
+        if not isinstance(rec, dict) or not rec.get("parquet"):
+            return None
+        gparquet = rec["parquet"]
+        if rec.get("kind") == "image":
+            # The gate column lives in a [x, y, …] image parquet; scatter its
+            # pixels back onto the source's rows via x/y.
+            man = self._image_load_manifest(gparquet)
+            if man is None:
+                return None
+            try:
+                src = pd.read_parquet(parquet_path, columns=["x", "y"])
+                gdf = pd.read_parquet(gparquet, columns=["x", "y", name])
+            except Exception:  # noqa: BLE001
+                return None
+            xmin = float(man["xmin"])
+            ymin = float(man["ymin"])
+            width = int(round(float(man["xmax"]) - xmin)) + 1
+            height = int(round(float(man["ymax"]) - ymin)) + 1
+            gxi = np.rint(gdf["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            gyi = np.rint(gdf["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            grid = np.zeros((height, width), dtype="float64")
+            gok = (gxi >= 0) & (gxi < width) & (gyi >= 0) & (gyi < height)
+            grid[gyi[gok], gxi[gok]] = gdf[name].to_numpy(dtype="float64")[gok]
+            sxi = np.rint(src["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            syi = np.rint(src["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            sok = (sxi >= 0) & (sxi < width) & (syi >= 0) & (syi < height)
+            out = np.zeros(len(src), dtype="float64")
+            out[sok] = grid[syi[sok], sxi[sok]]
+            return out
+        # Table source: the column is row-aligned directly.
+        try:
+            df = pd.read_parquet(gparquet, columns=[name])
+        except Exception:  # noqa: BLE001
+            return None
+        return df[name].to_numpy(dtype="float64")
+
+    # ----- Feature Up module outputs (mapped columns) ---------------------
+    def _feature_up_signature(self, params, to_path) -> str:
+        """Change signature for one target (To) file's mapped columns.
+
+        Covers the key columns, the feature rules, the matched From file and
+        the size/mtime of both the From and To files, so a saved output goes
+        stale whenever the mapping or either side's content changes.
+        """
+        from_path = self._fup_matched_from(params, to_path)
+        try:
+            st = Path(to_path).stat()
+            to_stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+        except OSError:
+            to_stat = ""
+        from_stat = ""
+        if from_path:
+            try:
+                st = Path(from_path).stat()
+                from_stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+            except OSError:
+                from_stat = ""
+        payload = json.dumps(
+            {
+                "key_from": params.get("key_from"),
+                "key_to": params.get("key_to"),
+                "features": params.get("features") or [],
+                "from_path": from_path,
+                "from_stat": from_stat,
+                "to_stat": to_stat,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _fup_matched_from(self, params, to_path):
+        """The From file currently matched to a To file, or None."""
+        matches = params.get("matches") or {}
+        for from_path, to in matches.items():
+            if to == to_path:
+                return from_path
+        return None
+
+    def _feature_up_params_for(self, task_def) -> dict:
+        """Saved params of a Feature Up task (its live snapshot while open)."""
+        task_id = task_def.get("id")
+        reg = self._module_registry.get(task_id)
+        if reg is not None and reg.get("task_type") == "feature_up":
+            snap = getattr(reg["page"], "_fup_snapshot", None)
+            if isinstance(snap, dict):
+                return snap
+        return task_def.get("params") or {}
+
+    def _feature_up_applied_columns(self, task_id, parquet_path) -> dict:
+        """{column_name: record} exposed by upstream Feature Up modules.
+
+        Each record is ``{"parquet": abs_path, "channel": name, "kind":
+        "image"|"table"}``. Only outputs whose saved signature still matches
+        are exposed, so downstream always sees the committed state.
+        """
+        if not task_id or not parquet_path or self.project is None:
+            return {}
+        out = {}
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "feature_up":
+                continue
+            params = self._feature_up_params_for(task)
+            rec = (params.get("outputs") or {}).get(parquet_path)
+            if not isinstance(rec, dict) or not rec.get("path"):
+                continue
+            if rec.get("signature") != self._feature_up_signature(params, parquet_path):
+                continue
+            path = self.project.path / rec["path"]
+            if not path.is_file():
+                continue
+            for name in rec.get("columns") or []:
+                out.setdefault(name, {
+                    "parquet": str(path),
+                    "channel": name,
+                    "kind": rec.get("kind", "table"),
+                })
+        return out
+
+    def _feature_up_column_values(self, parquet_path, rec, name):
+        """Row-aligned float64 values of one Feature Up column (for scatter)."""
+        import numpy as np
+        import pandas as pd
+
+        if not isinstance(rec, dict) or not rec.get("parquet"):
+            return None
+        fparquet = rec["parquet"]
+        if rec.get("kind") == "image":
+            # The mapped column lives in a [x, y, …] image parquet; scatter its
+            # pixels back onto the source's rows via x/y (NA where unmatched).
+            man = self._image_load_manifest(fparquet)
+            if man is None:
+                return None
+            try:
+                src = pd.read_parquet(parquet_path, columns=["x", "y"])
+                fdf = pd.read_parquet(fparquet, columns=["x", "y", name])
+            except Exception:  # noqa: BLE001
+                return None
+            xmin = float(man["xmin"])
+            ymin = float(man["ymin"])
+            width = int(round(float(man["xmax"]) - xmin)) + 1
+            height = int(round(float(man["ymax"]) - ymin)) + 1
+            fxi = np.rint(fdf["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            fyi = np.rint(fdf["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            grid = np.full((height, width), np.nan, dtype="float64")
+            fok = (fxi >= 0) & (fxi < width) & (fyi >= 0) & (fyi < height)
+            grid[fyi[fok], fxi[fok]] = fdf[name].to_numpy(dtype="float64")[fok]
+            sxi = np.rint(src["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            syi = np.rint(src["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            sok = (sxi >= 0) & (sxi < width) & (syi >= 0) & (syi < height)
+            out = np.full(len(src), np.nan, dtype="float64")
+            out[sok] = grid[syi[sok], sxi[sok]]
+            return out
+        # Table source: the column is row-aligned directly.
+        try:
+            df = pd.read_parquet(fparquet, columns=[name])
+        except Exception:  # noqa: BLE001
+            return None
+        return df[name].to_numpy(dtype="float64")
+
+    def _feature_up_raster(self, rec, bbox, spacing):
+        """Return (scalar_2d, data_rect) for a Feature Up channel over a bbox."""
+        if not isinstance(rec, dict) or not rec.get("parquet"):
+            return None, None
+        ent = self._ensure_image_index(rec["parquet"])
+        if ent is None or ent.get("manifest") is None:
+            return None, None
+        crop, rect, _frac = self._image_raster(
+            rec["parquet"], ent["manifest"], bbox, spacing, rec.get("channel"), None, None
+        )
+        return crop, rect
+
     def _seg_load_mask(self, mask_path):
         """Load a mask's full 2-D label grid (cached by path + signature)."""
         import numpy as np
@@ -13514,6 +13815,18 @@ class MainWindow(QMainWindow):
             return None, None
         crop, rect, _frac = self._image_raster(
             mask_path, ent["manifest"], bbox, spacing, "mask", None, None
+        )
+        return crop, rect
+
+    def _g2c_raster(self, rec, bbox, spacing):
+        """Return (scalar_2d, data_rect) for a Gate2Col 0/1 channel over a bbox."""
+        if not isinstance(rec, dict) or not rec.get("parquet"):
+            return None, None
+        ent = self._ensure_image_index(rec["parquet"])
+        if ent is None or ent.get("manifest") is None:
+            return None, None
+        crop, rect, _frac = self._image_raster(
+            rec["parquet"], ent["manifest"], bbox, spacing, rec.get("channel"), None, None
         )
         return crop, rect
 
@@ -16254,6 +16567,1506 @@ class MainWindow(QMainWindow):
             page._feat_task_def["params"]["log"] = log_lines
         self._close_module_page(page)
 
+    # ----- gate2col module (generate) ------------------------------------
+    def _build_gate2col_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Gate2Col page: files (1) | gates table (2) | log."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._g2c_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("files", [])
+        params.setdefault("rules", [])
+        params.setdefault("outputs", {})
+        params.setdefault("log", [])
+        page._g2c_task_def = task_def
+        page._g2c_task_id = task_def.get("id")
+        page._g2c_params = params
+        page._g2c_locked = locked
+        page._g2c_save_btn = save_btn
+        page._g2c_dirty = False
+        page._g2c_snapshot = copy.deepcopy(params)
+        page._g2c_log_lines = list(params.get("log") or [])
+        page._g2c_running = False
+        page._g2c_cancel = False
+        save_btn.clicked.connect(lambda _=False: self._g2c_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._g2c_files_panel(page))
+        splitter.addWidget(self._g2c_rules_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([300, 620])
+        row.addWidget(splitter, 1)
+
+        row.addWidget(self._g2c_log_panel(page))
+        layout.addWidget(content, 1)
+
+        self._g2c_refresh_files(page)
+        self._g2c_update_save_btn(page)
+        return page
+
+    def _g2c_log_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Log</b>"))
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Conversion output appears here…")
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        log.setFixedHeight(120)
+        for line in getattr(page, "_g2c_log_lines", []):
+            log.appendPlainText(line)
+        lay.addWidget(log)
+        page._g2c_log = log
+        return panel
+
+    def _g2c_log(self, page, text) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = getattr(page, "_g2c_log_lines", None)
+        if lines is None:
+            lines = []
+            page._g2c_log_lines = lines
+        for line in str(text).splitlines():
+            if line.strip():
+                lines.append(f"[{ts}] {line}")
+        if len(lines) > _FEATURE_LOG_LIMIT:
+            del lines[:-_FEATURE_LOG_LIMIT]
+        if getattr(page, "_g2c_params", None) is not None:
+            page._g2c_params["log"] = list(lines)
+        box = getattr(page, "_g2c_log", None)
+        if box is not None:
+            for line in str(text).splitlines():
+                if line.strip():
+                    box.appendPlainText(f"[{ts}] {line}")
+
+    def _g2c_gate_options(self, page):
+        """Enumerate every gate of every upstream Gating module."""
+        opts = []
+        gating_tasks = [
+            t for t in self._task_chain(page._g2c_task_id)
+            if t.get("id") != page._g2c_task_id and t.get("type") == "gating"
+        ]
+        multi = len(gating_tasks) > 1
+        for task in gating_tasks:
+            gates = list((task.get("params") or {}).get("gates") or [])
+            by_id = {g["id"]: g for g in gates}
+            for gate in gates:
+                chain = _gate_chain(gates, gate["id"])
+                needed = set()
+                for g in chain:
+                    needed |= _gate_needed_columns(g, by_id)
+                label = " -> ".join(g.get("name", g["id"]) for g in chain)
+                if multi:
+                    label += f" ({task.get('name', '')})"
+                opts.append({
+                    "gate_task": task["id"],
+                    "task_name": task.get("name", ""),
+                    "gate_id": gate["id"],
+                    "gates": gates,
+                    "name": gate.get("name", gate["id"]),
+                    "label": label,
+                    "needed": needed,
+                })
+        return opts
+
+    def _g2c_gate_mask(self, gate_task_id, gates, gate_id, parquet_path):
+        """Row-aligned int8 0/1 mask of a gate and its ancestors, or None."""
+        import numpy as np
+
+        by_id = {g["id"]: g for g in gates}
+        needed = set()
+        for g in _gate_chain(gates, gate_id):
+            needed |= _gate_needed_columns(g, by_id)
+        if not needed:
+            return None
+        values = self._column_data(gate_task_id, parquet_path, list(needed))
+        if not values:
+            return None
+        try:
+            mask = _compute_gate_filter_mask(
+                gates, gate_id, parquet_path, {},
+                existing=set(values), extra=values,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if mask is None:
+            return None
+        return mask.astype("int8")
+
+    def _g2c_files_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Data files</b>"))
+        select_btn = QPushButton("Select files…")
+        select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        select_btn.setEnabled(not page._g2c_locked)
+        lay.addWidget(select_btn)
+
+        count = QLabel("")
+        count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(count)
+
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["File", "Status"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(26)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+        lay.addWidget(table, 1)
+        page._g2c_files_table = table
+        page._g2c_count_label = count
+        select_btn.clicked.connect(lambda _=False: self._g2c_select_files(page))
+        return panel
+
+    def _g2c_select_files(self, page) -> None:
+        records = self._available_files(page._g2c_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [self._comp_file_name(p) for p in page._g2c_params.get("files") or []]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        # Reject a file that lacks the columns needed by an already-selected gate.
+        rules = page._g2c_params.get("rules") or []
+        selected_opts = [
+            o for o in self._g2c_gate_options(page)
+            if any(r.get("gate_task") == o["gate_task"] and r.get("gate_id") == o["gate_id"]
+                   for r in rules)
+        ]
+        rejected = []
+        accepted = []
+        for name in chosen:
+            path = by_name.get(name)
+            if path is None:
+                continue
+            cols = set(self._columns_for(path, page._g2c_task_id))
+            missing = [
+                o["label"] for o in selected_opts if not (o["needed"] <= cols)
+            ]
+            if missing:
+                rejected.append(f"{name} (missing {', '.join(missing)})")
+            else:
+                accepted.append(path)
+        if rejected:
+            QMessageBox.warning(
+                self, "Select files",
+                "These files were not added because they lack the columns "
+                "needed by the selected gates:\n" + "\n".join(rejected),
+            )
+        page._g2c_params["files"] = accepted
+        self._g2c_refresh_files(page)
+        self._g2c_mark_dirty(page)
+
+    def _g2c_file_status(self, page, parquet_path) -> str:
+        params = page._g2c_params
+        rec = (params.get("outputs") or {}).get(parquet_path)
+        if not isinstance(rec, dict) or not rec.get("path"):
+            return "Not converted"
+        if self.project is None:
+            return "Not converted"
+        if not (self.project.path / rec["path"]).is_file():
+            return "Not converted"
+        if rec.get("signature") != self._gate2col_signature(params, parquet_path):
+            return "Not converted"
+        return "Converted"
+
+    def _g2c_refresh_files(self, page) -> None:
+        table = getattr(page, "_g2c_files_table", None)
+        files = list(page._g2c_params.get("files") or [])
+        if table is not None:
+            table.blockSignals(True)
+            table.setRowCount(len(files))
+            for i, path in enumerate(files):
+                item = QTableWidgetItem(self._comp_file_name(path))
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                table.setItem(i, 0, item)
+                status = self._g2c_file_status(page, path)
+                sitem = QTableWidgetItem(status)
+                sitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                sitem.setForeground(
+                    QColor("#1a7f37") if status == "Converted" else QColor("#9aa0a6")
+                )
+                table.setItem(i, 1, sitem)
+            table.blockSignals(False)
+        count = getattr(page, "_g2c_count_label", None)
+        if count is not None:
+            count.setText(f"{len(files)} file(s) selected")
+        self._g2c_rebuild_rules(page)
+
+    def _g2c_rules_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Convert gates</b>"))
+
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Gate", "New column name"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(34)
+        table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+        lay.addWidget(table, 1)
+        page._g2c_rules_table = table
+
+        btns = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setEnabled(not page._g2c_locked)
+        del_btn = QPushButton("Delete")
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.setEnabled(not page._g2c_locked)
+        btns.addWidget(add_btn)
+        btns.addWidget(del_btn)
+        btns.addStretch()
+        lay.addLayout(btns)
+
+        calc_btn = QPushButton("Convert")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setEnabled(not page._g2c_locked)
+        lay.addWidget(calc_btn)
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        page._g2c_calc_btn = calc_btn
+        page._g2c_calc_status = status
+
+        add_btn.clicked.connect(lambda _=False: self._g2c_add_rule(page))
+        del_btn.clicked.connect(lambda _=False: self._g2c_delete_rule(page))
+        calc_btn.clicked.connect(lambda _=False: self._g2c_calculate(page))
+        return panel
+
+    def _g2c_add_rule(self, page) -> None:
+        page._g2c_params["rules"].append({"gate_task": None, "gate_id": None, "name": ""})
+        self._g2c_refresh_rules(page)
+        self._g2c_mark_dirty(page)
+
+    def _g2c_delete_rule(self, page) -> None:
+        table = page._g2c_rules_table
+        row = table.currentRow()
+        rules = page._g2c_params["rules"]
+        if 0 <= row < len(rules):
+            del rules[row]
+            self._g2c_refresh_rules(page)
+            self._g2c_mark_dirty(page)
+
+    def _g2c_existing_columns(self, page) -> set:
+        cols = set()
+        for path in page._g2c_params.get("files") or []:
+            cols |= set(self._columns_for(path, page._g2c_task_id))
+        return cols
+
+    def _g2c_duplicate_names(self, page) -> set:
+        """Set of new-column names that are duplicated or clash with a file column."""
+        existing = self._g2c_existing_columns(page)
+        dup = set()
+        seen = set()
+        for rule in page._g2c_params.get("rules") or []:
+            name = (rule.get("name") or "").strip()
+            if not name:
+                continue
+            if name in existing or name in seen:
+                dup.add(name)
+            seen.add(name)
+        return dup
+
+    def _g2c_rebuild_rules(self, page) -> None:
+        table = getattr(page, "_g2c_rules_table", None)
+        if table is None:
+            return
+        params = page._g2c_params
+        rules = params.get("rules") or []
+        opts = self._g2c_gate_options(page)
+        enabled = not page._g2c_locked
+        dup_names = self._g2c_duplicate_names(page)
+
+        table.blockSignals(True)
+        table.setRowCount(0)
+        table.setRowCount(len(rules))
+
+        def mark():
+            self._g2c_mark_dirty(page)
+            self._g2c_refresh_statuses(page)
+
+        def rebuild_soon():
+            QTimer.singleShot(0, lambda: self._g2c_rebuild_rules(page))
+
+        for i, rule in enumerate(rules):
+            combo = _NoWheelComboBox()
+            combo.addItem("", None)
+            for o in opts:
+                combo.addItem(o["label"], f"{o['gate_task']}|{o['gate_id']}")
+            cur = f"{rule.get('gate_task')}|{rule.get('gate_id')}"
+            idx = combo.findData(cur)
+            combo.setCurrentIndex(max(0, idx))
+            combo.setEnabled(enabled)
+
+            def on_gate(value, r=rule):
+                if value:
+                    task, _, gid = str(value).partition("|")
+                    r["gate_task"], r["gate_id"] = task, gid
+                    opt = next((o for o in opts
+                                if o["gate_task"] == task and o["gate_id"] == gid),
+                               None)
+                    if opt is not None:
+                        old = (r.get("name") or "").strip()
+                        if not old or old == r.get("_default"):
+                            r["name"] = opt["name"]
+                        r["_default"] = opt["name"]
+                else:
+                    r["gate_task"], r["gate_id"] = None, None
+                rebuild_soon()
+                mark()
+
+            combo.currentIndexChanged.connect(
+                lambda _=0, c=combo, cb=on_gate: cb(c.currentData())
+            )
+            table.setCellWidget(i, 0, combo)
+
+            name_box = QWidget()
+            nh = QHBoxLayout(name_box)
+            nh.setContentsMargins(0, 0, 0, 0)
+            nh.setSpacing(4)
+            name_edit = QLineEdit(str(rule.get("name") or ""))
+            name_edit.setEnabled(enabled)
+            warn = QLabel("⚠")
+            warn.setToolTip("Duplicate column name")
+            warn.setStyleSheet("color: #b58900; font-weight: bold;")
+
+            def on_name(text, r=rule, warn_label=warn):
+                r["name"] = text.strip()
+                mark()
+                warn_label.setVisible(
+                    (r.get("name") or "").strip() in self._g2c_duplicate_names(page)
+                )
+
+            name_edit.textEdited.connect(lambda t, cb=on_name: cb(t))
+            nh.addWidget(name_edit, 1)
+            nh.addWidget(warn)
+            table.setCellWidget(i, 1, name_box)
+            warn.setVisible((rule.get("name") or "").strip() in dup_names)
+
+        table.blockSignals(False)
+
+    def _g2c_refresh_rules(self, page) -> None:
+        self._g2c_rebuild_rules(page)
+
+    def _g2c_refresh_statuses(self, page) -> None:
+        table = getattr(page, "_g2c_files_table", None)
+        if table is None:
+            return
+        files = list(page._g2c_params.get("files") or [])
+        for i, path in enumerate(files):
+            if i >= table.rowCount():
+                break
+            status = self._g2c_file_status(page, path)
+            item = table.item(i, 1)
+            if item is None:
+                item = QTableWidgetItem()
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                table.setItem(i, 1, item)
+            item.setText(status)
+            item.setForeground(
+                QColor("#1a7f37") if status == "Converted" else QColor("#9aa0a6")
+            )
+
+    def _g2c_mark_dirty(self, page) -> None:
+        page._g2c_dirty = True
+        self._g2c_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _g2c_update_save_btn(self, page) -> None:
+        btn = getattr(page, "_g2c_save_btn", None)
+        if btn is not None:
+            btn.setEnabled(page._g2c_dirty and not page._g2c_locked)
+
+    def _g2c_save_now(self, page) -> None:
+        params = page._g2c_params
+        page._g2c_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._g2c_snapshot = copy.deepcopy(params)
+        page._g2c_dirty = False
+        self._g2c_update_save_btn(page)
+        self._g2c_log(page, "Settings saved")
+        self.statusBar().showMessage("Gate2Col settings saved")
+        self._module_saved(page)
+
+    def _g2c_validate(self, page):
+        params = page._g2c_params
+        if not params.get("files"):
+            return False, "Select at least one data file."
+        rules = params.get("rules") or []
+        if not rules:
+            return False, "Add at least one gate to convert."
+        existing = self._g2c_existing_columns(page)
+        names = []
+        for i, rule in enumerate(rules):
+            if not rule.get("gate_task") or not rule.get("gate_id"):
+                return False, f"Row {i + 1}: choose a gate."
+            name = (rule.get("name") or "").strip()
+            if not name:
+                return False, f"Row {i + 1}: give the new column a name."
+            names.append(name)
+        if len(names) != len(set(names)):
+            return False, "New column names must be unique."
+        if any(name in existing for name in names):
+            return False, "A new column name collides with an existing column."
+        return True, ""
+
+    def _g2c_calculate(self, page) -> None:
+        ok, message = self._g2c_validate(page)
+        if not ok:
+            QMessageBox.warning(self, "Convert", message)
+            return
+        params = page._g2c_params
+        outputs = params.get("outputs") or {}
+        selected = params.get("files") or []
+        existing = [p for p in selected if isinstance(outputs.get(p), dict)]
+        if existing:
+            reply = QMessageBox.question(
+                self, "Convert",
+                f"{len(existing)} file(s) already have results.\n"
+                "Recompute and overwrite them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        status = getattr(page, "_g2c_calc_status", None)
+        if status is not None:
+            status.setText("Converting…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        done = 0
+        failed = []
+        page._g2c_running = True
+        page._g2c_cancel = False
+        try:
+            for path in selected:
+                if getattr(page, "_g2c_cancel", False):
+                    self._g2c_log(page, "Conversion cancelled.")
+                    break
+                name = self._comp_file_name(path)
+                if status is not None:
+                    status.setText(f"Converting… {name}")
+                QApplication.processEvents()
+                try:
+                    rel, columns, kind = self._g2c_compute_file(page, path)
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(f"{name}: {exc}")
+                    self._g2c_log(page, f"✗ {name}: {exc}")
+                    continue
+                outputs[path] = {
+                    "path": rel,
+                    "columns": columns,
+                    "kind": kind,
+                    "signature": self._gate2col_signature(params, path),
+                }
+                done += 1
+                self._g2c_log(
+                    page, f"✓ {name} → {Path(rel).name} ({len(columns)} column(s))"
+                )
+        finally:
+            QApplication.restoreOverrideCursor()
+            page._g2c_running = False
+
+        for path in list(outputs.keys()):
+            if path not in selected:
+                outputs.pop(path, None)
+        params["outputs"] = outputs
+        page._g2c_task_def["output"] = {"saved": bool(outputs)}
+        page._g2c_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._g2c_snapshot = copy.deepcopy(params)
+        page._g2c_dirty = False
+        self._g2c_update_save_btn(page)
+        self._g2c_refresh_files(page)
+
+        summary = f"Converted {done} file(s)."
+        if failed:
+            summary += f" {len(failed)} failed — see the log."
+        if status is not None:
+            status.setText(summary)
+        self._g2c_log(page, summary)
+        self.statusBar().showMessage(summary)
+        self._module_saved(page)
+
+    def _g2c_row_count(self, parquet_path) -> int:
+        """Number of rows in a data file (read from the parquet metadata)."""
+        import pyarrow.parquet as pq
+
+        try:
+            return int(pq.ParquetFile(parquet_path).metadata.num_rows)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _g2c_compute_file(self, page, parquet_path):
+        """Convert every rule into a 0/1 column and save them; return (rel, columns, kind)."""
+        import numpy as np
+        import pandas as pd
+
+        params = page._g2c_params
+        rules = params.get("rules") or []
+        opts = self._g2c_gate_options(page)
+        by_key = {(o["gate_task"], o["gate_id"]): o for o in opts}
+
+        cols = []
+        for rule in rules:
+            opt = by_key.get((rule.get("gate_task"), rule.get("gate_id")))
+            if opt is None:
+                raise ValueError(f"gate not found for '{rule.get('name')}'")
+            mask = self._g2c_gate_mask(
+                opt["gate_task"], opt["gates"], opt["gate_id"], parquet_path
+            )
+            if mask is None:
+                mask = np.zeros(self._g2c_row_count(parquet_path), dtype="int8")
+            cols.append((rule["name"], mask))
+
+        ent = self._ensure_image_index(parquet_path)
+        is_image = ent is not None and ent.get("manifest") is not None
+        stem = Path(str(parquet_path)).stem
+        rel = f"Module/{page._g2c_task_id}/{stem}_gates.parquet"
+        path = self.project.path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if is_image:
+            man = ent["manifest"]
+            xmin = int(round(float(man["xmin"])))
+            ymin = int(round(float(man["ymin"])))
+            width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
+            height = int(round(float(man["ymax"]) - float(man["ymin"]))) + 1
+            src = pd.read_parquet(parquet_path, columns=["x", "y"])
+            xi = np.rint(src["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            yi = np.rint(src["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            ok = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+            flat = yi[ok] * width + xi[ok]
+            xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
+            yy = np.repeat(np.arange(height, dtype=np.int32), width) + ymin
+            data = {"x": xx, "y": yy}
+            for name, mask in cols:
+                grid = np.zeros(height * width, dtype=np.int8)
+                grid[flat] = mask[ok]
+                data[name] = grid
+            pd.DataFrame(data).to_parquet(path, index=False)
+            _build_image_index_files(str(path))
+            kind = "image"
+        else:
+            pd.DataFrame(
+                {name: np.asarray(mask, dtype=np.int8) for name, mask in cols}
+            ).to_parquet(path, index=False)
+            kind = "table"
+        return rel, [name for name, _ in cols], kind
+
+    def _g2c_close(self, page) -> None:
+        if getattr(page, "_g2c_running", False):
+            reply = QMessageBox.question(
+                self, "Close Gate2Col",
+                "A conversion is still running.\nStop it and close the module?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._g2c_cancel = True
+            self._g2c_log(page, "Stopping after the current file…")
+            return
+        if getattr(page, "_g2c_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Gate2Col",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            log_lines = list(getattr(page, "_g2c_log_lines", []) or [])
+            page._g2c_task_def["params"] = page._g2c_snapshot
+            page._g2c_task_def["params"]["log"] = log_lines
+        self._close_module_page(page)
+
+    # ----- feature up module (generate) -----------------------------------
+    def _build_feature_up_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Feature Up page: files/keys (1) | match (2) | features (2) | log."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._fup_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("from_files", [])
+        params.setdefault("to_files", [])
+        params.setdefault("key_from", None)
+        params.setdefault("key_to", None)
+        params.setdefault("matches", {})
+        params.setdefault("features", [])
+        params.setdefault("outputs", {})
+        params.setdefault("log", [])
+        page._fup_task_def = task_def
+        page._fup_task_id = task_def.get("id")
+        page._fup_params = params
+        page._fup_locked = locked
+        page._fup_save_btn = save_btn
+        page._fup_dirty = False
+        page._fup_snapshot = copy.deepcopy(params)
+        page._fup_log_lines = list(params.get("log") or [])
+        page._fup_running = False
+        page._fup_cancel = False
+        save_btn.clicked.connect(lambda _=False: self._fup_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._fup_files_panel(page))
+        splitter.addWidget(self._fup_match_panel(page))
+        splitter.addWidget(self._fup_features_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 2)
+        splitter.setSizes([240, 480, 480])
+        row.addWidget(splitter, 1)
+
+        row.addWidget(self._fup_log_panel(page))
+        layout.addWidget(content, 1)
+
+        self._fup_refresh_files(page)
+        self._fup_update_save_btn(page)
+        return page
+
+    def _fup_log_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Log</b>"))
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Mapping output appears here…")
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        log.setFixedHeight(120)
+        for line in getattr(page, "_fup_log_lines", []):
+            log.appendPlainText(line)
+        lay.addWidget(log)
+        page._fup_log = log
+        return panel
+
+    def _fup_log(self, page, text) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = getattr(page, "_fup_log_lines", None)
+        if lines is None:
+            lines = []
+            page._fup_log_lines = lines
+        for line in str(text).splitlines():
+            if line.strip():
+                lines.append(f"[{ts}] {line}")
+        if len(lines) > _FEATURE_LOG_LIMIT:
+            del lines[:-_FEATURE_LOG_LIMIT]
+        if getattr(page, "_fup_params", None) is not None:
+            page._fup_params["log"] = list(lines)
+        box = getattr(page, "_fup_log", None)
+        if box is not None:
+            for line in str(text).splitlines():
+                if line.strip():
+                    box.appendPlainText(f"[{ts}] {line}")
+
+    def _fup_files_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("<b>From Files</b>"))
+        hint_from = QLabel("The new (aggregated) files whose columns are mapped across.")
+        hint_from.setWordWrap(True)
+        hint_from.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint_from)
+        from_btn = QPushButton("Select From files…")
+        from_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        from_btn.setEnabled(not page._fup_locked)
+        lay.addWidget(from_btn)
+        from_box = QListWidget()
+        from_box.setFixedHeight(80)
+        from_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(from_box)
+        page._fup_from_box = from_box
+
+        lay.addWidget(QLabel("<b>To Files</b>"))
+        hint_to = QLabel("The old (target) files that will receive the new columns.")
+        hint_to.setWordWrap(True)
+        hint_to.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint_to)
+        to_btn = QPushButton("Select To files…")
+        to_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        to_btn.setEnabled(not page._fup_locked)
+        lay.addWidget(to_btn)
+        to_box = QListWidget()
+        to_box.setFixedHeight(80)
+        to_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(to_box)
+        page._fup_to_box = to_box
+
+        lay.addWidget(QLabel("<b>Key in From Files</b>"))
+        key_from = _NoWheelComboBox()
+        key_from.setEnabled(not page._fup_locked)
+        lay.addWidget(key_from)
+        page._fup_key_from = key_from
+
+        lay.addWidget(QLabel("<b>Key in To Files</b>"))
+        key_to = _NoWheelComboBox()
+        key_to.setEnabled(not page._fup_locked)
+        lay.addWidget(key_to)
+        page._fup_key_to = key_to
+
+        hint_key = QLabel(
+            "The two key columns identify matching rows (usually the same name)."
+        )
+        hint_key.setWordWrap(True)
+        hint_key.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint_key)
+
+        match_btn = QPushButton("Match")
+        match_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        match_btn.setEnabled(not page._fup_locked)
+        lay.addWidget(match_btn)
+        page._fup_match_btn = match_btn
+
+        lay.addStretch()
+
+        from_btn.clicked.connect(lambda _=False: self._fup_select_files(page, "from"))
+        to_btn.clicked.connect(lambda _=False: self._fup_select_files(page, "to"))
+        match_btn.clicked.connect(lambda _=False: self._fup_match(page))
+        key_from.currentIndexChanged.connect(lambda _=0: self._fup_on_key(page, "from"))
+        key_to.currentIndexChanged.connect(lambda _=0: self._fup_on_key(page, "to"))
+        return panel
+
+    def _fup_match_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Match</b>"))
+        table = QTableWidget()
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels([
+            "From File", "To File", "From keys", "To keys", "From only", "To only",
+        ])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for c in (2, 3, 4, 5):
+            header.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(34)
+        table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+        lay.addWidget(table, 1)
+        page._fup_match_table = table
+        hint = QLabel(
+            "From/To keys = distinct key values in each file. "
+            "From only / To only = values present in one file but missing in the "
+            "other (ideally both 0)."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        return panel
+
+    def _fup_features_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Features to map</b>"))
+        select_btn = QPushButton("Select features…")
+        select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        select_btn.setEnabled(not page._fup_locked)
+        lay.addWidget(select_btn)
+
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(
+            ["Feature in From Files", "New name in To Files"]
+        )
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(34)
+        table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+        lay.addWidget(table, 1)
+        page._fup_features_table = table
+
+        btns = QHBoxLayout()
+        del_btn = QPushButton("Delete")
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.setEnabled(not page._fup_locked)
+        btns.addWidget(del_btn)
+        btns.addStretch()
+        lay.addLayout(btns)
+
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setEnabled(not page._fup_locked)
+        lay.addWidget(calc_btn)
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        page._fup_calc_btn = calc_btn
+        page._fup_calc_status = status
+
+        select_btn.clicked.connect(lambda _=False: self._fup_select_features(page))
+        del_btn.clicked.connect(lambda _=False: self._fup_delete_feature(page))
+        calc_btn.clicked.connect(lambda _=False: self._fup_calculate(page))
+        return panel
+
+    def _fup_refresh_files(self, page) -> None:
+        from_box = getattr(page, "_fup_from_box", None)
+        to_box = getattr(page, "_fup_to_box", None)
+        params = page._fup_params
+        if from_box is not None:
+            from_box.blockSignals(True)
+            from_box.clear()
+            for p in params.get("from_files") or []:
+                from_box.addItem(self._comp_file_name(p))
+            from_box.blockSignals(False)
+        if to_box is not None:
+            to_box.blockSignals(True)
+            to_box.clear()
+            for p in params.get("to_files") or []:
+                to_box.addItem(self._comp_file_name(p))
+            to_box.blockSignals(False)
+        self._fup_refresh_key_combos(page)
+        self._fup_rebuild_matches(page)
+        self._fup_rebuild_features(page)
+
+    def _fup_common_columns(self, page, files_key) -> list:
+        """Columns shared by every file selected under `files_key`."""
+        paths = list(page._fup_params.get(files_key) or [])
+        if not paths:
+            return []
+        common = set(self._columns_for(paths[0], page._fup_task_id))
+        for p in paths[1:]:
+            common &= set(self._columns_for(p, page._fup_task_id))
+        return sorted(common)
+
+    def _fup_refresh_key_combos(self, page) -> None:
+        params = page._fup_params
+        for which, combo_attr, key_attr, files_key in (
+            ("from", "_fup_key_from", "key_from", "from_files"),
+            ("to", "_fup_key_to", "key_to", "to_files"),
+        ):
+            combo = getattr(page, combo_attr, None)
+            if combo is None:
+                continue
+            cols = self._fup_common_columns(page, files_key)
+            cur = params.get(key_attr)
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("", None)
+            for c in cols:
+                combo.addItem(c, c)
+            idx = combo.findData(cur)
+            combo.setCurrentIndex(max(0, idx))
+            combo.blockSignals(False)
+
+    def _fup_on_key(self, page, which) -> None:
+        params = page._fup_params
+        combo = getattr(page, f"_fup_key_{which}", None)
+        if combo is None:
+            return
+        params[f"key_{which}"] = combo.currentData()
+        self._fup_mark_dirty(page)
+        self._fup_rebuild_matches(page)
+
+    def _fup_select_files(self, page, which) -> None:
+        records = self._available_files(page._fup_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        key = "from_files" if which == "from" else "to_files"
+        current = [self._comp_file_name(p) for p in page._fup_params.get(key) or []]
+        title = "Select From files" if which == "from" else "Select To files"
+        chosen = self._pick_items_dialog(title, names, current, "Filter files...")
+        if chosen is None:
+            return
+        page._fup_params[key] = [by_name[n] for n in chosen if n in by_name]
+        self._fup_refresh_files(page)
+        self._fup_mark_dirty(page)
+
+    def _fup_select_features(self, page) -> None:
+        from_cols = self._fup_common_columns(page, "from_files")
+        if not from_cols:
+            QMessageBox.information(self, "Features", "Select From files first.")
+            return
+        key_from = page._fup_params.get("key_from")
+        options = [c for c in from_cols if c != key_from]
+        existing = [f.get("source") for f in page._fup_params.get("features") or []]
+        chosen = self._pick_items_dialog(
+            "Select features", options, existing, "Filter columns..."
+        )
+        if chosen is None:
+            return
+        kept = {
+            f.get("source"): f for f in page._fup_params.get("features") or []
+            if f.get("source") in chosen
+        }
+        features = []
+        for source in chosen:
+            if source in kept:
+                features.append(kept[source])
+            else:
+                features.append({"source": source, "name": source})
+        page._fup_params["features"] = features
+        self._fup_rebuild_features(page)
+        self._fup_mark_dirty(page)
+
+    def _fup_delete_feature(self, page) -> None:
+        table = page._fup_features_table
+        row = table.currentRow()
+        features = page._fup_params.get("features") or []
+        if 0 <= row < len(features):
+            del features[row]
+            self._fup_rebuild_features(page)
+            self._fup_mark_dirty(page)
+
+    def _fup_rebuild_features(self, page) -> None:
+        table = getattr(page, "_fup_features_table", None)
+        if table is None:
+            return
+        features = page._fup_params.get("features") or []
+        enabled = not page._fup_locked
+        dup = self._fup_duplicate_names(page)
+        table.blockSignals(True)
+        table.setRowCount(0)
+        table.setRowCount(len(features))
+        for i, feat in enumerate(features):
+            src_item = QTableWidgetItem(feat.get("source") or "")
+            src_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            table.setItem(i, 0, src_item)
+
+            name_box = QWidget()
+            nh = QHBoxLayout(name_box)
+            nh.setContentsMargins(0, 0, 0, 0)
+            nh.setSpacing(4)
+            name_edit = QLineEdit(str(feat.get("name") or ""))
+            name_edit.setEnabled(enabled)
+            warn = QLabel("⚠")
+            warn.setToolTip("Duplicate column name")
+            warn.setStyleSheet("color: #b58900; font-weight: bold;")
+
+            def on_name(text, f=feat, warn_label=warn):
+                f["name"] = text.strip()
+                warn_label.setVisible(
+                    (f.get("name") or "").strip() in self._fup_duplicate_names(page)
+                )
+                self._fup_mark_dirty(page)
+
+            name_edit.textEdited.connect(lambda t, cb=on_name: cb(t))
+            nh.addWidget(name_edit, 1)
+            nh.addWidget(warn)
+            table.setCellWidget(i, 1, name_box)
+            warn.setVisible((feat.get("name") or "").strip() in dup)
+        table.blockSignals(False)
+
+    def _fup_existing_columns(self, page) -> set:
+        cols = set()
+        for path in page._fup_params.get("to_files") or []:
+            cols |= set(self._columns_for(path, page._fup_task_id))
+        return cols
+
+    def _fup_duplicate_names(self, page) -> set:
+        existing = self._fup_existing_columns(page)
+        dup = set()
+        seen = set()
+        for feat in page._fup_params.get("features") or []:
+            name = (feat.get("name") or "").strip()
+            if not name:
+                continue
+            if name in existing or name in seen:
+                dup.add(name)
+            seen.add(name)
+        return dup
+
+    def _fup_default_to(self, page, from_path):
+        """Default pairing: the To file whose stem is the longest prefix."""
+        from_stem = Path(str(from_path)).stem
+        best = None
+        for to_path in page._fup_params.get("to_files") or []:
+            if str(to_path) == str(from_path):
+                continue
+            stem = Path(str(to_path)).stem
+            if stem and from_stem.startswith(stem):
+                if best is None or len(Path(str(best)).stem) < len(stem):
+                    best = to_path
+        return best
+
+    def _fup_match(self, page) -> None:
+        params = page._fup_params
+        if not params.get("from_files"):
+            QMessageBox.warning(self, "Match", "Select at least one From file.")
+            return
+        if not params.get("to_files"):
+            QMessageBox.warning(self, "Match", "Select at least one To file.")
+            return
+        if not params.get("key_from") or not params.get("key_to"):
+            QMessageBox.warning(
+                self, "Match", "Choose a key column for both From and To files."
+            )
+            return
+        if params.get("matches"):
+            reply = QMessageBox.question(
+                self, "Match",
+                "Re-matching will overwrite the current file pairing.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        matches = {}
+        for from_path in params.get("from_files") or []:
+            to_path = self._fup_default_to(page, from_path)
+            if to_path is not None:
+                matches[from_path] = to_path
+        params["matches"] = matches
+        self._fup_rebuild_matches(page)
+        self._fup_mark_dirty(page)
+        self._fup_log(page, "Matched files.")
+
+    def _fup_fill_match_stats(self, page, row, from_path, to_path) -> None:
+        import numpy as np
+        import pandas as pd
+
+        table = getattr(page, "_fup_match_table", None)
+        if table is None:
+            return
+        for col in range(2, 6):
+            table.setItem(row, col, QTableWidgetItem(""))
+        params = page._fup_params
+        key_from = params.get("key_from")
+        key_to = params.get("key_to")
+        if not from_path or not to_path or not key_from or not key_to:
+            return
+        try:
+            fv = self._column_data(page._fup_task_id, from_path, [key_from]).get(key_from)
+            tv = self._column_data(page._fup_task_id, to_path, [key_to]).get(key_to)
+            if fv is None or tv is None:
+                return
+            fv = pd.Series(fv).dropna()
+            tv = pd.Series(tv).dropna()
+            fu = fv.nunique()
+            tu = tv.nunique()
+            fset = set(fv.unique().tolist())
+            tset = set(tv.unique().tolist())
+            fonly = len(fset - tset)
+            tonly = len(tset - fset)
+            items = {
+                2: (str(fu), False),
+                3: (str(tu), False),
+                4: (str(fonly), fonly > 0),
+                5: (str(tonly), tonly > 0),
+            }
+            for col, (text, bad) in items.items():
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if bad:
+                    item.setForeground(QColor("#c0392b"))
+                table.setItem(row, col, item)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _fup_rebuild_match_row(self, page, row) -> None:
+        table = getattr(page, "_fup_match_table", None)
+        if table is None:
+            return
+        from_files = page._fup_params.get("from_files") or []
+        from_path = from_files[row] if row < len(from_files) else None
+        combo = table.cellWidget(row, 1)
+        to_path = combo.currentData() if combo is not None else None
+        self._fup_fill_match_stats(page, row, from_path, to_path)
+
+    def _fup_rebuild_matches(self, page) -> None:
+        table = getattr(page, "_fup_match_table", None)
+        if table is None:
+            return
+        params = page._fup_params
+        from_files = params.get("from_files") or []
+        to_files = params.get("to_files") or []
+        enabled = not page._fup_locked
+        table.blockSignals(True)
+        table.setRowCount(0)
+        table.setRowCount(len(from_files))
+        for i, from_path in enumerate(from_files):
+            item = QTableWidgetItem(self._comp_file_name(from_path))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            table.setItem(i, 0, item)
+
+            combo = _NoWheelComboBox()
+            combo.addItem("", None)
+            for to_path in to_files:
+                combo.addItem(self._comp_file_name(to_path), to_path)
+            cur = (params.get("matches") or {}).get(from_path)
+            idx = combo.findData(cur)
+            combo.setCurrentIndex(max(0, idx))
+            combo.setEnabled(enabled)
+
+            def on_to(value, f=from_path, ri=i):
+                matches = params.setdefault("matches", {})
+                if value:
+                    matches[f] = value
+                else:
+                    matches.pop(f, None)
+                self._fup_rebuild_match_row(page, ri)
+                self._fup_mark_dirty(page)
+
+            combo.currentIndexChanged.connect(
+                lambda _=0, c=combo, cb=on_to: cb(c.currentData())
+            )
+            table.setCellWidget(i, 1, combo)
+            self._fup_fill_match_stats(page, i, from_path, cur)
+        table.blockSignals(False)
+
+    def _fup_validate(self, page):
+        params = page._fup_params
+        if not params.get("from_files"):
+            return False, "Select at least one From file."
+        if not params.get("to_files"):
+            return False, "Select at least one To file."
+        if not params.get("key_from") or not params.get("key_to"):
+            return False, "Choose a key column for both From and To files."
+        features = params.get("features") or []
+        if not features:
+            return False, "Select at least one feature to map."
+        from_common = set(self._fup_common_columns(page, "from_files"))
+        to_common = set(self._fup_common_columns(page, "to_files"))
+        if params.get("key_from") not in from_common:
+            return False, f"Key '{params['key_from']}' is not in every From file."
+        if params.get("key_to") not in to_common:
+            return False, f"Key '{params['key_to']}' is not in every To file."
+        for feat in features:
+            if feat.get("source") not in from_common:
+                return False, f"Feature '{feat.get('source')}' is not in every From file."
+        names = [(feat.get("name") or "").strip() for feat in features]
+        if any(not n for n in names):
+            return False, "Give every mapped feature a new column name."
+        if len(names) != len(set(names)):
+            return False, "New column names must be unique."
+        existing = self._fup_existing_columns(page)
+        if any(n in existing for n in names):
+            return False, "A new column name collides with an existing To-file column."
+        return True, ""
+
+    def _fup_calculate(self, page) -> None:
+        ok, message = self._fup_validate(page)
+        if not ok:
+            QMessageBox.warning(self, "Calculate", message)
+            return
+        params = page._fup_params
+        matches = params.get("matches") or {}
+        from_files = params.get("from_files") or []
+        unmatched = [f for f in from_files if not matches.get(f)]
+        if unmatched:
+            names = ", ".join(self._comp_file_name(f) for f in unmatched)
+            reply = QMessageBox.question(
+                self, "Calculate",
+                f"{len(unmatched)} From file(s) have no matched To file and "
+                f"will not be processed:\n{names}\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        outputs = params.get("outputs") or {}
+        to_targets = list(dict.fromkeys(matches.values()))
+        existing = [t for t in to_targets if isinstance(outputs.get(t), dict)]
+        if existing:
+            reply = QMessageBox.question(
+                self, "Calculate",
+                f"{len(existing)} file(s) already have results.\n"
+                "Recalculate and overwrite them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        status = getattr(page, "_fup_calc_status", None)
+        if status is not None:
+            status.setText("Calculating…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        done = 0
+        failed = []
+        skipped = len(unmatched)
+        page._fup_running = True
+        page._fup_cancel = False
+        try:
+            for to_path in to_targets:
+                if getattr(page, "_fup_cancel", False):
+                    self._fup_log(page, "Calculation cancelled.")
+                    break
+                name = self._comp_file_name(to_path)
+                if status is not None:
+                    status.setText(f"Calculating… {name}")
+                QApplication.processEvents()
+                try:
+                    rel, columns, kind = self._fup_compute_file(page, to_path)
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(f"{name}: {exc}")
+                    self._fup_log(page, f"✗ {name}: {exc}")
+                    continue
+                outputs[to_path] = {
+                    "path": rel,
+                    "columns": columns,
+                    "kind": kind,
+                    "signature": self._feature_up_signature(params, to_path),
+                }
+                done += 1
+                self._fup_log(
+                    page, f"✓ {name} → {Path(rel).name} ({len(columns)} column(s))"
+                )
+        finally:
+            QApplication.restoreOverrideCursor()
+            page._fup_running = False
+
+        for to_path in list(outputs.keys()):
+            if to_path not in to_targets:
+                outputs.pop(to_path, None)
+        params["outputs"] = outputs
+        page._fup_task_def["output"] = {"saved": bool(outputs)}
+        page._fup_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._fup_snapshot = copy.deepcopy(params)
+        page._fup_dirty = False
+        self._fup_update_save_btn(page)
+        self._fup_rebuild_matches(page)
+
+        summary = f"Calculated {done} file(s)."
+        if skipped:
+            summary += f" {skipped} skipped (no match)."
+        if failed:
+            summary += f" {len(failed)} failed — see the log."
+        if status is not None:
+            status.setText(summary)
+        self._fup_log(page, summary)
+        self.statusBar().showMessage(summary)
+        self._module_saved(page)
+
+    def _fup_compute_file(self, page, to_path):
+        """Map features from the matched From file onto `to_path`; return (rel, columns, kind)."""
+        import numpy as np
+        import pandas as pd
+
+        params = page._fup_params
+        from_path = self._fup_matched_from(params, to_path)
+        if not from_path:
+            raise ValueError("no matched From file")
+        key_from = params["key_from"]
+        key_to = params["key_to"]
+        features = params.get("features") or []
+        sources = [f["source"] for f in features]
+        names = [(f.get("name") or f["source"]).strip() for f in features]
+
+        # Build the From lookup table (key -> feature values); the first row
+        # wins when a key value repeats.
+        fv = self._column_data(page._fup_task_id, from_path, [key_from] + sources)
+        if key_from not in fv:
+            raise ValueError(f"'{key_from}' is missing from the From file")
+        from_keys = pd.Series(fv[key_from])
+        tmp = [f"__fup_src_{j}" for j in range(len(sources))]
+        lf = pd.DataFrame({
+            "__fup_key": from_keys,
+            **{tmp[j]: fv[s] for j, s in enumerate(sources)},
+        })
+        lf = lf[lf["__fup_key"].notna()]
+        dup = int(len(lf) - lf.drop_duplicates(subset="__fup_key", keep="first").shape[0])
+        if dup:
+            self._fup_log(
+                page,
+                f"{self._comp_file_name(from_path)}: {dup} duplicate key value(s) "
+                f"— kept the first row.",
+            )
+        lf = lf.drop_duplicates(subset="__fup_key", keep="first")
+
+        tv = self._column_data(page._fup_task_id, to_path, [key_to]).get(key_to)
+        if tv is None:
+            raise ValueError(f"'{key_to}' is missing from the To file")
+        merged = pd.DataFrame({"__fup_key": pd.Series(tv)}).merge(
+            lf, on="__fup_key", how="left"
+        )
+        row_vals = {}
+        for j, name in enumerate(names):
+            row_vals[name] = pd.to_numeric(
+                merged[tmp[j]], errors="coerce"
+            ).to_numpy(dtype="float64")
+
+        ent = self._ensure_image_index(to_path)
+        is_image = ent is not None and ent.get("manifest") is not None
+        stem = Path(str(to_path)).stem
+        rel = f"Module/{page._fup_task_id}/{stem}_mapped.parquet"
+        path = self.project.path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if is_image:
+            man = ent["manifest"]
+            xmin = int(round(float(man["xmin"])))
+            ymin = int(round(float(man["ymin"])))
+            width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
+            height = int(round(float(man["ymax"]) - float(man["ymin"]))) + 1
+            src = pd.read_parquet(to_path, columns=["x", "y"])
+            xi = np.rint(src["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            yi = np.rint(src["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            ok = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+            flat = yi[ok] * width + xi[ok]
+            xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
+            yy = np.repeat(np.arange(height, dtype=np.int32), width) + ymin
+            data = {"x": xx, "y": yy}
+            for name in names:
+                grid = np.full(height * width, np.nan, dtype="float64")
+                grid[flat] = row_vals[name][ok]
+                data[name] = grid
+            pd.DataFrame(data).to_parquet(path, index=False)
+            _build_image_index_files(str(path))
+            kind = "image"
+        else:
+            pd.DataFrame(row_vals).to_parquet(path, index=False)
+            kind = "table"
+        return rel, names, kind
+
+    def _fup_mark_dirty(self, page) -> None:
+        page._fup_dirty = True
+        self._fup_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _fup_update_save_btn(self, page) -> None:
+        btn = getattr(page, "_fup_save_btn", None)
+        if btn is not None:
+            btn.setEnabled(page._fup_dirty and not page._fup_locked)
+
+    def _fup_save_now(self, page) -> None:
+        params = page._fup_params
+        page._fup_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._fup_snapshot = copy.deepcopy(params)
+        page._fup_dirty = False
+        self._fup_update_save_btn(page)
+        self._fup_log(page, "Settings saved")
+        self.statusBar().showMessage("Feature Up settings saved")
+        self._module_saved(page)
+
+    def _fup_close(self, page) -> None:
+        if getattr(page, "_fup_running", False):
+            reply = QMessageBox.question(
+                self, "Close Feature Up",
+                "A calculation is still running.\nStop it and close the module?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._fup_cancel = True
+            self._fup_log(page, "Stopping after the current file…")
+            return
+        if getattr(page, "_fup_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Feature Up",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            log_lines = list(getattr(page, "_fup_log_lines", []) or [])
+            page._fup_task_def["params"] = page._fup_snapshot
+            page._fup_task_def["params"]["log"] = log_lines
+        self._close_module_page(page)
+
     # ----- gating module (map) -----------------------------------------
     def _build_gating_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
         """Build the Gating page: gate tree (1) | gate area (3) | settings (2)."""
@@ -18045,6 +19858,10 @@ class MainWindow(QMainWindow):
             page = self._build_segmentation_page(name, task_def, locked)
         elif task_type == "feature":
             page = self._build_feature_page(name, task_def, locked)
+        elif task_type == "gate2col":
+            page = self._build_gate2col_page(name, task_def, locked)
+        elif task_type == "feature_up":
+            page = self._build_feature_up_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
