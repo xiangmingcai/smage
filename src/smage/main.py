@@ -255,6 +255,12 @@ TASK_TYPES = {
     "segmentation": ("Segmentation", "#00acc1"),
     "compensation": ("Compensation", "#fb8c00"),
     "illumination": ("Illumination Correction", "#8d6e63"),
+    "feature": ("Feature", "#ec407a"),
+    "subset": ("Subset", "#5c6bc0"),
+    "subsample": ("Subsample", "#78909c"),
+    "dimred": ("Dimension Reduction", "#ab47bc"),
+    "cluster": ("Cluster", "#ef5350"),
+    "export": ("Export", "#66bb6a"),
 }
 
 ADDABLE_TYPES = [
@@ -266,6 +272,12 @@ ADDABLE_TYPES = [
     "segmentation",
     "compensation",
     "illumination",
+    "feature",
+    "subset",
+    "subsample",
+    "dimred",
+    "cluster",
+    "export",
 ]
 
 ROOT_COLOR = "#5f6368"
@@ -3161,6 +3173,13 @@ MODULE_KINDS = {
     "unmix": "map",
     "segmentation": "generate",
     "figure": "visualize",
+    # Placeholder modules (no implementation yet).
+    "feature": "map",
+    "subset": "map",
+    "subsample": "map",
+    "dimred": "generate",
+    "cluster": "generate",
+    "export": "map",
 }
 
 
@@ -4497,7 +4516,8 @@ class MainWindow(QMainWindow):
             btn.setText(name)
             btn.setIcon(QIcon(_dot_pixmap(color)))
             btn.setIconSize(QSize(28, 28))
-            btn.setFixedSize(96, 72)
+            btn.setFixedSize(112, 72)
+            btn.setToolTip(name)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(
                 lambda checked=False, t=mtype: self._add_module(parent_task_def, t, dialog)
@@ -4575,7 +4595,7 @@ class MainWindow(QMainWindow):
             note = QLabel("Draft (locked) — changes here are temporary and cannot be saved.")
             note.setStyleSheet("color: #b58900;")
             cl.addWidget(note)
-        hint = QLabel("Module content goes here (placeholder)")
+        hint = QLabel(f"{name} is a placeholder module — not implemented yet.")
         hint.setStyleSheet("color: gray;")
         cl.addWidget(hint)
         cl.addStretch()
@@ -7576,10 +7596,13 @@ class MainWindow(QMainWindow):
         file_combo.setEnabled(enabled)
         layout.addWidget(self._file_nav_row(file_combo, enabled))
 
-        # X parameter.
-        layout.addWidget(QLabel("X parameter"))
-        x_combo = self._figure_param_combo(columns, plot_dict.get("x"), enabled)
-        layout.addWidget(x_combo)
+        # X parameter (image plots have no x parameter: their axes are the
+        # image's own spatial coordinates, fixed by the image itself).
+        x_combo = None
+        if plot_dict.get("type") != "image":
+            layout.addWidget(QLabel("X parameter"))
+            x_combo = self._figure_param_combo(columns, plot_dict.get("x"), enabled)
+            layout.addWidget(x_combo)
 
         # Filter: apply an upstream gate (gate + ancestors) to the data.
         layout.addWidget(QLabel("Filter"))
@@ -7610,9 +7633,13 @@ class MainWindow(QMainWindow):
         hist_mode_combo = None
 
         if _is_scatter_plot(plot_dict.get("type")):
-            layout.addWidget(QLabel("Y parameter"))
-            y_combo = self._figure_param_combo(columns, plot_dict.get("y"), enabled)
-            layout.addWidget(y_combo)
+            # Image plots have no x/y parameters to pick — their axes are the
+            # image's own spatial coordinates; channel choice is the Channels
+            # table built below.
+            if plot_dict.get("type") != "image":
+                layout.addWidget(QLabel("Y parameter"))
+                y_combo = self._figure_param_combo(columns, plot_dict.get("y"), enabled)
+                layout.addWidget(y_combo)
 
             self._figure_scatter_color_settings(
                 layout, plot_dict, plot_widget, columns, enabled,
@@ -7797,7 +7824,8 @@ class MainWindow(QMainWindow):
                 self._figure_rebuild_settings(page)
             return handler
 
-        x_combo.currentTextChanged.connect(on_axis_param("x"))
+        if x_combo is not None:
+            x_combo.currentTextChanged.connect(on_axis_param("x"))
         if y_combo is not None:
             y_combo.currentTextChanged.connect(on_axis_param("y"))
 
@@ -8077,11 +8105,14 @@ class MainWindow(QMainWindow):
 
         file_combo.currentIndexChanged.connect(on_file_changed)
 
-        # X parameter.
-        layout.addWidget(QLabel("X parameter"))
-        xv = common(plots, "x")
-        x_combo = self._figure_param_combo(col_set, None if xv is _MIXED else xv, enabled)
-        layout.addWidget(x_combo)
+        # X parameter (omit when every selected plot is an image — image axes
+        # are fixed to the image's own spatial coordinates).
+        x_combo = None
+        if any(p.get("type") != "image" for p in plots):
+            layout.addWidget(QLabel("X parameter"))
+            xv = common(plots, "x")
+            x_combo = self._figure_param_combo(col_set, None if xv is _MIXED else xv, enabled)
+            layout.addWidget(x_combo)
 
         def on_x(v):
             v = v or None
@@ -8093,7 +8124,8 @@ class MainWindow(QMainWindow):
             self._figure_apply_change_multi(page)
             self._figure_rebuild_settings_multi(page)
 
-        x_combo.currentTextChanged.connect(on_x)
+        if x_combo is not None:
+            x_combo.currentTextChanged.connect(on_x)
 
         # Filter: apply an upstream gate (gate + ancestors) to the data.
         layout.addWidget(QLabel("Filter"))
