@@ -9,6 +9,7 @@ functionality comes in later phases.
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import queue
 import shutil
@@ -255,7 +256,9 @@ TASK_TYPES = {
     "segmentation": ("Segmentation", "#00acc1"),
     "compensation": ("Compensation", "#fb8c00"),
     "illumination": ("Illumination Correction", "#8d6e63"),
-    "feature": ("Feature", "#ec407a"),
+    "feature": ("Feature Down", "#ec407a"),
+    "feature_up": ("Feature Up", "#c2185b"),
+    "gate2col": ("Gate2Col", "#455a64"),
     "subset": ("Subset", "#5c6bc0"),
     "subsample": ("Subsample", "#78909c"),
     "dimred": ("Dimension Reduction", "#ab47bc"),
@@ -273,6 +276,8 @@ ADDABLE_TYPES = [
     "compensation",
     "illumination",
     "feature",
+    "feature_up",
+    "gate2col",
     "subset",
     "subsample",
     "dimred",
@@ -366,6 +371,131 @@ SEG_DEFAULT_PARAMS = {
     "min_area": 30,
     "expand": 5,
 }
+
+# Feature module: aggregation methods, in the order shown in the dropdown.
+FEATURE_METHODS = [
+    ("Count", "count"),
+    ("Sum", "sum"),
+    ("Max", "max"),
+    ("Min", "min"),
+    ("Mean", "mean"),
+    ("Median", "median"),
+    ("Percentile", "percentile"),
+]
+FEATURE_METHOD_LABELS = {key: label for label, key in FEATURE_METHODS}
+# Per-file status shown in the Feature file table.
+FEATURE_STATUS_PENDING = "Not calculated"
+FEATURE_STATUS_DONE = "Calculated"
+# The Feature log is stored in the module's params; cap it so project.json
+# does not grow without bound.
+_FEATURE_LOG_LIMIT = 400
+
+
+def _feature_auto_name(rule) -> str:
+    """Default new-column name for a rule: '<source>_<method>' (or 'count')."""
+    if rule.get("method") == "count":
+        return "count"
+    source = rule.get("source") or "value"
+    method = rule.get("method") or "mean"
+    if method == "percentile":
+        perc = rule.get("perc")
+        suffix = f"p{int(perc)}" if perc else "p"
+    else:
+        suffix = method
+    return f"{source}_{suffix}"
+
+
+def _feature_safe_stem(text: str) -> str:
+    """Make a filesystem-safe file stem (no path separators or reserved chars)."""
+    import re
+
+    cleaned = re.sub(r'[\\/:*?"<>|\s]+', "_", str(text)).strip("._")
+    return cleaned or "feature"
+
+
+def _feature_count_name(params) -> str:
+    """The Count column name: its stored name, made unique on a clash.
+
+    Defaults to 'count'; when that would collide with the feature column or
+    another rule's new name it becomes 'count_1', 'count_2', …
+    """
+    rules = params.get("rules") or []
+    stored = (rules[0].get("name") or "").strip() if rules else ""
+    base = stored or "count"
+    used = {
+        (r.get("name") or "").strip()
+        for r in rules
+        if r.get("method") != "count"
+    }
+    used.add(params.get("feature") or "")
+    if base not in used:
+        return base
+    n = 1
+    while f"{base}_{n}" in used:
+        n += 1
+    return f"{base}_{n}"
+
+
+def _feature_aggregate_frame(df, feature, rules, count_name):
+    """Aggregate `df` by the `feature` column.
+
+    Every distinct feature value becomes one output row. The first rule is the
+    fixed Count; the others aggregate one source variable each, optionally
+    restricted to an in-class percentile range (sorted by that row's own
+    source variable). Returns ``(out, columns, warnings)``.
+    """
+    import pandas as pd
+
+    grouped = df.groupby(feature, sort=True)
+    sizes = grouped.size()
+    out = pd.DataFrame(index=sizes.index)
+    out.index.name = feature
+    out[count_name] = sizes.astype("int64")
+    warnings = []
+
+    for rule in rules:
+        if rule.get("method") == "count":
+            continue
+        source = rule["source"]
+        method = rule.get("method") or "mean"
+        name = (rule.get("name") or _feature_auto_name(rule)).strip()
+        series = df[source]
+        lo = float(rule.get("lo", 0.0))
+        hi = float(rule.get("hi", 100.0))
+        if lo <= 0.0 and hi >= 100.0:
+            values_in_range = series
+        else:
+            # Per-class thresholds; mapping the group quantiles back onto the
+            # rows is much faster than a per-group transform.
+            q_lo_by = grouped[source].quantile(lo / 100.0)
+            q_hi_by = grouped[source].quantile(hi / 100.0)
+            q_lo = df[feature].map(q_lo_by)
+            q_hi = df[feature].map(q_hi_by)
+            keep = (series >= q_lo) & (series <= q_hi)
+            values_in_range = series.where(keep)
+        sub = values_in_range.groupby(df[feature], sort=True)
+        if method == "percentile":
+            agg = sub.quantile(float(rule.get("perc") or 50.0) / 100.0)
+        elif method == "sum":
+            agg = sub.sum(min_count=1)
+        else:
+            agg = sub.agg(method)
+        out[name] = agg.reindex(out.index)
+        if lo > 0.0 or hi < 100.0:
+            empty = int(agg.isna().sum())
+            if empty:
+                warnings.append(
+                    f"{empty} class(es) had no points in {lo:g}–{hi:g}% for '{name}'"
+                )
+
+    out = out.reset_index()
+    columns = [feature, count_name] + [
+        (r.get("name") or _feature_auto_name(r)).strip()
+        for r in rules
+        if r.get("method") != "count"
+    ]
+    return out.loc[:, columns], columns, warnings
+
 
 # Extensions: external Python environments managed outside the workflow. Each
 # entry describes one optional method plus how to run/install it. `deps` are
@@ -1446,6 +1576,113 @@ def _build_image_index_files(parquet_path, progress_cb=None):
         json.dump(manifest, fh)
     if progress_cb is not None:
         progress_cb(1.0)
+    return manifest
+
+
+def _row_mode(blocks):
+    """Mode (most frequent value) of each row of an ``(N, k)`` integer array.
+
+    Ties are broken toward the smallest value (a stable result independent of
+    input order). Used to downsample a label image by taking each block's
+    dominant label instead of its mean.
+    """
+    import warnings
+
+    import numpy as np
+    from scipy.stats import mode as _scipy_mode
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        modes, _counts = _scipy_mode(blocks, axis=1, keepdims=False)
+    return np.asarray(modes, dtype=blocks.dtype).reshape(blocks.shape[0])
+
+
+def _mode_pool(arr2d, block):
+    """Downsample a 2-D integer array by ``block``, returning the mode per block."""
+    import math
+
+    import numpy as np
+
+    height, width = arr2d.shape
+    nby = int(math.ceil(height / block))
+    nbx = int(math.ceil(width / block))
+    ph = nby * block
+    pw = nbx * block
+    padded = np.zeros((ph, pw), dtype=arr2d.dtype)
+    padded[:height, :width] = arr2d
+    blocks = (
+        padded.reshape(nby, block, nbx, block)
+        .transpose(0, 2, 1, 3)
+        .reshape(nby * nbx, block * block)
+    )
+    return _row_mode(blocks).reshape(nby, nbx)
+
+
+def _build_label_index(parquet_path, mask_2d, xmin, xmax, ymin, ymax):
+    """Build a label (mode) raster pyramid for a mask parquet.
+
+    Each level stores the per-block dominant label, so a zoomed-out view shows
+    the most frequent cell in each block. The mask is a self-contained
+    ``[x, y, mask]`` parquet; the pyramid lives in ``<parquet>.imgidx/`` with
+    the same geometry as the source image.
+    """
+    import json
+    import math
+
+    import numpy as np
+
+    idx_dir = _image_index_dir(parquet_path)
+    idx_dir.mkdir(parents=True, exist_ok=True)
+    height, width = mask_2d.shape
+    geo_w = xmax - xmin + 1.0
+    geo_h = ymax - ymin + 1.0
+
+    block = 1
+    while True:
+        nbx = int(math.ceil(geo_w / block))
+        nby = int(math.ceil(geo_h / block))
+        if nbx * nby <= _IMAGE_FINEST_CAP:
+            break
+        block *= 2
+    b0 = block
+
+    levels = []
+    level = _mode_pool(mask_2d, b0)
+    fname = f"level_{b0}.npy"
+    np.save(idx_dir / fname, level[..., None].astype(np.int32))
+    levels.append({"block": int(b0), "file": fname})
+
+    prev = level
+    prev_b = b0
+    while prev_b < max(geo_w, geo_h):
+        nb = prev_b * 2
+        nxt = _mode_pool(prev, 2)
+        fname = f"level_{nb}.npy"
+        np.save(idx_dir / fname, nxt[..., None].astype(np.int32))
+        levels.append({"block": int(nb), "file": fname})
+        prev = nxt
+        prev_b = nb
+        if (nxt.shape[0] * nxt.shape[1]) <= _IMAGE_COARSEST:
+            break
+
+    max_label = int(mask_2d.max()) if mask_2d.size else 0
+    st = Path(parquet_path).stat()
+    manifest = {
+        "version": 2,
+        "file_size": int(st.st_size),
+        "file_mtime": float(st.st_mtime),
+        "xmin": float(xmin),
+        "xmax": float(xmax),
+        "ymin": float(ymin),
+        "ymax": float(ymax),
+        "total": int(mask_2d.size),
+        "color_cols": ["mask"],
+        "color_ranges": {"mask": [0.0, float(max_label)]},
+        "levels": levels,
+        "kind": "label",
+    }
+    with open(idx_dir / "manifest.json", "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)
     return manifest
 
 
@@ -3173,8 +3410,10 @@ MODULE_KINDS = {
     "unmix": "map",
     "segmentation": "generate",
     "figure": "visualize",
+    "feature": "generate",
     # Placeholder modules (no implementation yet).
-    "feature": "map",
+    "feature_up": "generate",
+    "gate2col": "map",
     "subset": "map",
     "subsample": "map",
     "dimred": "generate",
@@ -5585,6 +5824,123 @@ class MainWindow(QMainWindow):
             return []
         return task.get("params", {}).get("processed", [])
 
+    # ----- Feature module outputs (generated data files) -----------------
+    def _feature_signature(self, params, parquet_path) -> str:
+        """A change signature for one source file's aggregation output.
+
+        Covers the feature column, every aggregation rule and the source
+        file's own size/mtime, so a saved output is considered stale when any
+        of them changes (the file table then shows "Not calculated").
+        """
+        try:
+            st = Path(parquet_path).stat()
+            stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+        except OSError:
+            stat = ""
+        payload = json.dumps(
+            {
+                "feature": params.get("feature"),
+                "rules": params.get("rules") or [],
+                "source": str(parquet_path),
+                "stat": stat,
+            },
+            sort_keys=True,
+        )
+        # hashlib (not hash()) so the signature is stable across restarts.
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _feature_outputs(self, task_id) -> list:
+        """Data files produced by upstream Feature modules, newest chain first.
+
+        Only outputs whose saved signature still matches the module's current
+        settings (and whose parquet exists) are returned, so downstream
+        modules always see the committed, up-to-date results.
+        """
+        if not task_id or self.project is None:
+            return []
+        out = []
+        seen = set()
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id:
+                continue
+            if task.get("type") != "feature":
+                continue
+            params = self._feature_params_for(task)
+            outputs = params.get("outputs") or {}
+            for source, rec in outputs.items():
+                if not isinstance(rec, dict):
+                    continue
+                rel = rec.get("path")
+                if not rel:
+                    continue
+                path = self.project.path / rel
+                if not path.is_file():
+                    continue
+                if rec.get("signature") != self._feature_signature(params, source):
+                    continue
+                key = str(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({
+                    "name": rec.get("name") or path.stem,
+                    "parquet": key,
+                    "columns": list(rec.get("columns") or []),
+                    "source": source,
+                    "feature_task": task.get("id"),
+                })
+        return out
+
+    def _feature_output(self, parquet_path):
+        """Return the Feature output record for a parquet path, or None."""
+        if not parquet_path or self.project is None:
+            return None
+        for task in self.project.workflow.get("tasks", []):
+            for node in self._walk_tasks(task):
+                if node.get("type") != "feature":
+                    continue
+                params = self._feature_params_for(node)
+                for source, rec in (params.get("outputs") or {}).items():
+                    if not isinstance(rec, dict) or not rec.get("path"):
+                        continue
+                    path = self.project.path / rec["path"]
+                    if str(path) == str(parquet_path):
+                        return {**rec, "parquet": str(path), "source": source,
+                                "feature_task": node.get("id")}
+        return None
+
+    def _walk_tasks(self, node):
+        yield node
+        for child in node.get("children", []):
+            yield from self._walk_tasks(child)
+
+    def _feature_params_for(self, task_def) -> dict:
+        """Saved params of a Feature task (its live snapshot while open)."""
+        task_id = task_def.get("id")
+        reg = self._module_registry.get(task_id)
+        if reg is not None and reg.get("task_type") == "feature":
+            snap = getattr(reg["page"], "_feat_snapshot", None)
+            if isinstance(snap, dict):
+                return snap
+        return task_def.get("params") or {}
+
+    def _available_files(self, task_id=None) -> list:
+        """Data files visible to a module: imported files + upstream Feature outputs."""
+        files = list(self._imported_files())
+        if task_id:
+            known = {rec.get("parquet") for rec in files}
+            for rec in self._feature_outputs(task_id):
+                if rec.get("parquet") not in known:
+                    files.append(rec)
+        return files
+
+    def _file_record(self, parquet_path):
+        """Return the file record (imported or Feature output) for a path."""
+        for rec in self._imported_files():
+            if rec.get("parquet") == parquet_path:
+                return rec
+        return self._feature_output(parquet_path)
+
     def _rel_data_key(self, parquet_path) -> str:
         """Return the parquet path relative to the data dir (index key)."""
         try:
@@ -5598,12 +5954,17 @@ class MainWindow(QMainWindow):
     def _columns_for(self, parquet_path, task_id=None) -> list:
         """Return the column names for a parquet file from the column index.
 
+        Feature outputs carry their own column list (stored when generated).
         When `task_id` is given, the parameters produced by upstream modules
         for this file are appended: Unmix output names, then any mask column
         exposed by an upstream Segmentation module.
         """
         if not parquet_path:
             return []
+        feat = self._feature_output(parquet_path)
+        if feat is not None:
+            # Aggregated data: upstream transforms are already baked in.
+            return list(feat.get("columns") or [])
         columns = list(self._column_index.get(self._rel_data_key(parquet_path), []))
         if task_id:
             for name in self._unmix_output_names(task_id, parquet_path):
@@ -5615,11 +5976,8 @@ class MainWindow(QMainWindow):
         return columns
 
     def _figure_record(self, file_path):
-        """Return the imported-file record matching a parquet path, or None."""
-        for rec in self._imported_files():
-            if rec.get("parquet") == file_path:
-                return rec
-        return None
+        """Return the file record (imported or Feature output) for a path."""
+        return self._file_record(file_path)
 
     def _task_chain(self, task_id) -> list:
         """Return the workflow task chain from root down to (and including) task_id."""
@@ -5847,9 +6205,19 @@ class MainWindow(QMainWindow):
             return {}
         names = list(names)
         stages = self._map_stages(task_id) if task_id else []
+        feature_output = self._feature_output(parquet_path)
+        if feature_output is not None:
+            # A Feature output was aggregated with the upstream transforms
+            # already applied; applying them again would corrupt the values.
+            stages = []
         if extra_stages:
             stages = stages + list(extra_stages)
-        base = set(self._column_index.get(self._rel_data_key(parquet_path), []))
+        if feature_output is not None:
+            # Generated files are not in the import column index; their columns
+            # were recorded when the module generated them.
+            base = set(feature_output.get("columns") or [])
+        else:
+            base = set(self._column_index.get(self._rel_data_key(parquet_path), []))
         if not base:
             try:
                 import pyarrow.parquet as pq
@@ -5991,10 +6359,17 @@ class MainWindow(QMainWindow):
         scroll.setWidget(host)
         sl.addWidget(scroll, 1)
 
-        cl.addWidget(fig_panel, 3)
-        cl.addWidget(settings_panel, 1)
+        # Figures canvas (left) | settings (right), resizable; default 2:1.
+        fig_splitter = QSplitter(Qt.Orientation.Horizontal)
+        fig_splitter.setChildrenCollapsible(False)
+        fig_splitter.addWidget(fig_panel)
+        fig_splitter.addWidget(settings_panel)
+        fig_splitter.setStretchFactor(0, 2)
+        fig_splitter.setStretchFactor(1, 1)
+        fig_splitter.setSizes([800, 400])
+        cl.addWidget(fig_splitter, 1)
+        page._fig_splitter = fig_splitter
         layout.addWidget(content, 1)
-
         # Per-page state (each Figure module instance has its own).
         page._fig_snapshot = copy.deepcopy(task_def.get("params", {}))
         page._fig_task_def = task_def
@@ -6356,7 +6731,7 @@ class MainWindow(QMainWindow):
 
     def _figure_add_plot(self, page, ptype: str) -> None:
         """Append a new plot (scatter or histogram) and select it."""
-        records = self._imported_files()
+        records = self._available_files(page._fig_task_id)
         rec = records[0] if records else None
         columns = self._columns_for(
             rec.get("parquet"), page._fig_task_id
@@ -6919,7 +7294,7 @@ class MainWindow(QMainWindow):
                 continue
             if channel in seg_cols:
                 chan, rect = self._seg_mask_raster(
-                    manifest, (x0, x1, y0, y1), seg_cols[channel]
+                    seg_cols[channel], (x0, x1, y0, y1), spacing
                 )
                 if chan is None:
                     unavailable.append(channel)
@@ -7578,7 +7953,7 @@ class MainWindow(QMainWindow):
             note.setWordWrap(True)
             layout.addWidget(note)
 
-        records = self._imported_files()
+        records = self._available_files(page._fig_task_id)
         rec = self._figure_record(plot_dict.get("file"))
         columns = self._columns_for(
             rec.get("parquet"), page._fig_task_id
@@ -8058,7 +8433,7 @@ class MainWindow(QMainWindow):
             h.addStretch()
             return row
 
-        records = self._imported_files()
+        records = self._available_files(page._fig_task_id)
 
         # Union of columns across every selected plot's file.
         col_set = []
@@ -8834,7 +9209,7 @@ class MainWindow(QMainWindow):
     def _scaling_column_set(self, task_id=None) -> list:
         """Return the sorted, de-duplicated set of input column names."""
         cols = set()
-        for rec in self._imported_files():
+        for rec in self._available_files(task_id):
             for c in self._columns_for(rec.get("parquet"), task_id):
                 cols.add(c)
         return sorted(cols)
@@ -8923,7 +9298,7 @@ class MainWindow(QMainWindow):
 
         # Build the preview config first so the plot widget's A/F buttons can
         # bind to it (same dict object is mutated in place later).
-        records = self._imported_files()
+        records = self._available_files(task_def.get("id"))
         rec = records[0] if records else None
         cols = self._columns_for(
             rec.get("parquet"), task_def.get("id")
@@ -9235,7 +9610,7 @@ class MainWindow(QMainWindow):
         enabled = not page._scaling_locked
         plot_widget = page._scaling_plot_widget
 
-        records = self._imported_files()
+        records = self._available_files(page._scaling_task_id)
         rec = self._figure_record(preview.get("file"))
         columns = self._columns_for(
             rec.get("parquet"), page._scaling_task_id
@@ -9361,7 +9736,6 @@ class MainWindow(QMainWindow):
             self._gating_render(page)
             self._gating_rebuild_settings(page)
         # Other module types have no live visualization to refresh yet.
-
     # ----- unmix module (map) -----------------------------------------
     def _build_unmix_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
         """Build the Unmix page: two fixed sub-pages (extraction / matrix)."""
@@ -9438,7 +9812,7 @@ class MainWindow(QMainWindow):
         page._unmix_matrix = page._unmix_params["matrix"]
         if "samples" not in page._unmix_params:
             page._unmix_params["samples"] = [
-                r.get("parquet") for r in self._imported_files() if r.get("parquet")
+                r.get("parquet") for r in self._available_files(page._unmix_task_id) if r.get("parquet")
             ]
         # Per-spectrum value cache, cleared whenever anything changes.
         page._unmix_spectrum_cache = {}
@@ -9714,7 +10088,7 @@ class MainWindow(QMainWindow):
         tied to one gate tree's file.
         """
         columns = []
-        for rec in self._imported_files():
+        for rec in self._available_files(page._unmix_task_id):
             for name in self._columns_for(rec.get("parquet")):
                 if name not in columns:
                     columns.append(name)
@@ -11072,7 +11446,7 @@ class MainWindow(QMainWindow):
         selected = set(page._unmix_params.get("samples") or [])
         samples_list.blockSignals(True)
         samples_list.clear()
-        for rec in self._imported_files():
+        for rec in self._available_files(page._unmix_task_id):
             path = rec.get("parquet")
             item = QListWidgetItem(rec.get("name", ""))
             item.setData(Qt.ItemDataRole.UserRole, path)
@@ -11484,9 +11858,9 @@ class MainWindow(QMainWindow):
 
     # --- compensation helpers
     def _comp_file_name(self, path) -> str:
-        for rec in self._imported_files():
-            if rec.get("parquet") == path:
-                return rec.get("name", "")
+        rec = self._file_record(path)
+        if rec is not None:
+            return rec.get("name", "")
         return Path(str(path)).name
 
     def _comp_columns_for(self, page, path) -> list:
@@ -11494,7 +11868,7 @@ class MainWindow(QMainWindow):
 
     def _comp_all_columns(self, page) -> list:
         columns = []
-        for rec in self._imported_files():
+        for rec in self._available_files(page._comp_task_id):
             for name in self._comp_columns_for(page, rec.get("parquet")):
                 if name not in columns:
                     columns.append(name)
@@ -11630,7 +12004,7 @@ class MainWindow(QMainWindow):
                 "Set the compensation matrix parameters first.",
             )
             return
-        records = self._imported_files()
+        records = self._available_files(page._comp_task_id)
         names = [rec.get("name", "") for rec in records]
         current = [self._comp_file_name(path) for path in page._comp_files]
         chosen = self._pick_items_dialog(
@@ -12011,10 +12385,10 @@ class MainWindow(QMainWindow):
             n += 1
         return f"{base} {n}"
 
-    def _illum_default_axes(self):
+    def _illum_default_axes(self, task_id=None):
         columns = []
-        for rec in self._imported_files():
-            for name in self._columns_for(rec.get("parquet")):
+        for rec in self._available_files(task_id):
+            for name in self._columns_for(rec.get("parquet"), task_id):
                 if name not in columns:
                     columns.append(name)
         return (
@@ -12023,7 +12397,7 @@ class MainWindow(QMainWindow):
         )
 
     def _illum_add_submodule(self, page) -> None:
-        x_default, y_default = self._illum_default_axes()
+        x_default, y_default = self._illum_default_axes(page._illum_task_id)
         sub = {
             "id": uuid4().hex[:8],
             "name": self._illum_next_name(page),
@@ -12203,7 +12577,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
         editable = not page._illum_locked
-        columns = self._illum_all_columns()
+        columns = self._illum_all_columns(page._illum_task_id)
 
         top = QWidget()
         top_lay = QVBoxLayout(top)
@@ -12297,10 +12671,10 @@ class MainWindow(QMainWindow):
         y_combo.currentIndexChanged.connect(lambda _=0: on_axis("y", y_combo)())
         return panel
 
-    def _illum_all_columns(self) -> list:
+    def _illum_all_columns(self, task_id=None) -> list:
         columns = []
-        for rec in self._imported_files():
-            for name in self._columns_for(rec.get("parquet")):
+        for rec in self._available_files(task_id):
+            for name in self._columns_for(rec.get("parquet"), task_id):
                 if name not in columns:
                     columns.append(name)
         return columns
@@ -12312,7 +12686,7 @@ class MainWindow(QMainWindow):
                 self, "Set Files", "Select the channel first."
             )
             return
-        records = self._imported_files()
+        records = self._available_files(page._illum_task_id)
         names = [rec.get("name", "") for rec in records]
         current = [
             self._comp_file_name(path) for path in (sub.get("files") or [])
@@ -12628,7 +13002,7 @@ class MainWindow(QMainWindow):
         page._illum_plot = plot_dict
         page._illum_plot_settings_built = True
 
-        records = self._imported_files()
+        records = self._available_files(page._illum_task_id)
         enabled = not page._illum_locked
 
         def refresh():
@@ -13008,7 +13382,7 @@ class MainWindow(QMainWindow):
         return rec if isinstance(rec, dict) else None
 
     def _seg_mask_file(self, rec):
-        """Absolute path of a mask record's .npy file, or None if missing."""
+        """Absolute path of a mask record's parquet file, or None if missing."""
         if not rec or self.project is None:
             return None
         rel = rec.get("path")
@@ -13052,8 +13426,9 @@ class MainWindow(QMainWindow):
         return out
 
     def _seg_load_mask(self, mask_path):
-        """Load a mask .npy (cached by path + signature)."""
+        """Load a mask's full 2-D label grid (cached by path + signature)."""
         import numpy as np
+        import pandas as pd
 
         cache = getattr(self, "_seg_mask_cache", None)
         if cache is None:
@@ -13064,12 +13439,24 @@ class MainWindow(QMainWindow):
         hit = cache.get(key)
         if hit is not None and hit[0] == sign:
             return hit[1]
+        man = self._image_load_manifest(mask_path)
+        if man is None:
+            return None
+        width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
+        height = int(round(float(man["ymax"]) - float(man["ymin"]))) + 1
         try:
-            mask = np.load(mask_path)
+            df = pd.read_parquet(mask_path, columns=["x", "y", "mask"])
         except (OSError, ValueError):
             return None
-        if mask.ndim != 2:
-            return None
+        xi = np.rint(
+            df["x"].to_numpy(dtype="float64") - float(man["xmin"])
+        ).astype(np.int64)
+        yi = np.rint(
+            df["y"].to_numpy(dtype="float64") - float(man["ymin"])
+        ).astype(np.int64)
+        mask = np.zeros((height, width), dtype=np.int32)
+        ok = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+        mask[yi[ok], xi[ok]] = df["mask"].to_numpy(dtype=np.int32)[ok]
         if len(cache) > 4:
             cache.clear()
         cache[key] = (sign, mask)
@@ -13116,24 +13503,18 @@ class MainWindow(QMainWindow):
         cache[key] = out
         return out
 
-    def _seg_mask_raster(self, manifest, bbox, mask_path):
-        """Return (label_2d, data_rect) for a mask over the visible bbox."""
-        import numpy as np
+    def _seg_mask_raster(self, mask_path, bbox, spacing):
+        """Return (label_2d, data_rect) for a mask over the visible bbox.
 
-        mask = self._seg_load_mask(mask_path)
-        if mask is None:
+        Reads the mask's own raster pyramid (mode per block) so zoomed-out
+        views load only the coarse level; deep zooms read raw labels.
+        """
+        ent = self._ensure_image_index(mask_path)
+        if ent is None or ent.get("manifest") is None:
             return None, None
-        x0, x1, y0, y1 = bbox
-        xmin = float(manifest["xmin"])
-        ymin = float(manifest["ymin"])
-        i0 = max(0, int(np.floor(x0 - xmin)))
-        i1 = min(mask.shape[1], int(np.ceil(x1 - xmin)))
-        j0 = max(0, int(np.floor(y0 - ymin)))
-        j1 = min(mask.shape[0], int(np.ceil(y1 - ymin)))
-        if i1 <= i0 or j1 <= j0:
-            return None, None
-        crop = np.asarray(mask[j0:j1, i0:i1], dtype="float32")
-        rect = QRectF(xmin + i0, ymin + j0, i1 - i0, j1 - j0)
+        crop, rect, _frac = self._image_raster(
+            mask_path, ent["manifest"], bbox, spacing, "mask", None, None
+        )
         return crop, rect
 
     def _seg_temp_dir(self):
@@ -13524,7 +13905,7 @@ class MainWindow(QMainWindow):
         return False
 
     def _seg_set_files(self, page) -> None:
-        records = self._imported_files()
+        records = self._available_files(page._seg_task_id)
         names = [rec.get("name", "") for rec in records]
         current = [self._comp_file_name(p) for p in self._seg_file_rows(page)]
         chosen = self._pick_items_dialog(
@@ -14046,12 +14427,20 @@ class MainWindow(QMainWindow):
         self._seg_mark_dirty(page)
 
     def _seg_delete_mask(self, page, parquet_path) -> None:
-        """Remove a file's mask .npy and its record."""
+        """Remove a file's mask parquet, its raster pyramid and its record."""
+        import shutil
+
         rec = self._seg_mask_record(page._seg_params, parquet_path) or {}
         rel = rec.get("path")
         if rel and self.project is not None:
             try:
                 (self.project.path / rel).unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                shutil.rmtree(
+                    _image_index_dir(self.project.path / rel), ignore_errors=True
+                )
             except OSError:
                 pass
         page._seg_mask_cache = {}
@@ -14132,16 +14521,43 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg.splitlines()[0])
 
     def _seg_write_mask(self, task_id, parquet_path, array) -> str:
-        """Save a mask array under <project>/Module/<task-id>/; return rel path."""
+        """Save a mask as a self-contained ``[x, y, mask]`` parquet + label pyramid.
+
+        The mask becomes an extra channel of the source image: a parquet with
+        one row per pixel (x/y shared with the source) plus a mode-based raster
+        pyramid so large masks zoom like the original image. Returns the
+        relative path of the mask parquet.
+        """
         import numpy as np
+        import pandas as pd
 
         if self.project is None:
             raise RuntimeError("no project")
+        ent = self._ensure_image_index(parquet_path)
+        if ent is None or ent.get("manifest") is None:
+            raise RuntimeError("source image has no index")
+        man = ent["manifest"]
+        xmin = int(round(float(man["xmin"])))
+        ymin = int(round(float(man["ymin"])))
+        width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
+        height = int(round(float(man["ymax"]) - float(man["ymin"]))) + 1
+        arr = np.asarray(array, dtype=np.int32)
+        if arr.ndim != 2 or arr.shape[0] != height or arr.shape[1] != width:
+            # Trust the array's own shape if it disagrees with the manifest.
+            height, width = arr.shape
+
         stem = Path(str(parquet_path)).stem
-        rel = f"Module/{task_id}/{stem}.npy"
+        rel = f"Module/{task_id}/{stem}_mask.parquet"
         path = self.project.path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(path, np.asarray(array, dtype=np.int32))
+        xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
+        yy = np.repeat(np.arange(height, dtype=np.int32), width) + ymin
+        pd.DataFrame({"x": xx, "y": yy, "mask": arr.ravel()}).to_parquet(
+            path, index=False
+        )
+        _build_label_index(
+            path, arr, xmin, xmin + width - 1, ymin, ymin + height - 1
+        )
         self._seg_mask_cache = {}
         self._seg_value_cache = {}
         return rel
@@ -14998,6 +15414,846 @@ class MainWindow(QMainWindow):
         plot.addItem(item)
         page._seg_overlay_item = item
 
+    # ----- feature module (generate) ------------------------------------
+    def _build_feature_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Feature page: files (1) | aggregation rules (3) | log."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Toolbar with Save/Close.
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._feat_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("feature", None)
+        params.setdefault("files", [])
+        params.setdefault("rules", [])
+        params.setdefault("outputs", {})
+        params.setdefault("log", [])
+        # The first rule is always Count; it cannot be deleted.
+        rules = params.get("rules") or []
+        if not rules or (rules[0].get("method") != "count"):
+            rules = [{"source": None, "method": "count", "lo": 0, "hi": 100,
+                      "perc": None, "name": "count"}] + [
+                r for r in rules if r.get("method") != "count"
+            ]
+            params["rules"] = rules
+        page._feat_task_def = task_def
+        page._feat_task_id = task_def.get("id")
+        page._feat_params = params
+        page._feat_locked = locked
+        page._feat_save_btn = save_btn
+        page._feat_dirty = False
+        page._feat_snapshot = copy.deepcopy(params)
+        page._feat_log_lines = list(params.get("log") or [])
+        page._feat_running = False
+        page._feat_cancel = False
+        save_btn.clicked.connect(lambda _=False: self._feat_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._feat_files_panel(page))
+        splitter.addWidget(self._feat_rules_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([320, 880])
+        row.addWidget(splitter, 1)
+
+        row.addWidget(self._feat_log_panel(page))
+        layout.addWidget(content, 1)
+
+        self._feat_refresh_files(page)
+        self._feat_update_save_btn(page)
+        return page
+
+    def _feat_log_panel(self, page) -> QWidget:
+        """Timestamped log area shared by the whole module."""
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Log</b>"))
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Calculation output appears here…")
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        log.setFixedHeight(120)
+        for line in getattr(page, "_feat_log_lines", []):
+            log.appendPlainText(line)
+        lay.addWidget(log)
+        page._feat_log = log
+        return panel
+
+    def _feat_log(self, page, text) -> None:
+        """Append a timestamped line to the Feature log (persisted with the module)."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = getattr(page, "_feat_log_lines", None)
+        if lines is None:
+            lines = []
+            page._feat_log_lines = lines
+        for line in str(text).splitlines():
+            if line.strip():
+                lines.append(f"[{ts}] {line}")
+        # Keep the log bounded, then store it in the module's params so it is
+        # saved with the project and shown again when the module is reopened.
+        if len(lines) > _FEATURE_LOG_LIMIT:
+            del lines[:-_FEATURE_LOG_LIMIT]
+        if getattr(page, "_feat_params", None) is not None:
+            page._feat_params["log"] = list(lines)
+        box = getattr(page, "_feat_log", None)
+        if box is not None:
+            for line in str(text).splitlines():
+                if line.strip():
+                    box.appendPlainText(f"[{ts}] {line}")
+
+    def _feat_all_columns(self, page) -> list:
+        """Every column visible at this module (union across available files)."""
+        columns = []
+        for rec in self._available_files(page._feat_task_id):
+            for name in self._columns_for(rec.get("parquet"), page._feat_task_id):
+                if name not in columns:
+                    columns.append(name)
+        return columns
+
+    def _feat_file_columns(self, page, parquet_path) -> list:
+        return self._columns_for(parquet_path, page._feat_task_id)
+
+    def _feat_common_columns(self, page) -> list:
+        """Columns shared by every selected file (rule sources must exist in all)."""
+        files = list(page._feat_params.get("files") or [])
+        if not files:
+            return []
+        common = set(self._feat_file_columns(page, files[0]))
+        for path in files[1:]:
+            common &= set(self._feat_file_columns(page, path))
+        return sorted(common)
+
+    def _feat_files_panel(self, page) -> QWidget:
+        """Left panel: feature variable, file picker and per-file status."""
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Feature variable</b>"))
+
+        combo = _NoWheelComboBox()
+        combo.addItem("", None)
+        for name in self._feat_all_columns(page):
+            combo.addItem(name, name)
+        idx = combo.findData(page._feat_params.get("feature"))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.setEnabled(not page._feat_locked)
+        lay.addWidget(combo)
+        page._feat_column_combo = combo
+
+        lay.addWidget(QLabel("Data files"))
+        select_btn = QPushButton("Select files…")
+        select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        select_btn.setEnabled(not page._feat_locked)
+        lay.addWidget(select_btn)
+
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["File", "Status"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(26)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+        lay.addWidget(table, 1)
+        page._feat_files_table = table
+
+        def on_column_changed(_=0):
+            page._feat_params["feature"] = combo.currentData()
+            # Keep only the files that contain the chosen feature variable.
+            feature = page._feat_params["feature"]
+            if feature:
+                files = [
+                    p for p in page._feat_params.get("files") or []
+                    if feature in self._feat_file_columns(page, p)
+                ]
+                page._feat_params["files"] = files
+            self._feat_refresh_files(page)
+            self._feat_mark_dirty(page)
+
+        combo.currentIndexChanged.connect(on_column_changed)
+        select_btn.clicked.connect(lambda _=False: self._feat_select_files(page))
+        return panel
+
+    def _feat_select_files(self, page) -> None:
+        """Pick the data files this module aggregates."""
+        feature = page._feat_params.get("feature")
+        if not feature:
+            QMessageBox.information(
+                self, "Select files", "Choose the feature variable first."
+            )
+            return
+        candidates = [
+            rec for rec in self._available_files(page._feat_task_id)
+            if feature in self._feat_file_columns(page, rec.get("parquet"))
+        ]
+        names = [rec.get("name", "") for rec in candidates]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in candidates}
+        current = [self._comp_file_name(p) for p in page._feat_params.get("files") or []]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        files = []
+        for name in chosen:
+            path = by_name.get(name)
+            if path and path not in files:
+                files.append(path)
+        page._feat_params["files"] = files
+        self._feat_refresh_files(page)
+        self._feat_mark_dirty(page)
+
+    def _feat_file_status(self, page, parquet_path) -> str:
+        """'Calculated' only when a current, matching output exists for the file."""
+        params = page._feat_params
+        rec = (params.get("outputs") or {}).get(parquet_path)
+        if not isinstance(rec, dict) or not rec.get("path"):
+            return FEATURE_STATUS_PENDING
+        if self.project is None:
+            return FEATURE_STATUS_PENDING
+        path = self.project.path / rec["path"]
+        if not path.is_file():
+            return FEATURE_STATUS_PENDING
+        if rec.get("signature") != self._feature_signature(params, parquet_path):
+            return FEATURE_STATUS_PENDING
+        return FEATURE_STATUS_DONE
+
+    def _feat_refresh_files(self, page) -> None:
+        """Rebuild the file status table and the rules table."""
+        table = getattr(page, "_feat_files_table", None)
+        if table is not None:
+            files = list(page._feat_params.get("files") or [])
+            table.blockSignals(True)
+            table.setRowCount(len(files))
+            for i, path in enumerate(files):
+                name_item = QTableWidgetItem(self._comp_file_name(path))
+                name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                table.setItem(i, 0, name_item)
+                status = self._feat_file_status(page, path)
+                sitem = QTableWidgetItem(status)
+                sitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                sitem.setForeground(
+                    QColor("#1a7f37") if status == FEATURE_STATUS_DONE
+                    else QColor("#9aa0a6")
+                )
+                table.setItem(i, 1, sitem)
+            table.blockSignals(False)
+        self._feat_rebuild_rules(page)
+
+    def _feat_rules_panel(self, page) -> QWidget:
+        """Right panel: the 4-column aggregation rules table."""
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Aggregation rules</b>"))
+
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(
+            ["Source variable", "Method", "Range (% per class)", "New column name"]
+        )
+        header = table.horizontalHeader()
+        for column in range(4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(34)
+        table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+        lay.addWidget(table, 1)
+        page._feat_rules_table = table
+
+        note = QLabel(
+            "Range (% per class): for each class, use only the points between "
+            "these two percentiles, sorted by the row's own source variable. "
+            "0–100 means all points (e.g. 0–30 = dimmest 30%, 90–100 = "
+            "brightest 10%). The Count row always uses all points."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #6b7785;")
+        lay.addWidget(note)
+
+        btns = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setEnabled(not page._feat_locked)
+        del_btn = QPushButton("Delete")
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.setEnabled(not page._feat_locked)
+        btns.addWidget(add_btn)
+        btns.addWidget(del_btn)
+        btns.addStretch()
+        lay.addLayout(btns)
+
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setEnabled(not page._feat_locked)
+        lay.addWidget(calc_btn)
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        page._feat_calc_btn = calc_btn
+        page._feat_calc_status = status
+
+        def on_add():
+            page._feat_params["rules"].append(
+                {"source": None, "method": "mean", "lo": 0, "hi": 100,
+                 "perc": None, "name": ""}
+            )
+            self._feat_refresh_rules(page)
+            self._feat_mark_dirty(page)
+
+        def on_delete():
+            row = table.currentRow()
+            rules = page._feat_params["rules"]
+            if row <= 0 or row >= len(rules):
+                if row == 0:
+                    QMessageBox.information(
+                        self, "Delete", "The Count row is fixed and cannot be deleted."
+                    )
+                return
+            del rules[row]
+            self._feat_refresh_rules(page)
+            self._feat_mark_dirty(page)
+
+        add_btn.clicked.connect(lambda _=False: on_add())
+        del_btn.clicked.connect(lambda _=False: on_delete())
+        calc_btn.clicked.connect(lambda _=False: self._feat_calculate(page))
+        return panel
+
+    def _feat_rebuild_rules(self, page) -> None:
+        """Rebuild the rules table widgets from params (without losing edits)."""
+        table = getattr(page, "_feat_rules_table", None)
+        if table is None:
+            return
+        params = page._feat_params
+        rules = params.get("rules") or []
+        common = self._feat_common_columns(page)
+        enabled = not page._feat_locked
+
+        table.blockSignals(True)
+        # Clear via row count so old cell widgets are destroyed too (items are
+        # cleared by clearContents, cell widgets are not).
+        table.setRowCount(0)
+        table.setRowCount(len(rules))
+
+        def mark():
+            self._feat_mark_dirty(page)
+            self._feat_refresh_statuses(page)
+
+        def rebuild_soon():
+            # Rebuilding the table destroys the widget whose signal we are
+            # handling, so defer the rebuild to the next event-loop turn.
+            QTimer.singleShot(0, lambda: self._feat_rebuild_rules(page))
+
+        for i, rule in enumerate(rules):
+            is_count = rule.get("method") == "count"
+
+            # Column 0: source variable (fixed label for Count).
+            if is_count:
+                item = QTableWidgetItem("(all rows)")
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                item.setForeground(QColor("#6b7785"))
+                table.setItem(i, 0, item)
+            else:
+                combo = _NoWheelComboBox()
+                combo.addItem("", None)
+                names = list(common)
+                if rule.get("source") and rule["source"] not in names:
+                    names.append(rule["source"])
+                for name in names:
+                    combo.addItem(name, name)
+                idx = combo.findData(rule.get("source"))
+                combo.setCurrentIndex(max(0, idx))
+                combo.setEnabled(enabled)
+
+                def on_source(value, r=rule):
+                    old_auto = self._feat_auto_name(r)
+                    r["source"] = value
+                    current = (r.get("name") or "").strip()
+                    if not current or current == old_auto:
+                        r["name"] = self._feat_auto_name(r)
+                    rebuild_soon()
+                    mark()
+
+                combo.currentIndexChanged.connect(
+                    lambda _=0, c=combo, cb=on_source: cb(c.currentData())
+                )
+                table.setCellWidget(i, 0, combo)
+
+            # Column 1: method (+ percentile value when relevant).
+            method_box = QWidget()
+            mh = QHBoxLayout(method_box)
+            mh.setContentsMargins(0, 0, 0, 0)
+            mh.setSpacing(4)
+            method_combo = _NoWheelComboBox()
+            for label, key in FEATURE_METHODS:
+                method_combo.addItem(label, key)
+            midx = method_combo.findData(rule.get("method", "mean"))
+            method_combo.setCurrentIndex(max(0, midx))
+            percent_spin = None
+            if is_count:
+                method_combo.setEnabled(False)
+            else:
+                def on_method(value, r=rule):
+                    r["method"] = value
+                    rebuild_soon()
+                    mark()
+                method_combo.currentIndexChanged.connect(
+                    lambda _=0, c=method_combo, cb=on_method: cb(c.currentData())
+                )
+            mh.addWidget(method_combo)
+            if rule.get("method") == "percentile":
+                percent_spin = _NoWheelSpinBox()
+                percent_spin.setRange(0, 100)
+                percent_spin.setSingleStep(1)
+                percent_spin.setValue(int(rule.get("perc") or 50))
+                percent_spin.setEnabled(enabled)
+                percent_spin.setFixedWidth(76)
+                percent_spin.setToolTip("Percentile to compute within each class")
+
+                def on_perc(value, r=rule):
+                    r["perc"] = int(value)
+                    mark()
+
+                percent_spin.valueChanged.connect(
+                    lambda v, cb=on_perc: cb(v)
+                )
+                mh.addWidget(percent_spin)
+            table.setCellWidget(i, 1, method_box)
+
+            # Column 2: in-class percentile range.
+            range_box = QWidget()
+            rh = QHBoxLayout(range_box)
+            rh.setContentsMargins(0, 0, 0, 0)
+            rh.setSpacing(4)
+            lo_spin = _NoWheelSpinBox()
+            hi_spin = _NoWheelSpinBox()
+            for spin, value in ((lo_spin, rule.get("lo", 0)),
+                                (hi_spin, rule.get("hi", 100))):
+                spin.setRange(0, 100)
+                spin.setSingleStep(1)
+                spin.setValue(int(value))
+                spin.setFixedWidth(72)
+                spin.setEnabled(enabled and not is_count)
+            if is_count:
+                tip = "Not used by the Count row (always counts all points)"
+            else:
+                tip = ("Use only the points between these percentiles within "
+                       "each class (sorted by this row's source variable)")
+            lo_spin.setToolTip(tip)
+            hi_spin.setToolTip(tip)
+
+            def on_range(_=0, r=rule, lo=lo_spin, hi=hi_spin):
+                if r.get("method") == "count":
+                    return
+                r["lo"] = int(lo.value())
+                r["hi"] = int(hi.value())
+                mark()
+
+            lo_spin.valueChanged.connect(lambda v, cb=on_range: cb())
+            hi_spin.valueChanged.connect(lambda v, cb=on_range: cb())
+            rh.addWidget(lo_spin)
+            rh.addWidget(QLabel("–"))
+            rh.addWidget(hi_spin)
+            table.setCellWidget(i, 2, range_box)
+
+            # Column 3: new column name.
+            if is_count:
+                # Default 'count'; resolved to count_1, count_2… on a clash.
+                rule["name"] = self._feat_count_name(params)
+            name_edit = QLineEdit(str(rule.get("name") or self._feat_auto_name(rule)))
+            name_edit.setEnabled(enabled)
+
+            def on_name(text, r=rule):
+                r["name"] = text.strip()
+                mark()
+
+            name_edit.textEdited.connect(lambda t, cb=on_name: cb(t))
+            table.setCellWidget(i, 3, name_edit)
+
+        table.blockSignals(False)
+
+    def _feat_refresh_rules(self, page) -> None:
+        """Rebuild the rules table after a structural change."""
+        self._feat_rebuild_rules(page)
+
+    def _feat_auto_name(self, rule) -> str:
+        """Default new-column name: <source>_<method> (or 'count')."""
+        if rule.get("method") == "count":
+            return "count"
+        source = rule.get("source") or "value"
+        method = rule.get("method") or "mean"
+        if method == "percentile":
+            perc = rule.get("perc")
+            suffix = f"p{int(perc)}" if perc else "p"
+        else:
+            suffix = method
+        return f"{source}_{suffix}"
+
+    def _feat_refresh_statuses(self, page) -> None:
+        """Update only the status column of the file table."""
+        table = getattr(page, "_feat_files_table", None)
+        if table is None:
+            return
+        files = list(page._feat_params.get("files") or [])
+        for i, path in enumerate(files):
+            if i >= table.rowCount():
+                break
+            status = self._feat_file_status(page, path)
+            item = table.item(i, 1)
+            if item is None:
+                item = QTableWidgetItem()
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                table.setItem(i, 1, item)
+            item.setText(status)
+            item.setForeground(
+                QColor("#1a7f37") if status == FEATURE_STATUS_DONE
+                else QColor("#9aa0a6")
+            )
+
+    def _feat_mark_dirty(self, page) -> None:
+        page._feat_dirty = True
+        self._feat_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+        if getattr(page, "_feat_calc_status", None) is not None:
+            page._feat_calc_status.setText("")
+
+    def _feat_update_save_btn(self, page) -> None:
+        btn = getattr(page, "_feat_save_btn", None)
+        if btn is not None:
+            btn.setEnabled(page._feat_dirty and not page._feat_locked)
+
+    def _feat_save_now(self, page) -> None:
+        """Persist the module's settings without recomputing."""
+        params = page._feat_params
+        page._feat_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._feat_snapshot = copy.deepcopy(params)
+        page._feat_dirty = False
+        self._feat_update_save_btn(page)
+        self._feat_log(page, "Settings saved")
+        self.statusBar().showMessage("Feature settings saved")
+        self._module_saved(page)
+
+    def _feat_validate(self, page):
+        """Return (ok, message) for the current settings."""
+        params = page._feat_params
+        if not params.get("feature"):
+            return False, "Choose the feature variable first."
+        if not params.get("files"):
+            return False, "Select at least one data file."
+        rules = params.get("rules") or []
+        if not rules:
+            return False, "Add at least one aggregation rule."
+        common = set(self._feat_common_columns(page))
+        names = []
+        for i, rule in enumerate(rules):
+            if rule.get("method") == "count":
+                if i != 0:
+                    return False, "Count must be the first row."
+                name = (rule.get("name") or "").strip()
+                if not name:
+                    return False, "Give the Count row a column name."
+                names.append(name)
+                continue
+            source = rule.get("source")
+            if not source:
+                return False, f"Row {i + 1}: choose a source variable."
+            if source not in common:
+                return False, (
+                    f"Row {i + 1}: '{source}' is not present in every selected file."
+                )
+            lo = float(rule.get("lo", 0.0))
+            hi = float(rule.get("hi", 100.0))
+            if not (0.0 <= lo < hi <= 100.0):
+                return False, (
+                    f"Row {i + 1}: the range must satisfy 0 ≤ from < to ≤ 100."
+                )
+            if rule.get("method") == "percentile":
+                perc = rule.get("perc")
+                if perc is None or not (0.0 <= float(perc) <= 100.0):
+                    return False, f"Row {i + 1}: the percentile must be 0–100."
+            name = (rule.get("name") or "").strip()
+            if not name:
+                return False, f"Row {i + 1}: give the new column a name."
+            names.append(name)
+        if len(names) != len(set(names)):
+            return False, "New column names must be unique."
+        if params["feature"] in names:
+            return False, (
+                f"'{params['feature']}' is kept as the identifier column; "
+                "choose a different new column name."
+            )
+        return True, ""
+
+    def _feat_count_name(self, params) -> str:
+        """The Count column name, resolved to be unique (see the module helper)."""
+        return _feature_count_name(params)
+
+    def _feat_output_stem(self, page, parquet_path) -> str:
+        """Output file stem: '<source file name>_<feature>', '_new' on a clash.
+
+        The source file's display name (the name shown in the Workflow / file
+        lists) is used, not the internal parquet stem. A previous output of
+        this same file is overwritten in place when the name is unchanged.
+        """
+        params = page._feat_params
+        feature = params.get("feature") or "feature"
+        outputs = params.get("outputs") or {}
+        existing = outputs.get(parquet_path) if isinstance(outputs, dict) else None
+        old_stem = (
+            Path(existing["path"]).stem
+            if isinstance(existing, dict) and existing.get("path") else None
+        )
+        display = self._comp_file_name(parquet_path) or Path(str(parquet_path)).name
+        base = _feature_safe_stem(f"{Path(display).stem}_{feature}")
+        if old_stem == base:
+            return base
+        used = {
+            Path(rec["path"]).stem
+            for source, rec in outputs.items()
+            if source != parquet_path and isinstance(rec, dict) and rec.get("path")
+        }
+        if self.project is not None:
+            folder = self.project.path / "Module" / str(page._feat_task_id)
+            if folder.is_dir():
+                used |= {
+                    p.stem for p in folder.glob("*.parquet") if p.stem != old_stem
+                }
+        stem = base
+        n = 0
+        while stem in used:
+            n += 1
+            stem = f"{base}_new" if n == 1 else f"{base}_new{n}"
+        if n:
+            self._feat_log(
+                page,
+                f"'{base}' already exists — writing as '{stem}' instead.",
+            )
+        return stem
+
+    def _feat_calculate(self, page) -> None:
+        """Aggregate every selected file and save the generated parquet files."""
+        ok, message = self._feat_validate(page)
+        if not ok:
+            QMessageBox.warning(self, "Calculate", message)
+            return
+        params = page._feat_params
+        outputs = params.get("outputs") or {}
+        selected = params.get("files") or []
+        existing = [p for p in selected if isinstance(outputs.get(p), dict)]
+        if existing:
+            reply = QMessageBox.question(
+                self,
+                "Calculate",
+                f"{len(existing)} file(s) already have results.\n"
+                "Recalculate and overwrite them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        status = getattr(page, "_feat_calc_status", None)
+        if status is not None:
+            status.setText("Calculating…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        done = 0
+        failed = []
+        page._feat_running = True
+        page._feat_cancel = False
+        try:
+            for path in selected:
+                if getattr(page, "_feat_cancel", False):
+                    self._feat_log(page, "Calculation cancelled.")
+                    break
+                name = self._comp_file_name(path)
+                if status is not None:
+                    status.setText(f"Calculating… {name}")
+                QApplication.processEvents()
+                previous = outputs.get(path)
+                try:
+                    rel, columns, warnings = self._feat_compute_file(page, path)
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(f"{name}: {exc}")
+                    self._feat_log(page, f"✗ {name}: {exc}")
+                    continue
+                # A renamed output (e.g. after this file's name scheme changed)
+                # leaves its old parquet behind; remove it.
+                if isinstance(previous, dict) and previous.get("path"):
+                    if previous["path"] != rel and self.project is not None:
+                        try:
+                            (self.project.path / previous["path"]).unlink(
+                                missing_ok=True
+                            )
+                        except OSError:
+                            pass
+                for warning in warnings:
+                    self._feat_log(page, warning)
+                outputs[path] = {
+                    "path": rel,
+                    "name": Path(rel).stem,
+                    "columns": columns,
+                    "signature": self._feature_signature(params, path),
+                }
+                done += 1
+                self._feat_log(
+                    page,
+                    f"✓ {name} → {Path(rel).name} "
+                    f"({len(columns)} column(s))",
+                )
+        finally:
+            QApplication.restoreOverrideCursor()
+            page._feat_running = False
+
+        # Drop stale mappings for files that are no longer selected.
+        for path in list(outputs.keys()):
+            if path not in selected:
+                outputs.pop(path, None)
+        params["outputs"] = outputs
+        page._feat_task_def["output"] = {"saved": bool(outputs)}
+        page._feat_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._feat_snapshot = copy.deepcopy(params)
+        page._feat_dirty = False
+        self._feat_update_save_btn(page)
+        self._feat_refresh_files(page)
+
+        summary = f"Calculated {done} file(s)."
+        if failed:
+            summary += f" {len(failed)} failed — see the log."
+        if status is not None:
+            status.setText(summary)
+        self._feat_log(page, summary)
+        self.statusBar().showMessage(summary)
+        self._module_saved(page)
+
+    def _feat_compute_file(self, page, parquet_path):
+        """Aggregate one source file; return (relative path, columns, warnings)."""
+        import numpy as np
+        import pandas as pd
+
+        params = page._feat_params
+        feature = params["feature"]
+        rules = params.get("rules") or []
+        count_name = self._feat_count_name(params)
+        sources = [r["source"] for r in rules if r.get("source")]
+
+        values = self._column_data(
+            page._feat_task_id, parquet_path, [feature] + sources
+        )
+        if feature not in values:
+            raise ValueError(f"'{feature}' is missing from this file")
+        data = {feature: values[feature]}
+        for source in sources:
+            if source not in values:
+                raise ValueError(f"'{source}' is missing from this file")
+            data[source] = values[source]
+        df = pd.DataFrame(data)
+        before = len(df)
+        df = df[np.isfinite(df[feature])]
+        dropped = before - len(df)
+        warnings = []
+        if dropped:
+            warnings.append(
+                f"{self._comp_file_name(parquet_path)}: skipped {dropped} row(s) "
+                f"with an empty '{feature}' value"
+            )
+        if df.empty:
+            raise ValueError("no rows with a valid feature value")
+
+        out, columns, agg_warnings = _feature_aggregate_frame(
+            df, feature, rules, count_name
+        )
+        warnings.extend(agg_warnings)
+
+        stem = self._feat_output_stem(page, parquet_path)
+        rel = f"Module/{page._feat_task_id}/{stem}.parquet"
+        if self.project is None:
+            raise RuntimeError("no project")
+        path = self.project.path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        out.to_parquet(path, index=False)
+        return rel, columns, warnings
+
+    def _feat_close(self, page) -> None:
+        if getattr(page, "_feat_running", False):
+            reply = QMessageBox.question(
+                self,
+                "Close Feature",
+                "A calculation is still running.\n"
+                "Stop it and close the module?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            # Stop at the next file; the page stays open until the loop ends so
+            # its widgets are never destroyed mid-calculation.
+            page._feat_cancel = True
+            self._feat_log(page, "Stopping after the current file…")
+            return
+        if getattr(page, "_feat_dirty", False):
+            reply = QMessageBox.question(
+                self,
+                "Close Feature",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            # Keep the log: it is part of the module's record, not a setting.
+            log_lines = list(getattr(page, "_feat_log_lines", []) or [])
+            page._feat_task_def["params"] = page._feat_snapshot
+            page._feat_task_def["params"]["log"] = log_lines
+        self._close_module_page(page)
+
     # ----- gating module (map) -----------------------------------------
     def _build_gating_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
         """Build the Gating page: gate tree (1) | gate area (3) | settings (2)."""
@@ -15048,7 +16304,7 @@ class MainWindow(QMainWindow):
         `page` is either a module page (a QWidget) or a `_GatingState` bag, so
         the same methods can drive several gate trees in the Unmix module.
         """
-        records = self._imported_files()
+        records = self._available_files(task_def.get("id"))
         rec = records[0] if records else None
         cols = self._columns_for(
             rec.get("parquet"), task_def.get("id")
@@ -16526,7 +17782,7 @@ class MainWindow(QMainWindow):
         enabled = not page._gating_locked
         plot_widget = page._gating_plot_widget
 
-        records = self._imported_files()
+        records = self._available_files(page._gating_task_id)
         rec = self._figure_record(preview.get("file"))
         columns = self._columns_for(
             rec.get("parquet"), page._gating_task_id
@@ -16787,6 +18043,8 @@ class MainWindow(QMainWindow):
             page = self._build_illumination_page(name, task_def, locked)
         elif task_type == "segmentation":
             page = self._build_segmentation_page(name, task_def, locked)
+        elif task_type == "feature":
+            page = self._build_feature_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
