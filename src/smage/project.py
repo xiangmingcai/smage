@@ -23,6 +23,9 @@ import numpy as np
 PROJECT_VERSION = "0.1.0"
 DATA_DIRNAME = "data"
 MANIFEST_FILENAME = "project.json"
+# Window/UI preferences (tree expansion, …), kept out of the manifest so they
+# never mix with the data description.
+UI_STATE_FILENAME = "ui_state.json"
 # Each module's own persisted files live under this folder, keyed by task id.
 MODULE_DIRNAME = "Module"
 
@@ -169,3 +172,28 @@ class Project:
         """Write the column-name index."""
         self.columns_path.parent.mkdir(parents=True, exist_ok=True)
         self.columns_path.write_text(json.dumps(columns, indent=2), encoding="utf-8")
+
+    @property
+    def ui_state_path(self) -> Path:
+        """Path to the small UI-state file (tree expansion, window layout)."""
+        return self.path / UI_STATE_FILENAME
+
+    def load_ui_state(self) -> dict:
+        """Return the saved UI state, or {} when there is none."""
+        if not self.ui_state_path.is_file():
+            return {}
+        try:
+            with self.ui_state_path.open("r", encoding="utf-8") as file:
+                state = json.load(file)
+        except (OSError, ValueError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    def save_ui_state(self, state: dict) -> None:
+        """Write the UI state (best effort; it is only a convenience)."""
+        try:
+            self.ui_state_path.write_text(
+                json.dumps(state, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass

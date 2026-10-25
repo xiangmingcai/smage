@@ -497,6 +497,62 @@ def _feature_aggregate_frame(df, feature, rules, count_name):
     return out.loc[:, columns], columns, warnings
 
 
+# Defaults shown when a Subsample module first gets a sampling basis.
+_SUBS_DEFAULT_COUNT = 10000
+_SUBS_DEFAULT_PERCENT = 10.0
+
+
+def _subsample_allocate(params, sizes) -> dict:
+    """Points to keep per file for one Subsample module.
+
+    `sizes` maps every selected path to its row count as seen when it reaches
+    the module. An unset or zero count means "not configured yet" and returns
+    nothing to sample. A manual override wins over the computed value and is
+    clamped to the file's own size.
+    """
+    basis = params.get("basis") or ""
+    unit = params.get("unit") or "points"
+    try:
+        count = int(params.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    try:
+        percent = float(params.get("percent") or 0.0)
+    except (TypeError, ValueError):
+        percent = 0.0
+    files = [p for p in (params.get("files") or []) if p in sizes]
+    out = {}
+    if basis == "per_file" and unit == "percent":
+        # Percentage per file: the count itself is filled in per file (and
+        # stays editable in the table).
+        if percent > 0.0 and files:
+            for path in files:
+                k = int(sizes[path] * percent / 100.0)
+                out[path] = min(k, sizes[path])
+    elif count > 0 and files:
+        if basis == "per_file":
+            for path in files:
+                out[path] = min(count, sizes[path])
+        elif (params.get("allocation") or "uniform") == "weighted":
+            total = sum(sizes[p] for p in files)
+            for path in files:
+                share = int(count * sizes[path] // total) if total else 0
+                out[path] = min(share, sizes[path])
+        elif basis == "total":
+            share = count // len(files)
+            for path in files:
+                out[path] = min(share, sizes[path])
+    for path, value in (params.get("overrides") or {}).items():
+        if path not in out:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        out[path] = max(0, min(value, sizes[path]))
+    return out
+
+
 # Extensions: external Python environments managed outside the workflow. Each
 # entry describes one optional method plus how to run/install it. `deps` are
 # the heavy framework packages that must also be present (installed first,
@@ -1224,10 +1280,10 @@ class _GatingStatsWorker:
         self._thread.start()
 
     def request(self, generation, parquet_path, gates, stages, base_columns,
-                affected, virtual=None):
+                affected, virtual=None, row_index=None):
         self._req_q.put(
             (generation, parquet_path, gates, stages, set(base_columns),
-             affected, dict(virtual or {}))
+             affected, dict(virtual or {}), row_index)
         )
 
     def poll(self):
@@ -1256,7 +1312,7 @@ class _GatingStatsWorker:
             self._res_q.put(res)
 
     def _compute(self, generation, parquet_path, gates, stages, base_columns,
-                 affected, virtual=None):
+                 affected, virtual=None, row_index=None):
         import numpy as np
         import pandas as pd
         if not parquet_path or not gates:
@@ -1293,6 +1349,13 @@ class _GatingStatsWorker:
         arrays = {name: cols[name] for name in base_needed if name in cols}
         for name, values_arr in (virtual or {}).items():
             arrays.setdefault(name, values_arr)
+        if row_index is not None and arrays:
+            # An upstream Subsample module limits the visible rows.
+            n_rows = len(next(iter(arrays.values())))
+            arrays = {
+                name: (arr[row_index] if len(arr) == n_rows else arr)
+                for name, arr in arrays.items()
+            }
         arrays = _evaluate_stages(stages, arrays, needed, parquet_path)
         existing = set(arrays)
         if not arrays:
@@ -3486,6 +3549,11 @@ class MainWindow(QMainWindow):
         self._updating_sample = False
         self._current_entry = None
         self._module_registry = {}
+        # Workflow-tree expansion state, restored per project (see ui_state.json).
+        self._tree_project = None
+        self._tree_expanded = {}
+        self._tree_restoring = False
+        self._tree_force_expand = set()
         # On-the-fly Unmix configs and computed map-stage outputs.
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
@@ -3523,6 +3591,11 @@ class MainWindow(QMainWindow):
                 or getattr(widget, "_comp_dirty", False)
                 or getattr(widget, "_illum_dirty", False)
                 or getattr(widget, "_seg_dirty", False)
+                or getattr(widget, "_feat_dirty", False)
+                or getattr(widget, "_g2c_dirty", False)
+                or getattr(widget, "_fup_dirty", False)
+                or getattr(widget, "_subset_dirty", False)
+                or getattr(widget, "_subs_dirty", False)
             ):
                 return True
         return False
@@ -4351,12 +4424,16 @@ class MainWindow(QMainWindow):
             for item in self.project.data_dir.iterdir():
                 if item.is_file():
                     shutil.copy2(item, new_project.data_dir / item.name)
+            if self.project.ui_state_path.is_file():
+                shutil.copy2(self.project.ui_state_path, new_project.ui_state_path)
             new_project.save()
         except OSError as error:
             QMessageBox.warning(self, "Save Project As", f"Could not save project:\n{error}")
             return
 
         self.project = new_project
+        # Reload the tree layout from the copied UI state on the next rebuild.
+        self._tree_project = None
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
         self.statusBar().showMessage(f"Saved as: {self.project.path}")
 
@@ -4446,6 +4523,14 @@ class MainWindow(QMainWindow):
         self.workflow_tree = QTreeWidget()
         self.workflow_tree.setHeaderHidden(True)
         self.workflow_tree.setIndentation(22)
+        # Remember which nodes the user collapsed, so a rebuild (adding a
+        # module, saving, reopening the project) never re-expands everything.
+        self.workflow_tree.itemExpanded.connect(
+            lambda item: self._on_tree_toggled(item, True)
+        )
+        self.workflow_tree.itemCollapsed.connect(
+            lambda item: self._on_tree_toggled(item, False)
+        )
         wl.addWidget(self.workflow_tree)
 
         self.tabs.addTab(workflow_panel, "Workflow")
@@ -4711,6 +4796,8 @@ class MainWindow(QMainWindow):
                   task_id: str | None = None, locked: bool = False):
         """Add a task card to the tree and return its item."""
         item = QTreeWidgetItem([""])
+        if task_id:
+            item.setData(0, Qt.ItemDataRole.UserRole, str(task_id))
         if parent is None:
             self.workflow_tree.addTopLevelItem(item)
         else:
@@ -4723,18 +4810,53 @@ class MainWindow(QMainWindow):
         )
         return item
 
-    def _refresh_workflow_tree(self) -> None:
-        """Rebuild the workflow tree from the current project's workflow."""
-        self.workflow_tree.clear()
-        root = self._add_task(None, "Workflow", ROOT_COLOR, is_root=True)
-        root.setExpanded(True)
-
-        if self.project is None:
+    def _on_tree_toggled(self, item, expanded: bool) -> None:
+        """Record a node's expanded/collapsed state for this project."""
+        if self._tree_restoring:
             return
-        for task in self.project.workflow.get("tasks", []):
-            self._add_task_from_definition(root, task, None)
+        task_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if not task_id:
+            return
+        self._tree_expanded[str(task_id)] = bool(expanded)
+        if self.project is not None:
+            self.project.save_ui_state({"expanded": self._tree_expanded})
 
-    def _add_task_from_definition(self, parent, task_def: dict, parent_task_def=None):
+    def _load_tree_state(self) -> None:
+        """Reload the tree expansion state from the current project."""
+        if self.project is None:
+            self._tree_expanded = {}
+            return
+        state = self.project.load_ui_state()
+        expanded = state.get("expanded")
+        self._tree_expanded = dict(expanded) if isinstance(expanded, dict) else {}
+
+    def _refresh_workflow_tree(self) -> None:
+        """Rebuild the workflow tree, keeping each node's expansion state."""
+        if self.project is not self._tree_project:
+            # A different project is open: pick up its saved layout.
+            self._tree_project = self.project
+            self._load_tree_state()
+        force = set(self._tree_force_expand)
+        self._tree_force_expand = set()
+        live = set()
+        self._tree_restoring = True
+        try:
+            self.workflow_tree.clear()
+            root = self._add_task(None, "Workflow", ROOT_COLOR, is_root=True)
+            root.setExpanded(True)
+            if self.project is None:
+                return
+            for task in self.project.workflow.get("tasks", []):
+                self._add_task_from_definition(root, task, None, force, live)
+            # Drop remembered states of nodes that no longer exist.
+            for task_id in list(self._tree_expanded):
+                if task_id not in live:
+                    self._tree_expanded.pop(task_id, None)
+        finally:
+            self._tree_restoring = False
+
+    def _add_task_from_definition(self, parent, task_def: dict, parent_task_def=None,
+                                  force=None, live=None):
         """Add a task card (and its children) from a workflow definition dict."""
         task_type = task_def.get("type", "")
         name = task_def.get("name") or TASK_TYPES.get(task_type, ("Task",))[0]
@@ -4749,9 +4871,18 @@ class MainWindow(QMainWindow):
             task_id=task_def.get("id", ""),
             locked=_task_is_locked(task_def),
         )
-        item.setExpanded(True)
+        task_id = task_def.get("id", "")
+        if live is not None and task_id:
+            live.add(str(task_id))
+        expanded = bool(self._tree_expanded.get(str(task_id), True))
+        if force and str(task_id) in force:
+            expanded = True
+            # Revealing a newly added node is a deliberate user action, so it
+            # becomes the remembered state too.
+            self._tree_expanded[str(task_id)] = True
+        item.setExpanded(expanded)
         for child in task_def.get("children", []):
-            self._add_task_from_definition(item, child, task_def)
+            self._add_task_from_definition(item, child, task_def, force, live)
 
     # ----- add-module dialog ----------------------------------------
     def _show_add_module_dialog(self, parent_task_def: dict) -> None:
@@ -4790,6 +4921,13 @@ class MainWindow(QMainWindow):
         if _task_kind(mtype) == "generate":
             new_task["output"] = {"saved": False}
         parent_task_def.setdefault("children", []).append(new_task)
+        # Reveal the new module without expanding anything else: only its
+        # ancestor path is forced open, every other node keeps its state.
+        force = {str(new_task["id"])}
+        parent_id = parent_task_def.get("id")
+        if parent_id:
+            force |= {str(t.get("id")) for t in self._task_chain(parent_id)}
+        self._tree_force_expand = force
         if self.project is not None:
             self.project.save()
         self._refresh_workflow_tree()
@@ -5837,27 +5975,30 @@ class MainWindow(QMainWindow):
         return task.get("params", {}).get("processed", [])
 
     # ----- Feature module outputs (generated data files) -----------------
-    def _feature_signature(self, params, parquet_path) -> str:
+    def _feature_signature(self, params, parquet_path, task_id=None) -> str:
         """A change signature for one source file's aggregation output.
 
-        Covers the feature column, every aggregation rule and the source
-        file's own size/mtime, so a saved output is considered stale when any
-        of them changes (the file table then shows "Not calculated").
+        Covers the feature column, every aggregation rule, the source file's
+        own size/mtime and any upstream sampling of it, so a saved output is
+        considered stale when any of them changes.
         """
         try:
             st = Path(parquet_path).stat()
             stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
         except OSError:
             stat = ""
-        payload = json.dumps(
-            {
-                "feature": params.get("feature"),
-                "rules": params.get("rules") or [],
-                "source": str(parquet_path),
-                "stat": stat,
-            },
-            sort_keys=True,
-        )
+        payload = {
+            "feature": params.get("feature"),
+            "rules": params.get("rules") or [],
+            "source": str(parquet_path),
+            "stat": stat,
+        }
+        # Only fold in sampling when it actually applies, so projects without a
+        # Subsample module keep matching their previously saved outputs.
+        sample = self._subsample_sig(task_id, parquet_path)
+        if sample:
+            payload["sample"] = sample
+        payload = json.dumps(payload, sort_keys=True)
         # hashlib (not hash()) so the signature is stable across restarts.
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -5888,7 +6029,9 @@ class MainWindow(QMainWindow):
                 path = self.project.path / rel
                 if not path.is_file():
                     continue
-                if rec.get("signature") != self._feature_signature(params, source):
+                if rec.get("signature") != self._feature_signature(
+                    params, source, task.get("id")
+                ):
                     continue
                 key = str(path)
                 if key in seen:
@@ -5937,13 +6080,23 @@ class MainWindow(QMainWindow):
         return task_def.get("params") or {}
 
     def _available_files(self, task_id=None) -> list:
-        """Data files visible to a module: imported files + upstream Feature outputs."""
+        """Data files visible to a module: imported files + upstream Feature outputs.
+
+        Files hidden by an upstream Subset module are dropped here, so the
+        filter reaches every downstream module through this one entry point.
+        """
         files = list(self._imported_files())
         if task_id:
             known = {rec.get("parquet") for rec in files}
             for rec in self._feature_outputs(task_id):
                 if rec.get("parquet") not in known:
                     files.append(rec)
+            allowed = self._subset_visible_files(task_id)
+            if allowed is not None:
+                files = [
+                    rec for rec in files
+                    if str(rec.get("parquet")) in allowed
+                ]
         return files
 
     def _file_record(self, parquet_path):
@@ -5962,6 +6115,44 @@ class MainWindow(QMainWindow):
         except (ValueError, AttributeError):
             pass
         return Path(parquet_path).name
+
+    # ----- Subset filters (downstream visibility) -------------------------
+    def _subset_filters(self, task_id) -> list:
+        """Saved Subset filters above `task_id`, top-down.
+
+        Each entry is ``(files, columns)``; a ``None`` member means "no
+        filtering on that axis" (an empty selection is no filter). A module's
+        own Subset task is skipped, so a Subset never hides its own content.
+        """
+        if not task_id or self.project is None:
+            return []
+        out = []
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "subset":
+                continue
+            params = task.get("params") or {}
+            files = {str(p) for p in (params.get("files") or []) if p}
+            columns = {str(c) for c in (params.get("columns") or []) if c}
+            out.append((files or None, columns or None))
+        return out
+
+    def _subset_visible_files(self, task_id):
+        """Set of visible parquet paths, or None when nothing is hidden."""
+        allowed = None
+        for files, _columns in self._subset_filters(task_id):
+            if files is None:
+                continue
+            allowed = files if allowed is None else (allowed & files)
+        return allowed
+
+    def _subset_visible_columns(self, task_id):
+        """Set of visible column names, or None when nothing is hidden."""
+        allowed = None
+        for _files, columns in self._subset_filters(task_id):
+            if columns is None:
+                continue
+            allowed = columns if allowed is None else (allowed & columns)
+        return allowed
 
     def _columns_for(self, parquet_path, task_id=None) -> list:
         """Return the column names for a parquet file from the column index.
@@ -5994,6 +6185,11 @@ class MainWindow(QMainWindow):
             for name in self._feature_up_applied_columns(task_id, parquet_path):
                 if name not in columns:
                     columns.append(name)
+            # An upstream Subset module whitelists column names for everything
+            # below it (empty selection = no filtering).
+            allowed = self._subset_visible_columns(task_id)
+            if allowed is not None:
+                columns = [c for c in columns if c in allowed]
         return columns
 
     def _figure_record(self, file_path):
@@ -6218,8 +6414,13 @@ class MainWindow(QMainWindow):
                     }))
         return stages
 
-    def _column_data(self, task_id, parquet_path, names, extra_stages=None) -> dict:
-        """Column values as seen at `task_id`, with upstream map stages applied."""
+    def _column_data(self, task_id, parquet_path, names, extra_stages=None,
+                     row_filter=True) -> dict:
+        """Column values as seen at `task_id`, with upstream map stages applied.
+
+        When an upstream Subsample module samples this file, the returned
+        arrays hold only the sampled rows (unless `row_filter` is off).
+        """
         import pandas as pd
 
         if not parquet_path or not names:
@@ -6284,6 +6485,17 @@ class MainWindow(QMainWindow):
                     arr = self._feature_up_column_values(parquet_path, rec, name)
                     if arr is not None:
                         values[name] = arr
+        if row_filter and task_id:
+            # Keep only the rows an upstream Subsample module lets through.
+            # Every array here is row-aligned to the source file, so one index
+            # applies to base and virtual columns alike.
+            index = self._subsample_row_index(task_id, parquet_path)
+            if index is not None:
+                total = self._data_row_count(parquet_path)
+                values = {
+                    name: (arr[index] if len(arr) == total else arr)
+                    for name, arr in values.items()
+                }
         if not stages:
             return {n: values[n] for n in names if n in values}
         evaluated = _evaluate_stages(
@@ -6840,9 +7052,15 @@ class MainWindow(QMainWindow):
                 ))
         return options
 
-    def _figure_filter_mask(self, plot_dict):
+    def _figure_filter_mask(self, plot_dict, row_task_id=None):
         """Return (mask, error) for the plot's filter, or (None, None) when
-        there is no filter (or it is trivially empty)."""
+        there is no filter (or it is trivially empty).
+
+        `row_task_id` is the plotting module: the mask is reduced to the rows
+        that module can see, so it lines up with its (possibly sampled) data.
+        """
+        import numpy as np
+
         f = plot_dict.get("filter")
         if not f:
             return None, None
@@ -6882,6 +7100,10 @@ class MainWindow(QMainWindow):
             return None, "Filter could not be applied"
         if mask is None:
             return None, "Filter could not be applied"
+        if row_task_id:
+            index = self._subsample_row_index(row_task_id, rec["parquet"])
+            if index is not None and len(mask) == self._data_row_count(rec["parquet"]):
+                mask = np.asarray(mask)[index]
         return mask, None
 
     def _image_load_manifest(self, parquet_path):
@@ -7287,6 +7509,17 @@ class MainWindow(QMainWindow):
                 )
                 return
 
+        # Sampled pixels from an upstream Subsample module: an overlay that
+        # hides blocks that are not mostly sampled. It rides the same
+        # block-level fraction channel as the gate filter and uses the same
+        # "more than half" rule, so a block is opaque only when most of its
+        # pixels survived sampling.
+        cover = None
+        if task_id:
+            cover = self._subsample_cover_crop(
+                task_id, parquet_path, manifest, (x0, x1, y0, y1), spacing
+            )
+
         stages = self._map_stages(task_id) if task_id else []
         if extra_stages:
             stages = stages + list(extra_stages)
@@ -7440,8 +7673,16 @@ class MainWindow(QMainWindow):
             canvas += norm[..., None] * np.asarray(color, dtype="float64")[None, None, :]
         rgba = np.empty((height, width, 4), dtype=np.uint8)
         rgba[..., 0:3] = np.clip(canvas, 0.0, 255.0).astype(np.uint8)
+        alpha = None
         if has_mask and mask_accum is not None and mask_accum.shape == ref_shape:
-            rgba[..., 3] = (mask_accum * 255.0).astype(np.uint8)
+            alpha = mask_accum.astype("float64")
+        if cover is not None and cover.shape == ref_shape:
+            # A block is opaque only when more than half of its pixels were
+            # sampled (each raw-path cell is a single pixel, so it is 0 or 1).
+            visible = (cover > 0.5).astype("float64")
+            alpha = visible if alpha is None else alpha * visible
+        if alpha is not None:
+            rgba[..., 3] = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
         else:
             rgba[..., 3] = 255
         img.setImage(rgba, autoLevels=False)
@@ -7507,7 +7748,7 @@ class MainWindow(QMainWindow):
                 plot_dict, plot_widget, column_transforms, task_id, extra_stages
             )
             return
-        mask, error = self._figure_filter_mask(plot_dict)
+        mask, error = self._figure_filter_mask(plot_dict, task_id)
         if error:
             plot_widget.clear()
             plot_widget.setTitle(error, color="#c0392b", size="10pt")
@@ -9781,6 +10022,9 @@ class MainWindow(QMainWindow):
         self._unmix_value_cache = {}
         self._stage_cache = {}
         self._seg_value_cache = {}
+        # Row filtering depends on the saved sampling settings.
+        self._subsample_cache = {}
+        self._subsample_mask_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
         # Saved output can lock (or unlock) modules, so refresh the lock badges
         # and button states in the workflow tree.
@@ -9802,6 +10046,18 @@ class MainWindow(QMainWindow):
         elif task_type == "gating":
             self._gating_render(page)
             self._gating_rebuild_settings(page)
+        elif task_type == "segmentation":
+            self._seg_refresh_files(page)
+        elif task_type == "feature":
+            self._feat_refresh_files(page)
+        elif task_type == "gate2col":
+            self._g2c_refresh_files(page)
+        elif task_type == "feature_up":
+            self._fup_refresh_files(page)
+        elif task_type == "subset":
+            self._subset_refresh(page)
+        elif task_type == "subsample":
+            self._subs_refresh(page)
         # Other module types have no live visualization to refresh yet.
     # ----- unmix module (map) -----------------------------------------
     def _build_unmix_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
@@ -10156,7 +10412,7 @@ class MainWindow(QMainWindow):
         """
         columns = []
         for rec in self._available_files(page._unmix_task_id):
-            for name in self._columns_for(rec.get("parquet")):
+            for name in self._columns_for(rec.get("parquet"), page._unmix_task_id):
                 if name not in columns:
                     columns.append(name)
         return columns
@@ -10303,7 +10559,7 @@ class MainWindow(QMainWindow):
                 "This gate tree has no data file selected.",
             )
             return
-        columns = set(self._columns_for(preview.get("file")))
+        columns = set(self._columns_for(preview.get("file"), page._unmix_task_id))
         missing = [p for p in enabled if p not in columns]
         if missing:
             shown = ", ".join(str(m) for m in missing[:12])
@@ -12707,7 +12963,9 @@ class MainWindow(QMainWindow):
             files = sub.get("files") or []
             missing = [
                 self._comp_file_name(path) for path in files
-                if new_channel and new_channel not in set(self._columns_for(path))
+                if new_channel and new_channel not in set(
+                    self._columns_for(path, page._illum_task_id)
+                )
             ]
             if missing:
                 self._comp_show_missing(
@@ -12770,7 +13028,7 @@ class MainWindow(QMainWindow):
         ]
         problems = []
         for path in paths:
-            columns = set(self._columns_for(path))
+            columns = set(self._columns_for(path, page._illum_task_id))
             if channel not in columns:
                 problems.append((self._comp_file_name(path), [channel]))
         if problems:
@@ -13503,21 +13761,22 @@ class MainWindow(QMainWindow):
                 return snap
         return task_def.get("params") or {}
 
-    def _gate2col_signature(self, params, parquet_path) -> str:
+    def _gate2col_signature(self, params, parquet_path, task_id=None) -> str:
         """Change signature for one source file's gate columns."""
         try:
             st = Path(parquet_path).stat()
             stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
         except OSError:
             stat = ""
-        payload = json.dumps(
-            {
-                "rules": params.get("rules") or [],
-                "source": str(parquet_path),
-                "stat": stat,
-            },
-            sort_keys=True,
-        )
+        payload = {
+            "rules": params.get("rules") or [],
+            "source": str(parquet_path),
+            "stat": stat,
+        }
+        sample = self._subsample_sig(task_id, parquet_path)
+        if sample:
+            payload["sample"] = sample
+        payload = json.dumps(payload, sort_keys=True)
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
     def _gate2col_applied_columns(self, task_id, parquet_path) -> dict:
@@ -13537,7 +13796,9 @@ class MainWindow(QMainWindow):
             rec = (params.get("outputs") or {}).get(parquet_path)
             if not isinstance(rec, dict) or not rec.get("path"):
                 continue
-            if rec.get("signature") != self._gate2col_signature(params, parquet_path):
+            if rec.get("signature") != self._gate2col_signature(
+                params, parquet_path, task.get("id")
+            ):
                 continue
             path = self.project.path / rec["path"]
             if not path.is_file():
@@ -13592,12 +13853,12 @@ class MainWindow(QMainWindow):
         return df[name].to_numpy(dtype="float64")
 
     # ----- Feature Up module outputs (mapped columns) ---------------------
-    def _feature_up_signature(self, params, to_path) -> str:
+    def _feature_up_signature(self, params, to_path, task_id=None) -> str:
         """Change signature for one target (To) file's mapped columns.
 
-        Covers the key columns, the feature rules, the matched From file and
-        the size/mtime of both the From and To files, so a saved output goes
-        stale whenever the mapping or either side's content changes.
+        Covers the key columns, the feature rules, the matched From file, the
+        size/mtime of both files and any upstream sampling of either side, so
+        a saved output goes stale whenever the mapping changes.
         """
         from_path = self._fup_matched_from(params, to_path)
         try:
@@ -13612,17 +13873,21 @@ class MainWindow(QMainWindow):
                 from_stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
             except OSError:
                 from_stat = ""
-        payload = json.dumps(
-            {
-                "key_from": params.get("key_from"),
-                "key_to": params.get("key_to"),
-                "features": params.get("features") or [],
-                "from_path": from_path,
-                "from_stat": from_stat,
-                "to_stat": to_stat,
-            },
-            sort_keys=True,
-        )
+        payload = {
+            "key_from": params.get("key_from"),
+            "key_to": params.get("key_to"),
+            "features": params.get("features") or [],
+            "from_path": from_path,
+            "from_stat": from_stat,
+            "to_stat": to_stat,
+        }
+        sample_from = self._subsample_sig(task_id, from_path)
+        if sample_from:
+            payload["sample_from"] = sample_from
+        sample_to = self._subsample_sig(task_id, to_path)
+        if sample_to:
+            payload["sample_to"] = sample_to
+        payload = json.dumps(payload, sort_keys=True)
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
     def _fup_matched_from(self, params, to_path):
@@ -13660,7 +13925,9 @@ class MainWindow(QMainWindow):
             rec = (params.get("outputs") or {}).get(parquet_path)
             if not isinstance(rec, dict) or not rec.get("path"):
                 continue
-            if rec.get("signature") != self._feature_up_signature(params, parquet_path):
+            if rec.get("signature") != self._feature_up_signature(
+                params, parquet_path, task.get("id")
+            ):
                 continue
             path = self.project.path / rec["path"]
             if not path.is_file():
@@ -13981,12 +14248,12 @@ class MainWindow(QMainWindow):
         self._seg_update_save_btn(page)
         return page
 
-    def _seg_default_plot(self, parquet_path) -> dict:
+    def _seg_default_plot(self, parquet_path, task_id=None) -> dict:
         """A fresh image plot config for the preview panel."""
         columns = []
         rec = self._figure_record(parquet_path)
         if rec is not None:
-            columns = self._columns_for(rec.get("parquet"), None)
+            columns = self._columns_for(rec.get("parquet"), task_id)
         channel = next((c for c in columns if c not in ("x", "y")), None)
         return {
             "type": "image",
@@ -14318,7 +14585,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(QLabel("Nucleus channel"))
         columns = []
         for path in self._seg_file_rows(page):
-            for name in self._columns_for(path, None):
+            for name in self._columns_for(path, page._seg_task_id):
                 if name not in columns:
                     columns.append(name)
         channel_combo = _NoWheelComboBox()
@@ -14432,7 +14699,7 @@ class MainWindow(QMainWindow):
         """Union of non-coordinate columns across the selected files."""
         columns = []
         for path in self._seg_file_rows(page):
-            for name in self._columns_for(path, None):
+            for name in self._columns_for(path, page._seg_task_id):
                 if name in ("x", "y"):
                     continue
                 if name not in columns:
@@ -15490,7 +15757,7 @@ class MainWindow(QMainWindow):
         if not rows:
             return plot_dict
         if plot_dict.get("file") not in rows:
-            fresh = self._seg_default_plot(rows[0])
+            fresh = self._seg_default_plot(rows[0], page._seg_task_id)
             fresh.update({k: v for k, v in plot_dict.items() if k != "file"})
             plot_dict.clear()
             plot_dict.update(fresh)
@@ -15532,7 +15799,7 @@ class MainWindow(QMainWindow):
         columns = []
         rec = self._figure_record(plot_dict.get("file"))
         if rec is not None:
-            columns = self._columns_for(rec.get("parquet"), None)
+            columns = self._columns_for(rec.get("parquet"), page._seg_task_id)
 
         self._figure_image_layer_settings(
             lay, plot_dict, columns, enabled,
@@ -16452,7 +16719,9 @@ class MainWindow(QMainWindow):
                     "path": rel,
                     "name": Path(rel).stem,
                     "columns": columns,
-                    "signature": self._feature_signature(params, path),
+                    "signature": self._feature_signature(
+                        params, path, page._feat_task_id
+                    ),
                 }
                 done += 1
                 self._feat_log(
@@ -16815,7 +17084,9 @@ class MainWindow(QMainWindow):
             return "Not converted"
         if not (self.project.path / rec["path"]).is_file():
             return "Not converted"
-        if rec.get("signature") != self._gate2col_signature(params, parquet_path):
+        if rec.get("signature") != self._gate2col_signature(
+            params, parquet_path, page._g2c_task_id
+        ):
             return "Not converted"
         return "Converted"
 
@@ -17113,7 +17384,9 @@ class MainWindow(QMainWindow):
                     "path": rel,
                     "columns": columns,
                     "kind": kind,
-                    "signature": self._gate2col_signature(params, path),
+                    "signature": self._gate2col_signature(
+                        params, path, page._g2c_task_id
+                    ),
                 }
                 done += 1
                 self._g2c_log(
@@ -17145,7 +17418,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(summary)
         self._module_saved(page)
 
-    def _g2c_row_count(self, parquet_path) -> int:
+    def _data_row_count(self, parquet_path) -> int:
         """Number of rows in a data file (read from the parquet metadata)."""
         import pyarrow.parquet as pq
 
@@ -17153,6 +17426,9 @@ class MainWindow(QMainWindow):
             return int(pq.ParquetFile(parquet_path).metadata.num_rows)
         except Exception:  # noqa: BLE001
             return 0
+
+    def _g2c_row_count(self, parquet_path) -> int:
+        return self._data_row_count(parquet_path)
 
     def _g2c_compute_file(self, page, parquet_path):
         """Convert every rule into a 0/1 column and save them; return (rel, columns, kind)."""
@@ -17164,6 +17440,12 @@ class MainWindow(QMainWindow):
         opts = self._g2c_gate_options(page)
         by_key = {(o["gate_task"], o["gate_id"]): o for o in opts}
 
+        # A gate is evaluated row by row, so restricting the work to the rows a
+        # Subsample module keeps gives the same values. The output file stays
+        # row-aligned to the whole source; rows hidden by sampling hold 0 and
+        # are never read below the Subsample module.
+        n_full = self._data_row_count(parquet_path)
+        index = self._subsample_row_index(page._g2c_task_id, parquet_path)
         cols = []
         for rule in rules:
             opt = by_key.get((rule.get("gate_task"), rule.get("gate_id")))
@@ -17173,7 +17455,14 @@ class MainWindow(QMainWindow):
                 opt["gate_task"], opt["gates"], opt["gate_id"], parquet_path
             )
             if mask is None:
-                mask = np.zeros(self._g2c_row_count(parquet_path), dtype="int8")
+                mask = np.zeros(n_full, dtype="int8")
+            if index is not None:
+                full = np.zeros(n_full, dtype="int8")
+                if len(mask) == n_full:
+                    full[index] = mask[index]
+                elif len(mask) == len(index):
+                    full[index] = mask
+                mask = full
             cols.append((rule["name"], mask))
 
         ent = self._ensure_image_index(parquet_path)
@@ -17904,7 +18193,9 @@ class MainWindow(QMainWindow):
                     "path": rel,
                     "columns": columns,
                     "kind": kind,
-                    "signature": self._feature_up_signature(params, to_path),
+                    "signature": self._feature_up_signature(
+                        params, to_path, page._fup_task_id
+                    ),
                 }
                 done += 1
                 self._fup_log(
@@ -17986,6 +18277,20 @@ class MainWindow(QMainWindow):
                 merged[tmp[j]], errors="coerce"
             ).to_numpy(dtype="float64")
 
+        # The To file may be sampled upstream. The mapped file stays row-aligned
+        # to the whole file (downstream readers expect that), so the sampled
+        # rows are scattered back and the rest stays empty — those rows are
+        # never read below the Subsample module.
+        n_full = self._data_row_count(to_path)
+        index = self._subsample_row_index(page._fup_task_id, to_path)
+        if index is not None and row_vals:
+            for name in list(row_vals):
+                values = row_vals[name]
+                if len(values) == len(index):
+                    full = np.full(n_full, np.nan, dtype="float64")
+                    full[index] = values[: len(index)]
+                    row_vals[name] = full
+
         ent = self._ensure_image_index(to_path)
         is_image = ent is not None and ent.get("manifest") is not None
         stem = Path(str(to_path)).stem
@@ -18065,6 +18370,1058 @@ class MainWindow(QMainWindow):
             log_lines = list(getattr(page, "_fup_log_lines", []) or [])
             page._fup_task_def["params"] = page._fup_snapshot
             page._fup_task_def["params"]["log"] = log_lines
+        self._close_module_page(page)
+
+    # ----- subset module (map) -------------------------------------------
+    def _build_subset_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Subset page: summary | data files (1) | columns (1)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._subset_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("files", [])
+        params.setdefault("columns", [])
+        page._subset_task_def = task_def
+        page._subset_task_id = task_def.get("id")
+        page._subset_params = params
+        page._subset_locked = locked
+        page._subset_save_btn = save_btn
+        page._subset_dirty = False
+        # Edits stay in a draft until Save, so the filter changes downstream
+        # only when the user commits it (the document's "Save to take effect").
+        page._subset_draft_files = list(params.get("files") or [])
+        page._subset_draft_columns = list(params.get("columns") or [])
+        save_btn.clicked.connect(lambda _=False: self._subset_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        summary = QLabel("")
+        summary.setStyleSheet("color: #3c4043; font-weight: bold;")
+        row.addWidget(summary)
+        page._subset_summary = summary
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._subset_files_panel(page))
+        splitter.addWidget(self._subset_columns_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([440, 440])
+        row.addWidget(splitter, 1)
+        layout.addWidget(content, 1)
+
+        self._subset_refresh(page)
+        return page
+
+    def _subset_files_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Data files</b>"))
+        hint = QLabel(
+            "Only the files kept here stay visible to downstream modules. "
+            "An empty selection keeps every file."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        btn = QPushButton("Select files…")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setEnabled(not page._subset_locked)
+        lay.addWidget(btn)
+        box = QListWidget()
+        box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(box, 1)
+        page._subset_files_box = box
+        btn.clicked.connect(lambda _=False: self._subset_select_files(page))
+        return panel
+
+    def _subset_columns_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Columns</b>"))
+        hint = QLabel(
+            "Only the columns kept here stay visible to downstream modules. "
+            "The list is the union of the kept files' columns. "
+            "An empty selection keeps every column."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        btn = QPushButton("Select columns…")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setEnabled(not page._subset_locked)
+        lay.addWidget(btn)
+        box = QListWidget()
+        box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(box, 1)
+        page._subset_columns_box = box
+        btn.clicked.connect(lambda _=False: self._subset_select_columns(page))
+        return panel
+
+    def _subset_column_options(self, page) -> list:
+        """Columns available for selection: union over the kept (draft) files."""
+        paths = list(getattr(page, "_subset_draft_files", []) or [])
+        if not paths:
+            # No file filter yet, so every visible file counts as kept.
+            paths = [
+                rec.get("parquet")
+                for rec in self._available_files(page._subset_task_id)
+            ]
+        columns = []
+        for path in paths:
+            for name in self._columns_for(path, page._subset_task_id):
+                if name not in columns:
+                    columns.append(name)
+        return columns
+
+    def _subset_select_files(self, page) -> None:
+        records = self._available_files(page._subset_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [self._comp_file_name(p) for p in page._subset_draft_files]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        page._subset_draft_files = [by_name[n] for n in chosen if n in by_name]
+        # The column list follows the kept files, so drop selections that are
+        # no longer offered by any of them.
+        options = set(self._subset_column_options(page))
+        page._subset_draft_columns = [
+            c for c in page._subset_draft_columns if c in options
+        ]
+        self._subset_refresh(page)
+        self._subset_mark_dirty(page)
+
+    def _subset_select_columns(self, page) -> None:
+        options = self._subset_column_options(page)
+        if not options:
+            QMessageBox.information(
+                self, "Select columns", "There are no columns to choose from."
+            )
+            return
+        chosen = self._pick_items_dialog(
+            "Select columns", options, page._subset_draft_columns, "Filter columns..."
+        )
+        if chosen is None:
+            return
+        page._subset_draft_columns = list(chosen)
+        self._subset_refresh(page)
+        self._subset_mark_dirty(page)
+
+    def _subset_refresh(self, page) -> None:
+        files_box = getattr(page, "_subset_files_box", None)
+        cols_box = getattr(page, "_subset_columns_box", None)
+        files = list(getattr(page, "_subset_draft_files", []) or [])
+        columns = list(getattr(page, "_subset_draft_columns", []) or [])
+        if files_box is not None:
+            files_box.clear()
+            for path in files:
+                files_box.addItem(self._comp_file_name(path))
+        if cols_box is not None:
+            cols_box.clear()
+            for name in columns:
+                cols_box.addItem(str(name))
+        summary = getattr(page, "_subset_summary", None)
+        if summary is not None:
+            file_text = (
+                f"{len(files)} file(s) selected" if files else "All files visible"
+            )
+            col_text = (
+                f"{len(columns)} column(s) selected"
+                if columns else "All columns visible"
+            )
+            summary.setText(f"{file_text} · {col_text}")
+        self._subset_update_save_btn(page)
+
+    def _subset_mark_dirty(self, page) -> None:
+        page._subset_dirty = True
+        self._subset_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _subset_update_save_btn(self, page) -> None:
+        btn = getattr(page, "_subset_save_btn", None)
+        if btn is not None:
+            btn.setEnabled(page._subset_dirty and not page._subset_locked)
+
+    def _subset_save_now(self, page) -> None:
+        params = page._subset_params
+        params["files"] = list(page._subset_draft_files)
+        params["columns"] = list(page._subset_draft_columns)
+        page._subset_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._subset_dirty = False
+        self._subset_update_save_btn(page)
+        self.statusBar().showMessage("Subset settings saved")
+        self._module_saved(page)
+
+    def _subset_close(self, page) -> None:
+        if getattr(page, "_subset_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Subset",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self._close_module_page(page)
+
+    # ----- Subsample (map; row filtering) --------------------------------
+    def _subsample_params_for(self, task_def) -> dict:
+        """Saved params of a Subsample task (its live snapshot while open)."""
+        task_id = task_def.get("id")
+        reg = self._module_registry.get(task_id)
+        if reg is not None and reg.get("task_type") == "subsample":
+            snap = getattr(reg["page"], "_subs_snapshot", None)
+            if isinstance(snap, dict):
+                return snap
+        return task_def.get("params") or {}
+
+    def _subsample_tasks(self, task_id) -> list:
+        """Subsample tasks above `task_id`, top-down (never the task itself)."""
+        if not task_id or self.project is None:
+            return []
+        return [
+            task for task in self._task_chain(task_id)
+            if task.get("id") != task_id and task.get("type") == "subsample"
+        ]
+
+    def _subsample_sig(self, task_id, parquet_path) -> str:
+        """Signature of every upstream sampling decision that affects a file."""
+        path = str(parquet_path)
+        parts = []
+        for task in self._subsample_tasks(task_id):
+            params = self._subsample_params_for(task)
+            files = {str(p) for p in (params.get("files") or [])}
+            if path not in files:
+                continue
+            parts.append({
+                "task": task.get("id"),
+                "basis": params.get("basis"),
+                "count": params.get("count"),
+                "allocation": params.get("allocation"),
+                "override": (params.get("overrides") or {}).get(path),
+            })
+        if not parts:
+            return ""
+        return hashlib.sha1(
+            json.dumps(parts, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _subsample_seed(self, task_id, parquet_path) -> int:
+        """Stable per-(module, file) seed: same data samples the same rows.
+
+        Derived from the ids only (never Python's `hash()`), so the selection
+        does not change between sessions or when other files are added.
+        """
+        payload = f"smage-subsample-v1|{task_id}|{parquet_path}"
+        return int(hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16], 16)
+
+    def _subsample_visible_count(self, task_id, parquet_path) -> int:
+        """Rows of a file as seen at `task_id` (after upstream sampling)."""
+        index = self._subsample_row_index(task_id, parquet_path)
+        if index is None:
+            return self._data_row_count(parquet_path)
+        return int(len(index))
+
+    def _subsample_row_index(self, task_id, parquet_path):
+        """Row indices (into the full file) visible at `task_id`, or None.
+
+        Layers the sampling of every upstream Subsample module that lists this
+        file. Each module picks a fixed random permutation of its own visible
+        rows, so a larger target keeps every row picked before.
+        """
+        import numpy as np
+
+        if not task_id or not parquet_path or self.project is None:
+            return None
+        tasks = self._subsample_tasks(task_id)
+        if not tasks:
+            return None
+        path = str(parquet_path)
+        sig = self._subsample_sig(task_id, path)
+        if not sig:
+            return None
+        cache = getattr(self, "_subsample_cache", None)
+        if cache is None:
+            cache = {}
+            self._subsample_cache = cache
+        key = (task_id, path, sig)
+        if key in cache:
+            return cache[key]
+        index = None
+        for task in tasks:
+            params = self._subsample_params_for(task)
+            files = [str(p) for p in (params.get("files") or [])]
+            if path not in files:
+                continue
+            n = int(len(index)) if index is not None else self._data_row_count(path)
+            if n <= 0:
+                continue
+            sizes = {
+                p: self._subsample_visible_count(task.get("id"), p)
+                for p in files
+            }
+            k = _subsample_allocate(params, sizes).get(path)
+            if k is None or k >= n:
+                continue
+            if k <= 0:
+                index = (index[:0] if index is not None
+                         else np.zeros(0, dtype=np.int64))
+                continue
+            rng = np.random.default_rng(self._subsample_seed(task.get("id"), path))
+            keep = np.sort(rng.permutation(n)[:k]).astype(np.int64)
+            index = keep if index is None else index[keep]
+        if len(cache) > 16:
+            cache.clear()
+        cache[key] = index
+        return index
+
+    def _subsample_coverage_dir(self, task_id):
+        """Folder holding a Subsample module's saved image coverage masks."""
+        if self.project is None or not task_id:
+            return None
+        return self.project.path / "Module" / str(task_id) / "coverage"
+
+    def _subsample_coverage_paths(self, task, parquet_path):
+        """(mask .npy path, metadata .json path) for one module + file."""
+        folder = self._subsample_coverage_dir(task.get("id"))
+        if folder is None:
+            return None, None
+        key = hashlib.sha1(str(parquet_path).encode("utf-8")).hexdigest()[:16]
+        stem = f"{_feature_safe_stem(Path(str(parquet_path)).stem)}.{key}"
+        return folder / f"{stem}.npy", folder / f"{stem}.json"
+
+    def _subsample_mask_meta(self, task, parquet_path, manifest) -> dict:
+        """Fingerprint of everything a coverage mask depends on."""
+        params = self._subsample_params_for(task)
+        path = str(parquet_path)
+        try:
+            st = Path(path).stat()
+            stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+        except OSError:
+            stat = ""
+        return {
+            "version": 1,
+            "stat": stat,
+            "upstream": self._subsample_sig(task.get("id"), path),
+            "basis": params.get("basis"),
+            "count": params.get("count"),
+            "allocation": params.get("allocation"),
+            "override": (params.get("overrides") or {}).get(path),
+            "files": sorted(str(p) for p in (params.get("files") or [])),
+            "xmin": float(manifest["xmin"]),
+            "ymin": float(manifest["ymin"]),
+            "xmax": float(manifest["xmax"]),
+            "ymax": float(manifest["ymax"]),
+        }
+
+    def _subsample_own_mask(self, task, parquet_path, manifest):
+        """Dense (H, W) mask of the pixels THIS module keeps, or None.
+
+        None means "this module hides nothing from this file". The mask covers
+        only the module's own sampling: upstream sampling is already excluded
+        from the rows it sees.
+        """
+        import numpy as np
+        import pandas as pd
+
+        path = str(parquet_path)
+        params = self._subsample_params_for(task)
+        files = [str(p) for p in (params.get("files") or [])]
+        if path not in files:
+            return None
+        sizes = {
+            p: self._subsample_visible_count(task.get("id"), p) for p in files
+        }
+        n = sizes.get(path, 0)
+        k = _subsample_allocate(params, sizes).get(path)
+        if k is None or n <= 0 or k >= n:
+            return None
+        base = self._subsample_row_index(task.get("id"), path)
+        if k <= 0:
+            sel = np.zeros(0, dtype=np.int64)
+        else:
+            rng = np.random.default_rng(self._subsample_seed(task.get("id"), path))
+            local = np.sort(rng.permutation(n)[:k]).astype(np.int64)
+            sel = local if base is None else np.asarray(base)[local]
+        xmin = float(manifest["xmin"])
+        ymin = float(manifest["ymin"])
+        width = int(round(float(manifest["xmax"]) - xmin)) + 1
+        height = int(round(float(manifest["ymax"]) - ymin)) + 1
+        try:
+            df = pd.read_parquet(path, columns=["x", "y"])
+        except Exception:  # noqa: BLE001
+            return None
+        xi = np.rint(df["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+        yi = np.rint(df["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+        ok = (sel >= 0) & (sel < len(xi))
+        sel = sel[ok]
+        mask = np.zeros((height, width), dtype=np.uint8)
+        if sel.size:
+            sx, sy = xi[sel], yi[sel]
+            good = (sx >= 0) & (sx < width) & (sy >= 0) & (sy < height)
+            mask[sy[good], sx[good]] = 1
+        return mask
+
+    def _subsample_saved_mask(self, task, parquet_path, manifest):
+        """Load a module's saved coverage mask, or None when absent/stale."""
+        import numpy as np
+
+        npy, meta_path = self._subsample_coverage_paths(task, parquet_path)
+        if npy is None or not npy.is_file() or not meta_path.is_file():
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if meta != self._subsample_mask_meta(task, parquet_path, manifest):
+            return None
+        try:
+            mask = np.load(npy)
+        except (OSError, ValueError):
+            return None
+        return mask if mask.ndim == 2 else None
+
+    def _subsample_write_masks(self, page) -> int:
+        """Persist this module's image coverage masks into its own folder.
+
+        Called on Save, so the masks live with the module (and are removed
+        with it). Returns the number of masks written.
+        """
+        import numpy as np
+
+        task = page._subs_task_def
+        folder = self._subsample_coverage_dir(task.get("id"))
+        if folder is None:
+            return 0
+        wanted = set()
+        written = 0
+        for path in page._subs_params.get("files") or []:
+            ent = self._ensure_image_index(path)
+            if ent is None or ent.get("manifest") is None:
+                continue  # table data needs no raster coverage mask
+            manifest = ent["manifest"]
+            mask = self._subsample_own_mask(task, path, manifest)
+            npy, meta_path = self._subsample_coverage_paths(task, path)
+            if npy is None:
+                continue
+            wanted.add(npy.name)
+            wanted.add(meta_path.name)
+            if mask is None:
+                # Nothing hidden by this module: drop any stale mask.
+                for p in (npy, meta_path):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                continue
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                np.save(npy, mask)
+                meta_path.write_text(
+                    json.dumps(self._subsample_mask_meta(task, path, manifest)),
+                    encoding="utf-8",
+                )
+                written += 1
+            except OSError:
+                continue
+        # Remove masks for files that are no longer selected.
+        try:
+            for f in folder.iterdir():
+                if f.is_file() and f.name not in wanted:
+                    f.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._subsample_mask_cache = {}
+        return written
+
+    def _subsample_module_mask(self, task, parquet_path, manifest):
+        """This module's coverage mask: the saved one, else computed now."""
+        cache = getattr(self, "_subsample_mask_cache", None)
+        if cache is None:
+            cache = {}
+            self._subsample_mask_cache = cache
+        key = (task.get("id"), str(parquet_path),
+               self._subsample_sig(task.get("id"), parquet_path))
+        if key in cache:
+            return cache[key]
+        mask = self._subsample_saved_mask(task, parquet_path, manifest)
+        if mask is None:
+            mask = self._subsample_own_mask(task, parquet_path, manifest)
+        if len(cache) > 8:
+            cache.clear()
+        cache[key] = mask
+        return mask
+
+    def _subsample_pixel_mask(self, task_id, parquet_path, manifest):
+        """Dense (H, W) mask of the pixels every upstream Subsample keeps.
+
+        Each module stores its own mask in its folder; the visible set is the
+        intersection of them (a row kept by every module on the way down).
+        """
+        import numpy as np
+
+        masks = []
+        for task in self._subsample_tasks(task_id):
+            mask = self._subsample_module_mask(task, parquet_path, manifest)
+            if mask is not None:
+                masks.append(mask)
+        if not masks:
+            return None
+        out = masks[0]
+        for mask in masks[1:]:
+            if mask.shape != out.shape:
+                continue
+            out = np.logical_and(out, mask).astype(np.uint8)
+        return out
+
+    def _subsample_cover_ent(self, task_id, parquet_path, manifest):
+        """Block-level "fraction of sampled pixels" entry for the image renderer.
+
+        Same shape as the gate-filter mask entry, so the image renderer can
+        crop it with `_image_mask_crop`; the renderer keeps a block opaque
+        only when that fraction is above one half.
+        """
+        mask = self._subsample_pixel_mask(task_id, parquet_path, manifest)
+        if mask is None:
+            return None
+        blocks = [info["block"] for info in manifest.get("levels", [])]
+        levels = _pool_mask(mask, blocks)
+        if not levels:
+            return None
+        # `mask_2d` serves the deep-zoom path, where the renderer reads raw
+        # pixels instead of a pyramid level.
+        return {"levels": levels, "mask_2d": mask}
+
+    def _subsample_cover_crop(self, task_id, parquet_path, manifest, bbox, spacing):
+        """Sampled-pixel visibility over the visible bbox, shaped like the raster.
+
+        The image renderer draws either a pyramid level (coarse/medium zoom) or
+        raw pixels (deep zoom); each needs its own crop rule, otherwise the
+        mask would silently drop out once the view switches to raw pixels.
+        """
+        import math
+        import numpy as np
+
+        ent = self._subsample_cover_ent(task_id, parquet_path, manifest)
+        if ent is None:
+            return None
+        levels = manifest.get("levels", [])
+        raw = (not levels) or (
+            spacing < levels[0]["block"] and levels[0]["block"] > 1
+        )
+        if not raw:
+            cover, _rect = self._image_mask_crop(manifest, bbox, spacing, ent)
+            return cover
+        mask = ent.get("mask_2d")
+        if mask is None:
+            return None
+        x0, x1, y0, y1 = bbox
+        i0 = int(math.floor(x0 - float(manifest["xmin"])))
+        j0 = int(math.floor(y0 - float(manifest["ymin"])))
+        nbx = max(1, int(math.ceil(x1 - x0)))
+        nby = max(1, int(math.ceil(y1 - y0)))
+        out = np.zeros((nby, nbx), dtype=np.float32)
+        sx0, sy0 = max(0, i0), max(0, j0)
+        sx1 = min(mask.shape[1], i0 + nbx)
+        sy1 = min(mask.shape[0], j0 + nby)
+        if sx1 > sx0 and sy1 > sy0:
+            out[sy0 - j0:sy1 - j0, sx0 - i0:sx1 - i0] = mask[sy0:sy1, sx0:sx1]
+        return out
+
+    def _build_subsample_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Subsample page: settings (1) | per-file table (1)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._subs_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("files", [])
+        params.setdefault("basis", "")
+        params.setdefault("unit", "points")
+        params.setdefault("count", None)
+        params.setdefault("percent", None)
+        params.setdefault("allocation", "uniform")
+        params.setdefault("overrides", {})
+        page._subs_task_def = task_def
+        page._subs_task_id = task_def.get("id")
+        page._subs_params = params
+        page._subs_locked = locked
+        page._subs_save_btn = save_btn
+        page._subs_dirty = False
+        page._subs_snapshot = copy.deepcopy(params)
+        page._subs_updating = False
+        save_btn.clicked.connect(lambda _=False: self._subs_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._subs_settings_panel(page))
+        splitter.addWidget(self._subs_table_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([400, 520])
+        row.addWidget(splitter, 1)
+        layout.addWidget(content, 1)
+
+        self._subs_refresh(page)
+        return page
+
+    def _subs_settings_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("<b>Data files</b>"))
+        hint = QLabel(
+            "Selected files are sampled; the others pass through untouched. "
+            "Sampling only changes what downstream modules see — no new data "
+            "is written."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        files_btn = QPushButton("Select files…")
+        files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        files_btn.setEnabled(not page._subs_locked)
+        lay.addWidget(files_btn)
+        files_box = QListWidget()
+        files_box.setFixedHeight(110)
+        files_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(files_box)
+        page._subs_files_box = files_box
+
+        lay.addSpacing(8)
+        lay.addWidget(QLabel("<b>Sampling basis</b>"))
+        basis = _NoWheelComboBox()
+        basis.addItem("", None)
+        basis.addItem("Per file", "per_file")
+        basis.addItem("Total", "total")
+        basis.setEnabled(not page._subs_locked)
+        lay.addWidget(basis)
+        page._subs_basis = basis
+
+        unit_label = QLabel("Count by")
+        lay.addWidget(unit_label)
+        page._subs_unit_label = unit_label
+        unit = _NoWheelComboBox()
+        unit.addItem("Points per file", "points")
+        unit.addItem("Percentage per file", "percent")
+        unit.setEnabled(False)
+        lay.addWidget(unit)
+        page._subs_unit = unit
+
+        count_label = QLabel("Points per file")
+        lay.addWidget(count_label)
+        page._subs_count_label = count_label
+        count_box = _NoWheelDoubleSpinBox()
+        count_box.setDecimals(0)
+        count_box.setRange(1, 2_000_000_000)
+        count_box.setValue(_SUBS_DEFAULT_COUNT)
+        count_box.setEnabled(False)
+        lay.addWidget(count_box)
+        page._subs_count = count_box
+
+        alloc_label = QLabel("Allocation")
+        lay.addWidget(alloc_label)
+        page._subs_alloc_label = alloc_label
+        alloc = _NoWheelComboBox()
+        alloc.addItem("Equal (same count per file)", "uniform")
+        alloc.addItem("Weighted by file size", "weighted")
+        alloc.setEnabled(False)
+        lay.addWidget(alloc)
+        page._subs_alloc = alloc
+
+        lay.addStretch()
+
+        files_btn.clicked.connect(lambda _=False: self._subs_select_files(page))
+        basis.currentIndexChanged.connect(lambda _=0: self._subs_on_basis(page))
+        unit.currentIndexChanged.connect(lambda _=0: self._subs_on_unit(page))
+        count_box.valueChanged.connect(lambda _=0: self._subs_on_value(page))
+        alloc.currentIndexChanged.connect(lambda _=0: self._subs_on_alloc(page))
+        return panel
+
+    def _subs_table_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Sampling</b>"))
+        hint = QLabel(
+            "The sampled count is editable — type a value to override the "
+            "computed one for that file."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["File", "Original points", "Sampled points"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(26)
+        table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+        lay.addWidget(table, 1)
+        page._subs_table = table
+        override_hint = QLabel("* Sampled counts were adjusted manually")
+        override_hint.setStyleSheet("color: #b58900;")
+        override_hint.setVisible(False)
+        lay.addWidget(override_hint)
+        page._subs_override_hint = override_hint
+        table.itemChanged.connect(lambda item: self._subs_on_cell(page, item))
+        return panel
+
+    def _subs_visible_sizes(self, page) -> dict:
+        return {
+            path: self._subsample_visible_count(page._subs_task_id, path)
+            for path in (page._subs_params.get("files") or [])
+        }
+
+    def _subs_computed(self, page, sizes) -> dict:
+        """Computed counts, ignoring manual overrides."""
+        params = dict(page._subs_params)
+        params["overrides"] = {}
+        return _subsample_allocate(params, sizes)
+
+    def _subs_select_files(self, page) -> None:
+        records = self._available_files(page._subs_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [self._comp_file_name(p) for p in page._subs_params.get("files") or []]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        page._subs_params["files"] = [by_name[n] for n in chosen if n in by_name]
+        # Drop overrides for files that are no longer selected.
+        files = set(page._subs_params["files"])
+        page._subs_params["overrides"] = {
+            p: k for p, k in (page._subs_params.get("overrides") or {}).items()
+            if p in files
+        }
+        self._subs_refresh(page)
+        self._subs_mark_dirty(page)
+
+    def _subs_param_changed(self, page) -> None:
+        """A sampling setting changed: confirm before discarding manual counts."""
+        overrides = page._subs_params.get("overrides") or {}
+        if overrides:
+            reply = QMessageBox.question(
+                self, "Subsample",
+                "You adjusted some sampled counts manually.\n"
+                "Recalculating with the new settings will overwrite them.\n\n"
+                "Recalculate and discard the manual values?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                page._subs_params["overrides"] = {}
+        self._subs_refresh(page)
+        self._subs_mark_dirty(page)
+
+    def _subs_percent_mode(self, params) -> bool:
+        """True when sampling is "a percentage of each file"."""
+        return (
+            (params.get("basis") or "") == "per_file"
+            and (params.get("unit") or "points") == "percent"
+        )
+
+    def _subs_on_basis(self, page) -> None:
+        if page._subs_updating:
+            return
+        value = page._subs_basis.currentData()
+        params = page._subs_params
+        changed = value != (params.get("basis") or None)
+        params["basis"] = value or ""
+        if value:
+            # First basis choice: seed the value the right field needs.
+            if self._subs_percent_mode(params) and params.get("percent") is None:
+                params["percent"] = _SUBS_DEFAULT_PERCENT
+            elif params.get("count") is None:
+                params["count"] = int(page._subs_count.value()) or _SUBS_DEFAULT_COUNT
+        if changed:
+            self._subs_param_changed(page)
+        else:
+            self._subs_refresh(page)
+
+    def _subs_on_unit(self, page) -> None:
+        if page._subs_updating:
+            return
+        params = page._subs_params
+        value = page._subs_unit.currentData() or "points"
+        if value == (params.get("unit") or "points"):
+            return
+        params["unit"] = value
+        if self._subs_percent_mode(params) and params.get("percent") is None:
+            params["percent"] = _SUBS_DEFAULT_PERCENT
+        elif params.get("count") is None:
+            params["count"] = _SUBS_DEFAULT_COUNT
+        self._subs_param_changed(page)
+
+    def _subs_on_value(self, page) -> None:
+        if page._subs_updating:
+            return
+        params = page._subs_params
+        value = float(page._subs_count.value())
+        if self._subs_percent_mode(params):
+            params["percent"] = value
+        else:
+            params["count"] = int(round(value))
+        self._subs_param_changed(page)
+
+    def _subs_on_alloc(self, page) -> None:
+        if page._subs_updating:
+            return
+        value = page._subs_alloc.currentData() or "uniform"
+        if value == (page._subs_params.get("allocation") or "uniform"):
+            return
+        page._subs_params["allocation"] = value
+        self._subs_param_changed(page)
+
+    def _subs_on_cell(self, page, item) -> None:
+        if page._subs_updating or page._subs_locked:
+            return
+        if item.column() != 2:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+        sizes = self._subs_visible_sizes(page)
+        if path not in sizes:
+            return
+        text = (item.text() or "").strip()
+        if not text:
+            return
+        try:
+            value = int(float(text))
+        except ValueError:
+            self._subs_refresh(page)
+            return
+        # A manual value never exceeds the file's own point count.
+        value = max(0, min(value, sizes[path]))
+        computed = self._subs_computed(page, sizes).get(path)
+        if computed is not None and value == computed:
+            page._subs_params.get("overrides", {}).pop(path, None)
+        else:
+            page._subs_params.setdefault("overrides", {})[path] = value
+        self._subs_refresh(page)
+        self._subs_mark_dirty(page)
+
+    def _subs_refresh(self, page) -> None:
+        params = page._subs_params
+        files = list(params.get("files") or [])
+        sizes = self._subs_visible_sizes(page)
+        counts = _subsample_allocate(params, sizes)
+
+        page._subs_updating = True
+        try:
+            page._subs_basis.blockSignals(True)
+            idx = page._subs_basis.findData(params.get("basis") or None)
+            page._subs_basis.setCurrentIndex(max(0, idx))
+            page._subs_basis.blockSignals(False)
+            has_basis = bool(params.get("basis"))
+            total = params.get("basis") == "total"
+            per_file = params.get("basis") == "per_file"
+            percent_mode = self._subs_percent_mode(params)
+
+            page._subs_unit.blockSignals(True)
+            page._subs_unit.setCurrentIndex(
+                max(0, page._subs_unit.findData(params.get("unit") or "points"))
+            )
+            page._subs_unit.setEnabled(per_file and not page._subs_locked)
+            page._subs_unit.blockSignals(False)
+            page._subs_unit_label.setVisible(per_file)
+            page._subs_unit.setVisible(per_file)
+
+            box = page._subs_count
+            box.blockSignals(True)
+            if percent_mode:
+                box.setDecimals(1)
+                box.setRange(0.1, 100.0)
+                box.setSuffix(" %")
+                if params.get("percent"):
+                    box.setValue(float(params["percent"]))
+            else:
+                box.setDecimals(0)
+                box.setRange(1, 2_000_000_000)
+                box.setSuffix("")
+                if params.get("count"):
+                    box.setValue(int(params["count"]))
+            box.setEnabled(has_basis and not page._subs_locked)
+            box.blockSignals(False)
+            page._subs_count_label.setText(
+                "Percentage per file" if percent_mode
+                else ("Total points" if total else "Points per file")
+            )
+            page._subs_alloc.blockSignals(True)
+            page._subs_alloc.setCurrentIndex(
+                max(0, page._subs_alloc.findData(params.get("allocation") or "uniform"))
+            )
+            page._subs_alloc.setEnabled(total and not page._subs_locked)
+            page._subs_alloc.blockSignals(False)
+            page._subs_alloc_label.setVisible(total)
+
+            page._subs_files_box.clear()
+            for path in files:
+                page._subs_files_box.addItem(self._comp_file_name(path))
+
+            table = page._subs_table
+            table.blockSignals(True)
+            table.setRowCount(len(files))
+            for i, path in enumerate(files):
+                name_item = QTableWidgetItem(self._comp_file_name(path))
+                name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                table.setItem(i, 0, name_item)
+                orig_item = QTableWidgetItem(str(sizes.get(path, 0)))
+                orig_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                orig_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(i, 1, orig_item)
+                k = counts.get(path)
+                sampled = QTableWidgetItem("" if k is None else str(k))
+                sampled.setData(Qt.ItemDataRole.UserRole, path)
+                flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                if not page._subs_locked:
+                    flags |= Qt.ItemFlag.ItemIsEditable
+                sampled.setFlags(flags)
+                sampled.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(i, 2, sampled)
+            table.blockSignals(False)
+        finally:
+            page._subs_updating = False
+        page._subs_override_hint.setVisible(
+            bool(page._subs_params.get("overrides"))
+        )
+        self._subs_update_save_btn(page)
+
+    def _subs_mark_dirty(self, page) -> None:
+        page._subs_dirty = True
+        self._subs_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _subs_update_save_btn(self, page) -> None:
+        btn = getattr(page, "_subs_save_btn", None)
+        if btn is not None:
+            btn.setEnabled(page._subs_dirty and not page._subs_locked)
+
+    def _subs_save_now(self, page) -> None:
+        params = page._subs_params
+        page._subs_task_def["params"] = params
+        # Commit the settings first: the mask builders read the saved snapshot.
+        page._subs_snapshot = copy.deepcopy(params)
+        page._subs_dirty = False
+        if self.project is not None:
+            self.project.save()
+        # Image files get a coverage mask saved next to the module, so the
+        # figure can mask unsampled pixels without recomputing every render.
+        count = 0
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+            count = self._subsample_write_masks(page)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._subsample_cache = {}
+        self._subsample_mask_cache = {}
+        self._subs_update_save_btn(page)
+        message = "Subsample settings saved"
+        if count:
+            message += f" ({count} image mask(s))"
+        self.statusBar().showMessage(message)
+        self._module_saved(page)
+
+    def _subs_close(self, page) -> None:
+        if getattr(page, "_subs_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Subsample",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._subs_task_def["params"] = page._subs_snapshot
         self._close_module_page(page)
 
     # ----- gating module (map) -----------------------------------------
@@ -19425,6 +20782,7 @@ class MainWindow(QMainWindow):
         worker.request(
             page._gating_stat_generation,
             parquet_path, gates, stages, base_columns, affected, virtual,
+            self._subsample_row_index(page._gating_task_id, parquet_path),
         )
 
     def _gating_apply_stats(self, page, stats) -> None:
@@ -19862,6 +21220,10 @@ class MainWindow(QMainWindow):
             page = self._build_gate2col_page(name, task_def, locked)
         elif task_type == "feature_up":
             page = self._build_feature_up_page(name, task_def, locked)
+        elif task_type == "subset":
+            page = self._build_subset_page(name, task_def, locked)
+        elif task_type == "subsample":
+            page = self._build_subsample_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
