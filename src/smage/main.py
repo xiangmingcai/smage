@@ -744,6 +744,34 @@ def _apply_scale_transforms(x, configs):
 
 # --- Ordered map-module pipeline (Scale / Compensation / Unmix) -----------
 
+def _rename_applies(stage, parquet_path) -> bool:
+    """Whether a rename stage applies to this file (a None/empty scope = all)."""
+    files = stage.get("files")
+    if not files:
+        return True
+    return parquet_path is None or parquet_path in files
+
+
+def _rename_stage(params) -> dict | None:
+    """The column-rename stage declared by a Rename module's params, or None.
+
+    Only column-mode renames produce a stage; file-mode renames are applied to
+    display names elsewhere. Invalid rows are already excluded from `rename`.
+    """
+    if (params or {}).get("mode", "file") != "column":
+        return None
+    column_cfg = params.get("column") or {}
+    files = {str(p) for p in (column_cfg.get("files") or [])}
+    mapping = {
+        str(k): str(v)
+        for k, v in (column_cfg.get("rename") or {}).items()
+        if k and v and str(k) != str(v)
+    }
+    if not files or not mapping:
+        return None
+    return {"files": files, "map": mapping}
+
+
 def _pipeline_touches(stages, name) -> bool:
     """Whether any map stage changes or produces `name`."""
     for kind, stage in stages:
@@ -755,11 +783,18 @@ def _pipeline_touches(stages, name) -> bool:
             for sub in stage.get("submodules", []):
                 if sub.get("channel") == name:
                     return True
+        if kind == "rename":
+            if name in stage["map"] or name in stage["map"].values():
+                return True
     return False
 
 
-def _pipeline_dependencies(stages, names) -> set:
-    """Columns needed before the stages to obtain `names` after them."""
+def _pipeline_dependencies(stages, names, parquet_path=None) -> set:
+    """Columns needed before the stages to obtain `names` after them.
+
+    Rename stages map a downstream name back to the source column that feeds
+    it (only for the files the rename is scoped to).
+    """
     needed = set(names)
     for kind, stage in reversed(stages):
         if kind == "compensation":
@@ -775,6 +810,11 @@ def _pipeline_dependencies(stages, names) -> set:
                         needed.add(sub["x"])
                     if sub.get("y"):
                         needed.add(sub["y"])
+        elif kind == "rename":
+            if not _rename_applies(stage, parquet_path):
+                continue
+            reverse = {v: k for k, v in stage["map"].items()}
+            needed = {reverse.get(n, n) for n in needed}
     needed.discard(None)
     return needed
 
@@ -887,6 +927,15 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                     1.0,
                 )
                 values[channel] = values[channel] * factor
+            continue
+        if kind == "rename":
+            if not _rename_applies(stage, parquet_path):
+                continue
+            for old, new in stage["map"].items():
+                if old in values and old != new:
+                    # On a name collision the renamed value wins (the user was
+                    # warned in the module and chose to proceed).
+                    values[new] = values.pop(old)
     return {name: values[name] for name in names if name in values}
 
 
@@ -1332,7 +1381,7 @@ class _GatingStatsWorker:
             needed |= _gate_needed_columns(g, by_id)
         if not needed:
             return (generation, {})
-        dependencies = _pipeline_dependencies(stages, needed)
+        dependencies = _pipeline_dependencies(stages, needed, parquet_path)
         base_needed = [c for c in dependencies if c in base_columns]
         cols = self._columns
         missing = set(base_needed) - set(cols)
@@ -2029,7 +2078,7 @@ class _IlluminationWorker:
         used_files = 0
         for path in files:
             needed = {x_name, y_name, channel}
-            dependencies = _pipeline_dependencies(stages, needed)
+            dependencies = _pipeline_dependencies(stages, needed, path)
             base = base_columns.get(path) or set()
             if not base:
                 try:
@@ -2185,7 +2234,7 @@ class _ImageFilterWorker:
         needed = set()
         for g in gates:
             needed |= _gate_needed_columns(g, by_id)
-        dependencies = _pipeline_dependencies(stages, needed)
+        dependencies = _pipeline_dependencies(stages, needed, parquet_path)
         base = [c for c in dependencies if c in base_columns]
         values = {}
         if base:
@@ -3596,6 +3645,8 @@ class MainWindow(QMainWindow):
                 or getattr(widget, "_fup_dirty", False)
                 or getattr(widget, "_subset_dirty", False)
                 or getattr(widget, "_subs_dirty", False)
+                or getattr(widget, "_rename_dirty", False)
+                or getattr(widget, "_dimred_dirty", False)
             ):
                 return True
         return False
@@ -3679,8 +3730,12 @@ class MainWindow(QMainWindow):
     def _ext_ready(self, ext_id: str) -> bool:
         """Whether an extension's environment, library and model are set up."""
         e = self._ext_entry(ext_id)
+        entry = _extension_def(ext_id)
+        needs_model = bool(entry and entry.get("model"))
         return bool(
-            e.get("python") and e.get("verified") and e.get("model_ready")
+            e.get("python")
+            and e.get("verified")
+            and (not needs_model or e.get("model_ready"))
         )
 
     def _ext_runner_path(self, ext_id: str) -> Path:
@@ -3835,15 +3890,19 @@ class MainWindow(QMainWindow):
             "Runs in a separate Python environment; Smage does not bundle "
             "TensorFlow / PyTorch."
         ))
-        self_note = QLabel(
+        note = (
             "You don't have to use the buttons below — you can install "
             "everything yourself in any Python environment, then set that "
             "environment's python.exe above. This only needs to be done once; "
-            "after it succeeds, it keeps working. If installation proves too "
-            "difficult, you can instead run the cell segmentation in other "
-            "software and import the resulting mask files with the Segmentation "
-            "module's Mask Input."
+            "after it succeeds, it keeps working."
         )
+        if entry.get("family") in ("cellpose", "stardist"):
+            note += (
+                " If installation proves too difficult, you can instead run "
+                "the cell segmentation in other software and import the "
+                "resulting mask files with the Segmentation module's Mask Input."
+            )
+        self_note = QLabel(note)
         self_note.setWordWrap(True)
         self_note.setStyleSheet("color: #6b7785;")
         lay.addWidget(self_note)
@@ -3910,7 +3969,8 @@ class MainWindow(QMainWindow):
         install_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         lay.addWidget(install_btn)
 
-        lay.addWidget(QLabel("<b>3. Install dependencies</b>"))
+        if entry.get("deps"):
+            lay.addWidget(QLabel("<b>3. Install dependencies</b>"))
         if entry.get("device") == "gpu":
             gpu_note = QLabel(
                 "The GPU build needs an NVIDIA GPU and a matching CUDA version "
@@ -3940,18 +4000,24 @@ class MainWindow(QMainWindow):
             cuda_combo.currentIndexChanged.connect(
                 lambda _=0: on_cuda_changed(cuda_combo.currentData())
             )
-        install_deps_btn = QPushButton("Install dependencies")
-        install_deps_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        install_deps_btn.setToolTip(
-            "Force-reinstall the framework packages ("
-            + ", ".join(entry.get("deps") or []) + ") even if already present"
-        )
-        lay.addWidget(install_deps_btn)
+        if entry.get("deps"):
+            install_deps_btn = QPushButton("Install dependencies")
+            install_deps_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            install_deps_btn.setToolTip(
+                "Force-reinstall the framework packages ("
+                + ", ".join(entry.get("deps") or []) + ") even if already present"
+            )
+            lay.addWidget(install_deps_btn)
+        else:
+            install_deps_btn = None
 
-        lay.addWidget(QLabel("<b>4. Download model</b>"))
-        model_btn = QPushButton("Download model")
-        model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        lay.addWidget(model_btn)
+        if entry.get("model"):
+            lay.addWidget(QLabel("<b>4. Download model</b>"))
+            model_btn = QPushButton("Download model")
+            model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            lay.addWidget(model_btn)
+        else:
+            model_btn = None
 
         progress = QProgressBar()
         progress.setRange(0, 0)  # indeterminate while a command is running
@@ -3981,7 +4047,8 @@ class MainWindow(QMainWindow):
                 browse_btn, detect_python_btn, install_python_btn, create_btn,
                 detect_btn, install_btn, install_deps_btn, model_btn,
             ):
-                b.setEnabled(not busy)
+                if b is not None:
+                    b.setEnabled(not busy)
 
         def current_python():
             p = python_combo.currentText().strip()
@@ -4098,9 +4165,11 @@ class MainWindow(QMainWindow):
                                 f"Detected NVIDIA driver CUDA {driver_cuda:g} → "
                                 f"using {picked}."
                             )
-            if index_url:
-                argv += ["--index-url", index_url]
-            argv += deps
+                if index_url:
+                    argv += ["--index-url", index_url]
+                argv += deps
+            else:
+                argv += deps
             log.appendPlainText(
                 f"Reinstalling {' '.join(deps)} into {python}…\n"
                 + (f"Using index: {index_url}\n" if index_url else "")
@@ -4326,8 +4395,10 @@ class MainWindow(QMainWindow):
         create_btn.clicked.connect(create_venv)
         detect_btn.clicked.connect(on_detect)
         install_btn.clicked.connect(on_install)
-        install_deps_btn.clicked.connect(on_install_deps)
-        model_btn.clicked.connect(on_download_model)
+        if install_deps_btn is not None:
+            install_deps_btn.clicked.connect(on_install_deps)
+        if model_btn is not None:
+            model_btn.clicked.connect(on_download_model)
         host._ext_poll_timer = poll_timer
         refresh_status()
 
@@ -4343,10 +4414,11 @@ class MainWindow(QMainWindow):
             parts.append("✗ Missing packages: " + ", ".join(missing))
         else:
             parts.append("Not checked yet — click 'Detect library'.")
-        if e.get("model_ready"):
-            parts.append(f"Model: {entry['model']} ready")
-        else:
-            parts.append("Model: not downloaded")
+        if entry.get("model"):
+            if e.get("model_ready"):
+                parts.append(f"Model: {entry['model']} ready")
+            else:
+                parts.append("Model: not downloaded")
         if entry.get("device") == "gpu" and "gpu_ok" in e:
             if e["gpu_ok"]:
                 parts.append("✓ GPU: CUDA available")
@@ -6079,11 +6151,29 @@ class MainWindow(QMainWindow):
                 return snap
         return task_def.get("params") or {}
 
+    def _rename_file_name(self, task_id, parquet_path, name):
+        """Apply upstream file-mode renames to a display name."""
+        if not task_id or not parquet_path:
+            return name
+        path = str(parquet_path)
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "rename":
+                continue
+            params = task.get("params") or {}
+            if params.get("mode", "file") != "file":
+                continue
+            new = (params.get("file") or {}).get("rename", {}).get(path)
+            if new:
+                name = new
+        return name
+
     def _available_files(self, task_id=None) -> list:
         """Data files visible to a module: imported files + upstream Feature outputs.
 
         Files hidden by an upstream Subset module are dropped here, so the
         filter reaches every downstream module through this one entry point.
+        Upstream file renames relabel the display name (the parquet path, the
+        file's identity, is unchanged).
         """
         files = list(self._imported_files())
         if task_id:
@@ -6097,6 +6187,17 @@ class MainWindow(QMainWindow):
                     rec for rec in files
                     if str(rec.get("parquet")) in allowed
                 ]
+            # Rename display names on copies — never mutate the stored records.
+            renamed_files = []
+            for rec in files:
+                new_name = self._rename_file_name(
+                    task_id, rec.get("parquet"), rec.get("name")
+                )
+                if new_name != rec.get("name"):
+                    rec = dict(rec)
+                    rec["name"] = new_name
+                renamed_files.append(rec)
+            files = renamed_files
         return files
 
     def _file_record(self, parquet_path):
@@ -6154,6 +6255,28 @@ class MainWindow(QMainWindow):
             allowed = columns if allowed is None else (allowed & columns)
         return allowed
 
+    def _column_rename_stages(self, task_id) -> list:
+        """Ordered column-rename stages above `task_id` (name transforms only)."""
+        if not task_id or self.project is None:
+            return []
+        out = []
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "rename":
+                continue
+            stage = _rename_stage(task.get("params") or {})
+            if stage is not None:
+                out.append(stage)
+        return out
+
+    def _rename_columns_forward(self, task_id, parquet_path, names) -> list:
+        """Map a list of column names through upstream renames (for UI names)."""
+        out = list(names)
+        for stage in self._column_rename_stages(task_id):
+            if not _rename_applies(stage, parquet_path):
+                continue
+            out = [stage["map"].get(n, n) for n in out]
+        return out
+
     def _columns_for(self, parquet_path, task_id=None) -> list:
         """Return the column names for a parquet file from the column index.
 
@@ -6185,11 +6308,16 @@ class MainWindow(QMainWindow):
             for name in self._feature_up_applied_columns(task_id, parquet_path):
                 if name not in columns:
                     columns.append(name)
+            for name in self._dimred_applied_columns(task_id, parquet_path):
+                if name not in columns:
+                    columns.append(name)
             # An upstream Subset module whitelists column names for everything
             # below it (empty selection = no filtering).
             allowed = self._subset_visible_columns(task_id)
             if allowed is not None:
                 columns = [c for c in columns if c in allowed]
+            # Upstream Rename modules relabel column names for downstream.
+            columns = self._rename_columns_forward(task_id, parquet_path, columns)
         return columns
 
     def _figure_record(self, file_path):
@@ -6412,6 +6540,13 @@ class MainWindow(QMainWindow):
                         "task_id": task.get("id"),
                         "submodules": submodules,
                     }))
+            elif task_type == "rename":
+                # Column-mode renames are a name transform that participates in
+                # the pipeline (file-mode renames are handled elsewhere, on the
+                # display names only).
+                stage = _rename_stage(params)
+                if stage is not None:
+                    stages.append(("rename", stage))
         return stages
 
     def _column_data(self, task_id, parquet_path, names, extra_stages=None,
@@ -6429,9 +6564,10 @@ class MainWindow(QMainWindow):
         stages = self._map_stages(task_id) if task_id else []
         feature_output = self._feature_output(parquet_path)
         if feature_output is not None:
-            # A Feature output was aggregated with the upstream transforms
-            # already applied; applying them again would corrupt the values.
-            stages = []
+            # A Feature output was aggregated with the upstream value transforms
+            # already applied; renames are a name change, not a value change, so
+            # they must still be applied on top.
+            stages = [(kind, stage) for kind, stage in stages if kind == "rename"]
         if extra_stages:
             stages = stages + list(extra_stages)
         if feature_output is not None:
@@ -6446,7 +6582,7 @@ class MainWindow(QMainWindow):
                 base = set(pq.ParquetFile(parquet_path).schema.names)
             except Exception:  # noqa: BLE001
                 base = set()
-        needed = _pipeline_dependencies(stages, names) if stages else set(names)
+        needed = _pipeline_dependencies(stages, names, parquet_path) if stages else set(names)
         base_cols = [c for c in needed if c in base]
         values = {}
         if base_cols:
@@ -6485,6 +6621,14 @@ class MainWindow(QMainWindow):
                     arr = self._feature_up_column_values(parquet_path, rec, name)
                     if arr is not None:
                         values[name] = arr
+            # Dimension Reduction columns from upstream Dimension Reduction modules.
+            for name, rec in self._dimred_applied_columns(
+                task_id, parquet_path
+            ).items():
+                if name in needed and name not in values:
+                    arr = self._dimred_column_values(parquet_path, rec, name)
+                    if arr is not None:
+                        values[name] = arr
         if row_filter and task_id:
             # Keep only the rows an upstream Subsample module lets through.
             # Every array here is row-aligned to the source file, so one index
@@ -6499,7 +6643,7 @@ class MainWindow(QMainWindow):
         if not stages:
             return {n: values[n] for n in names if n in values}
         evaluated = _evaluate_stages(
-            stages, values, needed, parquet_path=parquet_path,
+            stages, values, names, parquet_path=parquet_path,
             cache=self._stage_cache,
         )
         return {n: evaluated[n] for n in names if n in evaluated}
@@ -7175,7 +7319,7 @@ class MainWindow(QMainWindow):
         import pyarrow.parquet as pq
         color_cols = manifest.get("color_cols", [])
         if stages is not None:
-            needed = _pipeline_dependencies(stages, [channel])
+            needed = _pipeline_dependencies(stages, [channel], parquet_path)
             wanted = [c for c in needed if c not in ("x", "y")]
         else:
             needed = {channel}
@@ -7257,7 +7401,7 @@ class MainWindow(QMainWindow):
         if not color_cols:
             return None, None, None
         if stages is not None:
-            needed = _pipeline_dependencies(stages, [channel])
+            needed = _pipeline_dependencies(stages, [channel], parquet_path)
             if not all(c in color_cols for c in needed):
                 # Not all inputs are indexed; fall back to raw pixels.
                 return self._image_raster_raw(
@@ -7560,6 +7704,8 @@ class MainWindow(QMainWindow):
         g2c_cols = self._gate2col_applied_columns(task_id, parquet_path) if task_id else {}
         # Feature Up mapped columns likewise come from their own image parquet.
         fup_cols = self._feature_up_applied_columns(task_id, parquet_path) if task_id else {}
+        # Dimension Reduction columns likewise come from their own image parquet.
+        dimred_cols = self._dimred_applied_columns(task_id, parquet_path) if task_id else {}
         for layer in layers:
             if layer.get("visible") is False:
                 continue
@@ -7596,6 +7742,19 @@ class MainWindow(QMainWindow):
             elif channel in fup_cols:
                 rec = fup_cols[channel]
                 chan, rect = self._feature_up_raster(rec, (x0, x1, y0, y1), spacing)
+                if chan is None:
+                    unavailable.append(channel)
+                    continue
+                lo = float(np.nanmin(chan)) if chan.size else 0.0
+                hi = float(np.nanmax(chan)) if chan.size else 1.0
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    lo, hi = 0.0, 1.0
+                frac = None
+                raster_stages = None
+                cname = None
+            elif channel in dimred_cols:
+                rec = dimred_cols[channel]
+                chan, rect = self._dimred_raster(rec, (x0, x1, y0, y1), spacing)
                 if chan is None:
                     unavailable.append(channel)
                     continue
@@ -10058,6 +10217,8 @@ class MainWindow(QMainWindow):
             self._subset_refresh(page)
         elif task_type == "subsample":
             self._subs_refresh(page)
+        elif task_type == "rename":
+            self._rename_refresh(page)
         # Other module types have no live visualization to refresh yet.
     # ----- unmix module (map) -----------------------------------------
     def _build_unmix_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
@@ -12180,11 +12341,12 @@ class MainWindow(QMainWindow):
         return panel
 
     # --- compensation helpers
-    def _comp_file_name(self, path) -> str:
+    def _comp_file_name(self, path, task_id=None) -> str:
         rec = self._file_record(path)
-        if rec is not None:
-            return rec.get("name", "")
-        return Path(str(path)).name
+        name = rec.get("name", "") if rec is not None else Path(str(path)).name
+        if task_id:
+            name = self._rename_file_name(task_id, path, name)
+        return name
 
     def _comp_columns_for(self, page, path) -> list:
         return self._columns_for(path, page._comp_task_id)
@@ -12202,7 +12364,7 @@ class MainWindow(QMainWindow):
         files_list.blockSignals(True)
         files_list.clear()
         for path in page._comp_files:
-            item = QListWidgetItem(self._comp_file_name(path))
+            item = QListWidgetItem(self._comp_file_name(path, page._comp_task_id))
             item.setData(Qt.ItemDataRole.UserRole, path)
             files_list.addItem(item)
         files_list.blockSignals(False)
@@ -12329,7 +12491,7 @@ class MainWindow(QMainWindow):
             return
         records = self._available_files(page._comp_task_id)
         names = [rec.get("name", "") for rec in records]
-        current = [self._comp_file_name(path) for path in page._comp_files]
+        current = [self._comp_file_name(path, page._comp_task_id) for path in page._comp_files]
         chosen = self._pick_items_dialog(
             "Select files", names, current, "Filter files..."
         )
@@ -12345,7 +12507,7 @@ class MainWindow(QMainWindow):
             columns = set(self._comp_columns_for(page, path))
             missing = [name for name in page._comp_names if name not in columns]
             if missing:
-                problems.append((self._comp_file_name(path), missing))
+                problems.append((self._comp_file_name(path, page._comp_task_id), missing))
         if problems:
             self._comp_show_missing(problems)
             return
@@ -12370,7 +12532,7 @@ class MainWindow(QMainWindow):
             columns = set(self._comp_columns_for(page, path))
             missing = [name for name in added if name not in columns]
             if missing:
-                problems.append((self._comp_file_name(path), missing))
+                problems.append((self._comp_file_name(path, page._comp_task_id), missing))
         if problems:
             self._comp_show_missing(problems)
             return
@@ -12949,7 +13111,7 @@ class MainWindow(QMainWindow):
             "QListWidget { background: #ffffff; border: none; }"
         )
         for path in sub.get("files") or []:
-            files_list.addItem(QListWidgetItem(self._comp_file_name(path)))
+            files_list.addItem(QListWidgetItem(self._comp_file_name(path, page._illum_task_id)))
         page._illum_files_list = files_list
         files_lay.addWidget(files_list, 1)
 
@@ -12962,7 +13124,7 @@ class MainWindow(QMainWindow):
                 return
             files = sub.get("files") or []
             missing = [
-                self._comp_file_name(path) for path in files
+                self._comp_file_name(path, page._illum_task_id) for path in files
                 if new_channel and new_channel not in set(
                     self._columns_for(path, page._illum_task_id)
                 )
@@ -13014,7 +13176,7 @@ class MainWindow(QMainWindow):
         records = self._available_files(page._illum_task_id)
         names = [rec.get("name", "") for rec in records]
         current = [
-            self._comp_file_name(path) for path in (sub.get("files") or [])
+            self._comp_file_name(path, page._illum_task_id) for path in (sub.get("files") or [])
         ]
         chosen = self._pick_items_dialog(
             "Select files", names, current, "Filter files..."
@@ -13030,7 +13192,7 @@ class MainWindow(QMainWindow):
         for path in paths:
             columns = set(self._columns_for(path, page._illum_task_id))
             if channel not in columns:
-                problems.append((self._comp_file_name(path), [channel]))
+                problems.append((self._comp_file_name(path, page._illum_task_id), [channel]))
         if problems:
             self._comp_show_missing(problems)
             return
@@ -13106,7 +13268,7 @@ class MainWindow(QMainWindow):
         files = sub.get("files") or []
         calc_list.blockSignals(True)
         for path in files:
-            item = QListWidgetItem(self._comp_file_name(path))
+            item = QListWidgetItem(self._comp_file_name(path, page._illum_task_id))
             item.setData(Qt.ItemDataRole.UserRole, path)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
@@ -13347,7 +13509,7 @@ class MainWindow(QMainWindow):
         file_combo = _NoWheelComboBox()
         files = sub.get("files") or []
         for path in files:
-            file_combo.addItem(self._comp_file_name(path), path)
+            file_combo.addItem(self._comp_file_name(path, page._illum_task_id), path)
         idx = file_combo.findData(plot_dict.get("file"))
         file_combo.setCurrentIndex(idx if idx >= 0 else 0)
         file_combo.setEnabled(enabled)
@@ -13993,6 +14155,120 @@ class MainWindow(QMainWindow):
         )
         return crop, rect
 
+    # ----- Dimension Reduction outputs (2 embedded columns) --------------
+    def _dimred_signature(self, params, parquet_path, task_id=None) -> str:
+        """Change signature for one file's dimensionality-reduction output."""
+        try:
+            st = Path(parquet_path).stat()
+            stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+        except OSError:
+            stat = ""
+        payload = {
+            "method": params.get("method"),
+            "normalize": params.get("normalize"),
+            "pca": params.get("pca"),
+            "parallel": params.get("parallel"),
+            "tsne_backend": params.get("tsne_backend"),
+            "columns": params.get("columns") or [],
+            "names": params.get("names") or [],
+            "umap": params.get("umap") or {},
+            "tsne": params.get("tsne") or {},
+            "source": str(parquet_path),
+            "stat": stat,
+        }
+        sample = self._subsample_sig(task_id, parquet_path)
+        if sample:
+            payload["sample"] = sample
+        payload = json.dumps(payload, sort_keys=True)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _dimred_params_for(self, task_def) -> dict:
+        """Saved params of a Dimension Reduction task (its live snapshot)."""
+        task_id = task_def.get("id")
+        reg = self._module_registry.get(task_id)
+        if reg is not None and reg.get("task_type") == "dimred":
+            snap = getattr(reg["page"], "_dimred_snapshot", None)
+            if isinstance(snap, dict):
+                return snap
+        return task_def.get("params") or {}
+
+    def _dimred_applied_columns(self, task_id, parquet_path) -> dict:
+        """{column_name: record} exposed by upstream Dimension Reduction modules."""
+        if not task_id or not parquet_path or self.project is None:
+            return {}
+        out = {}
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "dimred":
+                continue
+            params = self._dimred_params_for(task)
+            rec = (params.get("outputs") or {}).get(parquet_path)
+            if not isinstance(rec, dict) or not rec.get("path"):
+                continue
+            if rec.get("signature") != self._dimred_signature(
+                params, parquet_path, task.get("id")
+            ):
+                continue
+            path = self.project.path / rec["path"]
+            if not path.is_file():
+                continue
+            for name in rec.get("columns") or []:
+                out.setdefault(name, {
+                    "parquet": str(path),
+                    "channel": name,
+                    "kind": rec.get("kind", "table"),
+                })
+        return out
+
+    def _dimred_column_values(self, parquet_path, rec, name):
+        """Row-aligned float64 values of one Dimension Reduction column."""
+        import numpy as np
+        import pandas as pd
+
+        if not isinstance(rec, dict) or not rec.get("parquet"):
+            return None
+        dparquet = rec["parquet"]
+        if rec.get("kind") == "image":
+            man = self._image_load_manifest(dparquet)
+            if man is None:
+                return None
+            try:
+                src = pd.read_parquet(parquet_path, columns=["x", "y"])
+                ddf = pd.read_parquet(dparquet, columns=["x", "y", name])
+            except Exception:  # noqa: BLE001
+                return None
+            xmin = float(man["xmin"])
+            ymin = float(man["ymin"])
+            width = int(round(float(man["xmax"]) - xmin)) + 1
+            height = int(round(float(man["ymax"]) - ymin)) + 1
+            dxi = np.rint(ddf["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            dyi = np.rint(ddf["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            grid = np.full((height, width), np.nan, dtype="float64")
+            dok = (dxi >= 0) & (dxi < width) & (dyi >= 0) & (dyi < height)
+            grid[dyi[dok], dxi[dok]] = ddf[name].to_numpy(dtype="float64")[dok]
+            sxi = np.rint(src["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            syi = np.rint(src["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            sok = (sxi >= 0) & (sxi < width) & (syi >= 0) & (syi < height)
+            out = np.full(len(src), np.nan, dtype="float64")
+            out[sok] = grid[syi[sok], sxi[sok]]
+            return out
+        try:
+            df = pd.read_parquet(dparquet, columns=[name])
+        except Exception:  # noqa: BLE001
+            return None
+        return df[name].to_numpy(dtype="float64")
+
+    def _dimred_raster(self, rec, bbox, spacing):
+        """Return (scalar_2d, data_rect) for a Dimension Reduction channel."""
+        if not isinstance(rec, dict) or not rec.get("parquet"):
+            return None, None
+        ent = self._ensure_image_index(rec["parquet"])
+        if ent is None or ent.get("manifest") is None:
+            return None, None
+        crop, rect, _frac = self._image_raster(
+            rec["parquet"], ent["manifest"], bbox, spacing, rec.get("channel"), None, None
+        )
+        return crop, rect
+
     def _seg_load_mask(self, mask_path):
         """Load a mask's full 2-D label grid (cached by path + signature)."""
         import numpy as np
@@ -14396,7 +14672,7 @@ class MainWindow(QMainWindow):
         expose = page._seg_params.get("expose") or {}
         editable = not page._seg_locked
         for i, path in enumerate(rows):
-            name_item = QTableWidgetItem(self._comp_file_name(path))
+            name_item = QTableWidgetItem(self._comp_file_name(path, page._seg_task_id))
             name_item.setData(Qt.ItemDataRole.UserRole, path)
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             table.setItem(i, 0, name_item)
@@ -14487,7 +14763,7 @@ class MainWindow(QMainWindow):
     def _seg_set_files(self, page) -> None:
         records = self._available_files(page._seg_task_id)
         names = [rec.get("name", "") for rec in records]
-        current = [self._comp_file_name(p) for p in self._seg_file_rows(page)]
+        current = [self._comp_file_name(p, page._seg_task_id) for p in self._seg_file_rows(page)]
         chosen = self._pick_items_dialog(
             "Select data files", names, current, "Filter files..."
         )
@@ -14752,7 +15028,7 @@ class MainWindow(QMainWindow):
         )
         files_list.setMaximumHeight(110)
         for path in self._seg_file_rows(page):
-            item = QListWidgetItem(self._comp_file_name(path))
+            item = QListWidgetItem(self._comp_file_name(path, page._seg_task_id))
             item.setData(Qt.ItemDataRole.UserRole, path)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             has_mask = (
@@ -14947,7 +15223,7 @@ class MainWindow(QMainWindow):
         table.setRowCount(len(rows))
         enabled = not page._seg_locked
         for i, path in enumerate(rows):
-            name_item = QTableWidgetItem(self._comp_file_name(path))
+            name_item = QTableWidgetItem(self._comp_file_name(path, page._seg_task_id))
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             table.setItem(i, 0, name_item)
 
@@ -15057,7 +15333,7 @@ class MainWindow(QMainWindow):
             ent = self._ensure_image_index(parquet_path)
             if ent is None or ent.get("manifest") is None:
                 rec["state"] = SEG_IMPORT_UNKNOWN
-                errors.append(f"{self._comp_file_name(parquet_path)}: no image index")
+                errors.append(f"{self._comp_file_name(parquet_path, page._seg_task_id)}: no image index")
                 continue
             man = ent["manifest"]
             height = int(round(man["ymax"] - man["ymin"])) + 1
@@ -15186,17 +15462,17 @@ class MainWindow(QMainWindow):
                 if status is not None:
                     status.setText(
                         f"Calculating {i + 1}/{len(rows)}: "
-                        f"{self._comp_file_name(parquet_path)}…"
+                        f"{self._comp_file_name(parquet_path, page._seg_task_id)}…"
                     )
                     QApplication.processEvents()
                 mask, err = self._seg_nuclear_expansion(parquet_path, params)
                 if mask is None:
-                    errors.append(f"{self._comp_file_name(parquet_path)}: {err}")
+                    errors.append(f"{self._comp_file_name(parquet_path, page._seg_task_id)}: {err}")
                     continue
                 try:
                     rel = self._seg_write_mask(page._seg_task_id, parquet_path, mask)
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{self._comp_file_name(parquet_path)}: {exc}")
+                    errors.append(f"{self._comp_file_name(parquet_path, page._seg_task_id)}: {exc}")
                     continue
                 rec = self._seg_mask_record_live(page, parquet_path, create=True)
                 rec["path"] = rel
@@ -15287,7 +15563,7 @@ class MainWindow(QMainWindow):
         self._seg_log(page, f"Rasterizing {len(rows)} file(s)…")
         for i, parquet_path in enumerate(rows):
             self._seg_log(
-                page, f"  rasterizing {self._comp_file_name(parquet_path)}…"
+                page, f"  rasterizing {self._comp_file_name(parquet_path, page._seg_task_id)}…"
             )
             if cyto:
                 stack, err = self._seg_raster_stack(parquet_path, [cyto, nucleus])
@@ -15464,17 +15740,17 @@ class MainWindow(QMainWindow):
                         rec["state"] = SEG_IMPORT_DONE
                         cells += int(arr.max())
                         report.append(
-                            f"{self._comp_file_name(parquet_path)}: "
+                            f"{self._comp_file_name(parquet_path, page._seg_task_id)}: "
                             f"{n_cells} cells, {seconds:.1f}s"
                         )
                         self._seg_log(
                             page,
-                            f"✓ {self._comp_file_name(parquet_path)}: "
+                            f"✓ {self._comp_file_name(parquet_path, page._seg_task_id)}: "
                             f"{n_cells} cells, {seconds:.1f}s",
                         )
                     except Exception as exc:  # noqa: BLE001
-                        errors.append(f"{self._comp_file_name(parquet_path)}: {exc}")
-                        self._seg_log(page, f"✗ {self._comp_file_name(parquet_path)}: {exc}")
+                        errors.append(f"{self._comp_file_name(parquet_path, page._seg_task_id)}: {exc}")
+                        self._seg_log(page, f"✗ {self._comp_file_name(parquet_path, page._seg_task_id)}: {exc}")
                     done.add(out_path)
                 else:
                     # Non-progress output (e.g. TensorFlow/model loading lines):
@@ -15495,12 +15771,12 @@ class MainWindow(QMainWindow):
                     continue
                 if code != 0:
                     errors.append(
-                        f"{self._comp_file_name(job['parquet'])}: "
+                        f"{self._comp_file_name(job['parquet'], page._seg_task_id)}: "
                         f"{text.strip()[-200:]}"
                     )
                 else:
                     errors.append(
-                        f"{self._comp_file_name(job['parquet'])}: no output produced"
+                        f"{self._comp_file_name(job['parquet'], page._seg_task_id)}: no output produced"
                     )
                 done.add(job["output"])
             if text and code != 0:
@@ -15789,7 +16065,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(QLabel("File"))
         file_combo = _NoWheelComboBox()
         for path in rows:
-            file_combo.addItem(self._comp_file_name(path), path)
+            file_combo.addItem(self._comp_file_name(path, page._seg_task_id), path)
         idx = file_combo.findData(plot_dict.get("file"))
         if idx >= 0:
             file_combo.setCurrentIndex(idx)
@@ -16212,7 +16488,7 @@ class MainWindow(QMainWindow):
         ]
         names = [rec.get("name", "") for rec in candidates]
         by_name = {rec.get("name", ""): rec.get("parquet") for rec in candidates}
-        current = [self._comp_file_name(p) for p in page._feat_params.get("files") or []]
+        current = [self._comp_file_name(p, page._feat_task_id) for p in page._feat_params.get("files") or []]
         chosen = self._pick_items_dialog(
             "Select data files", names, current, "Filter files..."
         )
@@ -16250,7 +16526,7 @@ class MainWindow(QMainWindow):
             table.blockSignals(True)
             table.setRowCount(len(files))
             for i, path in enumerate(files):
-                name_item = QTableWidgetItem(self._comp_file_name(path))
+                name_item = QTableWidgetItem(self._comp_file_name(path, page._feat_task_id))
                 name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 table.setItem(i, 0, name_item)
                 status = self._feat_file_status(page, path)
@@ -16631,7 +16907,7 @@ class MainWindow(QMainWindow):
             Path(existing["path"]).stem
             if isinstance(existing, dict) and existing.get("path") else None
         )
-        display = self._comp_file_name(parquet_path) or Path(str(parquet_path)).name
+        display = self._comp_file_name(parquet_path, page._feat_task_id) or Path(str(parquet_path)).name
         base = _feature_safe_stem(f"{Path(display).stem}_{feature}")
         if old_stem == base:
             return base
@@ -16692,7 +16968,7 @@ class MainWindow(QMainWindow):
                 if getattr(page, "_feat_cancel", False):
                     self._feat_log(page, "Calculation cancelled.")
                     break
-                name = self._comp_file_name(path)
+                name = self._comp_file_name(path, page._feat_task_id)
                 if status is not None:
                     status.setText(f"Calculating… {name}")
                 QApplication.processEvents()
@@ -16784,7 +17060,7 @@ class MainWindow(QMainWindow):
         warnings = []
         if dropped:
             warnings.append(
-                f"{self._comp_file_name(parquet_path)}: skipped {dropped} row(s) "
+                f"{self._comp_file_name(parquet_path, page._feat_task_id)}: skipped {dropped} row(s) "
                 f"with an empty '{feature}' value"
             )
         if df.empty:
@@ -17038,7 +17314,7 @@ class MainWindow(QMainWindow):
         records = self._available_files(page._g2c_task_id)
         names = [rec.get("name", "") for rec in records]
         by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
-        current = [self._comp_file_name(p) for p in page._g2c_params.get("files") or []]
+        current = [self._comp_file_name(p, page._g2c_task_id) for p in page._g2c_params.get("files") or []]
         chosen = self._pick_items_dialog(
             "Select data files", names, current, "Filter files..."
         )
@@ -17097,7 +17373,7 @@ class MainWindow(QMainWindow):
             table.blockSignals(True)
             table.setRowCount(len(files))
             for i, path in enumerate(files):
-                item = QTableWidgetItem(self._comp_file_name(path))
+                item = QTableWidgetItem(self._comp_file_name(path, page._g2c_task_id))
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 table.setItem(i, 0, item)
                 status = self._g2c_file_status(page, path)
@@ -17370,7 +17646,7 @@ class MainWindow(QMainWindow):
                 if getattr(page, "_g2c_cancel", False):
                     self._g2c_log(page, "Conversion cancelled.")
                     break
-                name = self._comp_file_name(path)
+                name = self._comp_file_name(path, page._g2c_task_id)
                 if status is not None:
                     status.setText(f"Converting… {name}")
                 QApplication.processEvents()
@@ -17806,13 +18082,13 @@ class MainWindow(QMainWindow):
             from_box.blockSignals(True)
             from_box.clear()
             for p in params.get("from_files") or []:
-                from_box.addItem(self._comp_file_name(p))
+                from_box.addItem(self._comp_file_name(p, page._fup_task_id))
             from_box.blockSignals(False)
         if to_box is not None:
             to_box.blockSignals(True)
             to_box.clear()
             for p in params.get("to_files") or []:
-                to_box.addItem(self._comp_file_name(p))
+                to_box.addItem(self._comp_file_name(p, page._fup_task_id))
             to_box.blockSignals(False)
         self._fup_refresh_key_combos(page)
         self._fup_rebuild_matches(page)
@@ -17862,7 +18138,7 @@ class MainWindow(QMainWindow):
         names = [rec.get("name", "") for rec in records]
         by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
         key = "from_files" if which == "from" else "to_files"
-        current = [self._comp_file_name(p) for p in page._fup_params.get(key) or []]
+        current = [self._comp_file_name(p, page._fup_task_id) for p in page._fup_params.get(key) or []]
         title = "Select From files" if which == "from" else "Select To files"
         chosen = self._pick_items_dialog(title, names, current, "Filter files...")
         if chosen is None:
@@ -18074,14 +18350,14 @@ class MainWindow(QMainWindow):
         table.setRowCount(0)
         table.setRowCount(len(from_files))
         for i, from_path in enumerate(from_files):
-            item = QTableWidgetItem(self._comp_file_name(from_path))
+            item = QTableWidgetItem(self._comp_file_name(from_path, page._fup_task_id))
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             table.setItem(i, 0, item)
 
             combo = _NoWheelComboBox()
             combo.addItem("", None)
             for to_path in to_files:
-                combo.addItem(self._comp_file_name(to_path), to_path)
+                combo.addItem(self._comp_file_name(to_path, page._fup_task_id), to_path)
             cur = (params.get("matches") or {}).get(from_path)
             idx = combo.findData(cur)
             combo.setCurrentIndex(max(0, idx))
@@ -18143,7 +18419,7 @@ class MainWindow(QMainWindow):
         from_files = params.get("from_files") or []
         unmatched = [f for f in from_files if not matches.get(f)]
         if unmatched:
-            names = ", ".join(self._comp_file_name(f) for f in unmatched)
+            names = ", ".join(self._comp_file_name(f, page._fup_task_id) for f in unmatched)
             reply = QMessageBox.question(
                 self, "Calculate",
                 f"{len(unmatched)} From file(s) have no matched To file and "
@@ -18179,7 +18455,7 @@ class MainWindow(QMainWindow):
                 if getattr(page, "_fup_cancel", False):
                     self._fup_log(page, "Calculation cancelled.")
                     break
-                name = self._comp_file_name(to_path)
+                name = self._comp_file_name(to_path, page._fup_task_id)
                 if status is not None:
                     status.setText(f"Calculating… {name}")
                 QApplication.processEvents()
@@ -18260,7 +18536,7 @@ class MainWindow(QMainWindow):
         if dup:
             self._fup_log(
                 page,
-                f"{self._comp_file_name(from_path)}: {dup} duplicate key value(s) "
+                f"{self._comp_file_name(from_path, page._fup_task_id)}: {dup} duplicate key value(s) "
                 f"— kept the first row.",
             )
         lf = lf.drop_duplicates(subset="__fup_key", keep="first")
@@ -18518,7 +18794,7 @@ class MainWindow(QMainWindow):
         records = self._available_files(page._subset_task_id)
         names = [rec.get("name", "") for rec in records]
         by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
-        current = [self._comp_file_name(p) for p in page._subset_draft_files]
+        current = [self._comp_file_name(p, page._subset_task_id) for p in page._subset_draft_files]
         chosen = self._pick_items_dialog(
             "Select data files", names, current, "Filter files..."
         )
@@ -18558,7 +18834,7 @@ class MainWindow(QMainWindow):
         if files_box is not None:
             files_box.clear()
             for path in files:
-                files_box.addItem(self._comp_file_name(path))
+                files_box.addItem(self._comp_file_name(path, page._subset_task_id))
         if cols_box is not None:
             cols_box.clear()
             for name in columns:
@@ -19169,7 +19445,7 @@ class MainWindow(QMainWindow):
         records = self._available_files(page._subs_task_id)
         names = [rec.get("name", "") for rec in records]
         by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
-        current = [self._comp_file_name(p) for p in page._subs_params.get("files") or []]
+        current = [self._comp_file_name(p, page._subs_task_id) for p in page._subs_params.get("files") or []]
         chosen = self._pick_items_dialog(
             "Select data files", names, current, "Filter files..."
         )
@@ -19345,13 +19621,13 @@ class MainWindow(QMainWindow):
 
             page._subs_files_box.clear()
             for path in files:
-                page._subs_files_box.addItem(self._comp_file_name(path))
+                page._subs_files_box.addItem(self._comp_file_name(path, page._subs_task_id))
 
             table = page._subs_table
             table.blockSignals(True)
             table.setRowCount(len(files))
             for i, path in enumerate(files):
-                name_item = QTableWidgetItem(self._comp_file_name(path))
+                name_item = QTableWidgetItem(self._comp_file_name(path, page._subs_task_id))
                 name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 table.setItem(i, 0, name_item)
                 orig_item = QTableWidgetItem(str(sizes.get(path, 0)))
@@ -19422,6 +19698,1649 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
             page._subs_task_def["params"] = page._subs_snapshot
+        self._close_module_page(page)
+
+    # ----- rename module (map; name transforms) --------------------------
+    def _build_rename_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Rename page: mode toggle | file/column rename table."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._rename_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("mode", "file")
+        params.setdefault("file", {"files": [], "rows": [], "rename": {}})
+        params.setdefault("column", {"files": [], "rows": [], "rename": {}})
+        page._rename_task_def = task_def
+        page._rename_task_id = task_def.get("id")
+        page._rename_params = params
+        page._rename_locked = locked
+        page._rename_save_btn = save_btn
+        page._rename_dirty = False
+        save_btn.clicked.connect(lambda _=False: self._rename_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(8)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("<b>Rename</b>"))
+        mode = _NoWheelComboBox()
+        mode.addItem("Data files", "file")
+        mode.addItem("Variables", "column")
+        mode.setEnabled(not locked)
+        mode_row.addWidget(mode)
+        mode_row.addStretch()
+        row.addLayout(mode_row)
+        page._rename_mode = mode
+
+        stack = QStackedWidget()
+        stack.addWidget(self._rename_file_panel(page))
+        stack.addWidget(self._rename_column_panel(page))
+        row.addWidget(stack, 1)
+        page._rename_stack = stack
+        layout.addWidget(content, 1)
+
+        mode.currentIndexChanged.connect(lambda _=0: self._rename_on_mode(page))
+        self._rename_refresh(page)
+        return page
+
+    def _rename_file_panel(self, page) -> QWidget:
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        top = QHBoxLayout()
+        sel = QPushButton("Select files…")
+        sel.setCursor(Qt.CursorShape.PointingHandCursor)
+        sel.clicked.connect(lambda _=False: self._rename_select_files(page))
+        top.addWidget(sel)
+        top.addStretch()
+        lay.addLayout(top)
+        hint = QLabel(
+            "Rename the display name of selected files. The internal file "
+            "identity is unchanged; only downstream modules see the new name."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        lay.addWidget(self._rename_table(page, "file"), 1)
+        lay.addLayout(self._rename_copy_paste(page))
+        return panel
+
+    def _rename_column_panel(self, page) -> QWidget:
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left = self._build_panel_frame()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(10, 10, 10, 10)
+        ll.setSpacing(6)
+        ll.addWidget(QLabel("<b>Data files</b>"))
+        hint_files = QLabel(
+            "Renaming applies only to the selected files; the same variable in "
+            "an unselected file keeps its old name."
+        )
+        hint_files.setWordWrap(True)
+        hint_files.setStyleSheet("color: #6b7785;")
+        ll.addWidget(hint_files)
+        files_btn = QPushButton("Select files…")
+        files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        files_btn.clicked.connect(lambda _=False: self._rename_select_files(page))
+        ll.addWidget(files_btn)
+        files_box = QListWidget()
+        files_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        ll.addWidget(files_box, 1)
+        page._rename_column_files_box = files_box
+
+        right = self._build_panel_frame()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(10, 10, 10, 10)
+        rl.setSpacing(6)
+        rl.addWidget(QLabel("<b>Variables</b>"))
+        hint_vars = QLabel(
+            "Variables shared by the selected files (their union)."
+        )
+        hint_vars.setWordWrap(True)
+        hint_vars.setStyleSheet("color: #6b7785;")
+        rl.addWidget(hint_vars)
+        vars_btn = QPushButton("Select variables…")
+        vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vars_btn.clicked.connect(lambda _=False: self._rename_select_vars(page))
+        rl.addWidget(vars_btn)
+        vars_box = QListWidget()
+        vars_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        rl.addWidget(vars_box, 1)
+        page._rename_column_vars_box = vars_box
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        lay.addWidget(splitter, 3)
+        lay.addWidget(self._rename_table(page, "column"), 4)
+        lay.addLayout(self._rename_copy_paste(page))
+        return panel
+
+    def _rename_table(self, page, mode) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["original name", "new name", ""])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(30)
+        table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+        lay.addWidget(table, 1)
+        attr = "_rename_file_table" if mode == "file" else "_rename_column_table"
+        setattr(page, attr, table)
+        table.itemChanged.connect(
+            lambda item, m=mode: self._rename_on_cell(page, item, m)
+        )
+        return panel
+
+    def _rename_copy_paste(self, page) -> QHBoxLayout:
+        btns = QHBoxLayout()
+        copy_btn = QPushButton("Copy")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        paste_btn = QPushButton("Paste")
+        paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.clicked.connect(lambda _=False: self._rename_copy(page))
+        paste_btn.clicked.connect(lambda _=False: self._rename_paste(page))
+        btns.addWidget(copy_btn)
+        btns.addWidget(paste_btn)
+        btns.addStretch()
+        return btns
+
+    def _rename_on_mode(self, page) -> None:
+        if getattr(page, "_rename_updating", False):
+            return
+        mode = page._rename_mode.currentData() or "file"
+        if mode != page._rename_params.get("mode"):
+            page._rename_params["mode"] = mode
+            self._rename_mark_dirty(page)
+        page._rename_stack.setCurrentIndex(0 if mode == "file" else 1)
+        self._rename_refresh(page)
+
+    def _rename_cfg(self, page, mode=None):
+        params = page._rename_params
+        mode = mode or params.get("mode", "file")
+        return params.setdefault(mode, {"files": [], "rows": [], "rename": {}})
+
+    def _rename_select_files(self, page) -> None:
+        records = self._available_files(page._rename_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        mode = page._rename_params.get("mode", "file")
+        cfg = self._rename_cfg(page, mode)
+        current = [
+            self._comp_file_name(p, page._rename_task_id) for p in cfg.get("files") or []
+        ]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        paths = [by_name[n] for n in chosen if n in by_name]
+        cfg["files"] = paths
+        if mode == "file":
+            # File mode: the table is one row per selected file.
+            existing = {r["original"]: r for r in cfg.get("rows") or []}
+            rows = []
+            for path in paths:
+                if path in existing:
+                    rows.append(existing[path])
+                else:
+                    rows.append({
+                        "original": path,
+                        "new": self._comp_file_name(path, page._rename_task_id),
+                    })
+            cfg["rows"] = rows
+        else:
+            # Column mode: files only set the scope; the variable rows are
+            # picked separately. Drop rows whose column is no longer offered.
+            union = set(self._rename_column_union(page))
+            cfg["rows"] = [
+                r for r in (cfg.get("rows") or [])
+                if r.get("original") in union
+            ]
+        self._rename_refresh(page)
+        self._rename_mark_dirty(page)
+
+    def _rename_column_union(self, page) -> list:
+        cfg = self._rename_cfg(page, "column")
+        paths = list(cfg.get("files") or [])
+        columns = []
+        for path in paths:
+            for name in self._columns_for(path, page._rename_task_id):
+                if name not in columns:
+                    columns.append(name)
+        return columns
+
+    def _rename_select_vars(self, page) -> None:
+        options = self._rename_column_union(page)
+        if not options:
+            QMessageBox.information(
+                self, "Select variables", "Select data files first."
+            )
+            return
+        cfg = self._rename_cfg(page, "column")
+        existing = [r["original"] for r in cfg.get("rows") or []]
+        chosen = self._pick_items_dialog(
+            "Select variables", options, existing, "Filter variables..."
+        )
+        if chosen is None:
+            return
+        kept = {r["original"]: r for r in cfg.get("rows") or []}
+        rows = []
+        for name in chosen:
+            if name in kept:
+                rows.append(kept[name])
+            else:
+                rows.append({"original": name, "new": name})
+        cfg["rows"] = rows
+        self._rename_refresh(page)
+        self._rename_mark_dirty(page)
+
+    def _rename_file_status(self, page, path, new_name, taken) -> tuple:
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return "Empty name", "error"
+        if any(c in '\\/:*?"<>|' for c in new_name):
+            return "Invalid characters", "error"
+        if new_name in taken:
+            return "Duplicate name", "error"
+        return "", "ok"
+
+    def _rename_column_status(self, page, old, new_name, existing) -> tuple:
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return "Empty name", "error"
+        if any(c in '\\/:*?"<>|' for c in new_name):
+            return "Invalid characters", "error"
+        others = {c for c in existing if c != old}
+        if new_name in others:
+            return "Duplicate name", "warning"
+        return "", "ok"
+
+    def _rename_refresh(self, page) -> None:
+        page._rename_updating = True
+        try:
+            mode = page._rename_params.get("mode", "file")
+            page._rename_mode.blockSignals(True)
+            page._rename_mode.setCurrentIndex(
+                max(0, page._rename_mode.findData(mode))
+            )
+            page._rename_mode.blockSignals(False)
+            page._rename_stack.setCurrentIndex(0 if mode == "file" else 1)
+            if mode == "file":
+                self._rename_refresh_file(page)
+            else:
+                self._rename_refresh_column(page)
+        finally:
+            page._rename_updating = False
+        self._rename_update_save_btn(page)
+
+    def _rename_refresh_file(self, page) -> None:
+        cfg = self._rename_cfg(page, "file")
+        rows = cfg.get("rows") or []
+
+        table = page._rename_file_table
+        table.blockSignals(True)
+        table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            orig_item = QTableWidgetItem(
+                self._comp_file_name(r["original"], page._rename_task_id)
+            )
+            orig_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            table.setItem(i, 0, orig_item)
+            new_item = QTableWidgetItem(r.get("new", ""))
+            table.setItem(i, 1, new_item)
+        table.blockSignals(False)
+        self._rename_statuses_file(page)
+
+    def _rename_statuses_file(self, page) -> None:
+        cfg = self._rename_cfg(page, "file")
+        records = self._available_files(page._rename_task_id)
+        selected = set(cfg.get("files") or [])
+        rows = cfg.get("rows") or []
+        taken = set()
+        for r in rows:
+            n = (r.get("new") or "").strip()
+            if n:
+                taken.add(n)
+        for rec in records:
+            if rec.get("parquet") not in selected:
+                taken.add(rec.get("name", ""))
+        table = page._rename_file_table
+        table.blockSignals(True)
+        for i, r in enumerate(rows):
+            status, sev = self._rename_file_status(
+                page, r["original"], r.get("new"),
+                taken - {(r.get("new") or "").strip()},
+            )
+            table.setItem(i, 2, self._rename_status_item(status, sev))
+        table.blockSignals(False)
+
+    def _rename_refresh_column(self, page) -> None:
+        cfg = self._rename_cfg(page, "column")
+        rows = cfg.get("rows") or []
+
+        files_box = page._rename_column_files_box
+        files_box.clear()
+        for path in cfg.get("files") or []:
+            files_box.addItem(self._comp_file_name(path, page._rename_task_id))
+        vars_box = page._rename_column_vars_box
+        vars_box.clear()
+        for r in rows:
+            vars_box.addItem(str(r.get("original", "")))
+
+        table = page._rename_column_table
+        table.blockSignals(True)
+        table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            orig_item = QTableWidgetItem(str(r.get("original", "")))
+            orig_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            table.setItem(i, 0, orig_item)
+            new_item = QTableWidgetItem(r.get("new", ""))
+            table.setItem(i, 1, new_item)
+        table.blockSignals(False)
+        self._rename_statuses_column(page)
+
+    def _rename_statuses_column(self, page) -> None:
+        cfg = self._rename_cfg(page, "column")
+        union = set(self._rename_column_union(page))
+        rows = cfg.get("rows") or []
+        table = page._rename_column_table
+        table.blockSignals(True)
+        for i, r in enumerate(rows):
+            status, sev = self._rename_column_status(
+                page, r["original"], r.get("new"), union
+            )
+            table.setItem(i, 2, self._rename_status_item(status, sev))
+        table.blockSignals(False)
+
+    def _rename_status_item(self, status, severity):
+        item = QTableWidgetItem(status)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        if severity == "error":
+            item.setForeground(QColor("#c0392b"))
+        elif severity == "warning":
+            item.setForeground(QColor("#b58900"))
+        return item
+
+    def _rename_on_cell(self, page, item, mode) -> None:
+        if getattr(page, "_rename_updating", False) or page._rename_locked:
+            return
+        if item.column() != 1:
+            return
+        cfg = self._rename_cfg(page, mode)
+        rows = cfg.get("rows") or []
+        if item.row() >= len(rows):
+            return
+        rows[item.row()]["new"] = item.text()
+        self._rename_mark_dirty(page)
+        # Only the validation column changes; rebuild just that, so the editor
+        # keeps focus while the user types.
+        if mode == "file":
+            self._rename_statuses_file(page)
+        else:
+            self._rename_statuses_column(page)
+
+    def _rename_table_rows(self, page, mode) -> list:
+        cfg = self._rename_cfg(page, mode)
+        table = (
+            page._rename_file_table if mode == "file" else page._rename_column_table
+        )
+        rows = cfg.get("rows") or []
+        out = []
+        for i, r in enumerate(rows):
+            item = table.item(i, 1)
+            new = item.text().strip() if item is not None else r.get("new", "")
+            out.append({"original": r["original"], "new": new})
+        return out
+
+    def _rename_copy(self, page) -> None:
+        mode = page._rename_params.get("mode", "file")
+        rows = self._rename_table_rows(page, mode)
+        lines = ["original name\tnew name"]
+        for r in rows:
+            original = (
+                self._comp_file_name(r["original"], page._rename_task_id)
+                if mode == "file" else str(r["original"])
+            )
+            lines.append(f"{original}\t{r['new']}")
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _rename_paste(self, page) -> None:
+        mode = page._rename_params.get("mode", "file")
+        text = QApplication.clipboard().text()
+        lines = [ln.rstrip("\r") for ln in text.split("\n") if ln.strip()]
+        if not lines:
+            return
+        header = lines[0].split("\t")
+        if header != ["original name", "new name"]:
+            QMessageBox.warning(
+                self, "Paste",
+                "The pasted table must start with the header "
+                "'original name\\tnew name' (copy the table first).",
+            )
+            return
+        pasted = [ln.split("\t") for ln in lines[1:]]
+        cfg = self._rename_cfg(page, mode)
+        rows = cfg.get("rows") or []
+        current_originals = [
+            self._comp_file_name(r["original"], page._rename_task_id)
+            if mode == "file" else str(r["original"])
+            for r in rows
+        ]
+        if len(pasted) != len(current_originals):
+            QMessageBox.warning(
+                self, "Paste",
+                "The pasted row count does not match the current table.",
+            )
+            return
+        for idx, (expected, row) in enumerate(zip(current_originals, pasted)):
+            if len(row) < 1 or row[0] != expected:
+                QMessageBox.warning(
+                    self, "Paste",
+                    f"Row {idx + 1}: the original name does not match.",
+                )
+                return
+        for r, row in zip(rows, pasted):
+            r["new"] = (row[1] if len(row) > 1 else "").strip()
+        self._rename_refresh(page)
+        self._rename_mark_dirty(page)
+
+    def _rename_apply(self, page) -> None:
+        """Store the valid-only rename map for the current mode."""
+        mode = page._rename_params.get("mode", "file")
+        cfg = self._rename_cfg(page, mode)
+        rows = cfg.get("rows") or []
+        applied = {}
+        for r in rows:
+            original = r["original"]
+            new = (r.get("new") or "").strip()
+            if not new:
+                continue
+            if mode == "file":
+                taken = set()
+                for other in rows:
+                    if other is r:
+                        continue
+                    n = (other.get("new") or "").strip()
+                    if n:
+                        taken.add(n)
+                for rec in self._available_files(page._rename_task_id):
+                    if rec.get("parquet") not in (cfg.get("files") or []):
+                        taken.add(rec.get("name", ""))
+                status, _sev = self._rename_file_status(page, original, new, taken)
+                if status:
+                    continue
+            else:
+                status, _sev = self._rename_column_status(
+                    page, original, new, set(self._rename_column_union(page))
+                )
+                if status == "Empty name" or status == "Invalid characters":
+                    continue
+            applied[str(original)] = new
+        cfg["rename"] = applied
+
+    def _rename_mark_dirty(self, page) -> None:
+        page._rename_dirty = True
+        self._rename_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _rename_update_save_btn(self, page) -> None:
+        btn = getattr(page, "_rename_save_btn", None)
+        if btn is not None:
+            btn.setEnabled(page._rename_dirty and not page._rename_locked)
+
+    def _rename_save_now(self, page) -> None:
+        self._rename_apply(page)
+        page._rename_task_def["params"] = page._rename_params
+        if self.project is not None:
+            self.project.save()
+        page._rename_dirty = False
+        self._rename_update_save_btn(page)
+        self.statusBar().showMessage("Rename settings saved")
+        self._module_saved(page)
+
+    def _rename_close(self, page) -> None:
+        if getattr(page, "_rename_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Rename",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self._close_module_page(page)
+
+    # ----- dimension reduction module (generate) -------------------------
+    _DIMRED_SEED = 42
+    _DIMRED_PCA_DIMS = 50
+
+    def _build_dimred_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Dimension Reduction page: method/files | variables | params | log."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._dimred_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("method", "umap")
+        params.setdefault("files", [])
+        params.setdefault("columns", [])
+        params.setdefault("normalize", True)
+        params.setdefault("pca", True)
+        params.setdefault("parallel", True)
+        params.setdefault("tsne_backend", "sklearn")
+        params.setdefault("umap", {"n_neighbors": 15, "min_dist": 0.1})
+        params.setdefault("tsne", {"perplexity": 30, "n_iter": 1000})
+        params.setdefault("names", ["umap_1", "umap_2"])
+        params.setdefault("outputs", {})
+        params.setdefault("log", [])
+        page._dimred_task_def = task_def
+        page._dimred_task_id = task_def.get("id")
+        page._dimred_params = params
+        page._dimred_locked = locked
+        page._dimred_save_btn = save_btn
+        page._dimred_dirty = False
+        page._dimred_snapshot = copy.deepcopy(params)
+        page._dimred_log_lines = list(params.get("log") or [])
+        page._dimred_running = False
+        page._dimred_cancel = False
+        page._dimred_updating = False
+        save_btn.clicked.connect(lambda _=False: self._dimred_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._dimred_left_panel(page))
+        splitter.addWidget(self._dimred_center_panel(page))
+        splitter.addWidget(self._dimred_right_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([320, 320, 420])
+        row.addWidget(splitter, 1)
+
+        row.addWidget(self._dimred_log_panel(page))
+        layout.addWidget(content, 1)
+
+        self._dimred_refresh(page)
+        self._dimred_warm_umap()
+        return page
+
+    def _dimred_warm_umap(self) -> None:
+        """Pre-compile UMAP's numba kernels in the background.
+
+        UMAP's first fit_transform in a process spends ~30 s on numba JIT
+        compilation (the "cold" run). Warming it up while the user configures
+        the module hides that one-time cost from their first Calculate.
+        """
+        if getattr(self, "_umap_warmed", False):
+            return
+        self._umap_warmed = True
+
+        def _warm():
+            import numpy as np
+            import umap
+
+            try:
+                umap.UMAP(
+                    n_neighbors=15, min_dist=0.1, n_components=2, random_state=42
+                ).fit_transform(
+                    np.random.default_rng(0).normal(0, 1, (300, 4))
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=_warm, daemon=True).start()
+
+    def _dimred_warm_opentsne(self) -> None:
+        """Pre-compile openTSNE's numba kernels the first time it is chosen."""
+        if getattr(self, "_opentsne_warmed", False):
+            return
+        self._opentsne_warmed = True
+
+        def _warm():
+            import numpy as np
+
+            try:
+                from openTSNE import TSNE
+
+                TSNE(
+                    n_components=2, perplexity=30, n_iter=50, random_state=42
+                ).fit(np.random.default_rng(0).normal(0, 1, (300, 4)))
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=_warm, daemon=True).start()
+
+    def _dimred_log_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Log</b>"))
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Calculation output appears here…")
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        log.setFixedHeight(130)
+        for line in getattr(page, "_dimred_log_lines", []):
+            log.appendPlainText(line)
+        lay.addWidget(log)
+        page._dimred_log = log
+        return panel
+
+    def _dimred_log(self, page, text) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = getattr(page, "_dimred_log_lines", None)
+        if lines is None:
+            lines = []
+            page._dimred_log_lines = lines
+        for line in str(text).splitlines():
+            if line.strip():
+                lines.append(f"[{ts}] {line}")
+        if len(lines) > _FEATURE_LOG_LIMIT:
+            del lines[:-_FEATURE_LOG_LIMIT]
+        if getattr(page, "_dimred_params", None) is not None:
+            page._dimred_params["log"] = list(lines)
+        box = getattr(page, "_dimred_log", None)
+        if box is not None:
+            for line in str(text).splitlines():
+                if line.strip():
+                    box.appendPlainText(f"[{ts}] {line}")
+
+    def _dimred_left_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Algorithm</b>"))
+        method = _NoWheelComboBox()
+        method.addItem("UMAP", "umap")
+        method.addItem("t-SNE", "tsne")
+        method.setEnabled(not page._dimred_locked)
+        lay.addWidget(method)
+        page._dimred_method = method
+
+        lay.addWidget(QLabel("<b>Data files</b>"))
+        files_btn = QPushButton("Select files…")
+        files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        files_btn.setEnabled(not page._dimred_locked)
+        lay.addWidget(files_btn)
+        files_box = QListWidget()
+        files_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(files_box, 1)
+        page._dimred_files_box = files_box
+        files_count = QLabel("")
+        files_count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(files_count)
+        page._dimred_files_count = files_count
+
+        method.currentIndexChanged.connect(lambda _=0: self._dimred_on_method(page))
+        files_btn.clicked.connect(lambda _=False: self._dimred_select_files(page))
+        return panel
+
+    def _dimred_center_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Variables</b>"))
+        hint = QLabel(
+            "Variables shared by every selected file. All files are reduced "
+            "together in one embedding, so only common variables can be used."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        vars_btn = QPushButton("Select variables…")
+        vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vars_btn.setEnabled(not page._dimred_locked)
+        lay.addWidget(vars_btn)
+        vars_box = QListWidget()
+        vars_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(vars_box, 1)
+        page._dimred_vars_box = vars_box
+        vars_count = QLabel("")
+        vars_count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(vars_count)
+        page._dimred_vars_count = vars_count
+
+        vars_btn.clicked.connect(lambda _=False: self._dimred_select_vars(page))
+        return panel
+
+    def _dimred_right_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Algorithm parameters</b>"))
+
+        # UMAP parameters
+        umap_host = QWidget()
+        umap_l = QGridLayout(umap_host)
+        umap_l.setContentsMargins(0, 0, 0, 0)
+        umap_l.addWidget(QLabel("n_neighbors"), 0, 0)
+        nn = _NoWheelSpinBox()
+        nn.setRange(2, 500)
+        nn.setValue(15)
+        umap_l.addWidget(nn, 0, 1)
+        umap_l.addWidget(QLabel("min_dist"), 1, 0)
+        md = _NoWheelDoubleSpinBox()
+        md.setRange(0.0, 0.99)
+        md.setDecimals(3)
+        md.setSingleStep(0.01)
+        md.setValue(0.1)
+        umap_l.addWidget(md, 1, 1)
+        page._dimred_umap_host = umap_host
+        page._dimred_nn = nn
+        page._dimred_md = md
+
+        # t-SNE parameters
+        tsne_host = QWidget()
+        tsne_l = QGridLayout(tsne_host)
+        tsne_l.setContentsMargins(0, 0, 0, 0)
+        tsne_l.addWidget(QLabel("perplexity"), 0, 0)
+        perp = _NoWheelDoubleSpinBox()
+        perp.setRange(2.0, 500.0)
+        perp.setDecimals(1)
+        perp.setValue(30.0)
+        tsne_l.addWidget(perp, 0, 1)
+        tsne_l.addWidget(QLabel("n_iter"), 1, 0)
+        nit = _NoWheelSpinBox()
+        nit.setRange(250, 10000)
+        nit.setValue(1000)
+        tsne_l.addWidget(nit, 1, 1)
+        backend_label = QLabel("implementation")
+        tsne_l.addWidget(backend_label, 2, 0)
+        backend = _NoWheelComboBox()
+        backend.addItem("sklearn (default)", "sklearn")
+        backend.addItem("openTSNE (experimental)", "opentsne")
+        tsne_l.addWidget(backend, 2, 1)
+        page._dimred_tsne_host = tsne_host
+        page._dimred_perp = perp
+        page._dimred_nit = nit
+        page._dimred_backend = backend
+        page._dimred_backend_label = backend_label
+
+        lay.addWidget(umap_host)
+        lay.addWidget(tsne_host)
+
+        normalize = QCheckBox("Normalize (z-score)")
+        normalize.setChecked(True)
+        normalize.setEnabled(not page._dimred_locked)
+        lay.addWidget(normalize)
+        page._dimred_normalize = normalize
+
+        pca = QCheckBox("PCA pre-reduction (faster)")
+        pca.setChecked(True)
+        pca.setToolTip(
+            "Reduce to 50 dimensions with PCA before fitting (only when more "
+            "variables are selected). Standard practice; usually faster."
+        )
+        pca.setEnabled(not page._dimred_locked)
+        lay.addWidget(pca)
+        page._dimred_pca = pca
+
+        parallel = QCheckBox("Allow parallel (non-reproducible)")
+        parallel.setChecked(True)
+        parallel.setToolTip(
+            "Use every CPU core. Much faster, but the result changes every "
+            "run (the fixed seed is dropped)."
+        )
+        parallel.setEnabled(not page._dimred_locked)
+        lay.addWidget(parallel)
+        page._dimred_parallel = parallel
+
+        lay.addWidget(QLabel("<b>New column names</b>"))
+        name_box = QWidget()
+        nh = QGridLayout(name_box)
+        nh.setContentsMargins(0, 0, 0, 0)
+        nh.addWidget(QLabel("Dim 1"), 0, 0)
+        name1 = QLineEdit()
+        nh.addWidget(name1, 0, 1)
+        warn1 = QLabel("⚠")
+        warn1.setToolTip("Duplicate column name")
+        warn1.setStyleSheet("color: #b58900; font-weight: bold;")
+        nh.addWidget(warn1, 0, 2)
+        nh.addWidget(QLabel("Dim 2"), 1, 0)
+        name2 = QLineEdit()
+        nh.addWidget(name2, 1, 1)
+        warn2 = QLabel("⚠")
+        warn2.setToolTip("Duplicate column name")
+        warn2.setStyleSheet("color: #b58900; font-weight: bold;")
+        nh.addWidget(warn2, 1, 2)
+        lay.addWidget(name_box)
+        page._dimred_name1 = name1
+        page._dimred_name2 = name2
+        page._dimred_warn1 = warn1
+        page._dimred_warn2 = warn2
+
+        estimate = QLabel("")
+        estimate.setStyleSheet("color: #6b7785;")
+        estimate.setWordWrap(True)
+        lay.addWidget(estimate)
+        page._dimred_estimate = estimate
+
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setEnabled(False)
+        lay.addWidget(calc_btn)
+        page._dimred_calc_btn = calc_btn
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        page._dimred_status = status
+        lay.addStretch()
+
+        for w in (nn, md, perp, nit):
+            w.setEnabled(not page._dimred_locked)
+        name1.setEnabled(not page._dimred_locked)
+        name2.setEnabled(not page._dimred_locked)
+
+        nn.valueChanged.connect(lambda _=0: self._dimred_on_param(page, "umap", "n_neighbors", nn.value()))
+        md.valueChanged.connect(lambda _=0: self._dimred_on_param(page, "umap", "min_dist", md.value()))
+        perp.valueChanged.connect(lambda _=0: self._dimred_on_param(page, "tsne", "perplexity", perp.value()))
+        nit.valueChanged.connect(lambda _=0: self._dimred_on_param(page, "tsne", "n_iter", nit.value()))
+        backend.currentIndexChanged.connect(lambda _=0: self._dimred_on_backend(page))
+        normalize.toggled.connect(lambda _=0: self._dimred_on_normalize(page))
+        pca.toggled.connect(lambda _=0: self._dimred_on_pca(page))
+        parallel.toggled.connect(lambda _=0: self._dimred_on_parallel(page))
+        name1.textEdited.connect(lambda _=0: self._dimred_on_names(page))
+        name2.textEdited.connect(lambda _=0: self._dimred_on_names(page))
+        calc_btn.clicked.connect(lambda _=False: self._dimred_calculate(page))
+        return panel
+
+    def _dimred_is_tsne(self, method) -> bool:
+        return method == "tsne"
+
+    def _dimred_on_method(self, page) -> None:
+        if getattr(page, "_dimred_updating", False):
+            return
+        method = page._dimred_method.currentData() or "umap"
+        params = page._dimred_params
+        old = params.get("method", "umap")
+        old_defaults = ["umap_1", "umap_2"] if not self._dimred_is_tsne(old) else ["tsne_1", "tsne_2"]
+        new_defaults = ["tsne_1", "tsne_2"] if self._dimred_is_tsne(method) else ["umap_1", "umap_2"]
+        if params.get("names") == old_defaults:
+            params["names"] = list(new_defaults)
+        params["method"] = method
+        self._dimred_refresh(page)
+        self._dimred_mark_dirty(page)
+
+    def _dimred_on_param(self, page, group, key, value) -> None:
+        if getattr(page, "_dimred_updating", False):
+            return
+        page._dimred_params.setdefault(group, {})[key] = value
+        self._dimred_mark_dirty(page)
+
+    def _dimred_on_normalize(self, page) -> None:
+        if getattr(page, "_dimred_updating", False):
+            return
+        page._dimred_params["normalize"] = page._dimred_normalize.isChecked()
+        self._dimred_mark_dirty(page)
+
+    def _dimred_on_pca(self, page) -> None:
+        if getattr(page, "_dimred_updating", False):
+            return
+        page._dimred_params["pca"] = page._dimred_pca.isChecked()
+        self._dimred_mark_dirty(page)
+
+    def _dimred_on_parallel(self, page) -> None:
+        if getattr(page, "_dimred_updating", False):
+            return
+        page._dimred_params["parallel"] = page._dimred_parallel.isChecked()
+        self._dimred_mark_dirty(page)
+        self._dimred_refresh(page)
+
+    def _dimred_on_backend(self, page) -> None:
+        if getattr(page, "_dimred_updating", False):
+            return
+        value = page._dimred_backend.currentData() or "sklearn"
+        page._dimred_params["tsne_backend"] = value
+        self._dimred_mark_dirty(page)
+        if value == "opentsne":
+            self._dimred_warm_opentsne()
+
+    def _dimred_on_names(self, page) -> None:
+        if getattr(page, "_dimred_updating", False):
+            return
+        page._dimred_params["names"] = [
+            page._dimred_name1.text().strip(),
+            page._dimred_name2.text().strip(),
+        ]
+        self._dimred_mark_dirty(page)
+        self._dimred_update_names(page)
+
+    def _dimred_common_columns(self, page) -> list:
+        files = page._dimred_params.get("files") or []
+        if not files:
+            return []
+        common = set(self._columns_for(files[0], page._dimred_task_id))
+        for p in files[1:]:
+            common &= set(self._columns_for(p, page._dimred_task_id))
+        return sorted(common)
+
+    def _dimred_select_files(self, page) -> None:
+        records = self._available_files(page._dimred_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [
+            self._comp_file_name(p, page._dimred_task_id)
+            for p in page._dimred_params.get("files") or []
+        ]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        page._dimred_params["files"] = [by_name[n] for n in chosen if n in by_name]
+        # Variables that are no longer common are dropped.
+        common = set(self._dimred_common_columns(page))
+        page._dimred_params["columns"] = [
+            c for c in page._dimred_params.get("columns") or [] if c in common
+        ]
+        self._dimred_refresh(page)
+        self._dimred_mark_dirty(page)
+
+    def _dimred_select_vars(self, page) -> None:
+        files = page._dimred_params.get("files") or []
+        if not files:
+            QMessageBox.information(
+                self, "Select variables", "Select data files first."
+            )
+            return
+        options = self._dimred_common_columns(page)
+        if not options:
+            QMessageBox.information(
+                self, "Select variables",
+                "The selected files have no common variables.\n"
+                "Dimension reduction needs variables shared by every file.",
+            )
+            return
+        chosen = self._pick_items_dialog(
+            "Select variables",
+            options,
+            page._dimred_params.get("columns") or [],
+            "Filter variables...",
+        )
+        if chosen is None:
+            return
+        page._dimred_params["columns"] = list(chosen)
+        self._dimred_refresh(page)
+        self._dimred_mark_dirty(page)
+
+    def _dimred_existing_columns(self, page) -> set:
+        cols = set()
+        for path in page._dimred_params.get("files") or []:
+            cols |= set(self._columns_for(path, page._dimred_task_id))
+        return cols
+
+    def _dimred_name_conflicts(self, page) -> list:
+        names = page._dimred_params.get("names") or ["", ""]
+        existing = self._dimred_existing_columns(page)
+        conflicts = []
+        for name in names:
+            if name and name in existing:
+                conflicts.append(name)
+        if names[0] and names[1] and names[0] == names[1]:
+            if names[0] not in conflicts:
+                conflicts.append(names[0])
+        return conflicts
+
+    def _dimred_update_names(self, page) -> None:
+        conflicts = set(self._dimred_name_conflicts(page))
+        names = page._dimred_params.get("names") or ["", ""]
+        page._dimred_warn1.setVisible(bool(names[0]) and names[0] in conflicts)
+        page._dimred_warn2.setVisible(bool(names[1]) and names[1] in conflicts)
+        self._dimred_update_calc_btn(page)
+
+    def _dimred_update_calc_btn(self, page) -> None:
+        params = page._dimred_params
+        names = params.get("names") or ["", ""]
+        ok = bool(
+            params.get("files")
+            and params.get("columns")
+            and names[0] and names[1]
+            and names[0] != names[1]
+            and not self._dimred_name_conflicts(page)
+        )
+        page._dimred_calc_btn.setEnabled(ok and not page._dimred_locked)
+
+    def _dimred_estimate(self, page):
+        """Rough pre-run runtime estimate (order of magnitude), or None."""
+        params = page._dimred_params
+        files = params.get("files") or []
+        columns = params.get("columns") or []
+        if not files or not columns:
+            return None
+        try:
+            n = sum(
+                self._subsample_visible_count(page._dimred_task_id, p) for p in files
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if n <= 0:
+            return None
+        d = len(columns)
+        d_eff = min(d, self._DIMRED_PCA_DIMS) if params.get("pca", True) else d
+        method = params.get("method", "umap")
+        parallel = bool(params.get("parallel", False))
+        if method == "umap":
+            nn = int((params.get("umap") or {}).get("n_neighbors", 15))
+            # Measured on a reference laptop: ~50 s per 1e6 point·dims (serial,
+            # because the fixed reproducibility seed disables parallelism).
+            secs = n * d_eff / 1e6 * 50.0 * max(0.5, nn / 15.0)
+            if parallel:
+                secs /= 5.0  # parallel uses every core
+        else:
+            n_iter = int((params.get("tsne") or {}).get("n_iter", 1000))
+            secs = n * d_eff / 1e6 * 280.0 * (n_iter / 1000.0)
+            if parallel:
+                secs /= 2.0
+        return secs, n, d_eff
+
+    def _dimred_estimate_text(self, page) -> str:
+        est = self._dimred_estimate(page)
+        if est is None:
+            return ""
+        secs, n, d_eff = est
+        parts = [f"{n:,} points × {d_eff} dims"]
+        if secs < 60:
+            parts.append("≈ %ds" % max(1, int(round(secs))))
+        elif secs < 3600:
+            parts.append("≈ %.1f min" % (secs / 60.0))
+        else:
+            parts.append("≈ %.1f h" % (secs / 3600.0))
+        last = page._dimred_params.get("last_fit_seconds")
+        if last:
+            parts.append("· last run %.0fs" % last)
+        return " · ".join(parts)
+
+    def _dimred_refresh(self, page) -> None:
+        params = page._dimred_params
+        page._dimred_updating = True
+        try:
+            page._dimred_method.blockSignals(True)
+            page._dimred_method.setCurrentIndex(
+                max(0, page._dimred_method.findData(params.get("method", "umap")))
+            )
+            page._dimred_method.blockSignals(False)
+
+            umap = params.get("umap") or {}
+            tsne = params.get("tsne") or {}
+            page._dimred_nn.blockSignals(True)
+            page._dimred_nn.setValue(int(umap.get("n_neighbors", 15)))
+            page._dimred_nn.blockSignals(False)
+            page._dimred_md.blockSignals(True)
+            page._dimred_md.setValue(float(umap.get("min_dist", 0.1)))
+            page._dimred_md.blockSignals(False)
+            page._dimred_perp.blockSignals(True)
+            page._dimred_perp.setValue(float(tsne.get("perplexity", 30.0)))
+            page._dimred_perp.blockSignals(False)
+            page._dimred_nit.blockSignals(True)
+            page._dimred_nit.setValue(int(tsne.get("n_iter", 1000)))
+            page._dimred_nit.blockSignals(False)
+
+            page._dimred_backend.blockSignals(True)
+            page._dimred_backend.setCurrentIndex(
+                max(0, page._dimred_backend.findData(
+                    params.get("tsne_backend", "sklearn")
+                ))
+            )
+            page._dimred_backend.blockSignals(False)
+
+            page._dimred_umap_host.setVisible(params.get("method") == "umap")
+            page._dimred_tsne_host.setVisible(params.get("method") == "tsne")
+
+            page._dimred_normalize.blockSignals(True)
+            page._dimred_normalize.setChecked(bool(params.get("normalize", True)))
+            page._dimred_normalize.blockSignals(False)
+
+            page._dimred_pca.blockSignals(True)
+            page._dimred_pca.setChecked(bool(params.get("pca", True)))
+            page._dimred_pca.blockSignals(False)
+
+            page._dimred_parallel.blockSignals(True)
+            page._dimred_parallel.setChecked(bool(params.get("parallel", False)))
+            page._dimred_parallel.blockSignals(False)
+
+            names = params.get("names") or ["umap_1", "umap_2"]
+            page._dimred_name1.blockSignals(True)
+            page._dimred_name1.setText(names[0])
+            page._dimred_name1.blockSignals(False)
+            page._dimred_name2.blockSignals(True)
+            page._dimred_name2.setText(names[1])
+            page._dimred_name2.blockSignals(False)
+
+            files = params.get("files") or []
+            page._dimred_files_box.clear()
+            for path in files:
+                page._dimred_files_box.addItem(
+                    self._comp_file_name(path, page._dimred_task_id)
+                )
+            page._dimred_files_count.setText(f"{len(files)} file(s) selected")
+
+            columns = params.get("columns") or []
+            page._dimred_vars_box.clear()
+            for c in columns:
+                page._dimred_vars_box.addItem(str(c))
+            page._dimred_vars_count.setText(f"{len(columns)} variable(s) selected")
+        finally:
+            page._dimred_updating = False
+        self._dimred_update_names(page)
+        page._dimred_estimate.setText(self._dimred_estimate_text(page))
+
+    def _dimred_validate(self, page):
+        params = page._dimred_params
+        if not params.get("files"):
+            return False, "Select at least one data file."
+        if not params.get("columns"):
+            return False, "Select at least one variable."
+        names = params.get("names") or ["", ""]
+        if not names[0] or not names[1]:
+            return False, "Set both new column names."
+        if names[0] == names[1]:
+            return False, "The two new column names must differ."
+        if self._dimred_name_conflicts(page):
+            return False, "A new column name collides with an existing column."
+        return True, ""
+
+    def _dimred_run(self, page, q):
+        """Run the whole reduction in a background thread, posting progress."""
+        import time
+
+        import numpy as np
+
+        params = page._dimred_params
+        files = list(params.get("files") or [])
+        columns = list(params.get("columns") or [])
+        n_files = len(files)
+        failed = 0
+
+        class _FitWriter:
+            """Captures the fit library's stdout and turns it into progress."""
+
+            def __init__(self, q, method, total_iter):
+                self.q = q
+                self.method = method
+                self.total_iter = total_iter
+                self.start = time.time()
+                self._buf = ""
+
+            def write(self, text):
+                self._buf += text.replace("\r", "\n")
+                while "\n" in self._buf:
+                    line, self._buf = self._buf.split("\n", 1)
+                    self._parse(line.strip())
+
+            def flush(self):
+                if self._buf.strip():
+                    self._parse(self._buf.strip())
+                    self._buf = ""
+
+            def _parse(self, line):
+                import re
+
+                if not line:
+                    return
+                pct = None
+                if self.method == "umap":
+                    # UMAP (tqdm) prints "… 123/500 …" or "completed 123 / 500".
+                    m = re.search(r"(\d+)\s*/\s*(\d+)", line)
+                    if m:
+                        total = int(m.group(2))
+                        pct = 100.0 * int(m.group(1)) / total if total else None
+                else:
+                    m = re.search(r"Iteration\s+(\d+)", line)
+                    if m and self.total_iter:
+                        pct = 100.0 * int(m.group(1)) / self.total_iter
+                if pct is None:
+                    return
+                elapsed = time.time() - self.start
+                eta = None
+                if pct > 0:
+                    total = elapsed * 100.0 / pct
+                    eta = max(0.0, total - elapsed)
+                self.q.put(("fitprogress", min(pct, 100.0), eta))
+
+        try:
+            q.put(("log", "— Starting dimension reduction —"))
+            parts = []
+            counts = []
+            read_start = time.time()
+            for i, path in enumerate(files):
+                name = self._comp_file_name(path, page._dimred_task_id)
+                q.put(("log", f"Reading {i + 1}/{n_files}: {name}"))
+                q.put(("status", f"Reading {i + 1}/{n_files} ({25 * (i + 1) // n_files}%)"))
+                values = self._column_data(page._dimred_task_id, path, columns)
+                if any(c not in values for c in columns):
+                    raise ValueError(f"{name} is missing a column")
+                X = np.column_stack([values[c] for c in columns]).astype("float64")
+                parts.append(X)
+                counts.append(len(X))
+            if not parts:
+                raise ValueError("no data to reduce")
+            X = np.vstack(parts)
+            q.put(("log", f"Combined {X.shape[0]} row(s) × {X.shape[1]} variable(s)"))
+
+            pca_on = bool(params.get("pca", True)) and X.shape[1] > self._DIMRED_PCA_DIMS
+            q.put(("log", "Normalizing (z-score)…" if params.get("normalize")
+                   else "Normalization skipped"))
+            X = self._dimred_prepare(X, bool(params.get("normalize")), pca_on)
+            if pca_on:
+                q.put(("log", f"PCA: reduced to {X.shape[1]} dimensions (faster)"))
+
+            method = params.get("method", "umap")
+            base = "tsne" if self._dimred_is_tsne(method) else "umap"
+            cfg = params.get("umap") if base == "umap" else params.get("tsne")
+            detail = ", ".join(f"{k}={v}" for k, v in (cfg or {}).items())
+            q.put(("log", f"Fitting {method.upper()} ({detail})…"))
+            q.put(("status", "Fitting… (25%)"))
+            t0 = time.time()
+            writer = _FitWriter(q, base, int((cfg or {}).get("n_iter", 1000)))
+            import contextlib
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                embedding = self._dimred_fit(
+                    base, cfg, X, self._DIMRED_SEED,
+                    verbose=True, parallel=bool(params.get("parallel", False)),
+                    tsne_backend=params.get("tsne_backend", "sklearn"),
+                )
+            fit_seconds = time.time() - t0
+            q.put(("fit_time", fit_seconds))
+            q.put(("log", f"Fit finished in {fit_seconds:.1f}s"))
+
+            outputs = {}
+            offset = 0
+            names = params.get("names") or ["dim_1", "dim_2"]
+            for i, (path, n) in enumerate(zip(files, counts)):
+                if getattr(page, "_dimred_cancel", False):
+                    q.put(("log", "Calculation cancelled."))
+                    break
+                name = self._comp_file_name(path, page._dimred_task_id)
+                coords = embedding[offset:offset + n]
+                offset += n
+                q.put(("status", f"Writing {i + 1}/{n_files} ({90 + 10 * (i + 1) // n_files}%)"))
+                try:
+                    rel, cols, kind = self._dimred_write_file(page, path, coords)
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    q.put(("log", f"✗ {name}: {exc}"))
+                    continue
+                outputs[path] = {
+                    "path": rel,
+                    "columns": cols,
+                    "kind": kind,
+                    "signature": self._dimred_signature(
+                        params, path, page._dimred_task_id
+                    ),
+                }
+                q.put(("log", f"✓ {name} → {Path(rel).name} ({len(cols)} column(s))"))
+            q.put(("done", outputs, len(outputs), failed))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("error", str(exc)))
+
+    def _dimred_fit(self, method, cfg, X, seed, verbose=False, parallel=False,
+                    tsne_backend="sklearn"):
+        """Fit the chosen algorithm and return the (N, 2) embedding.
+
+        `parallel` trades reproducibility for speed: the algorithms then use
+        every CPU core (and drop the fixed seed).
+        """
+        if method == "umap":
+            import umap
+
+            reducer = umap.UMAP(
+                n_neighbors=int(cfg.get("n_neighbors", 15)),
+                min_dist=float(cfg.get("min_dist", 0.1)),
+                n_components=2,
+                random_state=None if parallel else seed,
+                n_jobs=-1 if parallel else 1,
+                verbose=verbose,
+            )
+            return reducer.fit_transform(X)
+        if tsne_backend == "opentsne":
+            from openTSNE import TSNE as OpenTSNE
+
+            model = OpenTSNE(
+                n_components=2,
+                perplexity=float(cfg.get("perplexity", 30.0)),
+                n_iter=int(cfg.get("n_iter", 1000)),
+                random_state=None if parallel else seed,
+                n_jobs=-1 if parallel else 1,
+                verbose=False,
+            )
+            return model.fit(X)
+        from sklearn.manifold import TSNE
+
+        model = TSNE(
+            n_components=2,
+            perplexity=float(cfg.get("perplexity", 30.0)),
+            max_iter=int(cfg.get("n_iter", 1000)),
+            init="pca",
+            random_state=None if parallel else seed,
+            n_jobs=-1 if parallel else 1,
+            verbose=1 if verbose else 0,
+        )
+        return model.fit_transform(X)
+
+    def _dimred_prepare(self, X, normalize, pca):
+        """Fill missing values with column means, optionally z-score, then PCA."""
+        import numpy as np
+
+        col_mean = np.nanmean(X, axis=0)
+        col_mean = np.where(np.isfinite(col_mean), col_mean, 0.0)
+        nan = np.isnan(X)
+        if nan.any():
+            X = X.copy()
+            X[nan] = np.take(col_mean, np.where(nan)[1])
+        if normalize:
+            std = np.std(X, axis=0)
+            std = np.where(std > 0, std, 1.0)
+            X = (X - col_mean) / std
+        if pca and X.shape[1] > self._DIMRED_PCA_DIMS:
+            from sklearn.decomposition import PCA
+
+            X = PCA(
+                n_components=self._DIMRED_PCA_DIMS, random_state=self._DIMRED_SEED
+            ).fit_transform(X)
+        return X
+
+    def _dimred_write_file(self, page, path, coords):
+        """Write one file's embedding; return (rel, columns, kind)."""
+        import numpy as np
+        import pandas as pd
+
+        params = page._dimred_params
+        names = params.get("names") or ["dim_1", "dim_2"]
+        stem = Path(str(path)).stem
+        rel = f"Module/{page._dimred_task_id}/{stem}_dimred.parquet"
+        out_path = self.project.path / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        ent = self._ensure_image_index(path)
+        is_image = ent is not None and ent.get("manifest") is not None
+        n_full = self._data_row_count(path)
+        index = self._subsample_row_index(page._dimred_task_id, path)
+
+        if is_image:
+            man = ent["manifest"]
+            xmin = int(round(float(man["xmin"])))
+            ymin = int(round(float(man["ymin"])))
+            width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
+            height = int(round(float(man["ymax"]) - float(man["ymin"]))) + 1
+            src = pd.read_parquet(path, columns=["x", "y"])
+            xi = np.rint(src["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            yi = np.rint(src["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            sel = np.asarray(index) if index is not None else np.arange(len(coords))
+            sel = sel.astype(np.int64)
+            ok = (sel >= 0) & (sel < len(xi))
+            g1 = np.full(height * width, np.nan, dtype="float64")
+            g2 = np.full(height * width, np.nan, dtype="float64")
+            s = sel[ok]
+            sx, sy = xi[s], yi[s]
+            good = (sx >= 0) & (sx < width) & (sy >= 0) & (sy < height)
+            flat = sy[good] * width + sx[good]
+            g1[flat] = coords[ok][good][:, 0]
+            g2[flat] = coords[ok][good][:, 1]
+            xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
+            yy = np.repeat(np.arange(height, dtype=np.int32), width) + ymin
+            pd.DataFrame({"x": xx, "y": yy, names[0]: g1, names[1]: g2}).to_parquet(
+                out_path, index=False
+            )
+            _build_image_index_files(str(out_path))
+            kind = "image"
+        else:
+            full = np.full((n_full, 2), np.nan, dtype="float64")
+            if index is not None and len(coords) == len(index):
+                full[index] = coords
+            else:
+                n = min(len(coords), n_full)
+                full[:n] = coords[:n]
+            pd.DataFrame({names[0]: full[:, 0], names[1]: full[:, 1]}).to_parquet(
+                out_path, index=False
+            )
+            kind = "table"
+        return rel, list(names), kind
+
+    def _dimred_calculate(self, page) -> None:
+        ok, message = self._dimred_validate(page)
+        if not ok:
+            QMessageBox.warning(self, "Calculate", message)
+            return
+        params = page._dimred_params
+        files = params.get("files") or []
+        existing = [p for p in files if isinstance((params.get("outputs") or {}).get(p), dict)]
+        if existing:
+            reply = QMessageBox.question(
+                self, "Calculate",
+                f"{len(existing)} file(s) already have results.\n"
+                "Recalculate and overwrite them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        page._dimred_running = True
+        page._dimred_cancel = False
+        page._dimred_status.setText("Calculating…")
+        page._dimred_calc_btn.setEnabled(False)
+
+        q = queue.Queue()
+        page._dimred_queue = q
+        page._dimred_thread = threading.Thread(
+            target=self._dimred_run, args=(page, q), daemon=True
+        )
+        page._dimred_thread.start()
+
+        timer = QTimer(self)
+        timer.setInterval(100)
+        timer.timeout.connect(lambda: self._dimred_poll(page))
+        timer.start()
+        page._dimred_timer = timer
+
+    def _dimred_poll(self, page) -> None:
+        q = getattr(page, "_dimred_queue", None)
+        if q is None:
+            return
+        finished = False
+        error = None
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            if kind == "log":
+                self._dimred_log(page, msg[1])
+            elif kind == "status":
+                page._dimred_status.setText(msg[1])
+            elif kind == "fit_time":
+                params = page._dimred_params
+                params["last_fit_seconds"] = float(msg[1])
+                page._dimred_estimate.setText(self._dimred_estimate_text(page))
+            elif kind == "fitprogress":
+                pct, eta = msg[1], msg[2]
+                text = f"Fitting… {pct:.0f}%"
+                if eta is not None:
+                    text += f" — ~{eta:.0f}s remaining"
+                page._dimred_status.setText(text)
+            elif kind == "done":
+                outputs, done, failed = msg[1], msg[2], msg[3]
+                params = page._dimred_params
+                params["outputs"] = outputs
+                page._dimred_task_def["output"] = {"saved": bool(done)}
+                page._dimred_task_def["params"] = params
+                if self.project is not None:
+                    self.project.save()
+                page._dimred_snapshot = copy.deepcopy(params)
+                page._dimred_dirty = False
+                self._dimred_update_save_btn(page)
+                page._dimred_done = done
+                page._dimred_failed = failed
+                finished = True
+            elif kind == "error":
+                error = msg[1]
+                finished = True
+        if not finished:
+            return
+        page._dimred_running = False
+        timer = getattr(page, "_dimred_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._dimred_timer = None
+        self._dimred_update_calc_btn(page)
+        if error:
+            self._dimred_log(page, f"✗ {error}")
+            QMessageBox.warning(self, "Calculate", error)
+            page._dimred_status.setText("Failed")
+        else:
+            summary = f"Calculated {page._dimred_done} file(s)."
+            if getattr(page, "_dimred_failed", 0):
+                summary += f" {page._dimred_failed} failed — see the log."
+            page._dimred_status.setText(summary)
+            self._dimred_log(page, summary)
+            self.statusBar().showMessage(summary)
+            self._module_saved(page)
+
+    def _dimred_mark_dirty(self, page) -> None:
+        page._dimred_dirty = True
+        self._dimred_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _dimred_update_save_btn(self, page) -> None:
+        btn = getattr(page, "_dimred_save_btn", None)
+        if btn is not None:
+            btn.setEnabled(page._dimred_dirty and not page._dimred_locked)
+
+    def _dimred_save_now(self, page) -> None:
+        params = page._dimred_params
+        page._dimred_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._dimred_snapshot = copy.deepcopy(params)
+        page._dimred_dirty = False
+        self._dimred_update_save_btn(page)
+        self._dimred_log(page, "Settings saved")
+        self.statusBar().showMessage("Dimension Reduction settings saved")
+        self._module_saved(page)
+
+    def _dimred_close(self, page) -> None:
+        if getattr(page, "_dimred_running", False):
+            reply = QMessageBox.question(
+                self, "Close Dimension Reduction",
+                "A calculation is still running.\nStop it and close? "
+                "This run's results will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            # The fit itself cannot be interrupted; signal it to stop at the
+            # next file and stay open until the worker finishes.
+            page._dimred_cancel = True
+            self._dimred_log(page, "Stopping after the current file…")
+            return
+        if getattr(page, "_dimred_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Dimension Reduction",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            log_lines = list(getattr(page, "_dimred_log_lines", []) or [])
+            page._dimred_task_def["params"] = page._dimred_snapshot
+            page._dimred_task_def["params"]["log"] = log_lines
         self._close_module_page(page)
 
     # ----- gating module (map) -----------------------------------------
@@ -21224,6 +23143,10 @@ class MainWindow(QMainWindow):
             page = self._build_subset_page(name, task_def, locked)
         elif task_type == "subsample":
             page = self._build_subsample_page(name, task_def, locked)
+        elif task_type == "rename":
+            page = self._build_rename_page(name, task_def, locked)
+        elif task_type == "dimred":
+            page = self._build_dimred_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:

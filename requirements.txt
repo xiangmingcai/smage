@@ -15,6 +15,7 @@ flowio
 # Analysis
 umap-learn
 scikit-learn
+openTSNE  # optional t-SNE backend (experimental)
 
 # Pipeline editor (used in a later phase)
 NodeGraphQt
