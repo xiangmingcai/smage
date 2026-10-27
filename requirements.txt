@@ -19,6 +19,9 @@ openTSNE  # optional t-SNE backend (experimental)
 flowsom  # clustering (FlowSOM)
 louvain  # clustering (PhenoGraph via scanpy)
 parc  # clustering (PARC)
+peacoqc-rs  # data cleaning (PeacoQC; imported as `peacoqc`)
+polars  # required by peacoqc-rs (event tables)
+matplotlib  # batch-alignment report figures (SVG/PDF/PNG)
 
 # Pipeline editor (used in a later phase)
 NodeGraphQt

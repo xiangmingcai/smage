@@ -8,6 +8,7 @@ functionality comes in later phases.
 """
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import math
@@ -263,6 +264,9 @@ TASK_TYPES = {
     "subsample": ("Subsample", "#78909c"),
     "dimred": ("Dimension Reduction", "#ab47bc"),
     "cluster": ("Cluster", "#ef5350"),
+    "area": ("Area", "#26a69a"),
+    "data_clean": ("Data Clean", "#ff7043"),
+    "batch_align": ("Batch Alignment", "#7e57c2"),
     "export": ("Export", "#66bb6a"),
 }
 
@@ -282,6 +286,9 @@ ADDABLE_TYPES = [
     "subsample",
     "dimred",
     "cluster",
+    "area",
+    "data_clean",
+    "batch_align",
     "export",
 ]
 
@@ -800,6 +807,11 @@ def _pipeline_dependencies(stages, names, parquet_path=None) -> set:
         if kind == "compensation":
             if needed & set(stage["names"]):
                 needed |= set(stage["names"])
+        elif kind == "batch_align":
+            # The correction is per cell and needs every aligned channel to
+            # decide which cluster the cell belongs to.
+            if needed & set(stage.get("columns") or []):
+                needed |= set(stage["columns"])
         elif kind == "unmix":
             if needed & set(stage["names"]):
                 needed |= set(stage["columns"])
@@ -928,6 +940,13 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                 )
                 values[channel] = values[channel] * factor
             continue
+        if kind == "batch_align":
+            aligned = list(stage.get("columns") or [])
+            if aligned and all(column in values for column in aligned):
+                values.update(
+                    _apply_batch_align(stage, values, parquet_path, cache)
+                )
+            continue
         if kind == "rename":
             if not _rename_applies(stage, parquet_path):
                 continue
@@ -937,6 +956,109 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                     # warned in the module and chose to proceed).
                     values[new] = values.pop(old)
     return {name: values[name] for name in names if name in values}
+
+
+def _assign_batch_clusters(model, matrix, cache, key):
+    """Cluster id of every row, from the trained SOM codebook.
+
+    The nearest code vector is found in chunks with the BLAS expansion of the
+    squared distance, so a million cells take well under a second. The result
+    is cached per (model, file) because the same rows are re-read by every
+    downstream module.
+    """
+    import numpy as np
+
+    if cache is not None and key in cache:
+        return cache[key]
+    codes = np.asarray(model["codes"], dtype="float64")
+    node_cluster = np.asarray(model["node_cluster"])
+    code_norm = np.einsum("ij,ij->i", codes, codes)
+    out = np.empty(matrix.shape[0], dtype=np.int16)
+    chunk = 200_000
+    for start in range(0, matrix.shape[0], chunk):
+        block = matrix[start:start + chunk]
+        distances = (
+            np.einsum("ij,ij->i", block, block)[:, None]
+            - 2.0 * (block @ codes.T)
+            + code_norm[None, :]
+        )
+        out[start:start + chunk] = node_cluster[distances.argmin(axis=1)]
+    if cache is not None:
+        if len(cache) > 8:
+            cache.clear()
+        cache[key] = out
+    return out
+
+
+def _apply_batch_align(stage, values, parquet_path, cache=None) -> dict:
+    """Correct the aligned columns of one file (see the Batch Alignment module)."""
+    import numpy as np
+
+    path = str(parquet_path) if parquet_path is not None else ""
+    batch = (stage.get("files") or {}).get(path)
+    if batch is None:
+        return {}
+    columns = list(stage.get("columns") or [])
+    arrays = [np.asarray(values[column], dtype="float64") for column in columns]
+    n_rows = arrays[0].size
+    if any(a.size != n_rows for a in arrays):
+        return {}
+    finite = np.ones(n_rows, dtype=bool)
+    for array in arrays:
+        finite &= np.isfinite(array)
+    if not finite.any():
+        return {}
+
+    if stage.get("method") == "combat":
+        affine = np.asarray(stage["affine"])
+        out = {}
+        for j, column in enumerate(columns):
+            scale = float(affine[batch, j, 0])
+            shift = float(affine[batch, j, 1])
+            result = np.array(values[column], dtype="float64", copy=True)
+            result[finite] = result[finite] * scale + shift
+            out[column] = result
+        return out
+
+    if stage.get("codes") is None:
+        return {}
+    rows = np.flatnonzero(finite)
+    matrix = np.column_stack([array[finite] for array in arrays])
+    # The row subset can change (an upstream Subsample), so the key carries a
+    # cheap fingerprint of the actual values, not just the row count.
+    fingerprint = round(float(matrix.sum()), 3) if matrix.size else 0.0
+    key = ("ba_nodes", stage.get("id"), stage.get("model_id"), path,
+           matrix.shape[0], fingerprint)
+    clusters = _assign_batch_clusters(stage, matrix, cache, key)
+    knots_x = np.asarray(stage["knots_x"])
+    knots_y = np.asarray(stage["knots_y"])
+    has_spline = np.asarray(stage["has_spline"])
+    out = {}
+    for j, column in enumerate(columns):
+        out[column] = np.array(values[column], dtype="float64", copy=True)
+    n_clusters = knots_y.shape[1]
+    global_x = stage.get("global_x")
+    global_y = stage.get("global_y")
+    has_global = stage.get("has_global")
+    for cluster in np.unique(clusters):
+        cluster = int(cluster)
+        if cluster < 0 or cluster >= n_clusters:
+            continue
+        target = rows[clusters == cluster]
+        if target.size == 0:
+            continue
+        if bool(has_spline[batch, cluster]):
+            for j, column in enumerate(columns):
+                out[column][target] = np.interp(
+                    out[column][target], knots_x[batch, cluster, j],
+                    knots_y[batch, cluster, j],
+                )
+        elif has_global is not None and bool(has_global[batch]):
+            for j, column in enumerate(columns):
+                out[column][target] = np.interp(
+                    out[column][target], global_x[batch, j], global_y[batch, j]
+                )
+    return out
 
 
 def _point_in_polygon(x, y, points):
@@ -3542,8 +3664,17 @@ MODULE_KINDS = {
     "subsample": "map",
     "dimred": "generate",
     "cluster": "generate",
+    # Area only computes and displays a result; it never changes the data that
+    # flows downstream, so it must not lock its upstream modules.
+    "area": "visualize",
+    "data_clean": "generate",
+    "batch_align": "map",
     "export": "map",
 }
+
+
+class _AreaCancelled(Exception):
+    """Raised inside a running Area job when its parameters changed."""
 
 
 def _task_kind(task_type: str) -> str:
@@ -3648,6 +3779,9 @@ class MainWindow(QMainWindow):
                 or getattr(widget, "_rename_dirty", False)
                 or getattr(widget, "_dimred_dirty", False)
                 or getattr(widget, "_cluster_dirty", False)
+                or getattr(widget, "_dc_dirty", False)
+                or getattr(widget, "_ba_dirty", False)
+                or getattr(widget, "_area_dirty", False)
             ):
                 return True
         return False
@@ -5171,6 +5305,15 @@ class MainWindow(QMainWindow):
             self._set_import_controls_enabled(False)
         return page
 
+    def _param_hint(self, text: str) -> QLabel:
+        """Small grey note shown directly under the parameter it explains."""
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            "color: #8a94a6; font-size: 8pt; margin: 0 0 6px 0;"
+        )
+        return label
+
     def _build_panel_frame(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("modulePanel")
@@ -6315,6 +6458,9 @@ class MainWindow(QMainWindow):
             for name in self._cluster_applied_columns(task_id, parquet_path):
                 if name not in columns:
                     columns.append(name)
+            for name in self._dc_applied_columns(task_id, parquet_path):
+                if name not in columns:
+                    columns.append(name)
             # An upstream Subset module whitelists column names for everything
             # below it (empty selection = no filtering).
             allowed = self._subset_visible_columns(task_id)
@@ -6544,6 +6690,10 @@ class MainWindow(QMainWindow):
                         "task_id": task.get("id"),
                         "submodules": submodules,
                     }))
+            elif task_type == "batch_align":
+                stage = self._ba_stage(task)
+                if stage is not None:
+                    stages.append(("batch_align", stage))
             elif task_type == "rename":
                 # Column-mode renames are a name transform that participates in
                 # the pipeline (file-mode renames are handled elsewhere, on the
@@ -6639,6 +6789,14 @@ class MainWindow(QMainWindow):
             ).items():
                 if name in needed and name not in values:
                     arr = self._cluster_column_values(parquet_path, rec, name)
+                    if arr is not None:
+                        values[name] = arr
+            # PeacoQC 0/1 columns from upstream Data Clean modules.
+            for name, rec in self._dc_applied_columns(
+                task_id, parquet_path
+            ).items():
+                if name in needed and name not in values:
+                    arr = self._dc_column_values(parquet_path, rec, name)
                     if arr is not None:
                         values[name] = arr
         if row_filter and task_id:
@@ -7720,6 +7878,8 @@ class MainWindow(QMainWindow):
         dimred_cols = self._dimred_applied_columns(task_id, parquet_path) if task_id else {}
         # Cluster label columns likewise come from their own image parquet.
         cluster_cols = self._cluster_applied_columns(task_id, parquet_path) if task_id else {}
+        # Data Clean 0/1 columns likewise come from their own image parquet.
+        dc_cols = self._dc_applied_columns(task_id, parquet_path) if task_id else {}
         for layer in layers:
             if layer.get("visible") is False:
                 continue
@@ -7789,6 +7949,17 @@ class MainWindow(QMainWindow):
                 hi = float(np.nanmax(chan)) if chan.size else 1.0
                 if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
                     lo, hi = 0.0, 1.0
+                frac = None
+                raster_stages = None
+                cname = None
+            elif channel in dc_cols:
+                rec = dc_cols[channel]
+                chan, rect = self._dc_raster(rec, (x0, x1, y0, y1), spacing)
+                if chan is None:
+                    unavailable.append(channel)
+                    continue
+                lo = 0.0
+                hi = 1.0
                 frac = None
                 raster_stages = None
                 cname = None
@@ -10211,6 +10382,9 @@ class MainWindow(QMainWindow):
         # Row filtering depends on the saved sampling settings.
         self._subsample_cache = {}
         self._subsample_mask_cache = {}
+        # Batch-alignment models and their per-file cluster assignments.
+        self._ba_cache = {}
+        self._ba_row_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
         # Saved output can lock (or unlock) modules, so refresh the lock badges
         # and button states in the workflow tree.
@@ -10250,6 +10424,12 @@ class MainWindow(QMainWindow):
             self._dimred_refresh(page)
         elif task_type == "cluster":
             self._cluster_refresh(page)
+        elif task_type == "area":
+            self._area_refresh(page)
+        elif task_type == "data_clean":
+            self._dc_refresh(page)
+        elif task_type == "batch_align":
+            self._ba_refresh(page)
         # Other module types have no live visualization to refresh yet.
     # ----- unmix module (map) -----------------------------------------
     def _build_unmix_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
@@ -13257,6 +13437,10 @@ class MainWindow(QMainWindow):
         sizes.addWidget(tile_h)
         sizes.addStretch()
         lay.addLayout(sizes)
+        lay.addWidget(self._param_hint(
+            "Tile size the correction is estimated on. Tiles that would run "
+            "past the right or bottom edge are excluded from the calculation."
+        ))
 
         hint = QLabel(self._illum_divisibility_hint(sub))
         hint.setWordWrap(True)
@@ -13278,6 +13462,10 @@ class MainWindow(QMainWindow):
         bins_row.addWidget(res_spin)
         bins_row.addStretch()
         lay.addLayout(bins_row)
+        lay.addWidget(self._param_hint(
+            "Bin = tile size of the coarse grid; Resolution = number of bins "
+            "across the image. The mask is fitted on that grid."
+        ))
 
         lay.addWidget(QLabel("Correction method"))
         method_combo = _NoWheelComboBox()
@@ -13288,6 +13476,10 @@ class MainWindow(QMainWindow):
         method_combo.setCurrentIndex(idx if idx >= 0 else 2)
         method_combo.setEnabled(editable)
         lay.addWidget(method_combo)
+        lay.addWidget(self._param_hint(
+            "Down keeps the darkest tile, Up the brightest; Median keeps the "
+            "median level and is the safe default."
+        ))
 
         lay.addWidget(QLabel("Files for the calculation"))
         calc_list = QListWidget()
@@ -14907,6 +15099,9 @@ class MainWindow(QMainWindow):
             channel_combo.setCurrentIndex(idx)
         channel_combo.setEnabled(enabled)
         lay.addWidget(channel_combo)
+        lay.addWidget(self._param_hint(
+            "Channel used to detect nuclei."
+        ))
 
         lay.addWidget(QLabel("Threshold"))
         mode_combo = _NoWheelComboBox()
@@ -14916,6 +15111,10 @@ class MainWindow(QMainWindow):
         mode_combo.setCurrentIndex(max(0, idx))
         mode_combo.setEnabled(enabled)
         lay.addWidget(mode_combo)
+        lay.addWidget(self._param_hint(
+            "Otsu picks the cut-off from the histogram; Manual uses the value "
+            "below."
+        ))
 
         def otsu_default():
             """The Otsu value of the chosen channel, used as the default."""
@@ -14937,6 +15136,10 @@ class MainWindow(QMainWindow):
             "switches to a manual threshold."
         )
         lay.addWidget(thr_spin)
+        lay.addWidget(self._param_hint(
+            "Prefilled with the Otsu value. Editing it switches the mode to "
+            "Manual."
+        ))
 
         lay.addWidget(QLabel("Minimum nucleus area (px)"))
         area_spin = _NoWheelSpinBox()
@@ -14944,6 +15147,9 @@ class MainWindow(QMainWindow):
         area_spin.setValue(int(params.get("min_area", 30)))
         area_spin.setEnabled(enabled)
         lay.addWidget(area_spin)
+        lay.addWidget(self._param_hint(
+            "Objects smaller than this many pixels are discarded as debris."
+        ))
 
         lay.addWidget(QLabel("Expansion radius (px)"))
         exp_spin = _NoWheelSpinBox()
@@ -14951,6 +15157,9 @@ class MainWindow(QMainWindow):
         exp_spin.setValue(int(params.get("expand", 5)))
         exp_spin.setEnabled(enabled)
         lay.addWidget(exp_spin)
+        lay.addWidget(self._param_hint(
+            "How far each nucleus grows to approximate the cell body."
+        ))
 
         calc_btn = QPushButton("Calculate")
         calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -15074,7 +15283,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(files_list)
         page._seg_calc_files_list = files_list
 
-        lay.addWidget(param_label("Nucleus channel", "nuclear stain channel"))
+        lay.addWidget(param_label("Nucleus channel"))
         columns = self._seg_channel_columns(page)
         channel_combo = _NoWheelComboBox()
         channel_combo.addItem("", None)
@@ -15085,12 +15294,13 @@ class MainWindow(QMainWindow):
             channel_combo.setCurrentIndex(idx)
         channel_combo.setEnabled(enabled)
         lay.addWidget(channel_combo)
+        lay.addWidget(self._param_hint(
+            "Channel used to detect nuclei."
+        ))
 
         cyto_combo = None
         if entry["family"] == "cellpose":
-            lay.addWidget(param_label(
-                "Cytoplasm channel (optional)", "optional second channel"
-            ))
+            lay.addWidget(param_label("Cytoplasm channel (optional)"))
             cyto_combo = _NoWheelComboBox()
             cyto_combo.addItem("(none)", None)
             for name in columns:
@@ -15100,6 +15310,10 @@ class MainWindow(QMainWindow):
                 cyto_combo.setCurrentIndex(idx)
             cyto_combo.setEnabled(enabled)
             lay.addWidget(cyto_combo)
+            lay.addWidget(self._param_hint(
+                "Optional second channel that helps Cellpose follow the cell "
+                "body around each nucleus."
+            ))
 
         prob_spin = None
         nms_spin = None
@@ -15109,7 +15323,7 @@ class MainWindow(QMainWindow):
             params.setdefault("prob", 0.5)
             params.setdefault("nms", 0.3)
             params.setdefault("tile_size", 0)
-            lay.addWidget(param_label("Probability threshold", "lower detects more cells"))
+            lay.addWidget(param_label("Probability threshold"))
             prob_spin = _NoWheelDoubleSpinBox()
             prob_spin.setRange(0.01, 1.0)
             prob_spin.setSingleStep(0.05)
@@ -15117,8 +15331,11 @@ class MainWindow(QMainWindow):
             prob_spin.setValue(float(params.get("prob", 0.5)))
             prob_spin.setEnabled(enabled)
             lay.addWidget(prob_spin)
+            lay.addWidget(self._param_hint(
+                "Lower values detect more cells, and more false positives."
+            ))
 
-            lay.addWidget(param_label("NMS threshold", "overlap suppression"))
+            lay.addWidget(param_label("NMS threshold"))
             nms_spin = _NoWheelDoubleSpinBox()
             nms_spin.setRange(0.0, 1.0)
             nms_spin.setSingleStep(0.05)
@@ -15126,10 +15343,12 @@ class MainWindow(QMainWindow):
             nms_spin.setValue(float(params.get("nms", 0.3)))
             nms_spin.setEnabled(enabled)
             lay.addWidget(nms_spin)
-
-            lay.addWidget(param_label(
-                "Tile size (px)", "approximate tile edge; 0 = auto"
+            lay.addWidget(self._param_hint(
+                "Non-maximum suppression: higher removes more overlapping "
+                "detections."
             ))
+
+            lay.addWidget(param_label("Tile size (px)"))
             tile_size_spin = _NoWheelSpinBox()
             tile_size_spin.setRange(0, 20000)
             tile_size_spin.setSingleStep(64)
@@ -15142,6 +15361,10 @@ class MainWindow(QMainWindow):
                 "pick a good size automatically."
             )
             lay.addWidget(tile_size_spin)
+            lay.addWidget(self._param_hint(
+                "Approximate tile edge in pixels; Smage adapts the actual "
+                "tiles to the image size. 0 = let StarDist choose."
+            ))
 
         calc_btn = QPushButton("Calculate")
         calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -20541,40 +20764,45 @@ class MainWindow(QMainWindow):
         max_events = _NoWheelSpinBox()
         max_events.setRange(0, 2_000_000_000)
         max_events.setValue(5000)
-        max_events.setToolTip(
-            "Randomly downsample each file to at most this many points before "
-            "fitting (0 = use every point)."
-        )
         max_events.setEnabled(not page._dimred_locked)
         lay.addWidget(max_events)
+        lay.addWidget(self._param_hint(
+            "Randomly cap the points each table (flow) file contributes "
+            "(0 = use everything). 5,000–10,000 per file is a good default for "
+            "UMAP, fewer for t-SNE. Image files always use every pixel. Fixed "
+            "seed, so the sample is reproducible."
+        ))
         page._dimred_max_events = max_events
-        me_hint = QLabel(
-            "Downsample each table (flow) file before fitting. Recommended "
-            "5,000–10,000 per file for UMAP (100 files ≈ up to 1M points); use "
-            "fewer for t-SNE. Image files are always used in full. Fixed seed, "
-            "so results are reproducible."
-        )
-        me_hint.setWordWrap(True)
-        me_hint.setStyleSheet("color: #6b7785;")
-        lay.addWidget(me_hint)
         max_events.valueChanged.connect(lambda _=0: self._dimred_on_max_events(page))
 
         # UMAP parameters
         umap_host = QWidget()
         umap_l = QGridLayout(umap_host)
         umap_l.setContentsMargins(0, 0, 0, 0)
-        umap_l.addWidget(QLabel("n_neighbors"), 0, 0)
+        umap_l.setVerticalSpacing(2)
+        umap_l.setColumnStretch(1, 1)
+        row = 0
+        umap_l.addWidget(QLabel("n_neighbors"), row, 0)
         nn = _NoWheelSpinBox()
         nn.setRange(2, 500)
         nn.setValue(15)
-        umap_l.addWidget(nn, 0, 1)
-        umap_l.addWidget(QLabel("min_dist"), 1, 0)
+        umap_l.addWidget(nn, row, 1)
+        row += 1
+        umap_l.addWidget(self._param_hint(
+            "Neighbours each point balances. Higher = more global structure."
+        ), row, 0, 1, 2)
+        row += 1
+        umap_l.addWidget(QLabel("min_dist"), row, 0)
         md = _NoWheelDoubleSpinBox()
         md.setRange(0.0, 0.99)
         md.setDecimals(3)
         md.setSingleStep(0.01)
         md.setValue(0.1)
-        umap_l.addWidget(md, 1, 1)
+        umap_l.addWidget(md, row, 1)
+        row += 1
+        umap_l.addWidget(self._param_hint(
+            "How tightly points may pack. Lower = denser, more separated clumps."
+        ), row, 0, 1, 2)
         page._dimred_umap_host = umap_host
         page._dimred_nn = nn
         page._dimred_md = md
@@ -20583,23 +20811,41 @@ class MainWindow(QMainWindow):
         tsne_host = QWidget()
         tsne_l = QGridLayout(tsne_host)
         tsne_l.setContentsMargins(0, 0, 0, 0)
-        tsne_l.addWidget(QLabel("perplexity"), 0, 0)
+        tsne_l.setVerticalSpacing(2)
+        tsne_l.setColumnStretch(1, 1)
+        row = 0
+        tsne_l.addWidget(QLabel("perplexity"), row, 0)
         perp = _NoWheelDoubleSpinBox()
         perp.setRange(2.0, 500.0)
         perp.setDecimals(1)
         perp.setValue(30.0)
-        tsne_l.addWidget(perp, 0, 1)
-        tsne_l.addWidget(QLabel("n_iter"), 1, 0)
+        tsne_l.addWidget(perp, row, 1)
+        row += 1
+        tsne_l.addWidget(self._param_hint(
+            "Roughly the number of neighbours per point; 5–50 is typical."
+        ), row, 0, 1, 2)
+        row += 1
+        tsne_l.addWidget(QLabel("n_iter"), row, 0)
         nit = _NoWheelSpinBox()
         nit.setRange(250, 10000)
         nit.setValue(1000)
-        tsne_l.addWidget(nit, 1, 1)
+        tsne_l.addWidget(nit, row, 1)
+        row += 1
+        tsne_l.addWidget(self._param_hint(
+            "Optimisation steps. More = slower but more settled."
+        ), row, 0, 1, 2)
+        row += 1
         backend_label = QLabel("implementation")
-        tsne_l.addWidget(backend_label, 2, 0)
+        tsne_l.addWidget(backend_label, row, 0)
         backend = _NoWheelComboBox()
         backend.addItem("sklearn (default)", "sklearn")
         backend.addItem("openTSNE (experimental)", "opentsne")
-        tsne_l.addWidget(backend, 2, 1)
+        tsne_l.addWidget(backend, row, 1)
+        row += 1
+        tsne_l.addWidget(self._param_hint(
+            "sklearn is the default; openTSNE is experimental and was slower "
+            "on this machine."
+        ), row, 0, 1, 2)
         page._dimred_tsne_host = tsne_host
         page._dimred_perp = perp
         page._dimred_nit = nit
@@ -20613,26 +20859,29 @@ class MainWindow(QMainWindow):
         normalize.setChecked(True)
         normalize.setEnabled(not page._dimred_locked)
         lay.addWidget(normalize)
+        lay.addWidget(self._param_hint(
+            "Z-score every variable first, so no channel dominates the distance."
+        ))
         page._dimred_normalize = normalize
 
         pca = QCheckBox("PCA pre-reduction (faster)")
         pca.setChecked(True)
-        pca.setToolTip(
-            "Reduce to 50 dimensions with PCA before fitting (only when more "
-            "variables are selected). Standard practice; usually faster."
-        )
         pca.setEnabled(not page._dimred_locked)
         lay.addWidget(pca)
+        lay.addWidget(self._param_hint(
+            "Reduce to 50 dimensions with PCA before fitting, when more "
+            "variables are selected. Standard practice, usually faster."
+        ))
         page._dimred_pca = pca
 
         parallel = QCheckBox("Allow parallel (non-reproducible)")
         parallel.setChecked(True)
-        parallel.setToolTip(
-            "Use every CPU core. Much faster, but the result changes every "
-            "run (the fixed seed is dropped)."
-        )
         parallel.setEnabled(not page._dimred_locked)
         lay.addWidget(parallel)
+        lay.addWidget(self._param_hint(
+            "Use every CPU core. Much faster, but the result changes on every "
+            "run (the fixed seed is dropped)."
+        ))
         page._dimred_parallel = parallel
 
         lay.addWidget(QLabel("<b>New column names</b>"))
@@ -21785,131 +22034,131 @@ class MainWindow(QMainWindow):
         max_events = _NoWheelSpinBox()
         max_events.setRange(0, 2_000_000_000)
         max_events.setValue(5000)
-        max_events.setToolTip(
-            "Randomly downsample each file to at most this many points before "
-            "clustering (0 = use every point)."
-        )
         max_events.setEnabled(not page._cluster_locked)
         lay.addWidget(max_events)
+        lay.addWidget(self._param_hint(
+            "Randomly cap the points each table (flow) file contributes "
+            "(0 = use everything). Image files are always clustered in full — "
+            "use an upstream Subsample module to thin a huge image. Fixed seed."
+        ))
         page._cluster_max_events = max_events
-        me_hint = QLabel(
-            "Downsample each table (flow) file before clustering. Image files "
-            "are always clustered in full — this limit is ignored for them. To "
-            "downsample a very large image for speed, use an upstream Subsample "
-            "module instead. Fixed seed, so results are reproducible."
-        )
-        me_hint.setWordWrap(True)
-        me_hint.setStyleSheet("color: #6b7785;")
-        lay.addWidget(me_hint)
 
-        kmeans_host = QWidget()
-        kl = QGridLayout(kmeans_host)
-        kl.setContentsMargins(0, 0, 0, 0)
-        kl.addWidget(QLabel("k (clusters)"), 0, 0)
+        def _param_host(rows):
+            host = QWidget()
+            grid = QGridLayout(host)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setVerticalSpacing(2)
+            grid.setColumnStretch(1, 1)
+            row = 0
+            for label, widget, hint in rows:
+                grid.addWidget(QLabel(label), row, 0)
+                grid.addWidget(widget, row, 1)
+                row += 1
+                grid.addWidget(self._param_hint(hint), row, 0, 1, 2)
+                row += 1
+            return host
+
         kmeans_k = _NoWheelSpinBox()
         kmeans_k.setRange(2, 1000)
         kmeans_k.setValue(20)
-        kl.addWidget(kmeans_k, 0, 1)
+        kmeans_host = _param_host([
+            ("k (clusters)", kmeans_k,
+             "Number of clusters to split the data into."),
+        ])
         page._cluster_kmeans_host = kmeans_host
         page._cluster_kmeans_k = kmeans_k
 
-        flowsom_host = QWidget()
-        fl = QGridLayout(flowsom_host)
-        fl.setContentsMargins(0, 0, 0, 0)
-        fl.addWidget(QLabel("SOM nodes"), 0, 0)
         flowsom_nodes = _NoWheelSpinBox()
         flowsom_nodes.setRange(4, 10000)
         flowsom_nodes.setValue(100)
-        fl.addWidget(flowsom_nodes, 0, 1)
-        fl.addWidget(QLabel("k (clusters)"), 1, 0)
         flowsom_k = _NoWheelSpinBox()
         flowsom_k.setRange(2, 1000)
         flowsom_k.setValue(20)
-        fl.addWidget(flowsom_k, 1, 1)
+        flowsom_host = _param_host([
+            ("SOM nodes", flowsom_nodes,
+             "Size of the self-organising map; more nodes = finer overclustering."),
+            ("k (clusters)", flowsom_k,
+             "Clusters the SOM nodes are merged into."),
+        ])
         page._cluster_flowsom_host = flowsom_host
         page._cluster_flowsom_nodes = flowsom_nodes
         page._cluster_flowsom_k = flowsom_k
 
         # PhenoGraph: k (neighbors); cluster count auto-determined.
-        phenograph_host = QWidget()
-        phl = QGridLayout(phenograph_host)
-        phl.setContentsMargins(0, 0, 0, 0)
-        phl.addWidget(QLabel("k (neighbors)"), 0, 0)
         phenograph_k = _NoWheelSpinBox()
         phenograph_k.setRange(2, 1000)
         phenograph_k.setValue(30)
-        phl.addWidget(phenograph_k, 0, 1)
+        phenograph_host = _param_host([
+            ("k (neighbors)", phenograph_k,
+             "Neighbours per point in the graph; higher = fewer, larger clusters."),
+        ])
         page._cluster_phenograph_host = phenograph_host
         page._cluster_phenograph_k = phenograph_k
 
         # Leiden: k (neighbors) + resolution.
-        leiden_host = QWidget()
-        ll = QGridLayout(leiden_host)
-        ll.setContentsMargins(0, 0, 0, 0)
-        ll.addWidget(QLabel("k (neighbors)"), 0, 0)
         leiden_k = _NoWheelSpinBox()
         leiden_k.setRange(2, 1000)
         leiden_k.setValue(30)
-        ll.addWidget(leiden_k, 0, 1)
-        ll.addWidget(QLabel("resolution"), 1, 0)
         leiden_res = _NoWheelDoubleSpinBox()
         leiden_res.setRange(0.05, 10.0)
         leiden_res.setDecimals(2)
         leiden_res.setSingleStep(0.1)
         leiden_res.setValue(1.0)
-        ll.addWidget(leiden_res, 1, 1)
+        leiden_host = _param_host([
+            ("k (neighbors)", leiden_k,
+             "Neighbours per point in the graph."),
+            ("resolution", leiden_res,
+             "Higher = more, smaller clusters."),
+        ])
         page._cluster_leiden_host = leiden_host
         page._cluster_leiden_k = leiden_k
         page._cluster_leiden_res = leiden_res
 
         # DBSCAN: eps + min_samples.
-        dbscan_host = QWidget()
-        dl = QGridLayout(dbscan_host)
-        dl.setContentsMargins(0, 0, 0, 0)
-        dl.addWidget(QLabel("eps"), 0, 0)
         dbscan_eps = _NoWheelDoubleSpinBox()
         dbscan_eps.setRange(0.01, 100.0)
         dbscan_eps.setDecimals(3)
         dbscan_eps.setSingleStep(0.05)
         dbscan_eps.setValue(0.5)
-        dl.addWidget(dbscan_eps, 0, 1)
-        dl.addWidget(QLabel("min samples"), 1, 0)
         dbscan_ms = _NoWheelSpinBox()
         dbscan_ms.setRange(2, 1000)
         dbscan_ms.setValue(10)
-        dl.addWidget(dbscan_ms, 1, 1)
+        dbscan_host = _param_host([
+            ("eps", dbscan_eps,
+             "Neighbourhood radius. Larger = fewer, bigger clusters."),
+            ("min samples", dbscan_ms,
+             "Points needed in a neighbourhood to count as dense."),
+        ])
         page._cluster_dbscan_host = dbscan_host
         page._cluster_dbscan_eps = dbscan_eps
         page._cluster_dbscan_ms = dbscan_ms
 
         # Hierarchical (agglomerative): k.
-        hier_host = QWidget()
-        hl = QGridLayout(hier_host)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.addWidget(QLabel("k (clusters)"), 0, 0)
         hier_k = _NoWheelSpinBox()
         hier_k.setRange(2, 1000)
         hier_k.setValue(20)
-        hl.addWidget(hier_k, 0, 1)
+        hier_host = _param_host([
+            ("k (clusters)", hier_k,
+             "Where to cut the cluster tree."),
+        ])
         page._cluster_hier_host = hier_host
         page._cluster_hier_k = hier_k
 
         # PARC: knn + resolution.
-        parc_host = QWidget()
-        pl = QGridLayout(parc_host)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.addWidget(QLabel("knn"), 0, 0)
         parc_knn = _NoWheelSpinBox()
         parc_knn.setRange(2, 1000)
         parc_knn.setValue(30)
-        pl.addWidget(parc_knn, 0, 1)
-        pl.addWidget(QLabel("resolution"), 1, 0)
         parc_res = _NoWheelDoubleSpinBox()
         parc_res.setRange(0.05, 10.0)
         parc_res.setDecimals(2)
         parc_res.setSingleStep(0.1)
         parc_res.setValue(1.0)
-        pl.addWidget(parc_res, 1, 1)
+        parc_host = _param_host([
+            ("knn", parc_knn,
+             "Neighbours per point in the graph."),
+            ("resolution", parc_res,
+             "Higher = more, smaller clusters."),
+        ])
         page._cluster_parc_host = parc_host
         page._cluster_parc_knn = parc_knn
         page._cluster_parc_res = parc_res
@@ -21926,6 +22175,9 @@ class MainWindow(QMainWindow):
         normalize.setChecked(True)
         normalize.setEnabled(not page._cluster_locked)
         lay.addWidget(normalize)
+        lay.addWidget(self._param_hint(
+            "Z-score the variables first, so no channel dominates the distance."
+        ))
         page._cluster_normalize = normalize
 
         lay.addWidget(QLabel("<b>New column name</b>"))
@@ -22568,6 +22820,4104 @@ class MainWindow(QMainWindow):
             page._cluster_task_def["params"] = page._cluster_snapshot
             page._cluster_task_def["params"]["log"] = log_lines
         self._close_module_page(page)
+
+    # ----- area module (compute-only) -----------------------------------
+    _AREA_GRID_DEFAULT = 200
+    _AREA_LOW_DEFAULT = 100.0
+    _AREA_HIGH_DEFAULT = 10000.0
+    _AREA_DENSITY_DEFAULT = 10.0
+
+    def _build_area_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Area page: files/batch (1) | per-file table (2) | plot (1)."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._area_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("files", [])
+        params.setdefault("apply", [])
+        params.setdefault("rows", {})
+        params.setdefault("results", {})
+        params.setdefault("grid", self._AREA_GRID_DEFAULT)
+        params.setdefault("plot", {
+            # "auto" picks Image for image files and Scatter for table files.
+            "type": "auto",
+            "palette": "viridis",
+            "point_size": 4.0,
+        })
+        params.setdefault("selected", None)
+
+        page._area_task_def = task_def
+        page._area_task_id = task_def.get("id")
+        page._area_params = params
+        page._area_locked = locked
+        page._area_save_btn = save_btn
+        page._area_dirty = False
+        page._area_snapshot = copy.deepcopy(params)
+        page._area_paths = []
+        page._area_status = {}
+        page._area_latest = {}
+        page._area_counts = {}
+        page._area_cancel_events = {}
+        page._area_job_queue = None
+        page._area_thread = None
+        page._area_timer = None
+        page._area_updating = False
+        page._area_closing = False
+        save_btn.clicked.connect(lambda _=False: self._area_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._area_left_panel(page))
+        splitter.addWidget(self._area_center_panel(page))
+        splitter.addWidget(self._area_right_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([300, 560, 340])
+        row.addWidget(splitter, 1)
+        layout.addWidget(content, 1)
+
+        self._area_refresh(page)
+        return page
+
+    # ----- area: left panel (files + batch) -----------------------------
+    def _area_left_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("<b>Files</b>"))
+        pick = QPushButton("Select files…")
+        pick.setCursor(Qt.CursorShape.PointingHandCursor)
+        pick.clicked.connect(lambda _=False: self._area_select_files(page))
+        lay.addWidget(pick)
+
+        files = QListWidget()
+        files.setAlternatingRowColors(True)
+        files.setToolTip("Checked files receive the batch settings below.")
+        files.itemChanged.connect(lambda item: self._area_on_file_toggle(page, item))
+        lay.addWidget(files, 1)
+        page._area_file_list = files
+
+        summary = QLabel("No files selected")
+        summary.setStyleSheet("color: #5f6368;")
+        summary.setWordWrap(True)
+        lay.addWidget(summary)
+        page._area_summary = summary
+
+        lay.addWidget(QLabel("<b>Batch settings</b>"))
+        hint = QLabel("Only columns shared by the checked files are listed.")
+        hint.setStyleSheet("color: gray;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        page._area_batch_hint = hint
+
+        box = QGroupBox()
+        grid = QGridLayout(box)
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+
+        def _combo(key):
+            combo = _NoWheelComboBox()
+            combo.setMinimumContentsLength(6)
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
+            setattr(page, f"_area_batch_{key}", combo)
+            return combo
+
+        def _spin(key, value, lo, hi, decimals, step):
+            spin = _NoWheelDoubleSpinBox()
+            spin.setDecimals(decimals)
+            spin.setRange(lo, hi)
+            spin.setSingleStep(step)
+            spin.setValue(float(value))
+            setattr(page, f"_area_batch_{key}", spin)
+            return spin
+
+        grid.addWidget(QLabel("X"), 0, 0)
+        grid.addWidget(_combo("x"), 0, 1)
+        grid.addWidget(QLabel("Y"), 1, 0)
+        grid.addWidget(_combo("y"), 1, 1)
+        grid.addWidget(QLabel("Signal"), 2, 0)
+        grid.addWidget(_combo("signal"), 2, 1)
+        grid.addWidget(QLabel("Low"), 3, 0)
+        grid.addWidget(_spin("low", self._AREA_LOW_DEFAULT, -1e12, 1e12, 4, 10.0), 3, 1)
+        grid.addWidget(QLabel("High"), 4, 0)
+        grid.addWidget(_spin("high", self._AREA_HIGH_DEFAULT, -1e12, 1e12, 4, 100.0), 4, 1)
+        grid.addWidget(QLabel("Density >"), 5, 0)
+        grid.addWidget(_spin("density", self._AREA_DENSITY_DEFAULT, 0.0, 1e9, 2, 1.0), 5, 1)
+
+        apply_btn = QPushButton("Apply to checked files")
+        apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_btn.clicked.connect(lambda _=False: self._area_apply_batch(page))
+        grid.addWidget(apply_btn, 6, 0, 1, 2)
+        page._area_batch_apply = apply_btn
+        lay.addWidget(box)
+        return panel
+
+    # ----- area: middle panel (grid + table) ----------------------------
+    def _area_center_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("<b>Per-file parameters</b>"))
+        top.addStretch()
+        top.addWidget(QLabel("Grid cells (longer axis)"))
+        grid_spin = QSpinBox()
+        grid_spin.setRange(20, 2000)
+        grid_spin.setSingleStep(10)
+        grid_spin.setValue(int(page._area_params.get("grid") or self._AREA_GRID_DEFAULT))
+        grid_spin.setToolTip(
+            "Density grid used for every file. Finer grids give a more precise "
+            "area but make the density threshold stricter and the calculation "
+            "slower on large images."
+        )
+        grid_spin.valueChanged.connect(lambda value: self._area_on_grid(page, value))
+        top.addWidget(grid_spin)
+        page._area_grid_spin = grid_spin
+        lay.addLayout(top)
+        lay.addWidget(self._param_hint(
+            "Density grid used for every file. Finer = more precise area, but "
+            "each cell then holds fewer points — lower the density threshold "
+            "when you raise this."
+        ))
+
+        table = QTableWidget(0, 9)
+        table.setHorizontalHeaderLabels([
+            "File", "X", "Y", "Signal", "Low", "High", "Density", "Area", "Status",
+        ])
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 9):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(1, 90)
+        table.setColumnWidth(2, 90)
+        table.setColumnWidth(3, 110)
+        table.setColumnWidth(4, 80)
+        table.setColumnWidth(5, 80)
+        table.setColumnWidth(6, 70)
+        table.setColumnWidth(7, 110)
+        table.setColumnWidth(8, 120)
+        table.currentCellChanged.connect(
+            lambda row, *_a: self._area_on_row_selected(page, row)
+        )
+        page._area_table = table
+        lay.addWidget(table, 1)
+
+        footer = QHBoxLayout()
+        copy_btn = QPushButton("Copy")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.setToolTip("Copy the table to the clipboard (tab-separated)")
+        copy_btn.clicked.connect(lambda _=False: self._area_copy(page))
+        footer.addWidget(copy_btn)
+        footer.addStretch()
+        progress = QLabel("")
+        progress.setStyleSheet("color: #5f6368;")
+        footer.addWidget(progress)
+        page._area_progress = progress
+        lay.addLayout(footer)
+        return panel
+
+    # ----- area: right panel (plot + plot settings) ---------------------
+    def _area_right_panel(self, page) -> QWidget:
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        plot_panel = self._build_panel_frame()
+        pl = QVBoxLayout(plot_panel)
+        pl.setContentsMargins(10, 10, 10, 10)
+        pl.setSpacing(6)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("<b>Preview</b>"))
+        top.addStretch()
+        type_combo = _NoWheelComboBox()
+        type_combo.addItem("Auto", "auto")
+        type_combo.addItem("Scatter", "scatter")
+        type_combo.addItem("Image", "image")
+        type_combo.setToolTip(
+            "Auto shows image files as images and table files as scatter plots."
+        )
+        type_combo.currentIndexChanged.connect(
+            lambda _=0: self._area_on_plot_type(page)
+        )
+        top.addWidget(type_combo)
+        pl.addLayout(top)
+        pl.addWidget(self._param_hint(
+            "Auto shows image files as images and table files as scatter plots."
+        ))
+
+        plot_widget = self._figure_make_plot_widget({"type": "scatter"})
+        plot_widget.setMinimumHeight(240)
+        pl.addWidget(plot_widget, 1)
+        page._area_plot = plot_widget
+        page._area_type_combo = type_combo
+        lay.addWidget(plot_panel, 1)
+
+        settings = self._build_panel_frame()
+        sl = QVBoxLayout(settings)
+        sl.setContentsMargins(10, 10, 10, 10)
+        sl.setSpacing(6)
+        sl.addWidget(QLabel("<b>Plot settings</b>"))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Palette"))
+        palette = _NoWheelComboBox()
+        for name in FIGURE_PALETTES:
+            palette.addItem(name, name)
+        palette.currentIndexChanged.connect(
+            lambda _=0: self._area_on_plot_param(page)
+        )
+        row.addWidget(palette)
+        sl.addLayout(row)
+        sl.addWidget(self._param_hint(
+            "Colour map used for the signal variable."
+        ))
+        page._area_palette = palette
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Point size"))
+        size = _NoWheelDoubleSpinBox()
+        size.setRange(1.0, 20.0)
+        size.setSingleStep(0.5)
+        size.setDecimals(1)
+        size.valueChanged.connect(lambda _=0.0: self._area_on_plot_param(page))
+        row.addWidget(size)
+        row.addStretch()
+        sl.addLayout(row)
+        sl.addWidget(self._param_hint(
+            "Scatter dot size; ignored in the Image view."
+        ))
+        page._area_point_size = size
+
+        note = QLabel("Amber cells are the regions counted as tissue (density above the threshold).")
+        note.setStyleSheet("color: gray;")
+        note.setWordWrap(True)
+        sl.addWidget(note)
+        lay.addWidget(settings)
+        return panel
+
+    # ----- area: selection / refresh ------------------------------------
+    def _area_select_files(self, page) -> None:
+        params = page._area_params
+        records = self._available_files(page._area_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [
+            self._comp_file_name(p, page._area_task_id)
+            for p in params.get("files") or []
+        ]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        files = [by_name[n] for n in chosen if n in by_name]
+        params["files"] = files
+        apply_list = [p for p in params.get("apply") or [] if p in files]
+        params["apply"] = apply_list or list(files)
+        if params.get("selected") not in files:
+            params["selected"] = files[0] if files else None
+        self._area_refresh(page)
+        self._area_mark_dirty(page)
+
+    def _area_refresh(self, page) -> None:
+        """Rebuild the file list, the batch pickers and the table."""
+        params = page._area_params
+        files = [p for p in params.get("files") or []]
+        apply_list = [p for p in params.get("apply") or [] if p in files]
+        if not apply_list and files:
+            apply_list = list(files)
+        params["apply"] = apply_list
+        if params.get("selected") not in files:
+            params["selected"] = files[0] if files else None
+
+        lst = page._area_file_list
+        lst.blockSignals(True)
+        lst.clear()
+        for path in files:
+            item = QListWidgetItem(self._comp_file_name(path, page._area_task_id))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if path in apply_list else Qt.CheckState.Unchecked
+            )
+            lst.addItem(item)
+        lst.blockSignals(False)
+
+        self._area_update_summary(page)
+        self._area_rebuild_batch_combos(page)
+        self._area_rebuild_table(page)
+        self._area_sync_plot_settings(page)
+        self._area_render_plot(page)
+        for path in files:
+            self._area_enqueue(page, path)
+        self._area_update_progress(page)
+
+    def _area_update_summary(self, page) -> None:
+        params = page._area_params
+        files = params.get("files") or []
+        checked = [p for p in files if p in set(params.get("apply") or [])]
+        page._area_summary.setText(
+            f"{len(files)} file(s) · {len(checked)} checked for Apply"
+            if files else "No files selected"
+        )
+
+    def _area_on_file_toggle(self, page, item) -> None:
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+        apply_list = page._area_params.setdefault("apply", [])
+        checked = item.checkState() == Qt.CheckState.Checked
+        if checked and path not in apply_list:
+            apply_list.append(path)
+        elif not checked and path in apply_list:
+            apply_list.remove(path)
+        self._area_update_summary(page)
+        self._area_rebuild_batch_combos(page)
+
+    def _area_batch_common_columns(self, page) -> list:
+        paths = [
+            p for p in page._area_params.get("files") or []
+            if p in set(page._area_params.get("apply") or [])
+        ]
+        if not paths:
+            return []
+        common = set(self._columns_for(paths[0], page._area_task_id))
+        for path in paths[1:]:
+            common &= set(self._columns_for(path, page._area_task_id))
+        return sorted(common)
+
+    def _area_rebuild_batch_combos(self, page) -> None:
+        options = self._area_batch_common_columns(page)
+        for key in ("x", "y", "signal"):
+            combo = getattr(page, f"_area_batch_{key}", None)
+            if combo is None:
+                continue
+            current = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            if key == "signal":
+                combo.addItem("(none)", "")
+            for name in options:
+                combo.addItem(str(name), str(name))
+            idx = combo.findData(str(current or ""))
+            combo.setCurrentIndex(max(0, idx))
+            combo.blockSignals(False)
+        checked = bool(page._area_params.get("apply") or [])
+        page._area_batch_apply.setEnabled(bool(options) and checked)
+        if not checked:
+            page._area_batch_hint.setText(
+                "Check at least one file above to batch-edit its parameters."
+            )
+        elif not options:
+            page._area_batch_hint.setText(
+                "The checked files have no columns in common."
+            )
+        else:
+            page._area_batch_hint.setText(
+                f"Only columns shared by the checked files are listed ({len(options)})."
+            )
+
+    def _area_apply_batch(self, page) -> None:
+        paths = [
+            p for p in page._area_params.get("files") or []
+            if p in set(page._area_params.get("apply") or [])
+        ]
+        if not paths:
+            return
+        cfg = {
+            "x": page._area_batch_x.currentData() or "",
+            "y": page._area_batch_y.currentData() or "",
+            "signal": page._area_batch_signal.currentData() or "",
+            "low": float(page._area_batch_low.value()),
+            "high": float(page._area_batch_high.value()),
+            "density": float(page._area_batch_density.value()),
+        }
+        rows = page._area_params.setdefault("rows", {})
+        for path in paths:
+            row_cfg = self._area_row_cfg(page, path)
+            row_cfg.update(cfg)
+            self._area_sync_row(page, path)
+            self._area_enqueue(page, path)
+        if page._area_params.get("selected") in paths:
+            self._area_render_plot(page)
+        self._area_mark_dirty(page)
+
+    # ----- area: per-file table -----------------------------------------
+    def _area_default_cfg(self, page, path) -> dict:
+        columns = list(self._columns_for(path, page._area_task_id))
+        lower = {c.lower(): c for c in columns}
+        x_name = lower.get("x") or (columns[0] if columns else "")
+        y_name = lower.get("y") or next(
+            (c for c in columns if c != x_name), ""
+        )
+        signal = next((c for c in columns if c not in (x_name, y_name)), "")
+        return {
+            "x": x_name,
+            "y": y_name,
+            "signal": signal,
+            "low": self._AREA_LOW_DEFAULT,
+            "high": self._AREA_HIGH_DEFAULT,
+            "density": self._AREA_DENSITY_DEFAULT,
+        }
+
+    def _area_row_cfg(self, page, path) -> dict:
+        rows = page._area_params.setdefault("rows", {})
+        cfg = rows.get(path)
+        defaults = self._area_default_cfg(page, path)
+        if not isinstance(cfg, dict):
+            cfg = defaults
+            rows[path] = cfg
+        else:
+            for key, value in defaults.items():
+                cfg.setdefault(key, value)
+        return cfg
+
+    def _area_row_index(self, page, path):
+        try:
+            return page._area_paths.index(path)
+        except ValueError:
+            return None
+
+    def _area_rebuild_table(self, page) -> None:
+        table = page._area_table
+        paths = list(page._area_params.get("files") or [])
+        page._area_paths = paths
+        page._area_updating = True
+        table.blockSignals(True)
+        table.setRowCount(0)
+        table.setRowCount(len(paths))
+        for row, path in enumerate(paths):
+            cfg = self._area_row_cfg(page, path)
+            name_item = QTableWidgetItem(self._comp_file_name(path, page._area_task_id))
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            name_item.setToolTip(path)
+            table.setItem(row, 0, name_item)
+
+            columns = list(self._columns_for(path, page._area_task_id))
+            for col, key in ((1, "x"), (2, "y"), (3, "signal")):
+                combo = _NoWheelComboBox()
+                combo.setMinimumContentsLength(6)
+                combo.setSizeAdjustPolicy(
+                    QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+                )
+                if key == "signal":
+                    combo.addItem("(none)", "")
+                for name in columns:
+                    combo.addItem(str(name), str(name))
+                idx = combo.findData(str(cfg.get(key) or ""))
+                if idx < 0 and cfg.get(key):
+                    combo.addItem(str(cfg[key]), str(cfg[key]))
+                    idx = combo.count() - 1
+                combo.setCurrentIndex(max(0, idx))
+                combo.currentIndexChanged.connect(
+                    lambda _=0, p=path, k=key, c=combo: self._area_on_row_param(
+                        page, p, k, c.currentData()
+                    )
+                )
+                table.setCellWidget(row, col, combo)
+
+            for col, key, lo, hi, step in (
+                (4, "low", -1e12, 1e12, 10.0),
+                (5, "high", -1e12, 1e12, 100.0),
+                (6, "density", 0.0, 1e9, 1.0),
+            ):
+                spin = _NoWheelDoubleSpinBox()
+                spin.setDecimals(2 if key == "density" else 4)
+                spin.setRange(lo, hi)
+                spin.setSingleStep(step)
+                spin.setValue(float(cfg.get(key) or 0.0))
+                spin.valueChanged.connect(
+                    lambda value, p=path, k=key: self._area_on_row_param(page, p, k, value)
+                )
+                table.setCellWidget(row, col, spin)
+
+            area_item = QTableWidgetItem("")
+            area_item.setFlags(area_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            area_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            table.setItem(row, 7, area_item)
+            status_item = QTableWidgetItem("")
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            table.setItem(row, 8, status_item)
+        table.blockSignals(False)
+        page._area_updating = False
+
+        for row, path in enumerate(paths):
+            self._area_update_area_cell(page, path)
+            text, color = page._area_status.get(path, ("", "#5f6368"))
+            item = table.item(row, 8)
+            if item is not None and text:
+                item.setText(text)
+                item.setForeground(QColor(color))
+
+        selected = page._area_params.get("selected")
+        row = self._area_row_index(page, selected) if selected else None
+        if row is not None:
+            table.blockSignals(True)
+            table.setCurrentCell(row, 0)
+            table.selectRow(row)
+            table.blockSignals(False)
+
+    def _area_sync_row(self, page, path) -> None:
+        """Push a file's stored parameters into its table row widgets."""
+        row = self._area_row_index(page, path)
+        if row is None:
+            return
+        cfg = self._area_row_cfg(page, path)
+        table = page._area_table
+        previous = page._area_updating
+        page._area_updating = True
+        try:
+            for col, key in ((1, "x"), (2, "y"), (3, "signal")):
+                combo = table.cellWidget(row, col)
+                if combo is None:
+                    continue
+                combo.blockSignals(True)
+                idx = combo.findData(str(cfg.get(key) or ""))
+                if idx < 0 and cfg.get(key):
+                    combo.addItem(str(cfg[key]), str(cfg[key]))
+                    idx = combo.count() - 1
+                combo.setCurrentIndex(max(0, idx))
+                combo.blockSignals(False)
+            for col, key in ((4, "low"), (5, "high"), (6, "density")):
+                spin = table.cellWidget(row, col)
+                if spin is None:
+                    continue
+                spin.blockSignals(True)
+                spin.setValue(float(cfg.get(key) or 0.0))
+                spin.blockSignals(False)
+        finally:
+            page._area_updating = previous
+
+    def _area_on_row_param(self, page, path, key, value) -> None:
+        if getattr(page, "_area_updating", False):
+            return
+        cfg = self._area_row_cfg(page, path)
+        if key in ("x", "y", "signal"):
+            value = "" if value is None else str(value)
+        else:
+            value = float(value)
+        if cfg.get(key) == value:
+            return
+        cfg[key] = value
+        page._area_params["selected"] = path
+        row = self._area_row_index(page, path)
+        if row is not None:
+            table = page._area_table
+            table.blockSignals(True)
+            table.setCurrentCell(row, 0)
+            table.selectRow(row)
+            table.blockSignals(False)
+        self._area_enqueue(page, path)
+        self._area_render_plot(page)
+        self._area_mark_dirty(page)
+
+    def _area_on_row_selected(self, page, row) -> None:
+        if row is None or row < 0 or row >= len(page._area_paths):
+            return
+        path = page._area_paths[row]
+        if page._area_params.get("selected") == path:
+            return
+        page._area_params["selected"] = path
+        self._area_render_plot(page)
+
+    def _area_on_grid(self, page, value) -> None:
+        value = max(2, int(value))
+        if int(page._area_params.get("grid") or 0) == value:
+            return
+        page._area_params["grid"] = value
+        # Every area depends on the grid, and the cached counts are grid-sized.
+        page._area_params["results"] = {}
+        page._area_counts.clear()
+        for path in page._area_params.get("files") or []:
+            self._area_update_area_cell(page, path)
+            self._area_enqueue(page, path)
+        self._area_mark_dirty(page)
+
+    def _area_format(self, value) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(number):
+            return ""
+        return f"{number:,.6g}"
+
+    def _area_update_area_cell(self, page, path) -> None:
+        row = self._area_row_index(page, path)
+        if row is None:
+            return
+        item = page._area_table.item(row, 7)
+        if item is None:
+            return
+        cfg = self._area_row_cfg(page, path)
+        result = (page._area_params.get("results") or {}).get(path)
+        if (
+            isinstance(result, dict)
+            and result.get("area") is not None
+            and result.get("sig") == self._area_signature(page, path, cfg)
+        ):
+            item.setText(self._area_format(result["area"]))
+            item.setToolTip(
+                f"{int(result.get('cells') or 0)} cell(s) × "
+                f"{self._area_format(result.get('cell'))}² "
+                f"(grid {result.get('nx')}×{result.get('ny')}, "
+                f"{int(result.get('points') or 0)} point(s) in the signal range)"
+            )
+        else:
+            item.setText("—")
+            item.setToolTip("")
+
+    def _area_set_status(self, page, path, text, color) -> None:
+        page._area_status[path] = (text, color)
+        row = self._area_row_index(page, path)
+        if row is None:
+            return
+        item = page._area_table.item(row, 8)
+        if item is not None:
+            item.setText(text)
+            item.setForeground(QColor(color))
+
+    def _area_update_progress(self, page) -> None:
+        pending = sum(
+            1 for text, _color in page._area_status.values()
+            if text.startswith("Queued") or text.startswith("Computing")
+        )
+        label = getattr(page, "_area_progress", None)
+        if label is None:
+            return
+        label.setText(f"{pending} file(s) pending" if pending else "")
+
+    # ----- area: change signatures --------------------------------------
+    def _map_stage_token(self, task_id) -> str:
+        """A short digest of the upstream map stages that shape the values."""
+        import numpy as np
+
+        def _array_token(value):
+            try:
+                arr = np.ascontiguousarray(np.asarray(value, dtype="float64"))
+                return hashlib.sha1(arr.tobytes()).hexdigest()[:10]
+            except Exception:  # noqa: BLE001
+                return str(value)[:64]
+
+        stages = self._map_stages(task_id) if task_id else []
+        parts = []
+        for kind, stage in stages:
+            if kind == "scale":
+                parts.append([
+                    "scale",
+                    {k: dict(v) for k, v in (stage.get("columns") or {}).items()},
+                ])
+            elif kind == "compensation":
+                parts.append([
+                    "comp", stage.get("id"), sorted(stage.get("files") or []),
+                    list(stage.get("names") or []),
+                    _array_token(stage.get("matrix")),
+                ])
+            elif kind == "unmix":
+                parts.append([
+                    "unmix", stage.get("task_id"), sorted(stage.get("samples") or []),
+                    list(stage.get("names") or []),
+                    _array_token(stage.get("matrix")),
+                ])
+            elif kind == "illumination":
+                parts.append([
+                    "illum", stage.get("task_id"),
+                    [
+                        [sub.get("channel"), sorted(sub.get("files") or []), sub.get("T")]
+                        for sub in stage.get("submodules") or []
+                    ],
+                ])
+            elif kind == "batch_align":
+                parts.append([
+                    "batch_align", stage.get("id"), stage.get("method"),
+                    stage.get("model_id"), list(stage.get("columns") or []),
+                    sorted((stage.get("files") or {}).items()),
+                ])
+            elif kind == "rename":
+                parts.append(["rename", dict(stage.get("map") or {})])
+        return hashlib.sha1(
+            json.dumps(parts, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:12]
+
+    def _area_signature(self, page, path, cfg, include_density=True) -> str:
+        """Change signature for one file's area result."""
+        try:
+            st = Path(path).stat()
+            stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+        except OSError:
+            stat = ""
+        payload = {
+            "grid": int(page._area_params.get("grid") or self._AREA_GRID_DEFAULT),
+            "x": cfg.get("x"),
+            "y": cfg.get("y"),
+            "signal": cfg.get("signal"),
+            "low": float(cfg.get("low") or 0.0),
+            "high": float(cfg.get("high") or 0.0),
+            "source": str(path),
+            "stat": stat,
+            "stages": self._map_stage_token(page._area_task_id),
+            "columns": sorted(self._columns_for(path, page._area_task_id)),
+        }
+        if include_density:
+            payload["density"] = float(cfg.get("density") or 0.0)
+        sample = self._subsample_sig(page._area_task_id, path)
+        if sample:
+            payload["sample"] = sample
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+
+    # ----- area: background computation ---------------------------------
+    def _area_start_worker(self, page) -> None:
+        if getattr(page, "_area_job_queue", None) is not None:
+            return
+        jobs = queue.Queue()
+        results = queue.Queue()
+        page._area_job_queue = jobs
+        page._area_result_queue = results
+        page._area_thread = threading.Thread(
+            target=self._area_run, args=(page, jobs, results), daemon=True
+        )
+        page._area_thread.start()
+        timer = QTimer(self)
+        timer.setInterval(150)
+        timer.timeout.connect(lambda: self._area_poll(page))
+        timer.start()
+        page._area_timer = timer
+
+    def _area_enqueue(self, page, path) -> None:
+        """Queue a row for calculation when its stored result is out of date."""
+        if getattr(page, "_area_closing", False):
+            return
+        cfg = self._area_row_cfg(page, path)
+        sig = self._area_signature(page, path, cfg)
+        page._area_latest[path] = sig
+        results = page._area_params.setdefault("results", {})
+        result = results.get(path)
+        if isinstance(result, dict) and result.get("sig") == sig:
+            self._area_set_status(page, path, "Done", "#2e7d32")
+            self._area_update_area_cell(page, path)
+            return
+        if not (cfg.get("x") and cfg.get("y") and cfg.get("signal")):
+            self._area_set_status(page, path, "Set parameters", "#808080")
+            self._area_update_area_cell(page, path)
+            return
+
+        self._area_start_worker(page)
+        events = page._area_cancel_events
+        previous = events.get(path)
+        if previous is not None:
+            previous.set()
+        event = threading.Event()
+        events[path] = event
+        page._area_job_queue.put({
+            "path": path,
+            "cfg": dict(cfg),
+            "sig": sig,
+            "cancel": event,
+        })
+        self._area_set_status(page, path, "Queued", "#b58900")
+        self._area_update_progress(page)
+
+    def _area_run(self, page, jobs, results) -> None:
+        """Worker loop: calculate one queued file at a time."""
+        while True:
+            job = jobs.get()
+            if job is None:
+                return
+            if job["cancel"].is_set():
+                continue
+            path = job["path"]
+            sig = job["sig"]
+            try:
+                result = self._area_compute(page, job, results)
+            except _AreaCancelled:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                results.put(("error", path, sig, str(exc)))
+                continue
+            results.put(("done", path, sig, result))
+
+    def _area_compute(self, page, job, q):
+        """Turn a job into an area result, reusing cached density counts."""
+        import numpy as np
+
+        path = job["path"]
+        cfg = job["cfg"]
+        base_sig = self._area_signature(page, path, cfg, include_density=False)
+        cached = page._area_counts.get(path)
+        if isinstance(cached, dict) and cached.get("sig") == base_sig:
+            hist = cached
+        else:
+            hist = self._area_histogram(page, job, q)
+            if job["cancel"].is_set():
+                raise _AreaCancelled()
+            hist["sig"] = base_sig
+            page._area_counts[path] = hist
+            while len(page._area_counts) > 24:
+                page._area_counts.pop(next(iter(page._area_counts)))
+        counts = hist["counts"]
+        threshold = float(cfg.get("density") or 0.0)
+        qual = counts > threshold
+        cells = int(qual.sum())
+        cell = float(hist["cell"])
+        return {
+            "sig": job["sig"],
+            "area": float(cells) * cell * cell,
+            "cells": cells,
+            "nx": int(hist["nx"]),
+            "ny": int(hist["ny"]),
+            "cell": cell,
+            "xmin": float(hist["xmin"]),
+            "ymin": float(hist["ymin"]),
+            "rows": int(hist["rows"]),
+            "points": int(hist.get("points") or 0),
+            "seconds": round(float(hist.get("seconds") or 0.0), 2),
+            "mask": base64.b64encode(np.packbits(qual.ravel())).decode("ascii"),
+        }
+
+    def _area_histogram(self, page, job, q):
+        """Count the points of one file on the density grid (streaming)."""
+        import numpy as np
+        import pandas as pd
+        import pyarrow.parquet as pq
+
+        path = job["path"]
+        cfg = job["cfg"]
+        cancel = job["cancel"]
+        task_id = page._area_task_id
+        x_name, y_name, sig_name = cfg.get("x"), cfg.get("y"), cfg.get("signal")
+        low = float(cfg.get("low") or 0.0)
+        high = float(cfg.get("high") or 0.0)
+        names = [x_name, y_name, sig_name]
+        grid = max(2, int(page._area_params.get("grid") or self._AREA_GRID_DEFAULT))
+        started = time.time()
+
+        pf = pq.ParquetFile(path)
+        try:
+            schema_names = set(pf.schema_arrow.names)
+        except Exception:  # noqa: BLE001
+            schema_names = set()
+        stages = self._map_stages(task_id) if task_id else []
+        needed = _pipeline_dependencies(stages, names, path) if stages else set(names)
+        needed = set(needed) | set(names)
+        if not needed <= schema_names:
+            # A virtual column (Segment mask, Cluster label, …) is not stored in
+            # the data parquet: fall back to the materialised arrays.
+            return self._area_histogram_loaded(page, job, q)
+
+        bounds = self._area_bounds(pf, x_name, y_name, stages)
+        if bounds is None:
+            return self._area_histogram_loaded(page, job, q)
+        xmin, xmax, ymin, ymax = bounds
+        cell = max(xmax - xmin, ymax - ymin) / float(grid)
+        if not math.isfinite(cell) or cell <= 0:
+            cell = 1.0
+        nx = max(1, int(math.ceil((xmax - xmin) / cell - 1e-9)))
+        ny = max(1, int(math.ceil((ymax - ymin) / cell - 1e-9)))
+
+        total = int(pf.metadata.num_rows or 0)
+        counts = np.zeros(nx * ny, dtype=np.int64)
+        points = 0
+        keep_index = self._subsample_row_index(task_id, path)
+        origin = None
+        if any(kind == "illumination" for kind, _stage in stages):
+            origin = (float(xmin), float(ymin))
+        cols = sorted(needed)
+        offset = 0
+        last_report = 0.0
+        for batch in pf.iter_batches(batch_size=500_000, columns=cols):
+            if cancel.is_set():
+                raise _AreaCancelled()
+            n = batch.num_rows
+            df = batch.to_pandas()
+            values = {
+                c: pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")
+                for c in cols if c in df.columns
+            }
+            if stages:
+                values = _evaluate_stages(
+                    stages, values, names, path, cache=None, origin=origin
+                )
+            x = values.get(x_name)
+            y = values.get(y_name)
+            v = values.get(sig_name)
+            if x is None or y is None or v is None:
+                raise ValueError("A selected column is not available in this file")
+            if keep_index is not None:
+                i0 = int(np.searchsorted(keep_index, offset, side="left"))
+                i1 = int(np.searchsorted(keep_index, offset + n, side="left"))
+                sub = np.asarray(keep_index[i0:i1], dtype=np.int64) - offset
+                x, y, v = x[sub], y[sub], v[sub]
+            offset += n
+            keep = (
+                np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
+                & (v >= low) & (v <= high)
+            )
+            if keep.any():
+                bi = np.floor((x[keep] - xmin) / cell).astype(np.int64)
+                bj = np.floor((y[keep] - ymin) / cell).astype(np.int64)
+                np.clip(bi, 0, nx - 1, out=bi)
+                np.clip(bj, 0, ny - 1, out=bj)
+                counts += np.bincount(
+                    bj * nx + bi, minlength=nx * ny
+                ).astype(np.int64, copy=False)
+                points += int(keep.sum())
+            now = time.time()
+            if total and now - last_report > 0.25:
+                last_report = now
+                q.put(("progress", path, job["sig"], min(1.0, offset / total)))
+        return {
+            "counts": counts.reshape(ny, nx),
+            "cell": cell,
+            "nx": nx,
+            "ny": ny,
+            "xmin": float(xmin),
+            "ymin": float(ymin),
+            "rows": int(offset),
+            "points": int(points),
+            "seconds": time.time() - started,
+        }
+
+    def _area_histogram_loaded(self, page, job, q):
+        """Density grid from fully materialised columns (virtual columns)."""
+        import numpy as np
+
+        path = job["path"]
+        cfg = job["cfg"]
+        cancel = job["cancel"]
+        names = [cfg.get("x"), cfg.get("y"), cfg.get("signal")]
+        grid = max(2, int(page._area_params.get("grid") or self._AREA_GRID_DEFAULT))
+        started = time.time()
+        q.put(("progress", path, job["sig"], 0.05))
+        values = self._column_data(page._area_task_id, path, names)
+        if cancel.is_set():
+            raise _AreaCancelled()
+        if any(name not in values for name in names):
+            raise ValueError("A selected column is not available in this file")
+        x = np.asarray(values[names[0]], dtype="float64")
+        y = np.asarray(values[names[1]], dtype="float64")
+        v = np.asarray(values[names[2]], dtype="float64")
+        if not (len(x) == len(y) == len(v)):
+            raise ValueError("The selected columns have different row counts")
+        q.put(("progress", path, job["sig"], 0.5))
+        finite = np.isfinite(x) & np.isfinite(y)
+        if not finite.any():
+            raise ValueError("The file has no finite X/Y values")
+        xmin, xmax = float(x[finite].min()), float(x[finite].max())
+        ymin = float(y[finite].min())
+        ymax = float(y[finite].max())
+        cell = max(xmax - xmin, ymax - ymin) / float(grid)
+        if not math.isfinite(cell) or cell <= 0:
+            cell = 1.0
+        nx = max(1, int(math.ceil((xmax - xmin) / cell - 1e-9)))
+        ny = max(1, int(math.ceil((ymax - ymin) / cell - 1e-9)))
+        counts = np.zeros(nx * ny, dtype=np.int64)
+        low = float(cfg.get("low") or 0.0)
+        high = float(cfg.get("high") or 0.0)
+        keep = finite & np.isfinite(v) & (v >= low) & (v <= high)
+        points = int(keep.sum())
+        if keep.any():
+            bi = np.floor((x[keep] - xmin) / cell).astype(np.int64)
+            bj = np.floor((y[keep] - ymin) / cell).astype(np.int64)
+            np.clip(bi, 0, nx - 1, out=bi)
+            np.clip(bj, 0, ny - 1, out=bj)
+            counts += np.bincount(bj * nx + bi, minlength=nx * ny)
+        return {
+            "counts": counts.reshape(ny, nx),
+            "cell": cell,
+            "nx": nx,
+            "ny": ny,
+            "xmin": xmin,
+            "ymin": ymin,
+            "rows": int(len(x)),
+            "points": points,
+            "seconds": time.time() - started,
+        }
+
+    def _area_bounds(self, pf, x_name, y_name, stages):
+        """(xmin, xmax, ymin, ymax) from parquet statistics, or None."""
+        if _pipeline_touches(stages, x_name) or _pipeline_touches(stages, y_name):
+            return None
+        try:
+            names = list(pf.schema.names)
+            indices = (names.index(x_name), names.index(y_name))
+        except (ValueError, AttributeError):
+            return None
+        bounds = []
+        metadata = pf.metadata
+        for index in indices:
+            low, high = math.inf, -math.inf
+            for group_index in range(metadata.num_row_groups):
+                try:
+                    stats = metadata.row_group(group_index).column(index).statistics
+                except Exception:  # noqa: BLE001
+                    return None
+                if stats is None or not getattr(stats, "has_min_max", True):
+                    return None
+                try:
+                    low = min(low, float(stats.min))
+                    high = max(high, float(stats.max))
+                except (TypeError, ValueError):
+                    return None
+            if not (math.isfinite(low) and math.isfinite(high)):
+                return None
+            bounds.append((low, high))
+        return bounds[0][0], bounds[0][1], bounds[1][0], bounds[1][1]
+
+    def _area_poll(self, page) -> None:
+        q = getattr(page, "_area_result_queue", None)
+        if q is None:
+            return
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            path = msg[1]
+            sig = msg[2]
+            if kind == "progress":
+                if page._area_latest.get(path) == sig:
+                    self._area_set_status(
+                        page, path, f"Computing… {msg[3] * 100:.0f}%", "#b58900"
+                    )
+            elif kind == "done":
+                page._area_cancel_events.pop(path, None)
+                if page._area_latest.get(path) != sig:
+                    continue
+                page._area_params.setdefault("results", {})[path] = msg[3]
+                self._area_set_status(page, path, "Done", "#2e7d32")
+                self._area_update_area_cell(page, path)
+                if page._area_params.get("selected") == path:
+                    self._area_render_plot(page)
+                self._area_mark_dirty(page)
+            elif kind == "error":
+                page._area_cancel_events.pop(path, None)
+                if page._area_latest.get(path) != sig:
+                    continue
+                page._area_params.setdefault("results", {}).pop(path, None)
+                self._area_set_status(page, path, f"Error: {msg[3]}", "#c0392b")
+                self._area_update_area_cell(page, path)
+        self._area_update_progress(page)
+
+    # ----- area: preview plot -------------------------------------------
+    def _area_sync_plot_settings(self, page) -> None:
+        plot_cfg = page._area_params.get("plot") or {}
+        palette = page._area_palette
+        palette.blockSignals(True)
+        idx = palette.findData(plot_cfg.get("palette", "viridis"))
+        palette.setCurrentIndex(max(0, idx))
+        palette.blockSignals(False)
+        size = page._area_point_size
+        size.blockSignals(True)
+        size.setValue(float(plot_cfg.get("point_size", 4.0)))
+        size.blockSignals(False)
+        combo = page._area_type_combo
+        combo.blockSignals(True)
+        idx = combo.findData(plot_cfg.get("type", "scatter"))
+        combo.setCurrentIndex(max(0, idx))
+        combo.blockSignals(False)
+
+    def _area_on_plot_type(self, page) -> None:
+        plot_cfg = page._area_params.setdefault("plot", {})
+        value = page._area_type_combo.currentData() or "scatter"
+        if plot_cfg.get("type") == value:
+            return
+        plot_cfg["type"] = value
+        self._area_render_plot(page)
+        self._area_mark_dirty(page)
+
+    def _area_on_plot_param(self, page) -> None:
+        plot_cfg = page._area_params.setdefault("plot", {})
+        plot_cfg["palette"] = page._area_palette.currentData() or "viridis"
+        plot_cfg["point_size"] = float(page._area_point_size.value())
+        self._area_render_plot(page)
+        self._area_mark_dirty(page)
+
+    def _area_render_plot(self, page) -> None:
+        pw = page._area_plot
+        params = page._area_params
+        plot_cfg = params.get("plot") or {}
+        path = params.get("selected")
+        if not path:
+            pw.clear()
+            pw.setTitle("Select a file row to preview", color="#808080", size="10pt")
+            return
+        cfg = self._area_row_cfg(page, path)
+        x_name, y_name, sig_name = cfg.get("x"), cfg.get("y"), cfg.get("signal")
+        if not (x_name and y_name):
+            pw.clear()
+            pw.setTitle("Set X and Y for this row", color="#b58900", size="10pt")
+            return
+        is_image = self._image_load_manifest(path) is not None
+        ptype = plot_cfg.get("type") or "auto"
+        if ptype == "auto":
+            ptype = "image" if is_image else "scatter"
+        if ptype == "image" and not is_image:
+            ptype = "scatter"
+        plot_dict = {
+            "type": ptype,
+            "file": path,
+            "palette": plot_cfg.get("palette", "viridis"),
+            "file_name": self._comp_file_name(path, page._area_task_id),
+            "xmin": None,
+            "xmax": None,
+            "ymin": None,
+            "ymax": None,
+            "show_legend": False,
+            "point_size": float(plot_cfg.get("point_size", 4.0)),
+        }
+        try:
+            if ptype == "image":
+                if not sig_name:
+                    pw.clear()
+                    pw.setTitle(
+                        "Set a signal variable to render the image",
+                        color="#b58900", size="10pt",
+                    )
+                    return
+                plot_dict["layers"] = [{
+                    "parameter": sig_name,
+                    "color": (255, 255, 255),
+                    "name": str(sig_name),
+                }]
+                self._figure_render_image(plot_dict, pw, task_id=page._area_task_id)
+            else:
+                plot_dict["x"] = x_name
+                plot_dict["y"] = y_name
+                plot_dict["color_mode"] = "parameter" if sig_name else "density"
+                if sig_name:
+                    plot_dict["color_param"] = sig_name
+                self._figure_render_scatter(
+                    plot_dict, pw, task_id=page._area_task_id
+                )
+        except Exception as exc:  # noqa: BLE001
+            pw.clear()
+            pw.setTitle(f"Preview failed: {exc}", color="#c0392b", size="10pt")
+            return
+        self._area_draw_overlay(page, path)
+
+    def _area_draw_overlay(self, page, path) -> None:
+        """Shade the grid cells that were counted as tissue."""
+        import numpy as np
+        import pyqtgraph as pg
+
+        pw = getattr(page, "_area_plot", None)
+        if pw is None:
+            return
+        item = getattr(pw, "_area_overlay", None)
+        result = (page._area_params.get("results") or {}).get(path)
+        if not isinstance(result, dict) or not result.get("mask"):
+            if item is not None:
+                try:
+                    item.setVisible(False)
+                except RuntimeError:
+                    pw._area_overlay = None
+            return
+        try:
+            nx = int(result["nx"])
+            ny = int(result["ny"])
+            bits = np.frombuffer(
+                base64.b64decode(result["mask"]), dtype=np.uint8
+            )
+            qual = np.unpackbits(bits)[: nx * ny].reshape(ny, nx).astype(bool)
+        except Exception:  # noqa: BLE001
+            return
+        rgba = np.zeros((ny, nx, 4), dtype=np.uint8)
+        rgba[..., 0] = 255
+        rgba[..., 1] = 176
+        rgba[..., 2] = 32
+        rgba[..., 3] = np.where(qual, 70, 0).astype(np.uint8)
+
+        view = pw.getPlotItem().getViewBox()
+        if item is None or item not in view.addedItems:
+            item = pg.ImageItem(axisOrder="row-major")
+            item.setZValue(30)
+            pw.addItem(item)
+            pw._area_overlay = item
+        item.setImage(rgba, autoLevels=False)
+        item.setRect(QRectF(
+            float(result["xmin"]),
+            float(result["ymin"]),
+            nx * float(result["cell"]),
+            ny * float(result["cell"]),
+        ))
+        item.setVisible(True)
+
+    # ----- area: clipboard / save / close -------------------------------
+    def _area_copy(self, page) -> None:
+        params = page._area_params
+        headers = [
+            "File", "X", "Y", "Signal", "Low", "High", "Density", "Area", "Status",
+        ]
+        lines = ["\t".join(headers)]
+        for path in page._area_paths:
+            cfg = self._area_row_cfg(page, path)
+            result = (params.get("results") or {}).get(path) or {}
+            status = page._area_status.get(path, ("", ""))[0]
+            lines.append("\t".join([
+                self._comp_file_name(path, page._area_task_id),
+                str(cfg.get("x") or ""),
+                str(cfg.get("y") or ""),
+                str(cfg.get("signal") or ""),
+                self._area_format(cfg.get("low")),
+                self._area_format(cfg.get("high")),
+                self._area_format(cfg.get("density")),
+                self._area_format(result.get("area")),
+                status,
+            ]))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Area table copied to the clipboard")
+
+    def _area_mark_dirty(self, page) -> None:
+        page._area_dirty = True
+        self._area_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _area_update_save_btn(self, page) -> None:
+        page._area_save_btn.setEnabled(
+            page._area_dirty and not page._area_locked
+        )
+
+    def _area_save_now(self, page) -> None:
+        page._area_task_def["params"] = page._area_params
+        if self.project is not None:
+            self.project.save()
+        page._area_snapshot = copy.deepcopy(page._area_params)
+        page._area_dirty = False
+        self._area_update_save_btn(page)
+        self.statusBar().showMessage("Area settings saved")
+        self._module_saved(page)
+
+    def _area_close(self, page) -> None:
+        if getattr(page, "_area_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Area",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._area_task_def["params"] = page._area_snapshot
+        page._area_closing = True
+        for event in list((page._area_cancel_events or {}).values()):
+            event.set()
+        q = getattr(page, "_area_job_queue", None)
+        if q is not None:
+            q.put(None)
+        timer = getattr(page, "_area_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._area_timer = None
+        self._close_module_page(page)
+
+    # ----- data clean module (PeacoQC) ----------------------------------
+    _DC_MODES = [
+        ("All (MAD + Isolation Tree)", "all"),
+        ("MAD only", "mad"),
+        ("Isolation Tree only", "isolation_tree"),
+    ]
+
+    def _dc_signature(self, params, parquet_path, task_id=None) -> str:
+        """Change signature for one file's Data Clean output."""
+        try:
+            st = Path(parquet_path).stat()
+            stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+        except OSError:
+            stat = ""
+        payload = {
+            "method": params.get("method"),
+            "time": params.get("time"),
+            "columns": params.get("columns") or [],
+            "mode": params.get("mode"),
+            "mad": params.get("mad"),
+            "it_limit": params.get("it_limit"),
+            "consecutive_bins": params.get("consecutive_bins"),
+            "min_cells": params.get("min_cells"),
+            "remove_zeros": params.get("remove_zeros"),
+            "name": params.get("name"),
+            "source": str(parquet_path),
+            "stat": stat,
+            "stages": self._map_stage_token(task_id),
+        }
+        sample = self._subsample_sig(task_id, parquet_path)
+        if sample:
+            payload["sample"] = sample
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _dc_params_for(self, task_def) -> dict:
+        """Saved params of a Data Clean task (its live snapshot while open)."""
+        task_id = task_def.get("id")
+        reg = self._module_registry.get(task_id)
+        if reg is not None and reg.get("task_type") == "data_clean":
+            snap = getattr(reg["page"], "_dc_snapshot", None)
+            if isinstance(snap, dict):
+                return snap
+        return task_def.get("params") or {}
+
+    def _dc_applied_columns(self, task_id, parquet_path) -> dict:
+        """{column_name: record} exposed by upstream Data Clean modules."""
+        if not task_id or not parquet_path or self.project is None:
+            return {}
+        out = {}
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "data_clean":
+                continue
+            params = self._dc_params_for(task)
+            rec = (params.get("outputs") or {}).get(parquet_path)
+            if not isinstance(rec, dict) or not rec.get("path"):
+                continue
+            if rec.get("signature") != self._dc_signature(
+                params, parquet_path, task.get("id")
+            ):
+                continue
+            path = self.project.path / rec["path"]
+            if not path.is_file():
+                continue
+            for name in rec.get("columns") or []:
+                out.setdefault(name, {
+                    "parquet": str(path),
+                    "channel": name,
+                    "kind": rec.get("kind", "table"),
+                })
+        return out
+
+    def _dc_column_values(self, parquet_path, rec, name):
+        """Row-aligned float64 values of one Data Clean column."""
+        return self._cluster_column_values(parquet_path, rec, name)
+
+    def _dc_raster(self, rec, bbox, spacing):
+        """Return (scalar_2d, data_rect) for a Data Clean channel over a bbox."""
+        return self._cluster_raster(rec, bbox, spacing)
+
+    # ----- data clean: page ---------------------------------------------
+    def _build_dc_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        """Build the Data Clean page: algorithm/files | variables | calculate."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._dc_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("method", "peacoqc")
+        params.setdefault("files", [])
+        params.setdefault("time", "")
+        params.setdefault("columns", [])
+        params.setdefault("mode", "all")
+        params.setdefault("mad", 6.0)
+        params.setdefault("it_limit", 0.6)
+        params.setdefault("consecutive_bins", 5)
+        params.setdefault("min_cells", 150)
+        params.setdefault("remove_zeros", False)
+        params.setdefault("name", "PeacoQC_pass")
+        params.setdefault("outputs", {})
+        params.setdefault("log", [])
+
+        page._dc_task_def = task_def
+        page._dc_task_id = task_def.get("id")
+        page._dc_params = params
+        page._dc_locked = locked
+        page._dc_save_btn = save_btn
+        page._dc_dirty = False
+        page._dc_snapshot = copy.deepcopy(params)
+        page._dc_log_lines = list(params.get("log") or [])
+        page._dc_running = False
+        page._dc_cancel = False
+        page._dc_updating = False
+        save_btn.clicked.connect(lambda _=False: self._dc_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._dc_left_panel(page))
+        splitter.addWidget(self._dc_center_panel(page))
+        splitter.addWidget(self._dc_right_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([320, 320, 400])
+        row.addWidget(splitter, 1)
+
+        row.addWidget(self._dc_log_panel(page))
+        layout.addWidget(content, 1)
+
+        self._dc_refresh(page)
+        return page
+
+    def _dc_log_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Log</b>"))
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Calculation output appears here…")
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        log.setFixedHeight(130)
+        for line in getattr(page, "_dc_log_lines", []):
+            log.appendPlainText(line)
+        lay.addWidget(log)
+        page._dc_log = log
+        return panel
+
+    def _dc_log(self, page, text) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = getattr(page, "_dc_log_lines", None)
+        if lines is None:
+            lines = []
+            page._dc_log_lines = lines
+        for line in str(text).splitlines():
+            if line.strip():
+                lines.append(f"[{ts}] {line}")
+        log = getattr(page, "_dc_log", None)
+        if log is not None:
+            for line in str(text).splitlines():
+                if line.strip():
+                    log.appendPlainText(f"[{ts}] {line}")
+
+    def _dc_left_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("<b>Algorithm</b>"))
+        method = _NoWheelComboBox()
+        method.addItem("PeacoQC", "peacoqc")
+        method.setEnabled(not page._dc_locked)
+        lay.addWidget(method)
+        page._dc_method = method
+        desc = QLabel(
+            "Peak-based quality control: splits the acquisition into bins and "
+            "removes bins whose signal drifts."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #6b7785;")
+        lay.addWidget(desc)
+
+        lay.addWidget(QLabel("<b>Data files</b>"))
+        files_btn = QPushButton("Select files…")
+        files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        files_btn.setEnabled(not page._dc_locked)
+        lay.addWidget(files_btn)
+        files_box = QListWidget()
+        files_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(files_box, 1)
+        page._dc_files_box = files_box
+        files_count = QLabel("")
+        files_count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(files_count)
+        page._dc_files_count = files_count
+
+        files_btn.clicked.connect(lambda _=False: self._dc_select_files(page))
+        return panel
+
+    def _dc_center_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("<b>Time parameter</b>"))
+        hint_time = QLabel(
+            "The column that holds the acquisition order. Required: the "
+            "algorithm splits the file into time bins. A column named "
+            "\"time\" is selected automatically."
+        )
+        hint_time.setWordWrap(True)
+        hint_time.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint_time)
+        time_combo = _NoWheelComboBox()
+        time_combo.setStyleSheet(
+            "QComboBox { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        time_combo.setEnabled(not page._dc_locked)
+        lay.addWidget(time_combo)
+        page._dc_time = time_combo
+        time_state = QLabel("")
+        time_state.setStyleSheet("color: #b58900;")
+        time_state.setWordWrap(True)
+        lay.addWidget(time_state)
+        page._dc_time_state = time_state
+
+        lay.addSpacing(6)
+        lay.addWidget(QLabel("<b>Test variables</b>"))
+        hint = QLabel(
+            "Variables shared by every selected file. The algorithm checks "
+            "these columns for signal drift."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        vars_btn = QPushButton("Select variables…")
+        vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vars_btn.setEnabled(not page._dc_locked)
+        lay.addWidget(vars_btn)
+        vars_box = QListWidget()
+        vars_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(vars_box, 1)
+        page._dc_vars_box = vars_box
+        vars_count = QLabel("")
+        vars_count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(vars_count)
+        page._dc_vars_count = vars_count
+
+        vars_btn.clicked.connect(lambda _=False: self._dc_select_vars(page))
+        time_combo.currentIndexChanged.connect(
+            lambda _=0: self._dc_on_time(page)
+        )
+        return panel
+
+    def _dc_right_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Algorithm parameters</b>"))
+
+        lay.addWidget(QLabel("Mode"))
+        mode = _NoWheelComboBox()
+        for label, value in self._DC_MODES:
+            mode.addItem(label, value)
+        mode.setEnabled(not page._dc_locked)
+        lay.addWidget(mode)
+        lay.addWidget(self._param_hint(
+            "All runs both checks and keeps the union of their flags; each "
+            "single mode uses only that check."
+        ))
+        page._dc_mode = mode
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(2)
+        grid.setColumnStretch(1, 1)
+        row = 0
+        grid.addWidget(QLabel("MAD threshold"), row, 0)
+        mad = _NoWheelDoubleSpinBox()
+        mad.setRange(1.0, 50.0)
+        mad.setDecimals(1)
+        mad.setSingleStep(0.5)
+        mad.setValue(6.0)
+        grid.addWidget(mad, row, 1)
+        row += 1
+        grid.addWidget(self._param_hint(
+            "How many MADs a bin may deviate before it is removed. Lower = "
+            "stricter."
+        ), row, 0, 1, 2)
+        row += 1
+        grid.addWidget(QLabel("IT limit"), row, 0)
+        it_limit = _NoWheelDoubleSpinBox()
+        it_limit.setRange(0.05, 1.0)
+        it_limit.setDecimals(2)
+        it_limit.setSingleStep(0.05)
+        it_limit.setValue(0.6)
+        grid.addWidget(it_limit, row, 1)
+        row += 1
+        grid.addWidget(self._param_hint(
+            "Isolation Tree gain limit. Lower = stricter; skipped when there "
+            "are too few bins."
+        ), row, 0, 1, 2)
+        row += 1
+        grid.addWidget(QLabel("Consecutive bins"), row, 0)
+        consecutive = _NoWheelSpinBox()
+        consecutive.setRange(0, 100)
+        consecutive.setValue(5)
+        grid.addWidget(consecutive, row, 1)
+        row += 1
+        grid.addWidget(self._param_hint(
+            "Also drop runs of up to this many consecutive bad bins."
+        ), row, 0, 1, 2)
+        row += 1
+        grid.addWidget(QLabel("Min cells / bin"), row, 0)
+        min_cells = _NoWheelSpinBox()
+        min_cells.setRange(10, 100000)
+        min_cells.setValue(150)
+        grid.addWidget(min_cells, row, 1)
+        row += 1
+        grid.addWidget(self._param_hint(
+            "Smallest bin the statistics are computed on; larger = more stable "
+            "but fewer bins."
+        ), row, 0, 1, 2)
+        page._dc_mad = mad
+        page._dc_it_limit = it_limit
+        page._dc_consecutive = consecutive
+        page._dc_min_cells = min_cells
+        lay.addLayout(grid)
+
+        remove_zeros = QCheckBox("Remove zeros before peak detection")
+        remove_zeros.setEnabled(not page._dc_locked)
+        lay.addWidget(remove_zeros)
+        lay.addWidget(self._param_hint(
+            "Ignore zero values when locating the peaks (useful for "
+            "sparse/low-background channels)."
+        ))
+        page._dc_remove_zeros = remove_zeros
+
+        lay.addWidget(QLabel("<b>New column name</b>"))
+        name_row = QWidget()
+        nh = QHBoxLayout(name_row)
+        nh.setContentsMargins(0, 0, 0, 0)
+        nh.setSpacing(4)
+        name_edit = QLineEdit()
+        nh.addWidget(name_edit, 1)
+        warn = QLabel("⚠")
+        warn.setToolTip("Duplicate column name")
+        warn.setStyleSheet("color: #b58900; font-weight: bold;")
+        nh.addWidget(warn)
+        lay.addWidget(name_row)
+        page._dc_name = name_edit
+        page._dc_warn = warn
+
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setEnabled(False)
+        lay.addWidget(calc_btn)
+        page._dc_calc_btn = calc_btn
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        page._dc_status = status
+        lay.addStretch()
+
+        for widget in (mad, it_limit, consecutive, min_cells):
+            widget.setEnabled(not page._dc_locked)
+        name_edit.setEnabled(not page._dc_locked)
+
+        mode.currentIndexChanged.connect(lambda _=0: self._dc_on_mode(page))
+        mad.valueChanged.connect(lambda _=0.0: self._dc_on_param(page))
+        it_limit.valueChanged.connect(lambda _=0.0: self._dc_on_param(page))
+        consecutive.valueChanged.connect(lambda _=0: self._dc_on_param(page))
+        min_cells.valueChanged.connect(lambda _=0: self._dc_on_param(page))
+        remove_zeros.toggled.connect(lambda _=0: self._dc_on_param(page))
+        name_edit.textEdited.connect(lambda _=0: self._dc_on_name(page))
+        calc_btn.clicked.connect(lambda _=False: self._dc_calculate(page))
+        return panel
+
+    # ----- data clean: state ---------------------------------------------
+    def _dc_common_columns(self, page) -> list:
+        files = page._dc_params.get("files") or []
+        if not files:
+            return []
+        common = set(self._columns_for(files[0], page._dc_task_id))
+        for path in files[1:]:
+            common &= set(self._columns_for(path, page._dc_task_id))
+        return sorted(common)
+
+    def _dc_select_files(self, page) -> None:
+        records = self._available_files(page._dc_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [
+            self._comp_file_name(p, page._dc_task_id)
+            for p in page._dc_params.get("files") or []
+        ]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        page._dc_params["files"] = [by_name[n] for n in chosen if n in by_name]
+        common = set(self._dc_common_columns(page))
+        time_col = page._dc_params.get("time") or ""
+        if time_col not in common:
+            time_col = next((c for c in common if c.lower() == "time"), "")
+            page._dc_params["time"] = time_col
+        page._dc_params["columns"] = [
+            c for c in page._dc_params.get("columns") or []
+            if c in common and c != time_col
+        ]
+        self._dc_refresh(page)
+        self._dc_mark_dirty(page)
+
+    def _dc_select_vars(self, page) -> None:
+        options = [
+            c for c in self._dc_common_columns(page)
+            if c != (page._dc_params.get("time") or "")
+        ]
+        if not options:
+            QMessageBox.information(
+                self, "Select variables",
+                "Select data files with common columns first."
+            )
+            return
+        chosen = self._pick_items_dialog(
+            "Select variables", options,
+            page._dc_params.get("columns") or [], "Filter variables...",
+        )
+        if chosen is None:
+            return
+        page._dc_params["columns"] = list(chosen)
+        self._dc_refresh(page)
+        self._dc_mark_dirty(page)
+
+    def _dc_on_time(self, page) -> None:
+        if getattr(page, "_dc_updating", False):
+            return
+        value = page._dc_time.currentData() or ""
+        page._dc_params["time"] = value
+        if value in (page._dc_params.get("columns") or []):
+            page._dc_params["columns"] = [
+                c for c in page._dc_params["columns"] if c != value
+            ]
+            self._dc_refresh(page)
+        self._dc_mark_dirty(page)
+
+    def _dc_on_mode(self, page) -> None:
+        if getattr(page, "_dc_updating", False):
+            return
+        page._dc_params["mode"] = page._dc_mode.currentData() or "all"
+        self._dc_mark_dirty(page)
+
+    def _dc_on_param(self, page) -> None:
+        if getattr(page, "_dc_updating", False):
+            return
+        page._dc_params["mad"] = float(page._dc_mad.value())
+        page._dc_params["it_limit"] = float(page._dc_it_limit.value())
+        page._dc_params["consecutive_bins"] = int(page._dc_consecutive.value())
+        page._dc_params["min_cells"] = int(page._dc_min_cells.value())
+        page._dc_params["remove_zeros"] = bool(page._dc_remove_zeros.isChecked())
+        self._dc_mark_dirty(page)
+
+    def _dc_on_name(self, page) -> None:
+        if getattr(page, "_dc_updating", False):
+            return
+        page._dc_params["name"] = page._dc_name.text().strip()
+        self._dc_mark_dirty(page)
+        self._dc_update_name(page)
+
+    def _dc_existing_columns(self, page) -> set:
+        cols = set()
+        for path in page._dc_params.get("files") or []:
+            cols |= set(self._columns_for(path, page._dc_task_id))
+        return cols
+
+    def _dc_name_conflict(self, page) -> bool:
+        name = (page._dc_params.get("name") or "").strip()
+        if not name:
+            return False
+        return name in self._dc_existing_columns(page)
+
+    def _dc_update_name(self, page) -> None:
+        page._dc_warn.setVisible(self._dc_name_conflict(page))
+        self._dc_update_calc_btn(page)
+
+    def _dc_update_calc_btn(self, page) -> None:
+        params = page._dc_params
+        name = (params.get("name") or "").strip()
+        ok = bool(
+            params.get("files")
+            and params.get("time")
+            and params.get("columns")
+            and name
+            and not self._dc_name_conflict(page)
+        )
+        page._dc_calc_btn.setEnabled(ok and not page._dc_locked)
+        if not params.get("files"):
+            page._dc_time_state.setText("")
+        elif not params.get("time"):
+            page._dc_time_state.setText("Choose the time parameter before calculating.")
+        else:
+            page._dc_time_state.setText("")
+
+    def _dc_refresh(self, page) -> None:
+        params = page._dc_params
+        page._dc_updating = True
+        try:
+            page._dc_mode.blockSignals(True)
+            page._dc_mode.setCurrentIndex(
+                max(0, page._dc_mode.findData(params.get("mode", "all")))
+            )
+            page._dc_mode.blockSignals(False)
+            for widget, key, cast in (
+                (page._dc_mad, "mad", float),
+                (page._dc_it_limit, "it_limit", float),
+                (page._dc_consecutive, "consecutive_bins", int),
+                (page._dc_min_cells, "min_cells", int),
+            ):
+                widget.blockSignals(True)
+                widget.setValue(cast(params.get(key) or 0))
+                widget.blockSignals(False)
+            page._dc_remove_zeros.blockSignals(True)
+            page._dc_remove_zeros.setChecked(bool(params.get("remove_zeros")))
+            page._dc_remove_zeros.blockSignals(False)
+
+            page._dc_name.blockSignals(True)
+            page._dc_name.setText(params.get("name", "PeacoQC_pass"))
+            page._dc_name.blockSignals(False)
+
+            files = params.get("files") or []
+            page._dc_files_box.clear()
+            for path in files:
+                page._dc_files_box.addItem(
+                    self._comp_file_name(path, page._dc_task_id)
+                )
+            page._dc_files_count.setText(f"{len(files)} file(s) selected")
+
+            common = self._dc_common_columns(page)
+            time_col = params.get("time") or ""
+            page._dc_time.blockSignals(True)
+            page._dc_time.clear()
+            if common:
+                page._dc_time.addItem("(select a column)", "")
+            for column in common:
+                page._dc_time.addItem(str(column), str(column))
+            index = page._dc_time.findData(time_col)
+            page._dc_time.setCurrentIndex(index if index >= 0 else 0)
+            page._dc_time.blockSignals(False)
+
+            columns = params.get("columns") or []
+            page._dc_vars_box.clear()
+            for c in columns:
+                page._dc_vars_box.addItem(str(c))
+            page._dc_vars_count.setText(f"{len(columns)} variable(s) selected")
+        finally:
+            page._dc_updating = False
+        self._dc_update_name(page)
+
+    # ----- data clean: calculation ---------------------------------------
+    def _dc_validate(self, page):
+        params = page._dc_params
+        try:
+            import peacoqc  # noqa: F401
+        except Exception:  # noqa: BLE001
+            return False, (
+                "The PeacoQC runtime is missing.\n"
+                "Install it with:  pip install peacoqc-rs polars"
+            )
+        if not params.get("files"):
+            return False, "Select at least one data file."
+        if not params.get("time"):
+            return False, "Choose the parameter that represents acquisition time."
+        if not params.get("columns"):
+            return False, "Select at least one variable to check."
+        name = (params.get("name") or "").strip()
+        if not name:
+            return False, "Enter a name for the new column."
+        if self._dc_name_conflict(page):
+            return False, f"The column name '{name}' is already used."
+        return True, ""
+
+    def _dc_analyze_file(self, page, path, q, index, total):
+        """Run PeacoQC on one file; return (flags, row_index, detail)."""
+        import numpy as np
+        import peacoqc
+        import polars as pl
+
+        params = page._dc_params
+        task_id = page._dc_task_id
+        time_col = params.get("time") or ""
+        columns = list(params.get("columns") or [])
+        name = self._comp_file_name(path, task_id)
+        q.put(("log", f"Reading {index}/{total}: {name}"))
+        q.put(("status", f"Cleaning {index}/{total} — reading"))
+        values = self._column_data(task_id, path, [time_col] + columns)
+        missing = [c for c in [time_col] + columns if c not in values]
+        if missing:
+            raise ValueError("column(s) not available: " + ", ".join(missing))
+        time_values = np.asarray(values[time_col], dtype="float64")
+        matrix = np.column_stack(
+            [np.asarray(values[c], dtype="float64") for c in columns]
+        )
+        n_rows = len(matrix)
+        if n_rows == 0:
+            raise ValueError("the file has no rows")
+        up_index = self._subsample_row_index(task_id, path)
+        row_index = (
+            np.asarray(up_index, dtype=np.int64)
+            if up_index is not None else np.arange(n_rows, dtype=np.int64)
+        )
+        if len(row_index) != n_rows:
+            row_index = row_index[:n_rows]
+        usable = np.isfinite(time_values) & np.isfinite(matrix).all(axis=1)
+        n_usable = int(usable.sum())
+        if n_usable == 0:
+            raise ValueError("no rows have finite values in the selected columns")
+        order = np.flatnonzero(usable)
+        order = order[np.argsort(time_values[order], kind="stable")]
+
+        ranges = {}
+        for j, column in enumerate(columns):
+            column_values = matrix[order, j]
+            low = float(np.min(column_values))
+            high = float(np.max(column_values))
+            if not math.isfinite(low) or not math.isfinite(high) or high <= low:
+                high = low + 1.0
+            ranges[column] = (low, high)
+
+        q.put(("log", f"  {n_usable:,} row(s) in time order, "
+                      f"{len(columns)} variable(s)"))
+        q.put(("status", f"Cleaning {index}/{total} — running PeacoQC"))
+        frame = pl.DataFrame({
+            column: matrix[order, j].astype("float32")
+            for j, column in enumerate(columns)
+        })
+        try:
+            result = peacoqc.run_qc(
+                frame,
+                channels=columns,
+                channel_ranges=ranges,
+                mode=str(params.get("mode") or "all"),
+                mad=float(params.get("mad") or 6.0),
+                it_limit=float(params.get("it_limit") or 0.6),
+                consecutive_bins=int(params.get("consecutive_bins") or 5),
+                min_cells=int(params.get("min_cells") or 150),
+                remove_zeros=bool(params.get("remove_zeros")),
+            )
+        except BaseException as exc:  # noqa: BLE001 - the Rust core can panic
+            raise ValueError(f"PeacoQC failed: {exc}") from exc
+        good = np.asarray(result.good_cells, dtype=bool)
+        if good.size != n_usable:
+            raise ValueError("PeacoQC returned an unexpected number of rows")
+
+        flags = np.zeros(n_rows, dtype="float64")
+        flags[order[good]] = 1.0
+        detail = {
+            "rows": n_usable,
+            "skipped": int(n_rows - n_usable),
+            "removed": float(getattr(result, "percentage_removed", 0.0) or 0.0),
+            "bins": int(getattr(result, "n_bins", 0) or 0),
+            "events_per_bin": int(getattr(result, "events_per_bin", 0) or 0),
+            "mad": getattr(result, "mad_percentage", None),
+            "it": getattr(result, "it_percentage", None),
+        }
+        return flags, row_index, detail
+
+    def _dc_write_file(self, page, path, flags, row_indices=None):
+        """Write one file's 0/1 column; return (rel, columns, kind)."""
+        import numpy as np
+        import pandas as pd
+
+        params = page._dc_params
+        name = (params.get("name") or "PeacoQC_pass").strip()
+        stem = Path(str(path)).stem
+        rel = f"Module/{page._dc_task_id}/{stem}_dataclean.parquet"
+        out_path = self.project.path / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        ent = self._ensure_image_index(path)
+        is_image = ent is not None and ent.get("manifest") is not None
+        n_full = self._data_row_count(path)
+        sel = (
+            np.asarray(row_indices) if row_indices is not None
+            else np.arange(len(flags))
+        ).astype(np.int64)
+
+        if is_image:
+            man = ent["manifest"]
+            xmin = int(round(float(man["xmin"])))
+            ymin = int(round(float(man["ymin"])))
+            width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
+            height = int(round(float(man["ymax"]) - float(man["ymin"]))) + 1
+            src = pd.read_parquet(path, columns=["x", "y"])
+            xi = np.rint(src["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
+            yi = np.rint(src["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
+            ok = (sel >= 0) & (sel < len(xi))
+            grid = np.full(height * width, np.nan, dtype="float64")
+            s = sel[ok]
+            sx, sy = xi[s], yi[s]
+            good = (sx >= 0) & (sx < width) & (sy >= 0) & (sy < height)
+            flat = sy[good] * width + sx[good]
+            grid[flat] = flags[ok][good]
+            xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
+            yy = np.repeat(np.arange(height, dtype=np.int32), width) + ymin
+            pd.DataFrame({"x": xx, "y": yy, name: grid}).to_parquet(
+                out_path, index=False
+            )
+            _build_image_index_files(str(out_path))
+            kind = "image"
+        else:
+            full = np.full(n_full, np.nan, dtype="float64")
+            if len(flags) == len(sel):
+                full[sel] = flags
+            else:
+                n = min(len(flags), n_full)
+                full[:n] = flags[:n]
+            pd.DataFrame({name: full}).to_parquet(out_path, index=False)
+            kind = "table"
+        return rel, [name], kind
+
+    def _dc_run(self, page, q):
+        """Run the PeacoQC cleaning in a background thread."""
+        params = page._dc_params
+        files = list(params.get("files") or [])
+        n_files = len(files)
+        failed = 0
+        outputs = {}
+        try:
+            q.put(("log", "— Starting PeacoQC —"))
+            mode = next(
+                (label for label, value in self._DC_MODES
+                 if value == params.get("mode")),
+                params.get("mode"),
+            )
+            q.put(("log", f"Mode: {mode} · MAD {params.get('mad')} · "
+                          f"IT limit {params.get('it_limit')} · "
+                          f"{params.get('consecutive_bins')} consecutive bin(s)"))
+            for i, path in enumerate(files):
+                if getattr(page, "_dc_cancel", False):
+                    q.put(("log", "Calculation cancelled."))
+                    break
+                name = self._comp_file_name(path, page._dc_task_id)
+                try:
+                    flags, row_index, detail = self._dc_analyze_file(
+                        page, path, q, i + 1, n_files
+                    )
+                    rel, cols, kind = self._dc_write_file(
+                        page, path, flags, row_index
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    q.put(("log", f"✗ {name}: {exc}"))
+                    continue
+                outputs[path] = {
+                    "path": rel,
+                    "columns": cols,
+                    "kind": kind,
+                    "signature": self._dc_signature(
+                        params, path, page._dc_task_id
+                    ),
+                }
+                passed = int(round(detail["rows"] * (1.0 - detail["removed"] / 100.0)))
+                extra = ""
+                if detail["skipped"]:
+                    extra += f", {detail['skipped']:,} row(s) skipped (missing values)"
+                q.put(("log", f"✓ {name}: kept {passed:,}/{detail['rows']:,} "
+                              f"({100.0 - detail['removed']:.1f}%), "
+                              f"{detail['bins']} bin(s) × {detail['events_per_bin']}"
+                              f"{extra}"))
+            q.put(("done", outputs, len(outputs), failed))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("error", str(exc)))
+
+    def _dc_calculate(self, page) -> None:
+        ok, message = self._dc_validate(page)
+        if not ok:
+            QMessageBox.warning(self, "Calculate", message)
+            return
+        existing = [
+            p for p in page._dc_params.get("files") or []
+            if isinstance((page._dc_params.get("outputs") or {}).get(p), dict)
+        ]
+        if existing:
+            reply = QMessageBox.question(
+                self, "Calculate",
+                f"{len(existing)} file(s) already have results.\n"
+                "Recalculate and overwrite them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        page._dc_running = True
+        page._dc_cancel = False
+        page._dc_status.setText("Calculating…")
+        page._dc_calc_btn.setEnabled(False)
+
+        q = queue.Queue()
+        page._dc_queue = q
+        page._dc_thread = threading.Thread(
+            target=self._dc_run, args=(page, q), daemon=True
+        )
+        page._dc_thread.start()
+
+        timer = QTimer(self)
+        timer.setInterval(120)
+        timer.timeout.connect(lambda: self._dc_poll(page))
+        timer.start()
+        page._dc_timer = timer
+
+    def _dc_poll(self, page) -> None:
+        q = getattr(page, "_dc_queue", None)
+        if q is None:
+            return
+        finished = False
+        error = None
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            if kind == "log":
+                self._dc_log(page, msg[1])
+            elif kind == "status":
+                page._dc_status.setText(msg[1])
+            elif kind == "done":
+                outputs, done, failed = msg[1], msg[2], msg[3]
+                params = page._dc_params
+                params["outputs"] = outputs
+                page._dc_task_def["params"] = params
+                page._dc_task_def["output"] = {"saved": bool(done)}
+                if self.project is not None:
+                    self.project.save()
+                page._dc_snapshot = copy.deepcopy(params)
+                page._dc_dirty = False
+                self._dc_update_save_btn(page)
+                page._dc_done = done
+                page._dc_failed = failed
+                finished = True
+            elif kind == "error":
+                error = msg[1]
+                finished = True
+        if not finished:
+            return
+        page._dc_running = False
+        timer = getattr(page, "_dc_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._dc_timer = None
+        self._dc_update_calc_btn(page)
+        if error:
+            self._dc_log(page, f"✗ {error}")
+            QMessageBox.warning(self, "Calculate", error)
+            page._dc_status.setText("Failed")
+        else:
+            summary = f"Cleaned {page._dc_done} file(s)."
+            if getattr(page, "_dc_failed", 0):
+                summary += f" {page._dc_failed} failed — see the log."
+            page._dc_status.setText(summary)
+            self._dc_log(page, summary)
+            self.statusBar().showMessage(summary)
+            self._module_saved(page)
+
+    def _dc_mark_dirty(self, page) -> None:
+        page._dc_dirty = True
+        self._dc_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _dc_update_save_btn(self, page) -> None:
+        page._dc_save_btn.setEnabled(page._dc_dirty and not page._dc_locked)
+
+    def _dc_save_now(self, page) -> None:
+        params = page._dc_params
+        params["log"] = list(getattr(page, "_dc_log_lines", []) or [])
+        page._dc_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._dc_snapshot = copy.deepcopy(params)
+        page._dc_dirty = False
+        self._dc_update_save_btn(page)
+        self._dc_log(page, "Settings saved")
+        self.statusBar().showMessage("Data Clean settings saved")
+        self._module_saved(page)
+
+    def _dc_close(self, page) -> None:
+        if getattr(page, "_dc_running", False):
+            reply = QMessageBox.question(
+                self, "Close Data Clean",
+                "A calculation is still running.\nStop it and close? "
+                "This run's results will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._dc_cancel = True
+            self._dc_log(page, "Stopping after the current file…")
+            return
+        if getattr(page, "_dc_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Data Clean",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            log_lines = list(getattr(page, "_dc_log_lines", []) or [])
+            page._dc_task_def["params"] = page._dc_snapshot
+            page._dc_task_def["params"]["log"] = log_lines
+        self._close_module_page(page)
+
+    # ----- batch alignment module (map) ---------------------------------
+    _BA_MIN_CELLS = 50          # cells per batch per cluster for a spline
+    _BA_MODES = [
+        ("CytoNorm (reference-based)", "cytonorm"),
+        ("ComBat (reference-free)", "combat"),
+    ]
+
+    def _ba_config_sig(self, params) -> str:
+        """Digest of the inputs a fitted model was trained from."""
+        payload = {
+            "method": params.get("method"),
+            "files": list(params.get("files") or []),
+            "batches": params.get("batches") or {},
+            "references": sorted(params.get("references") or []),
+            "columns": list(params.get("columns") or []),
+            "cytonorm": params.get("cytonorm") or {},
+            "combat": params.get("combat") or {},
+        }
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _ba_load_model(self, task_def):
+        """Load a fitted model's .npz (cached by file mtime)."""
+        import numpy as np
+
+        params = task_def.get("params") or {}
+        model = params.get("model")
+        if not isinstance(model, dict) or not model.get("npz"):
+            return None
+        if self.project is None:
+            return None
+        path = self.project.path / model["npz"]
+        if not path.is_file():
+            return None
+        try:
+            stat = path.stat()
+            key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            return None
+        cache = getattr(self, "_ba_cache", None)
+        if cache is None:
+            cache = {}
+            self._ba_cache = cache
+        if key in cache:
+            return cache[key]
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                arrays = {name: data[name] for name in data.files}
+        except Exception:  # noqa: BLE001
+            return None
+        if len(cache) > 8:
+            cache.clear()
+        cache[key] = arrays
+        return arrays
+
+    def _ba_stage(self, task_def):
+        """The map stage for a Batch Alignment task, or None when not fitted."""
+        params = task_def.get("params") or {}
+        model = params.get("model")
+        if not isinstance(model, dict):
+            return None
+        if model.get("config_sig") != self._ba_config_sig(params):
+            return None
+        arrays = self._ba_load_model(task_def)
+        if arrays is None:
+            return None
+        stage = {
+            "id": task_def.get("id"),
+            "method": model.get("method"),
+            "columns": list(model.get("columns") or []),
+            "files": {
+                str(path): int(index)
+                for path, index in (model.get("file_batch") or {}).items()
+            },
+            "batches": list(model.get("batches") or []),
+            "model_id": model.get("model_id"),
+            "affine": arrays.get("affine"),
+            "codes": arrays.get("codes"),
+            "node_cluster": arrays.get("node_cluster"),
+            "knots_x": arrays.get("knots_x"),
+            "knots_y": arrays.get("knots_y"),
+            "has_spline": arrays.get("has_spline"),
+            "global_x": arrays.get("global_x"),
+            "global_y": arrays.get("global_y"),
+            "has_global": arrays.get("has_global"),
+        }
+        if stage["method"] == "combat" and stage["affine"] is None:
+            return None
+        if stage["method"] != "combat" and stage["codes"] is None:
+            return None
+        return stage
+
+    # ----- batch alignment: page ----------------------------------------
+    def _build_ba_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        if locked:
+            lock_icon = QLabel()
+            lock_icon.setPixmap(_lock_pixmap())
+            lock_icon.setFixedSize(14, 14)
+            lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+            tl.addWidget(lock_icon)
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._ba_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("method", "cytonorm")
+        params.setdefault("files", [])
+        params.setdefault("batches", {})
+        params.setdefault("references", [])
+        params.setdefault("columns", [])
+        params.setdefault("cytonorm", {
+            "nq": 99, "xdim": 10, "ydim": 10, "clusters": 10,
+            "train_cells": 200000, "seed": 42,
+        })
+        params.setdefault("combat", {"eb": True, "adjust_variance": True})
+        params.setdefault("model", None)
+        params.setdefault("log", [])
+
+        page._ba_task_def = task_def
+        page._ba_task_id = task_def.get("id")
+        page._ba_params = params
+        page._ba_locked = locked
+        page._ba_save_btn = save_btn
+        page._ba_dirty = False
+        page._ba_snapshot = copy.deepcopy(params)
+        page._ba_log_lines = list(params.get("log") or [])
+        page._ba_running = False
+        page._ba_cancel = False
+        page._ba_updating = False
+        page._ba_reporting = False
+        save_btn.clicked.connect(lambda _=False: self._ba_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        row = QVBoxLayout(content)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._ba_left_panel(page))
+        splitter.addWidget(self._ba_center_panel(page))
+        splitter.addWidget(self._ba_right_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([340, 300, 400])
+        row.addWidget(splitter, 1)
+
+        row.addWidget(self._ba_log_panel(page))
+        layout.addWidget(content, 1)
+
+        self._ba_refresh(page)
+        return page
+
+    def _ba_log_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Log</b>"))
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Calculation output appears here…")
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        log.setFixedHeight(130)
+        for line in getattr(page, "_ba_log_lines", []):
+            log.appendPlainText(line)
+        lay.addWidget(log)
+        page._ba_log = log
+        return panel
+
+    def _ba_log(self, page, text) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = getattr(page, "_ba_log_lines", None)
+        if lines is None:
+            lines = []
+            page._ba_log_lines = lines
+        for line in str(text).splitlines():
+            if line.strip():
+                lines.append(f"[{ts}] {line}")
+        log = getattr(page, "_ba_log", None)
+        if log is not None:
+            for line in str(text).splitlines():
+                if line.strip():
+                    log.appendPlainText(f"[{ts}] {line}")
+
+    def _ba_left_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("<b>Algorithm</b>"))
+        method = _NoWheelComboBox()
+        for label, value in self._BA_MODES:
+            method.addItem(label, value)
+        method.setEnabled(not page._ba_locked)
+        lay.addWidget(method)
+        page._ba_method = method
+        desc = QLabel("")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #6b7785;")
+        lay.addWidget(desc)
+        page._ba_method_desc = desc
+
+        lay.addWidget(QLabel("<b>Data files</b>"))
+        files_btn = QPushButton("Select files…")
+        files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        files_btn.setEnabled(not page._ba_locked)
+        lay.addWidget(files_btn)
+        files_count = QLabel("")
+        files_count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(files_count)
+        page._ba_files_count = files_count
+
+        lay.addWidget(QLabel("<b>Batches</b>"))
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["File", "Batch", "Reference"])
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.setColumnWidth(1, 90)
+        table.itemChanged.connect(lambda item: self._ba_on_table_item(page, item))
+        lay.addWidget(table, 1)
+        page._ba_table = table
+
+        hint = QLabel(
+            "Every file needs a batch. Mark the reference (control) sample of "
+            "each batch for CytoNorm. Copy / paste to edit the table in Excel."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+
+        btns = QHBoxLayout()
+        copy_btn = QPushButton("Copy")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        paste_btn = QPushButton("Paste")
+        paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.clicked.connect(lambda _=False: self._ba_copy(page))
+        paste_btn.clicked.connect(lambda _=False: self._ba_paste(page))
+        btns.addWidget(copy_btn)
+        btns.addWidget(paste_btn)
+        btns.addStretch()
+        lay.addLayout(btns)
+
+        files_btn.clicked.connect(lambda _=False: self._ba_select_files(page))
+        method.currentIndexChanged.connect(lambda _=0: self._ba_on_method(page))
+        return panel
+
+    def _ba_center_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Variables</b>"))
+        hint = QLabel(
+            "Variables shared by every selected file. These are the columns "
+            "that get aligned; other columns pass through unchanged."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        vars_btn = QPushButton("Select variables…")
+        vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vars_btn.setEnabled(not page._ba_locked)
+        lay.addWidget(vars_btn)
+        vars_box = QListWidget()
+        vars_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(vars_box, 1)
+        page._ba_vars_box = vars_box
+        vars_count = QLabel("")
+        vars_count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(vars_count)
+        page._ba_vars_count = vars_count
+
+        vars_btn.clicked.connect(lambda _=False: self._ba_select_vars(page))
+        return panel
+
+    def _ba_right_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Algorithm parameters</b>"))
+
+        _hint = self._param_hint
+
+        cytonorm_host = QWidget()
+        cg = QGridLayout(cytonorm_host)
+        cg.setContentsMargins(0, 0, 0, 0)
+        cg.setHorizontalSpacing(6)
+        cg.setVerticalSpacing(2)
+        cg.setColumnStretch(1, 1)
+        row = 0
+        cg.addWidget(QLabel("Quantiles (nQ)"), row, 0)
+        nq = _NoWheelSpinBox()
+        nq.setRange(11, 501)
+        nq.setSingleStep(10)
+        nq.setValue(99)
+        cg.addWidget(nq, row, 1)
+        row += 1
+        cg.addWidget(_hint(
+            "Quantiles read per channel and cluster. Higher = finer mapping."
+        ), row, 0, 1, 2)
+        row += 1
+        cg.addWidget(QLabel("SOM grid"), row, 0)
+        som = QWidget()
+        sl = QHBoxLayout(som)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(4)
+        xdim = _NoWheelSpinBox()
+        xdim.setRange(4, 30)
+        xdim.setValue(10)
+        ydim = _NoWheelSpinBox()
+        ydim.setRange(4, 30)
+        ydim.setValue(10)
+        sl.addWidget(xdim)
+        sl.addWidget(QLabel("×"))
+        sl.addWidget(ydim)
+        cg.addWidget(som, row, 1)
+        row += 1
+        cg.addWidget(_hint(
+            "FlowSOM grid. Larger = more, smaller cell groups."
+        ), row, 0, 1, 2)
+        row += 1
+        cg.addWidget(QLabel("Clusters"), row, 0)
+        clusters = _NoWheelSpinBox()
+        clusters.setRange(2, 100)
+        clusters.setValue(10)
+        cg.addWidget(clusters, row, 1)
+        row += 1
+        cg.addWidget(_hint(
+            "Cell groups the splines are fitted in."
+        ), row, 0, 1, 2)
+        row += 1
+        cg.addWidget(QLabel("Cells for training"), row, 0)
+        cells = _NoWheelSpinBox()
+        cells.setRange(1000, 2_000_000)
+        cells.setSingleStep(10000)
+        cells.setValue(200000)
+        cg.addWidget(cells, row, 1)
+        row += 1
+        cg.addWidget(_hint(
+            "Cap on reference cells used to train the SOM."
+        ), row, 0, 1, 2)
+        row += 1
+        cg.addWidget(QLabel("Seed"), row, 0)
+        seed = _NoWheelSpinBox()
+        seed.setRange(0, 999999)
+        seed.setValue(42)
+        cg.addWidget(seed, row, 1)
+        row += 1
+        cg.addWidget(_hint(
+            "Random seed for the SOM, so the fit is reproducible."
+        ), row, 0, 1, 2)
+        lay.addWidget(cytonorm_host)
+        page._ba_cytonorm_host = cytonorm_host
+        page._ba_nq = nq
+        page._ba_xdim = xdim
+        page._ba_ydim = ydim
+        page._ba_clusters = clusters
+        page._ba_train_cells = cells
+        page._ba_seed = seed
+
+        combat_host = QWidget()
+        cb = QVBoxLayout(combat_host)
+        cb.setContentsMargins(0, 0, 0, 0)
+        cb.setSpacing(2)
+        eb = QCheckBox("Empirical Bayes shrinkage")
+        eb.setChecked(True)
+        cb.addWidget(eb)
+        cb.addWidget(_hint(
+            "Pull each batch estimate towards the pooled value. Safer when a "
+            "batch has few cells."
+        ))
+        adjust_var = QCheckBox("Adjust variance as well as location")
+        adjust_var.setChecked(True)
+        cb.addWidget(adjust_var)
+        cb.addWidget(_hint(
+            "Also equalise the spread, not just the median. Off = shift means "
+            "only."
+        ))
+        lay.addWidget(combat_host)
+        page._ba_combat_host = combat_host
+        page._ba_eb = eb
+        page._ba_adjust_var = adjust_var
+
+        hint = QLabel("")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+        page._ba_param_hint = hint
+
+        lay.addWidget(QLabel("<b>Run</b>"))
+        buttons = QHBoxLayout()
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        report_btn = QPushButton("Report")
+        report_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        report_btn.setToolTip(
+            "Write an HTML/PDF report with the before/after distributions"
+        )
+        buttons.addWidget(calc_btn)
+        buttons.addWidget(report_btn)
+        lay.addLayout(buttons)
+        page._ba_calc_btn = calc_btn
+        page._ba_report_btn = report_btn
+
+        status = QLabel("")
+        status.setStyleSheet("color: #6b7785;")
+        status.setWordWrap(True)
+        lay.addWidget(status)
+        page._ba_status = status
+        lay.addStretch()
+
+        for widget in (nq, xdim, ydim, clusters, cells, seed, eb, adjust_var):
+            widget.setEnabled(not page._ba_locked)
+
+        nq.valueChanged.connect(lambda _=0: self._ba_on_param(page))
+        xdim.valueChanged.connect(lambda _=0: self._ba_on_param(page))
+        ydim.valueChanged.connect(lambda _=0: self._ba_on_param(page))
+        clusters.valueChanged.connect(lambda _=0: self._ba_on_param(page))
+        cells.valueChanged.connect(lambda _=0: self._ba_on_param(page))
+        seed.valueChanged.connect(lambda _=0: self._ba_on_param(page))
+        eb.toggled.connect(lambda _=0: self._ba_on_param(page))
+        adjust_var.toggled.connect(lambda _=0: self._ba_on_param(page))
+        calc_btn.clicked.connect(lambda _=False: self._ba_calculate(page))
+        report_btn.clicked.connect(lambda _=False: self._ba_report(page))
+        return panel
+
+    # ----- batch alignment: state ---------------------------------------
+    def _ba_common_columns(self, page) -> list:
+        files = page._ba_params.get("files") or []
+        if not files:
+            return []
+        common = set(self._columns_for(files[0], page._ba_task_id))
+        for path in files[1:]:
+            common &= set(self._columns_for(path, page._ba_task_id))
+        return sorted(common)
+
+    def _ba_select_files(self, page) -> None:
+        records = self._available_files(page._ba_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [
+            self._comp_file_name(p, page._ba_task_id)
+            for p in page._ba_params.get("files") or []
+        ]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        files = [by_name[n] for n in chosen if n in by_name]
+        params = page._ba_params
+        params["files"] = files
+        batches = params.setdefault("batches", {})
+        params["batches"] = {p: batches.get(p, "") for p in files}
+        refs = set(params.get("references") or [])
+        params["references"] = [p for p in files if p in refs]
+        common = set(self._ba_common_columns(page))
+        params["columns"] = [c for c in params.get("columns") or [] if c in common]
+        self._ba_refresh(page)
+        self._ba_mark_dirty(page)
+
+    def _ba_select_vars(self, page) -> None:
+        options = [
+            c for c in self._ba_common_columns(page)
+            if c not in ("x", "y")
+        ]
+        if not options:
+            QMessageBox.information(
+                self, "Select variables",
+                "Select data files with common columns first."
+            )
+            return
+        chosen = self._pick_items_dialog(
+            "Select variables", options,
+            page._ba_params.get("columns") or [], "Filter variables...",
+        )
+        if chosen is None:
+            return
+        page._ba_params["columns"] = list(chosen)
+        self._ba_refresh(page)
+        self._ba_mark_dirty(page)
+
+    def _ba_on_method(self, page) -> None:
+        if getattr(page, "_ba_updating", False):
+            return
+        page._ba_params["method"] = page._ba_method.currentData() or "cytonorm"
+        self._ba_refresh(page)
+        self._ba_mark_dirty(page)
+
+    def _ba_on_param(self, page) -> None:
+        if getattr(page, "_ba_updating", False):
+            return
+        params = page._ba_params
+        params["cytonorm"] = {
+            "nq": int(page._ba_nq.value()),
+            "xdim": int(page._ba_xdim.value()),
+            "ydim": int(page._ba_ydim.value()),
+            "clusters": int(page._ba_clusters.value()),
+            "train_cells": int(page._ba_train_cells.value()),
+            "seed": int(page._ba_seed.value()),
+        }
+        params["combat"] = {
+            "eb": bool(page._ba_eb.isChecked()),
+            "adjust_variance": bool(page._ba_adjust_var.isChecked()),
+        }
+        self._ba_mark_dirty(page)
+
+    def _ba_on_table_item(self, page, item) -> None:
+        if getattr(page, "_ba_updating", False) or page._ba_locked:
+            return
+        row = item.row()
+        files = page._ba_params.get("files") or []
+        if row < 0 or row >= len(files):
+            return
+        path = files[row]
+        params = page._ba_params
+        batches = params.setdefault("batches", {})
+        if item.column() == 1:
+            value = item.text().strip()
+            if batches.get(path, "") == value:
+                return
+            batches[path] = value
+        elif item.column() == 2:
+            refs = list(params.get("references") or [])
+            checked = item.checkState() == Qt.CheckState.Checked
+            if checked and path not in refs:
+                refs.append(path)
+            elif not checked and path in refs:
+                refs.remove(path)
+            params["references"] = refs
+        else:
+            return
+        self._ba_mark_dirty(page)
+        self._ba_update_calc_btn(page)
+        self._ba_paint_table(page)
+
+    def _ba_paint_table(self, page) -> None:
+        """Colour rows whose batch is still empty."""
+        table = page._ba_table
+        files = page._ba_params.get("files") or []
+        batches = page._ba_params.get("batches") or {}
+        table.blockSignals(True)
+        for row, path in enumerate(files):
+            item = table.item(row, 1)
+            if item is None:
+                continue
+            missing = not (batches.get(path) or "").strip()
+            item.setBackground(QColor("#fdecea") if missing else QColor("#ffffff"))
+            item.setToolTip(
+                "Every file must belong to a batch." if missing else ""
+            )
+        table.blockSignals(False)
+
+    def _ba_copy(self, page) -> None:
+        params = page._ba_params
+        refs = set(params.get("references") or [])
+        batches = params.get("batches") or {}
+        lines = ["File\tBatch\tReference"]
+        for path in params.get("files") or []:
+            lines.append("\t".join([
+                self._comp_file_name(path, page._ba_task_id),
+                str(batches.get(path, "") or ""),
+                "yes" if path in refs else "no",
+            ]))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Batch table copied to the clipboard")
+
+    def _ba_paste(self, page) -> None:
+        text = QApplication.clipboard().text()
+        lines = [line.rstrip("\r") for line in text.split("\n") if line.strip()]
+        if not lines:
+            return
+        header = [cell.strip().lower() for cell in lines[0].split("\t")]
+        if header[:3] != ["file", "batch", "reference"]:
+            QMessageBox.warning(
+                self, "Paste",
+                "The pasted table must start with the header "
+                "'File\\tBatch\\tReference' (copy the table first).",
+            )
+            return
+        rows = [line.split("\t") for line in lines[1:]]
+        files = page._ba_params.get("files") or []
+        current = [self._comp_file_name(p, page._ba_task_id) for p in files]
+        if len(rows) != len(current):
+            QMessageBox.warning(
+                self, "Paste",
+                f"The pasted table has {len(rows)} row(s) but this module has "
+                f"{len(current)} file(s). Copy the table again after changing "
+                "the file selection.",
+            )
+            return
+        for index, (expected, row) in enumerate(zip(current, rows)):
+            if not row or row[0].strip() != expected:
+                QMessageBox.warning(
+                    self, "Paste",
+                    f"Row {index + 1}: expected file '{expected}' but found "
+                    f"'{row[0].strip() if row else ''}'.",
+                )
+                return
+        truthy = {"yes", "y", "true", "1", "x"}
+        batches = {}
+        refs = []
+        for path, row in zip(files, rows):
+            batches[path] = (row[1].strip() if len(row) > 1 else "")
+            flag = (row[2].strip().lower() if len(row) > 2 else "")
+            if flag in truthy:
+                refs.append(path)
+        page._ba_params["batches"] = batches
+        page._ba_params["references"] = refs
+        self._ba_refresh(page)
+        self._ba_mark_dirty(page)
+
+    def _ba_existing_columns(self, page) -> set:
+        prefix = page._ba_params.get("model") or {}
+        names = set(prefix.get("columns") or [])
+        return names
+
+    def _ba_model_current(self, page) -> bool:
+        model = page._ba_params.get("model")
+        return (
+            isinstance(model, dict)
+            and model.get("config_sig") == self._ba_config_sig(page._ba_params)
+        )
+
+    def _ba_update_calc_btn(self, page) -> None:
+        params = page._ba_params
+        files = params.get("files") or []
+        batches = params.get("batches") or {}
+        name = str(params.get("method") or "cytonorm")
+        ok = bool(files and params.get("columns"))
+        if ok:
+            ok = all((batches.get(path) or "").strip() for path in files)
+        if ok and name == "cytonorm":
+            refs = [p for p in params.get("references") or [] if p in files]
+            ok = bool(refs)
+        page._ba_calc_btn.setEnabled(ok and not page._ba_locked
+                                     and not page._ba_running)
+        page._ba_report_btn.setEnabled(
+            self._ba_model_current(page) and not page._ba_locked
+            and not page._ba_reporting
+        )
+
+    def _ba_refresh(self, page) -> None:
+        params = page._ba_params
+        page._ba_updating = True
+        try:
+            page._ba_method.blockSignals(True)
+            page._ba_method.setCurrentIndex(
+                max(0, page._ba_method.findData(params.get("method", "cytonorm")))
+            )
+            page._ba_method.blockSignals(False)
+            method = params.get("method", "cytonorm")
+            page._ba_cytonorm_host.setVisible(method == "cytonorm")
+            page._ba_combat_host.setVisible(method == "combat")
+            page._ba_method_desc.setText(
+                "Aligns every file to the reference samples of its batch: "
+                "quantile normalisation inside each FlowSOM cluster, fitted "
+                "against the mean reference distribution."
+                if method == "cytonorm" else
+                "Corrects each batch/channel by a location and scale "
+                "difference estimated with empirical Bayes. Reference samples "
+                "are not used."
+            )
+            # Each parameter carries its own note; this line only covers the
+            # points that apply to the algorithm as a whole.
+            page._ba_param_hint.setText(
+                "Reference samples drive the fit — files from a batch without "
+                "one are left unchanged. Put a Scale (log10) module upstream "
+                "to align on a log scale."
+                if method == "cytonorm" else
+                "Reference samples are not used. ComBat assumes an "
+                "approximately log-normal distribution — add a Scale (log10) "
+                "module upstream if needed."
+            )
+
+            cytonorm = params.get("cytonorm") or {}
+            for widget, key, default in (
+                (page._ba_nq, "nq", 99),
+                (page._ba_xdim, "xdim", 10),
+                (page._ba_ydim, "ydim", 10),
+                (page._ba_clusters, "clusters", 10),
+                (page._ba_train_cells, "train_cells", 200000),
+                (page._ba_seed, "seed", 42),
+            ):
+                widget.blockSignals(True)
+                widget.setValue(int(cytonorm.get(key, default)))
+                widget.blockSignals(False)
+            combat = params.get("combat") or {}
+            page._ba_eb.blockSignals(True)
+            page._ba_eb.setChecked(bool(combat.get("eb", True)))
+            page._ba_eb.blockSignals(False)
+            page._ba_adjust_var.blockSignals(True)
+            page._ba_adjust_var.setChecked(bool(combat.get("adjust_variance", True)))
+            page._ba_adjust_var.blockSignals(False)
+
+            files = params.get("files") or []
+            batches = params.get("batches") or {}
+            refs = set(params.get("references") or [])
+            table = page._ba_table
+            table.blockSignals(True)
+            table.setRowCount(len(files))
+            for row, path in enumerate(files):
+                name_item = QTableWidgetItem(
+                    self._comp_file_name(path, page._ba_task_id)
+                )
+                name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                name_item.setToolTip(path)
+                table.setItem(row, 0, name_item)
+                batch_item = QTableWidgetItem(str(batches.get(path, "") or ""))
+                batch_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsEditable
+                )
+                table.setItem(row, 1, batch_item)
+                ref_item = QTableWidgetItem("")
+                ref_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                ref_item.setCheckState(
+                    Qt.CheckState.Checked if path in refs
+                    else Qt.CheckState.Unchecked
+                )
+                table.setItem(row, 2, ref_item)
+            table.blockSignals(False)
+            page._ba_files_count.setText(f"{len(files)} file(s) selected")
+
+            columns = params.get("columns") or []
+            page._ba_vars_box.clear()
+            for column in columns:
+                page._ba_vars_box.addItem(str(column))
+            page._ba_vars_count.setText(f"{len(columns)} variable(s) selected")
+        finally:
+            page._ba_updating = False
+        self._ba_paint_table(page)
+        self._ba_update_calc_btn(page)
+
+    # ----- batch alignment: fitting --------------------------------------
+    def _ba_validate(self, page):
+        params = page._ba_params
+        if not params.get("files"):
+            return False, "Select at least one data file."
+        if not params.get("columns"):
+            return False, "Select at least one variable to align."
+        batches = params.get("batches") or {}
+        missing = [
+            self._comp_file_name(path, page._ba_task_id)
+            for path in params["files"]
+            if not (batches.get(path) or "").strip()
+        ]
+        if missing:
+            return False, (
+                "Every file needs a batch. Missing: " + ", ".join(missing[:5])
+                + ("…" if len(missing) > 5 else "")
+            )
+        if params.get("method") == "cytonorm":
+            refs = [p for p in params.get("references") or [] if p in params["files"]]
+            if not refs:
+                return False, (
+                    "CytoNorm needs at least one reference sample "
+                    "(tick the Reference column)."
+                )
+        return True, ""
+
+    def _ba_calculate(self, page) -> None:
+        ok, message = self._ba_validate(page)
+        if not ok:
+            QMessageBox.warning(self, "Calculate", message)
+            return
+        if self._ba_model_current(page):
+            reply = QMessageBox.question(
+                self, "Calculate",
+                "A model is already fitted for this configuration.\n"
+                "Fit it again and overwrite?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        page._ba_running = True
+        page._ba_cancel = False
+        page._ba_status.setText("Calculating…")
+        self._ba_update_calc_btn(page)
+
+        q = queue.Queue()
+        page._ba_queue = q
+        page._ba_thread = threading.Thread(
+            target=self._ba_run, args=(page, q), daemon=True
+        )
+        page._ba_thread.start()
+        timer = QTimer(self)
+        timer.setInterval(150)
+        timer.timeout.connect(lambda: self._ba_poll(page))
+        timer.start()
+        page._ba_timer = timer
+
+    def _ba_run(self, page, q) -> None:
+        params = page._ba_params
+        method = params.get("method", "cytonorm")
+        try:
+            label = dict(self._BA_MODES).get(method, method)
+            q.put(("log", f"— Starting {label} —"))
+            q.put(("status", "Fitting the batch model…"))
+            if method == "combat":
+                arrays, meta = self._ba_fit_combat(page, q)
+            else:
+                arrays, meta = self._ba_fit_cytonorm(page, q)
+            if getattr(page, "_ba_cancel", False):
+                q.put(("error", "Calculation cancelled."))
+                return
+            q.put(("status", "Writing the model…"))
+            model = self._ba_write_model(page, arrays, meta)
+            q.put(("done", model))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("error", str(exc)))
+
+    def _ba_read_matrix(self, page, path, columns):
+        import numpy as np
+
+        values = self._column_data(page._ba_task_id, path, columns)
+        missing = [c for c in columns if c not in values]
+        if missing:
+            raise ValueError(
+                f"{self._comp_file_name(path, page._ba_task_id)} is missing "
+                f"column(s): {', '.join(missing[:4])}"
+            )
+        matrix = np.column_stack(
+            [np.asarray(values[c], dtype="float64") for c in columns]
+        )
+        if matrix.size == 0:
+            return matrix
+        return matrix[np.isfinite(matrix).all(axis=1)]
+
+    def _ba_fit_cytonorm(self, page, q):
+        """Train FlowSOM on the references, then fit per-cluster splines."""
+        import anndata as ad
+        import numpy as np
+        import pandas as pd
+        from flowsom import FlowSOM
+        from scipy.interpolate import PchipInterpolator
+
+        params = page._ba_params
+        cfg = params.get("cytonorm") or {}
+        files = list(params.get("files") or [])
+        columns = list(params.get("columns") or [])
+        batches = params.get("batches") or {}
+        refs = [path for path in files if path in set(params.get("references") or [])]
+        if not refs:
+            raise ValueError("CytoNorm needs at least one reference sample")
+        batch_names = sorted({str(batches.get(path) or "") for path in files})
+        batch_index = {name: i for i, name in enumerate(batch_names)}
+        file_batch = {path: batch_index[str(batches.get(path) or "")] for path in files}
+        ref_set = set(refs)
+
+        nq = max(11, int(cfg.get("nq") or 99))
+        xdim = max(4, int(cfg.get("xdim") or 10))
+        ydim = max(4, int(cfg.get("ydim") or 10))
+        want_clusters = max(2, int(cfg.get("clusters") or 10))
+        cap = max(1000, int(cfg.get("train_cells") or 200000))
+        seed = int(cfg.get("seed") if cfg.get("seed") is not None else 42)
+        per_file = max(2000, cap // max(1, len(refs)))
+        rng = np.random.default_rng(seed)
+
+        blocks = []
+        block_batch = []
+        for index, path in enumerate(refs):
+            if getattr(page, "_ba_cancel", False):
+                raise ValueError("Calculation cancelled.")
+            name = self._comp_file_name(path, page._ba_task_id)
+            q.put(("log", f"Reading reference {index + 1}/{len(refs)}: {name}"))
+            matrix = self._ba_read_matrix(page, path, columns)
+            if matrix.shape[0] < self._BA_MIN_CELLS:
+                q.put(("log", f"  {name}: too few cells, skipped"))
+                continue
+            if matrix.shape[0] > per_file:
+                pick = np.sort(rng.choice(matrix.shape[0], per_file, replace=False))
+                matrix = matrix[pick]
+            blocks.append(matrix.astype("float32"))
+            block_batch.append(np.full(matrix.shape[0], file_batch[path], dtype=np.int32))
+            q.put(("log", f"  {name}: {matrix.shape[0]:,} cell(s) used for training"))
+        if not blocks:
+            raise ValueError("No reference sample produced usable cells")
+        train = np.vstack(blocks)
+        train_batch = np.concatenate(block_batch)
+
+        q.put(("status", f"Training FlowSOM ({xdim}×{ydim})…"))
+        q.put(("log", f"FlowSOM on {train.shape[0]:,} cells, grid {xdim}×{ydim}, "
+                      f"{want_clusters} cluster(s)"))
+        adata = ad.AnnData(X=train, var=pd.DataFrame(index=columns))
+        fsom = FlowSOM(
+            adata, n_clusters=want_clusters, cols_to_use=columns,
+            xdim=xdim, ydim=ydim, seed=seed,
+        )
+        codes = np.asarray(fsom.model.codes, dtype="float32")
+        nodes = np.asarray(fsom.model.cluster_labels).astype(np.int64)
+        metaclusters = np.asarray(fsom.model.metacluster_labels).astype(np.int64)
+        node_cluster = np.zeros(codes.shape[0], dtype=np.int32)
+        node_cluster[nodes] = metaclusters
+        n_clusters = int(node_cluster.max()) + 1
+        # Metacluster of every training cell (the unit the splines are fit on).
+        cell_cluster = node_cluster[nodes]
+
+        q.put(("status", "Fitting per-cluster splines…"))
+        probs = np.arange(1, nq + 1) / (nq + 1)
+        n_batches = len(batch_names)
+        grid_points = 256
+        knots_x = np.zeros(
+            (n_batches, n_clusters, len(columns), grid_points), dtype="float32"
+        )
+        knots_y = np.zeros_like(knots_x)
+        has_spline = np.zeros((n_batches, n_clusters), dtype=bool)
+        n_identity = 0
+        for cluster in range(n_clusters):
+            in_cluster = cell_cluster == cluster
+            quantiles = {}
+            for batch in range(n_batches):
+                mask = in_cluster & (train_batch == batch)
+                count = int(mask.sum())
+                if count < self._BA_MIN_CELLS:
+                    continue
+                quantiles[batch] = np.percentile(
+                    train[mask], probs * 100.0, axis=0
+                ).T  # (channels, nq)
+            if len(quantiles) < 2:
+                n_identity += 1
+                continue
+            goal = np.mean(list(quantiles.values()), axis=0)
+            for batch, batch_quantiles in quantiles.items():
+                for j in range(len(columns)):
+                    source = np.asarray(batch_quantiles[j], dtype="float64")
+                    target = np.asarray(goal[j], dtype="float64")
+                    unique, first = np.unique(source, return_index=True)
+                    if unique.size < 2:
+                        continue
+                    fitted = PchipInterpolator(unique, target[first])
+                    grid = np.linspace(unique[0], unique[-1], grid_points)
+                    knots_x[batch, cluster, j] = grid
+                    # PCHIP is monotone between the knots, so the evaluated
+                    # values need no clipping; clipping to the *source* range
+                    # would cut off a genuine shift.
+                    knots_y[batch, cluster, j] = fitted(grid)
+                has_spline[batch, cluster] = True
+        q.put(("log", f"{n_clusters} cluster(s); "
+                      f"{n_identity} kept the identity mapping (too few cells)"))
+        trained = int(has_spline.sum())
+        q.put(("log", f"{trained} cluster × batch spline(s) fitted"))
+
+        # A per-batch spline over all reference cells. It is the fallback for
+        # cells whose cluster has no batch-specific spline — for example when a
+        # strong batch effect splits the SOM into batch-specific clusters.
+        global_x = np.zeros((n_batches, len(columns), grid_points), dtype="float32")
+        global_y = np.zeros((n_batches, len(columns), grid_points), dtype="float32")
+        has_global = np.zeros(n_batches, dtype=bool)
+        overall = {}
+        for batch in range(n_batches):
+            mask = train_batch == batch
+            if int(mask.sum()) < self._BA_MIN_CELLS:
+                continue
+            overall[batch] = np.percentile(
+                train[mask], probs * 100.0, axis=0
+            ).T
+        if len(overall) >= 2:
+            goal = np.mean(list(overall.values()), axis=0)
+            for batch, batch_quantiles in overall.items():
+                for j in range(len(columns)):
+                    source = np.asarray(batch_quantiles[j], dtype="float64")
+                    target = np.asarray(goal[j], dtype="float64")
+                    unique, first = np.unique(source, return_index=True)
+                    if unique.size < 2:
+                        continue
+                    fitted = PchipInterpolator(unique, target[first])
+                    grid = np.linspace(unique[0], unique[-1], grid_points)
+                    global_x[batch, j] = grid
+                    global_y[batch, j] = fitted(grid)
+                has_global[batch] = True
+        q.put(("log", f"Fallback spline(s) for {int(has_global.sum())} batch(es)"))
+
+        arrays = {
+            "codes": codes,
+            "node_cluster": node_cluster,
+            "knots_x": knots_x,
+            "knots_y": knots_y,
+            "has_spline": has_spline,
+            "global_x": global_x,
+            "global_y": global_y,
+            "has_global": has_global,
+        }
+        meta = {
+            "method": "cytonorm",
+            "columns": columns,
+            "batches": batch_names,
+            "file_batch": file_batch,
+            "references": [p for p in files if p in ref_set],
+            "clusters": n_clusters,
+            "splines": trained,
+            "train_cells": int(train.shape[0]),
+        }
+        return arrays, meta
+
+    def _ba_fit_combat(self, page, q):
+        """Estimate a location/scale correction per batch and channel."""
+        import numpy as np
+
+        params = page._ba_params
+        cfg = params.get("combat") or {}
+        files = list(params.get("files") or [])
+        columns = list(params.get("columns") or [])
+        batches = params.get("batches") or {}
+        refs = set(params.get("references") or [])
+        batch_names = sorted({str(batches.get(path) or "") for path in files})
+        batch_index = {name: i for i, name in enumerate(batch_names)}
+        file_batch = {path: batch_index[str(batches.get(path) or "")] for path in files}
+        n_batches = len(batch_names)
+        n_channels = len(columns)
+
+        counts = np.zeros((n_batches, n_channels), dtype="float64")
+        sums = np.zeros((n_batches, n_channels), dtype="float64")
+        squares = np.zeros((n_batches, n_channels), dtype="float64")
+        for index, path in enumerate(files):
+            if getattr(page, "_ba_cancel", False):
+                raise ValueError("Calculation cancelled.")
+            name = self._comp_file_name(path, page._ba_task_id)
+            q.put(("log", f"Reading {index + 1}/{len(files)}: {name}"))
+            matrix = self._ba_read_matrix(page, path, columns)
+            if matrix.shape[0] == 0:
+                q.put(("log", f"  {name}: no finite rows, skipped"))
+                continue
+            batch = file_batch[path]
+            counts[batch] += matrix.shape[0]
+            sums[batch] += matrix.sum(axis=0)
+            squares[batch] += np.einsum("ij,ij->j", matrix, matrix)
+            q.put(("log", f"  {name}: {matrix.shape[0]:,} cell(s)"))
+
+        usable = counts >= 2
+        if not usable.all(axis=0).any():
+            raise ValueError("Not enough cells to estimate a Correction")
+        mean = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
+        var = np.divide(
+            squares - counts * mean * mean,
+            np.maximum(counts - 1.0, 1.0),
+            out=np.zeros_like(sums), where=counts > 1,
+        )
+        var = np.clip(var, 0.0, None)
+        total = counts.sum(axis=0)
+        grand = (sums.sum(axis=0) / np.maximum(total, 1.0))
+        pooled = (
+            (np.maximum(counts - 1.0, 0.0) * var).sum(axis=0)
+            + (counts * (mean - grand[None, :]) ** 2).sum(axis=0)
+        ) / np.maximum(total, 1.0)
+        pooled = np.clip(pooled, 1e-12, None)
+
+        scale_var = np.sqrt(pooled)[None, :]
+        standard_mean = (mean - grand[None, :]) / scale_var
+        standard_var = var / pooled[None, :]
+
+        gamma_bar = np.mean(standard_mean, axis=0)
+        t2 = np.var(standard_mean, axis=0, ddof=1) if n_batches > 1 else np.zeros(n_channels)
+        t2 = np.where(np.isfinite(t2), t2, 0.0)
+        prior_mean = np.mean(standard_var, axis=0)
+        prior_var = np.var(standard_var, axis=0, ddof=1) if n_batches > 1 else np.zeros(n_channels)
+        prior_var = np.where(np.isfinite(prior_var) & (prior_var > 1e-12), prior_var, 1e-12)
+        a_prior = (2.0 * prior_var + prior_mean ** 2) / prior_var
+        b_prior = (prior_mean * prior_var + prior_mean ** 3) / prior_var
+
+        gamma = standard_mean.copy()
+        delta = standard_var.copy()
+        if bool(cfg.get("eb", True)):
+            for _ in range(200):
+                new_gamma = (
+                    t2[None, :] * counts * gamma + delta * gamma_bar[None, :]
+                ) / (t2[None, :] * counts + delta + 1e-12)
+                sum2 = (
+                    np.maximum(counts - 1.0, 0.0) * standard_var
+                    + counts * (standard_mean - new_gamma) ** 2
+                )
+                new_delta = (0.5 * sum2 + b_prior[None, :]) / (
+                    counts / 2.0 + a_prior[None, :] - 1.0
+                )
+                new_delta = np.clip(new_delta, 1e-8, None)
+                change = np.max(np.abs(new_gamma - gamma) / (np.abs(gamma) + 1e-8))
+                change = max(change, float(
+                    np.max(np.abs(new_delta - delta) / (np.abs(delta) + 1e-8))
+                ))
+                gamma, delta = new_gamma, new_delta
+                if change < 1e-4:
+                    break
+        if not bool(cfg.get("adjust_variance", True)):
+            delta = np.ones_like(delta)
+
+        divisor = np.sqrt(delta)
+        affine = np.zeros((n_batches, n_channels, 2), dtype="float32")
+        for batch in range(n_batches):
+            a = 1.0 / divisor[batch]
+            shift = grand * (1.0 - a) - a * gamma[batch] * np.sqrt(pooled)
+            affine[batch, :, 0] = a
+            affine[batch, :, 1] = shift
+        # Degenerate channels stay unchanged.
+        bad = (~np.isfinite(affine[:, :, 0])) | (~np.isfinite(affine[:, :, 1]))
+        affine[:, :, 0] = np.where(bad, 1.0, affine[:, :, 0])
+        affine[:, :, 1] = np.where(bad, 0.0, affine[:, :, 1])
+
+        q.put(("log", f"ComBat fitted on {int(total.max()):,} cell(s) per channel "
+                      f"(max), {n_batches} batch(es)"))
+        arrays = {"affine": affine}
+        meta = {
+            "method": "combat",
+            "columns": columns,
+            "batches": batch_names,
+            "file_batch": file_batch,
+            "references": [p for p in files if p in refs],
+            "cells": int(total.sum()),
+        }
+        return arrays, meta
+
+    def _ba_write_model(self, page, arrays, meta):
+        """Save the fitted arrays into the module folder and describe them."""
+        import numpy as np
+
+        folder = self.project.path / "Module" / str(page._ba_task_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "alignment.npz"
+        np.savez_compressed(path, **arrays)
+        stat = path.stat()
+        model_id = f"{int(stat.st_mtime_ns)}-{int(stat.st_size)}"
+        model = {
+            "npz": f"Module/{page._ba_task_id}/alignment.npz",
+            "model_id": model_id,
+            "config_sig": self._ba_config_sig(page._ba_params),
+            "method": meta.get("method"),
+            "columns": list(meta.get("columns") or []),
+            "batches": list(meta.get("batches") or []),
+            "file_batch": dict(meta.get("file_batch") or {}),
+            "references": list(meta.get("references") or []),
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "clusters": int(meta.get("clusters") or 0),
+            "splines": int(meta.get("splines") or 0),
+            "train_cells": int(meta.get("train_cells") or 0),
+        }
+        return model
+
+    def _ba_poll(self, page) -> None:
+        q = getattr(page, "_ba_queue", None)
+        if q is None:
+            return
+        finished = False
+        error = None
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            if kind == "log":
+                self._ba_log(page, msg[1])
+            elif kind == "status":
+                page._ba_status.setText(msg[1])
+            elif kind == "done":
+                model = msg[1]
+                params = page._ba_params
+                params["model"] = model
+                page._ba_task_def["params"] = params
+                if self.project is not None:
+                    self.project.save()
+                page._ba_snapshot = copy.deepcopy(params)
+                page._ba_dirty = False
+                self._ba_update_save_btn(page)
+                finished = True
+            elif kind == "error":
+                error = msg[1]
+                finished = True
+        if not finished:
+            return
+        page._ba_running = False
+        timer = getattr(page, "_ba_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._ba_timer = None
+        if error:
+            self._ba_log(page, f"✗ {error}")
+            page._ba_status.setText("Failed")
+            QMessageBox.warning(self, "Calculate", error)
+        else:
+            method = page._ba_params.get("method")
+            if method == "cytonorm":
+                summary = (
+                    f"CytoNorm fitted: {page._ba_params['model'].get('clusters')} "
+                    f"cluster(s), {page._ba_params['model'].get('splines')} "
+                    "cluster × batch correction(s)."
+                )
+            else:
+                summary = (
+                    f"ComBat fitted for "
+                    f"{len(page._ba_params['model'].get('batches') or [])} batch(es)."
+                )
+            page._ba_status.setText(summary)
+            self._ba_log(page, summary)
+            self.statusBar().showMessage(summary)
+            self._module_saved(page)
+        self._ba_update_calc_btn(page)
+
+    def _ba_mark_dirty(self, page) -> None:
+        page._ba_dirty = True
+        self._ba_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _ba_update_save_btn(self, page) -> None:
+        page._ba_save_btn.setEnabled(page._ba_dirty and not page._ba_locked)
+
+    def _ba_save_now(self, page) -> None:
+        params = page._ba_params
+        params["log"] = list(getattr(page, "_ba_log_lines", []) or [])
+        page._ba_task_def["params"] = params
+        if self.project is not None:
+            self.project.save()
+        page._ba_snapshot = copy.deepcopy(params)
+        page._ba_dirty = False
+        self._ba_update_save_btn(page)
+        self._ba_log(page, "Settings saved")
+        self.statusBar().showMessage("Batch Alignment settings saved")
+        self._module_saved(page)
+
+    def _ba_close(self, page) -> None:
+        if getattr(page, "_ba_running", False) or getattr(page, "_ba_reporting", False):
+            reply = QMessageBox.question(
+                self, "Close Batch Alignment",
+                "A calculation is still running.\nStop it and close? "
+                "This run's results will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._ba_cancel = True
+            return
+        if getattr(page, "_ba_dirty", False):
+            reply = QMessageBox.question(
+                self, "Close Batch Alignment",
+                "There are unsaved changes.\nClose without saving? "
+                "Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            log_lines = list(getattr(page, "_ba_log_lines", []) or [])
+            page._ba_task_def["params"] = page._ba_snapshot
+            page._ba_task_def["params"]["log"] = log_lines
+        self._close_module_page(page)
+
+    # ----- batch alignment: report ---------------------------------------
+    _BA_REPORT_SAMPLE = 20000    # rows sampled per file
+    _BA_REPORT_CAP = 8000        # values kept per (batch, group, channel)
+
+    def _ba_report(self, page) -> None:
+        if not self._ba_model_current(page):
+            QMessageBox.information(
+                self, "Report", "Calculate first, then run the report."
+            )
+            return
+        if getattr(page, "_ba_reporting", False):
+            return
+        page._ba_reporting = True
+        page._ba_cancel = False
+        page._ba_status.setText("Building report…")
+        self._ba_update_calc_btn(page)
+
+        q = queue.Queue()
+        page._ba_report_queue = q
+        page._ba_report_thread = threading.Thread(
+            target=self._ba_report_run, args=(page, q), daemon=True
+        )
+        page._ba_report_thread.start()
+        timer = QTimer(self)
+        timer.setInterval(150)
+        timer.timeout.connect(lambda: self._ba_report_poll(page))
+        timer.start()
+        page._ba_report_timer = timer
+
+    def _ba_report_run(self, page, q) -> None:
+        import numpy as np
+
+        try:
+            params = page._ba_params
+            stage = self._ba_stage(page._ba_task_def)
+            if stage is None:
+                raise ValueError("The fitted model is no longer available")
+            columns = list(stage["columns"])
+            files = list(params.get("files") or [])
+            batches = params.get("batches") or {}
+            refs = set(params.get("references") or [])
+            use_groups = stage["method"] == "cytonorm"
+            names = list(stage.get("batches") or [])
+            batch_of = {
+                str(path): int(index)
+                for path, index in (stage.get("files") or {}).items()
+            }
+            rng = np.random.default_rng(20240517)
+            curves = {}
+            cell_counts = {}
+            file_rows = []
+            n_files = len(files)
+            for index, path in enumerate(files):
+                if getattr(page, "_ba_cancel", False):
+                    q.put(("error", "Report cancelled."))
+                    return
+                name = self._comp_file_name(path, page._ba_task_id)
+                q.put(("progress", index + 1, n_files, name))
+                if path not in batch_of:
+                    continue
+                values = self._column_data(page._ba_task_id, path, columns)
+                missing = [c for c in columns if c not in values]
+                if missing:
+                    q.put(("log", f"Skipped {name}: missing {missing[0]}"))
+                    continue
+                matrix = np.column_stack(
+                    [np.asarray(values[c], dtype="float64") for c in columns]
+                )
+                rows = matrix.shape[0]
+                if rows == 0:
+                    continue
+                pick = (
+                    np.sort(rng.choice(rows, self._BA_REPORT_SAMPLE, replace=False))
+                    if rows > self._BA_REPORT_SAMPLE else np.arange(rows)
+                )
+                sample = matrix[pick]
+                corrected = _apply_batch_align(
+                    stage,
+                    {column: sample[:, j] for j, column in enumerate(columns)},
+                    path,
+                )
+                batch = batch_of[path]
+                group = "ref" if (use_groups and path in refs) else "all"
+                key_group = group
+                cell_counts[(batch, key_group)] = (
+                    cell_counts.get((batch, key_group), 0) + rows
+                )
+                file_rows.append({
+                    "name": name,
+                    "batch": names[batch] if batch < len(names) else str(
+                        batches.get(path) or ""
+                    ),
+                    "reference": "yes" if path in refs else "no",
+                    "rows": rows,
+                    "used": int(len(pick)),
+                })
+                cap = self._BA_REPORT_CAP
+                for j, column in enumerate(columns):
+                    before = sample[:, j]
+                    after = np.asarray(
+                        corrected.get(column, before), dtype="float64"
+                    )
+                    entry = curves.get((batch, key_group, j))
+                    if entry is None:
+                        entry = {"before": before, "after": after}
+                        curves[(batch, key_group, j)] = entry
+                    else:
+                        entry["before"] = np.concatenate([entry["before"], before])
+                        entry["after"] = np.concatenate([entry["after"], after])
+                    if entry["before"].size > cap:
+                        keep = np.sort(
+                            rng.choice(entry["before"].size, cap, replace=False)
+                        )
+                        entry["before"] = entry["before"][keep]
+                        entry["after"] = entry["after"][keep]
+            if not curves:
+                raise ValueError("No data could be read for the report")
+            payload = {
+                "method": stage["method"],
+                "columns": columns,
+                "batches": names,
+                "curves": curves,
+                "cell_counts": cell_counts,
+                "file_rows": file_rows,
+                "use_groups": use_groups,
+                "params": copy.deepcopy(params),
+            }
+            q.put(("done", payload))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("error", str(exc)))
+
+    def _ba_report_poll(self, page) -> None:
+        q = getattr(page, "_ba_report_queue", None)
+        if q is None:
+            return
+        finished = False
+        error = None
+        payload = None
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            if kind == "progress":
+                page._ba_status.setText(
+                    f"Reading files for the report: {msg[1]}/{msg[2]} ({msg[3]})"
+                )
+            elif kind == "log":
+                self._ba_log(page, msg[1])
+            elif kind == "done":
+                payload = msg[1]
+                finished = True
+            elif kind == "error":
+                error = msg[1]
+                finished = True
+        if not finished:
+            return
+        timer = getattr(page, "_ba_report_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._ba_report_timer = None
+        page._ba_reporting = False
+        if error:
+            page._ba_status.setText("Report failed")
+            self._ba_log(page, f"✗ {error}")
+            QMessageBox.warning(self, "Report", error)
+            self._ba_update_calc_btn(page)
+            return
+        try:
+            page._ba_status.setText("Writing the report…")
+            QApplication.processEvents()
+            target = self._ba_write_report(page, payload)
+        except Exception as exc:  # noqa: BLE001
+            page._ba_status.setText("Report failed")
+            self._ba_log(page, f"✗ {exc}")
+            QMessageBox.warning(self, "Report", str(exc))
+            self._ba_update_calc_btn(page)
+            return
+        page._ba_status.setText("Report written")
+        self._ba_log(page, f"Report written to {target}")
+        self.statusBar().showMessage("Batch Alignment report written")
+        self._ba_update_calc_btn(page)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def _ba_density(self, values, low, high, log_axis, bins=256, sigma=1.6):
+        """A smooth density curve on a common grid."""
+        import numpy as np
+        from scipy.ndimage import gaussian_filter1d
+
+        values = np.asarray(values, dtype="float64")
+        values = values[np.isfinite(values)]
+        if values.size == 0 or not (high > low):
+            return np.array([low, high]), np.array([0.0, 0.0])
+        if log_axis:
+            values = np.log10(np.clip(values, 1e-12, None))
+        counts, edges = np.histogram(values, bins=bins, range=(low, high))
+        smooth = gaussian_filter1d(counts.astype("float64"), sigma)
+        peak = smooth.max() if smooth.size else 0.0
+        if peak <= 0:
+            peak = 1.0
+        centers = 0.5 * (edges[1:] + edges[:-1])
+        return centers, smooth / peak
+
+    def _ba_write_report(self, page, payload):
+        """Render the figures with matplotlib and write HTML + PDF."""
+        import base64
+        import io
+
+        import numpy as np
+        from matplotlib import colormaps
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.backends.backend_pdf import PdfPages
+        from matplotlib.figure import Figure
+
+        folder = self.project.path / "Module" / str(page._ba_task_id) / "report"
+        folder.mkdir(parents=True, exist_ok=True)
+        columns = payload["columns"]
+        batches = payload["batches"]
+        curves = payload["curves"]
+        cell_counts = payload["cell_counts"]
+        file_rows = payload["file_rows"]
+        params = payload["params"]
+        method = payload["method"]
+        cytonorm = params.get("cytonorm") or {}
+        combat = params.get("combat") or {}
+        groups = ["ref", "all"] if payload["use_groups"] else ["all"]
+
+        palette = colormaps["tab10"]
+        colors = [palette(i % 10) for i in range(max(1, len(batches)))]
+        group_label = {
+            "ref": "Reference samples", "all": "Other samples"
+            if payload["use_groups"] else "Samples",
+        }
+
+        def stat_pair(values):
+            values = np.asarray(values, dtype="float64")
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                return float("nan"), float("nan")
+            median = float(np.median(values))
+            return median, float(np.median(np.abs(values - median)))
+
+        summary_rows = []
+        channel_svg = []
+        pdf_path = folder / "batch_report.pdf"
+        with PdfPages(pdf_path) as pdf:
+            for j, channel in enumerate(columns):
+                rows_here = []
+                for group in groups:
+                    for batch in range(len(batches)):
+                        entry = curves.get((batch, group, j))
+                        if entry is None or entry["before"].size == 0:
+                            continue
+                        before_median, before_mad = stat_pair(entry["before"])
+                        after_median, after_mad = stat_pair(entry["after"])
+                        rows_here.append({
+                            "batch": batch,
+                            "group": group,
+                            "n": int(cell_counts.get((batch, group), 0)),
+                            "median_before": before_median,
+                            "median_after": after_median,
+                            "mad_before": before_mad,
+                            "mad_after": after_mad,
+                        })
+                if not rows_here:
+                    continue
+                # Batch spread: references first, all samples as a fallback.
+                spread_group = None
+                if payload["use_groups"] and any(
+                    r["group"] == "ref" for r in rows_here
+                ) and len({r["batch"] for r in rows_here if r["group"] == "ref"}) > 1:
+                    spread_group = "ref"
+                else:
+                    spread_group = "all"
+                spread_rows = [r for r in rows_here if r["group"] == spread_group]
+                spread_rows = spread_rows or rows_here
+                medians_before = [r["median_before"] for r in spread_rows]
+                medians_after = [r["median_after"] for r in spread_rows]
+                pooled_before = float(np.median(medians_before))
+                pooled_after = float(np.median(medians_after))
+                spread_before = max(
+                    abs(value - pooled_before) for value in medians_before
+                )
+                spread_after = max(
+                    abs(value - pooled_after) for value in medians_after
+                )
+                reduction = (
+                    100.0 * (spread_before - spread_after) / spread_before
+                    if spread_before > 0 else 0.0
+                )
+                summary_rows.append({
+                    "channel": channel, "before": spread_before,
+                    "after": spread_after, "reduction": reduction,
+                    "group": spread_group,
+                })
+
+                all_values = []
+                for (batch, group, channel_index), entry in curves.items():
+                    if channel_index != j:
+                        continue
+                    all_values.append(entry["before"])
+                    all_values.append(entry["after"])
+                stacked = np.concatenate(all_values) if all_values else np.array([])
+                stacked = stacked[np.isfinite(stacked)]
+                if stacked.size == 0:
+                    continue
+                low = float(np.min(stacked))
+                high = float(np.max(stacked))
+                log_axis = low > 0 and high / max(low, 1e-12) > 100.0
+                if log_axis:
+                    low, high = np.log10(low), np.log10(high)
+                if not (high > low):
+                    high = low + 1.0
+
+                n_rows = len(rows_here)
+                height = 2.0 + 0.42 * n_rows
+                fig = Figure(figsize=(11.0, height), dpi=150)
+                FigureCanvasAgg(fig)
+                axes = fig.subplots(1, 2, sharex=True)
+                for ax, panel, title in zip(
+                    axes, ("before", "after"), ("Before correction", "After correction")
+                ):
+                    baseline = 0.0
+                    previous_group = None
+                    ticks = []
+                    tick_labels = []
+                    for row in rows_here:
+                        batch = row["batch"]
+                        group = row["group"]
+                        entry = curves.get((batch, group, j))
+                        if entry is None:
+                            continue
+                        if previous_group is not None and group != previous_group:
+                            ax.axhline(baseline + 0.45, color="#c9ced6",
+                                       linewidth=0.6, linestyle=(0, (2, 2)))
+                            baseline -= 0.55
+                        previous_group = group
+                        centers, density = self._ba_density(
+                            entry[panel], low, high, log_axis
+                        )
+                        values = np.power(10.0, centers) if log_axis else centers
+                        color = colors[batch % len(colors)]
+                        reference = group == "ref"
+                        ax.fill_between(
+                            values, baseline, baseline + density * 0.8,
+                            color=color, alpha=0.30 if reference else 0.16,
+                            linewidth=0,
+                        )
+                        ax.plot(
+                            values, baseline + density * 0.8, color=color,
+                            linewidth=1.5 if reference else 1.0,
+                        )
+                        ticks.append(baseline)
+                        tick_labels.append(
+                            f"{batches[batch]} · {row['n']:,} cells"
+                            + (" · ref" if reference else "")
+                        )
+                        baseline -= 1.0
+                    ax.set_ylim(baseline + 0.2, 1.05)
+                    ax.set_yticks(ticks)
+                    ax.set_yticklabels(tick_labels, fontsize=6.5, color="#333333")
+                    ax.tick_params(axis="y", length=0)
+                    ax.set_title(title, fontsize=9, loc="left")
+                    for side in ("top", "right", "left"):
+                        ax.spines[side].set_visible(False)
+                    ax.spines["bottom"].set_color("#9aa0a6")
+                    ax.tick_params(axis="x", labelsize=7, colors="#444444")
+                    if log_axis:
+                        ax.set_xscale("log")
+                    ax.set_xlabel(
+                        f"{channel}" + (" (log10)" if log_axis else ""),
+                        fontsize=8,
+                    )
+                axes[0].set_xlim(low if not log_axis else 10 ** low,
+                                 high if not log_axis else 10 ** high)
+                fig.suptitle(
+                    f"{channel} — batch effect before / after", fontsize=10,
+                    x=0.01, ha="left",
+                )
+                fig.tight_layout(rect=(0, 0, 1, 0.96))
+                safe = "".join(
+                    ch if (ch.isalnum() or ch in "-_") else "_" for ch in channel
+                )
+                fig.savefig(folder / f"{safe}.svg", format="svg")
+                fig.savefig(folder / f"{safe}.png", dpi=300)
+                buffer = io.BytesIO()
+                fig.savefig(buffer, format="svg")
+                channel_svg.append({
+                    "channel": channel,
+                    "svg": base64.b64encode(buffer.getvalue()).decode("ascii"),
+                    "rows": rows_here,
+                    "log": log_axis,
+                })
+                pdf.savefig(fig)
+
+        overall = (
+            sum(row["reduction"] for row in summary_rows) / len(summary_rows)
+            if summary_rows else 0.0
+        )
+
+        def fmt(value):
+            if value is None or not np.isfinite(value):
+                return "—"
+            absolute = abs(value)
+            if absolute >= 1000 or (0 < absolute < 0.01):
+                return f"{value:.3g}"
+            return f"{value:,.4g}"
+
+        method_line = (
+            f"CytoNorm · nQ {cytonorm.get('nq')} · SOM {cytonorm.get('xdim')}×"
+            f"{cytonorm.get('ydim')} · {cytonorm.get('clusters')} cluster(s) · "
+            f"{int(cytonorm.get('train_cells') or 0):,} training cells"
+            if method == "cytonorm" else
+            f"ComBat · empirical Bayes "
+            f"{'on' if combat.get('eb', True) else 'off'} · variance "
+            f"{'adjusted' if combat.get('adjust_variance', True) else 'kept'}"
+        )
+
+        parts = [
+            "<!doctype html><html><head><meta charset='utf-8'>",
+            "<title>Batch alignment report</title><style>",
+            "body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;",
+            "margin:28px auto;max-width:1080px;color:#222;line-height:1.45}",
+            "h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;margin:26px 0 6px}",
+            "table{border-collapse:collapse;width:100%;font-size:12.5px}",
+            "th,td{border-bottom:1px solid #e3e7ee;padding:5px 8px;text-align:right}",
+            "th:first-child,td:first-child{text-align:left}",
+            "th{background:#f5f8fb;font-weight:600}",
+            ".muted{color:#6b7785;font-size:12px}",
+            ".good{color:#1b7f3b}.bad{color:#b3261e}",
+            "img{max-width:100%;border:1px solid #e3e7ee;border-radius:4px}",
+            "figure{margin:8px 0 12px}",
+            "</style></head><body>",
+            f"<h1>Batch alignment report — {self.project.name}</h1>",
+            f"<div class='muted'>Module: {page._ba_task_id} · "
+            f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>",
+            f"<p><b>Method:</b> {method_line}<br>",
+            f"<b>Variables ({len(columns)}):</b> {', '.join(columns)}</p>",
+            "<h2>1 · Batch spread per channel</h2>",
+            "<p class='muted'>Largest difference between a batch median and the "
+            "median across batches, before and after correction. "
+            "Computed on "
+            + ("the reference samples (the same control measured in every batch)."
+               if any(row.get("group") == "ref" for row in summary_rows)
+               else "all sampled cells.")
+            + "</p>",
+            "<table><tr><th>Channel</th><th>Before</th><th>After</th>"
+            "<th>Reduced</th></tr>",
+        ]
+        for row in summary_rows:
+            cls = "good" if row["reduction"] > 0 else "bad"
+            parts.append(
+                f"<tr><td>{row['channel']}</td><td>{fmt(row['before'])}</td>"
+                f"<td>{fmt(row['after'])}</td>"
+                f"<td class='{cls}'>{row['reduction']:.1f}%</td></tr>"
+            )
+        parts.append(
+            f"<tr><th>Mean over channels</th><th></th><th></th>"
+            f"<th class='{'good' if overall > 0 else 'bad'}'>{overall:.1f}%</th></tr>"
+            "</table>"
+        )
+
+        parts.append("<h2>2 · Distributions per channel</h2>")
+        parts.append(
+            "<p class='muted'>Each curve is a normalised density (peak = 1) of "
+            "one batch; references are drawn above, other samples below, both "
+            "vertically offset so they stay readable.</p>"
+        )
+        for block in channel_svg:
+            parts.append(f"<h3 style='font-size:13px;margin:18px 0 4px'>"
+                         f"{block['channel']}</h3>")
+            parts.append(
+                f"<figure><img alt='{block['channel']}' src='data:image/svg+xml;"
+                f"base64,{block['svg']}'></figure>"
+            )
+            parts.append(
+                "<table><tr><th>Batch</th><th>Group</th><th>Cells</th>"
+                "<th>Median before</th><th>Median after</th>"
+                "<th>MAD before</th><th>MAD after</th></tr>"
+            )
+            for row in block["rows"]:
+                parts.append(
+                    f"<tr><td>{batches[row['batch']]}</td>"
+                    f"<td>{group_label.get(row['group'], row['group'])}</td>"
+                    f"<td>{row['n']:,}</td>"
+                    f"<td>{fmt(row['median_before'])}</td>"
+                    f"<td>{fmt(row['median_after'])}</td>"
+                    f"<td>{fmt(row['mad_before'])}</td>"
+                    f"<td>{fmt(row['mad_after'])}</td></tr>"
+                )
+            parts.append("</table>")
+
+        parts.append("<h2>3 · Files</h2>")
+        parts.append(
+            "<table><tr><th>File</th><th>Batch</th><th>Reference</th>"
+            "<th>Rows</th></tr>"
+        )
+        for row in file_rows:
+            parts.append(
+                f"<tr><td>{row['name']}</td><td>{row['batch']}</td>"
+                f"<td>{row['reference']}</td><td>{row['rows']:,}</td></tr>"
+            )
+        parts.append("</table>")
+        parts.append(
+            "<p class='muted'>Statistics are estimated from up to "
+            f"{self._BA_REPORT_SAMPLE:,} randomly sampled rows per file "
+            f"(≤ {self._BA_REPORT_CAP:,} values per batch and group). "
+            "The after-correction values are the ones the pipeline applies to "
+            "every downstream module; they are not a second analysis.</p>"
+            "</body></html>"
+        )
+        target = folder / "batch_report.html"
+        target.write_text("".join(parts), encoding="utf-8")
+        return target
 
     # ----- gating module (map) -----------------------------------------
     def _build_gating_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
@@ -24375,6 +28725,12 @@ class MainWindow(QMainWindow):
             page = self._build_dimred_page(name, task_def, locked)
         elif task_type == "cluster":
             page = self._build_cluster_page(name, task_def, locked)
+        elif task_type == "area":
+            page = self._build_area_page(name, task_def, locked)
+        elif task_type == "data_clean":
+            page = self._build_dc_page(name, task_def, locked)
+        elif task_type == "batch_align":
+            page = self._build_ba_page(name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
