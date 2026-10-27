@@ -50,6 +50,6 @@
 
 ## 发布准备
 
-- [ ] 打包为 Windows 可执行程序（PyInstaller 等）并验证 `pythonw` 启动方式。
+- [ ] 打包为 Windows 可执行程序（PyInstaller 等）并验证 `pythonw` 启动方式；把 `data/icon/*.svg` 复制到 `src/smage/icons/` 一并打包（`_module_icon_dir()` 会优先读包内目录）。
 - [ ] 确定 License，补齐 README（功能列表、截图、安装说明）。
 - [ ] 统一错误提示与日志格式。

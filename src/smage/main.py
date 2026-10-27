@@ -26,7 +26,9 @@ from uuid import uuid4
 # Make the `smage` package importable when this file is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, QSize, QTimer, Qt, QUrl
+from PySide6.QtCore import (
+    QEvent, QObject, QPointF, QRect, QRectF, QSize, QTimer, Qt, QUrl, Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -97,6 +99,50 @@ from smage.project import Project
 import pyqtgraph as pg
 
 APP_NAME = "Smage"
+
+
+class _ModuleButton(QFrame):
+    """Add-Module tile: icon above a centred, word-wrapped name.
+
+    QToolButton only draws one line of text, so a two-word module name would be
+    elided; this tile breaks the name at the space and keeps both lines
+    centred under the icon.
+    """
+
+    clicked = Signal()
+
+    def __init__(self, pixmap: QPixmap, text: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("moduleTile")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            "QFrame#moduleTile { background: #ffffff; border: 1px solid #dbe3ec;"
+            " border-radius: 7px; }"
+            "QFrame#moduleTile:hover { border-color: #5aa0e0;"
+            " background: #f4f9ff; }"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 9, 6, 7)
+        lay.setSpacing(5)
+        icon = QLabel()
+        icon.setPixmap(pixmap)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(icon)
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        label.setStyleSheet("color: #2c3a48; font-size: 9pt;")
+        lay.addWidget(label)
+        lay.addStretch(1)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        ):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class _NoWheelComboBox(QComboBox):
@@ -197,6 +243,79 @@ def _dot_pixmap(color: str) -> QPixmap:
     return pixmap
 
 
+_MODULE_ICON_CACHE: dict = {}
+_MODULE_ICON_DIR = None
+_MODULE_ICON_DIR_CHECKED = False
+
+
+def _module_icon_dir():
+    """Folder with the per-module SVG icons, or None when they are missing."""
+    global _MODULE_ICON_DIR, _MODULE_ICON_DIR_CHECKED
+    if _MODULE_ICON_DIR_CHECKED:
+        return _MODULE_ICON_DIR
+    from pathlib import Path as _Path
+
+    here = _Path(__file__).resolve()
+    candidates = [
+        here.parent / "icons",                    # packaged next to the package
+        here.parents[2] / "data" / "icon",        # source checkout
+        _Path.cwd() / "data" / "icon",
+    ]
+    for folder in candidates:
+        if (folder / "import.svg").is_file():
+            _MODULE_ICON_DIR = folder
+            break
+    _MODULE_ICON_DIR_CHECKED = True
+    return _MODULE_ICON_DIR
+
+
+def _module_icon_pixmap(task_type: str, size: int):
+    """Render one module icon at `size` px, or None when there is no SVG."""
+    if not task_type:
+        return None
+    key = (task_type, size)
+    cached = _MODULE_ICON_CACHE.get(key)
+    if cached is not None:
+        return cached or None
+    folder = _module_icon_dir()
+    if folder is None:
+        _MODULE_ICON_CACHE[key] = False
+        return None
+    path = folder / f"{task_type}.svg"
+    if not path.is_file():
+        _MODULE_ICON_CACHE[key] = False
+        return None
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+
+        renderer = QSvgRenderer(str(path))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        renderer.render(painter, QRectF(0, 0, size, size))
+        painter.end()
+    except Exception:  # noqa: BLE001 - fall back to the coloured dot
+        _MODULE_ICON_CACHE[key] = False
+        return None
+    _MODULE_ICON_CACHE[key] = pixmap
+    return pixmap
+
+
+def _module_icon(task_type: str, fallback_color: str = "#9aa0a6") -> QIcon:
+    """QIcon for a module; several sizes so hi-DPI screens stay sharp."""
+    icon = QIcon()
+    rendered = False
+    for size in (16, 20, 24, 32, 48, 64):
+        pixmap = _module_icon_pixmap(task_type, size)
+        if pixmap is not None:
+            icon.addPixmap(pixmap)
+            rendered = True
+    if rendered:
+        return icon
+    return QIcon(_dot_pixmap(fallback_color))
+
+
 def _drag_handle_pixmap(color: str = "#8a94a6", size: int = 14) -> QPixmap:
     """Build the grip icon shown before a draggable list item."""
     pixmap = QPixmap(size, size)
@@ -270,27 +389,41 @@ TASK_TYPES = {
     "export": ("Export", "#66bb6a"),
 }
 
-ADDABLE_TYPES = [
-    "gating",
-    "figure",
-    "scale",
-    "rename",
-    "unmix",
-    "segmentation",
-    "compensation",
-    "illumination",
-    "feature",
-    "feature_up",
-    "gate2col",
-    "subset",
-    "subsample",
-    "dimred",
-    "cluster",
-    "area",
-    "data_clean",
-    "batch_align",
-    "export",
+# The Add-Module dialog lists the modules grouped by what they do, in roughly
+# workflow order. Each dialog row holds up to four buttons.
+ADD_MODULE_GROUPS = [
+    ("Correct & transform", [
+        "scale",
+        "rename",
+        "compensation",
+        "unmix",
+        "illumination",
+        "data_clean",
+        "batch_align",
+    ]),
+    ("Segment & quantify", [
+        "segmentation",
+        "feature",
+        "gate2col",
+        "feature_up",
+    ]),
+    ("Gate & select", [
+        "gating",
+        "subset",
+        "subsample",
+    ]),
+    ("Analyse", [
+        "dimred",
+        "cluster",
+        "area",
+    ]),
+    ("Present & export", [
+        "figure",
+        "export",
+    ]),
 ]
+
+ADDABLE_TYPES = [kind for _title, kinds in ADD_MODULE_GROUPS for kind in kinds]
 
 ROOT_COLOR = "#5f6368"
 FALLBACK_COLOR = "#a142f4"
@@ -4761,8 +4894,13 @@ class MainWindow(QMainWindow):
         lay.setSpacing(6)
 
         icon = QLabel()
-        icon.setPixmap(_dot_pixmap(color))
-        icon.setFixedSize(16, 16)
+        icon_pixmap = _module_icon_pixmap(task_type or "", 18)
+        if icon_pixmap is not None:
+            icon.setPixmap(icon_pixmap)
+            icon.setFixedSize(18, 18)
+        else:
+            icon.setPixmap(_dot_pixmap(color))
+            icon.setFixedSize(16, 16)
         lay.addWidget(icon)
 
         title = QLabel(name)
@@ -5097,21 +5235,41 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Add Module")
         grid = QGridLayout(dialog)
+        grid.setContentsMargins(14, 12, 14, 14)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
 
-        for i, mtype in enumerate(ADDABLE_TYPES):
-            name, color = TASK_TYPES[mtype]
-            btn = QToolButton()
-            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-            btn.setText(name)
-            btn.setIcon(QIcon(_dot_pixmap(color)))
-            btn.setIconSize(QSize(28, 28))
-            btn.setFixedSize(112, 72)
-            btn.setToolTip(name)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(
-                lambda checked=False, t=mtype: self._add_module(parent_task_def, t, dialog)
+        row = 0
+        for index, (title, kinds) in enumerate(ADD_MODULE_GROUPS):
+            if index:
+                spacer = QWidget()
+                spacer.setFixedHeight(6)
+                grid.addWidget(spacer, row, 0, 1, 4)
+                row += 1
+            heading = QLabel(title)
+            heading.setStyleSheet(
+                "color: #6b7785; font-weight: 600; font-size: 9pt;"
             )
-            grid.addWidget(btn, i // 4, i % 4)
+            grid.addWidget(heading, row, 0, 1, 4)
+            row += 1
+            for i, mtype in enumerate(kinds):
+                name, _color = TASK_TYPES[mtype]
+                pixmap = _module_icon_pixmap(mtype, 30)
+                if pixmap is None:
+                    pixmap = _dot_pixmap(_color).scaled(
+                        30, 30, Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                # Two-word names go on two centred lines.
+                caption = name.replace(" ", "\n", 1)
+                btn = _ModuleButton(pixmap, caption)
+                btn.setFixedSize(112, 86)
+                btn.setToolTip(name)
+                btn.clicked.connect(
+                    lambda t=mtype: self._add_module(parent_task_def, t, dialog)
+                )
+                grid.addWidget(btn, row + i // 4, i % 4)
+            row += (len(kinds) + 3) // 4
 
         dialog.exec()
 
@@ -28736,7 +28894,11 @@ class MainWindow(QMainWindow):
         else:
             page = self._build_module_page(name, locked=locked, task_id=task_id)
         page.setProperty("task_id", task_id)
-        self.tabs.addTab(page, name)
+        index = self.tabs.addTab(page, name)
+        if task_type:
+            self.tabs.setTabIcon(
+                index, _module_icon(task_type, _task_color(task_type))
+            )
         self.tabs.setCurrentWidget(page)
         if task_id:
             self._module_register(task_id, task_type, page)
