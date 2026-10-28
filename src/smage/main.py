@@ -8484,12 +8484,13 @@ class MainWindow(QMainWindow):
         add_scatter = QPushButton("Add Scatter")
         add_hist = QPushButton("Add Histogram")
         add_image = QPushButton("Add Image")
-        add_scatter.setCursor(Qt.CursorShape.PointingHandCursor)
-        add_hist.setCursor(Qt.CursorShape.PointingHandCursor)
-        add_image.setCursor(Qt.CursorShape.PointingHandCursor)
-        header.addWidget(add_scatter)
-        header.addWidget(add_hist)
-        header.addWidget(add_image)
+        add_nxn = QPushButton("Add N×N Plot")
+        add_nxn.setToolTip(
+            "Scatter matrix: one plot per variable pair below the diagonal"
+        )
+        for button in (add_scatter, add_hist, add_image, add_nxn):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            header.addWidget(button)
         fl.addLayout(header)
 
         scene = QGraphicsScene()
@@ -8571,11 +8572,13 @@ class MainWindow(QMainWindow):
         add_scatter.clicked.connect(lambda _=False: self._figure_add_plot(page, "scatter"))
         add_hist.clicked.connect(lambda _=False: self._figure_add_plot(page, "histogram"))
         add_image.clicked.connect(lambda _=False: self._figure_add_plot(page, "image"))
+        add_nxn.clicked.connect(lambda _=False: self._figure_add_nxn(page))
 
         if locked:
             add_scatter.setEnabled(False)
             add_hist.setEnabled(False)
             add_image.setEnabled(False)
+            add_nxn.setEnabled(False)
 
         self._figure_relayout(page)
         if page._fig_plots:
@@ -8618,8 +8621,12 @@ class MainWindow(QMainWindow):
         plot_widget._legend_widget = widget
         return widget
 
-    def _figure_new_card(self, page, plot_dict) -> int:
-        """Create a plot card for one plot, wrap it in a proxy, and render."""
+    def _figure_new_card(self, page, plot_dict, render: bool = True) -> int:
+        """Create a plot card for one plot, wrap it in a proxy and render it.
+
+        `render=False` leaves the card empty so callers can draw big batches
+        of new plots over several event-loop turns.
+        """
         plot_widget = self._figure_make_plot_widget(plot_dict)
 
         index = len(page._fig_cards)
@@ -8681,8 +8688,12 @@ class MainWindow(QMainWindow):
             plot_widget._img_refresh_timer = rt
 
         page._fig_cards.append(card)
-        self._figure_render(plot_dict, plot_widget, column_transforms=page._fig_column_transforms,
-                task_id=page._fig_task_id)
+        if render:
+            self._figure_render(
+                plot_dict, plot_widget,
+                column_transforms=page._fig_column_transforms,
+                task_id=page._fig_task_id,
+            )
         self._figure_relayout(page)
         return index
 
@@ -9087,6 +9098,164 @@ class MainWindow(QMainWindow):
         self._figure_mark_dirty(page)
         self._figure_select(page, index)
         self._figure_scroll_to(page, index)
+
+    def _figure_add_nxn(self, page) -> None:
+        """Add a lower-triangle scatter matrix for a set of variables."""
+        record = None
+        if page._fig_selected:
+            index = page._fig_selected[0]
+            if 0 <= index < len(page._fig_plots):
+                record = self._figure_record(page._fig_plots[index].get("file"))
+        if record is None:
+            record = next(
+                (
+                    rec for rec in self._available_files(page._fig_task_id)
+                    if rec.get("parquet")
+                ),
+                None,
+            )
+        if record is None:
+            QMessageBox.information(
+                self, "Add N×N Plot", "No data file is available."
+            )
+            return
+        columns = self._columns_for(record.get("parquet"), page._fig_task_id)
+        if len(columns) < 2:
+            QMessageBox.information(
+                self, "Add N×N Plot",
+                f"{record.get('name') or 'This file'} has fewer than two variables.",
+            )
+            return
+
+        def summary(count: int) -> str:
+            if count < 2:
+                return "Select at least 2 variables"
+            return f"{count} variables → {count * (count - 1) // 2} plots"
+
+        chosen = self._pick_items_dialog(
+            "Add N×N Plot", columns, [], "Filter variables…",
+            reorder=True, summary=summary,
+        )
+        if chosen is None:
+            return
+        if len(chosen) < 2:
+            QMessageBox.information(
+                self, "Add N×N Plot", "Select at least two variables."
+            )
+            return
+        total = len(chosen) * (len(chosen) - 1) // 2
+        if total > 100:
+            reply = QMessageBox.question(
+                self,
+                "Add N×N Plot",
+                f"{len(chosen)} variables create {total} plots.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        limit = int(_setting("plot", "nxn_max_points", 5000) or 5000)
+        plots = []
+        for row in range(1, len(chosen)):
+            for column in range(row):
+                plots.append({
+                    "type": "scatter",
+                    "file": record.get("parquet"),
+                    "file_name": record.get("name"),
+                    "x": chosen[column],
+                    "last_x": chosen[column],
+                    "y": chosen[row],
+                    "last_y": chosen[row],
+                    "color_mode": "density",
+                    "color_param": chosen[column],
+                    "last_color_param": chosen[column],
+                    "palette": _default_palette(),
+                    "layers": [],
+                    "xmin": None,
+                    "xmax": None,
+                    "ymin": None,
+                    "ymax": None,
+                    # Each matrix row starts its own line of cards.
+                    "break_before": column == 0,
+                    "show_axes": True,
+                    "show_axis_names": True,
+                    # A matrix would be unreadable with every label on.
+                    "show_indices": False,
+                    "show_sample_name": False,
+                    "point_size": 4,
+                    "fixed_point_size": False,
+                    "bins": 20,
+                    "hist_mode": "histogram",
+                    "hist_color": (0, 0, 200),
+                    "curve_color": (200, 40, 40),
+                    "solid_color": (0, 0, 200),
+                    "filter": None,
+                    "size": _figure_default_size("scatter"),
+                    # Matrix plots are one of many: keep fewer points.
+                    "max_points": limit,
+                })
+        self._figure_add_batch(page, plots)
+
+    def _figure_add_batch(self, page, plots) -> None:
+        """Create many cards at once and draw them over several event turns."""
+        if not plots:
+            return
+        first = len(page._fig_cards)
+        for plot in plots:
+            page._fig_plots.append(plot)
+            self._figure_new_card(page, plot, render=False)
+        self._figure_relayout(page)
+        self._figure_mark_dirty(page)
+        self._figure_set_selection(
+            page, list(range(first, first + len(plots)))
+        )
+        self._figure_scroll_to(page, first)
+        self._figure_render_queue(
+            page, list(range(first, first + len(plots)))
+        )
+        _debug_log(f"nxn added: plots={len(page._fig_plots)} batch={len(plots)}")
+
+    def _figure_render_queue(self, page, indices) -> None:
+        """Draw plot cards in small batches so the window stays responsive."""
+        indices = [i for i in indices if 0 <= i < len(page._fig_cards)]
+        if not indices:
+            return
+        existing = getattr(page, "_fig_batch_timer", None)
+        if existing is not None:
+            existing.stop()
+            existing.deleteLater()
+        state = {"queue": list(indices), "total": len(indices)}
+        page._fig_batch_state = state
+
+        def step() -> None:
+            queue = state["queue"]
+            batch = queue[:3]
+            del queue[:3]
+            for i in batch:
+                if not (0 <= i < len(page._fig_plots) and i < len(page._fig_cards)):
+                    continue
+                try:
+                    self._figure_render(
+                        page._fig_plots[i],
+                        page._fig_cards[i].plot_widget(),
+                        column_transforms=page._fig_column_transforms,
+                        task_id=page._fig_task_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _log_exception(exc)
+            done = state["total"] - len(queue)
+            self.statusBar().showMessage(
+                f"Building plots: {done} / {state['total']}"
+            )
+            if not queue:
+                timer.stop()
+                self.statusBar().showMessage("Plots ready", 3000)
+
+        timer = QTimer(page)
+        timer.setInterval(0)
+        timer.timeout.connect(step)
+        page._fig_batch_timer = timer
+        timer.start()
 
     def _figure_filter_options(self, figure_task_id):
         """Return [(display_name, {"task_id":..,"gate_id":..}), ...] for gates
@@ -9962,8 +10131,12 @@ class MainWindow(QMainWindow):
                 values = np.log1p(hist[xi, yi].astype(float))
 
         # Sample the rows to draw. Priorities come from the absolute row
-        # index, so changing the gate keeps the picture stable.
-        max_points = max(1000, int(_setting("plot", "max_points", 50000) or 50000))
+        # index, so changing the gate keeps the picture stable. A plot may
+        # carry its own limit (N×N matrix plots use a smaller one).
+        limit = plot_dict.get("max_points") or _setting(
+            "plot", "max_points", 50000
+        )
+        max_points = max(1000, int(limit or 50000))
         picked = _stable_sample_selection(keep, max_points)
         if picked is not None:
             x = x[picked]
@@ -10165,19 +10338,31 @@ class MainWindow(QMainWindow):
         x_name = plot_dict.get("x")
         y_name = plot_dict.get("y") if _is_scatter_plot(plot_dict.get("type")) else "Count"
 
-        plot_item.setLabel("bottom", x_name or "")
-        plot_item.setLabel("left", y_name or "")
+        name_size = max(6, int(plot_dict.get("axis_name_font_size", 11) or 11))
+        index_size = max(6, int(plot_dict.get("index_font_size", 10) or 10))
+        sample_size = max(
+            6, int(plot_dict.get("sample_name_font_size", 9) or 9)
+        )
+        label_style = {"font-size": f"{name_size}pt", "color": "#000000"}
+        plot_item.setLabel("bottom", x_name or "", **label_style)
+        plot_item.setLabel("left", y_name or "", **label_style)
 
         show_axes = plot_dict.get("show_axes", True)
         show_names = plot_dict.get("show_axis_names", True)
         show_indices = plot_dict.get("show_indices", True)
+        tick_font = QFont()
+        tick_font.setPointSize(index_size)
         for ax in ("bottom", "left"):
+            axis = plot_item.getAxis(ax)
             plot_item.showAxis(ax, show_axes)
-            plot_item.getAxis(ax).showLabel(show_names)
-            plot_item.getAxis(ax).setStyle(showValues=show_indices)
+            axis.showLabel(show_names)
+            axis.setStyle(showValues=show_indices, tickFont=tick_font)
 
         if plot_dict.get("show_sample_name", True) and plot_dict.get("file_name"):
-            plot_item.setTitle(plot_dict["file_name"], color="#808080", size="9pt")
+            plot_item.setTitle(
+                plot_dict["file_name"], color="#808080",
+                size=f"{sample_size}pt",
+            )
         else:
             plot_item.setTitle(None)
 
@@ -10189,6 +10374,27 @@ class MainWindow(QMainWindow):
                 column_transforms=page._fig_column_transforms,
                 task_id=page._fig_task_id,
             )
+        self._figure_mark_dirty(page)
+
+    def _figure_apply_display(self, page, index: int, plot_dict: dict) -> None:
+        """Re-apply only the labels/ticks/title of one plot.
+
+        Display changes (checkboxes, font sizes) never touch the data, so
+        skipping the full render keeps them instant.
+        """
+        if 0 <= index < len(page._fig_cards):
+            self._figure_apply_display_options(
+                plot_dict, page._fig_cards[index].plot_widget()
+            )
+        self._figure_mark_dirty(page)
+
+    def _figure_apply_display_all(self, page) -> None:
+        """Re-apply only the labels/ticks/title of every selected plot."""
+        for i in page._fig_selected:
+            if 0 <= i < len(page._fig_cards):
+                self._figure_apply_display_options(
+                    page._fig_plots[i], page._fig_cards[i].plot_widget()
+                )
         self._figure_mark_dirty(page)
 
     def _figure_apply_change_multi(self, page) -> None:
@@ -10568,10 +10774,10 @@ class MainWindow(QMainWindow):
         rh.addStretch()
         layout.addWidget(res_row)
 
-        # Display options.
+        # Display options: labels/ticks only, so no data re-read per keystroke.
         self._figure_display_toggles(
             layout, plot_dict, enabled,
-            on_change=lambda: self._figure_apply_change(page, index, plot_dict),
+            on_change=lambda: self._figure_apply_display(page, index, plot_dict),
         )
 
         layout.addStretch()
@@ -11193,12 +11399,39 @@ class MainWindow(QMainWindow):
                     if st == Qt.CheckState.PartiallyChecked:
                         return
                     apply(plots, k, st == Qt.CheckState.Checked)
-                    self._figure_apply_change_multi(page)
+                    self._figure_apply_display_all(page)
 
                 return h
 
             cb.stateChanged.connect(make_toggle(key, cb))
             layout.addWidget(cb)
+
+        layout.addWidget(QLabel("Font sizes"))
+        for label, key, default in (
+            ("Axis names", "axis_name_font_size", 11),
+            ("Indices", "index_font_size", 10),
+            ("Sample name", "sample_name_font_size", 9),
+        ):
+            row = QWidget()
+            rh = QHBoxLayout(row)
+            rh.setContentsMargins(0, 0, 0, 0)
+            rh.setSpacing(6)
+            rh.addWidget(QLabel(label))
+            value = common(plots, key, default)
+            spin = _NoWheelSpinBox()
+            spin.setRange(6, 32)
+            spin.setSuffix(" pt")
+            spin.setValue(int(default if value is _MIXED else value))
+            spin.setEnabled(enabled)
+            rh.addWidget(spin)
+            rh.addStretch()
+            layout.addWidget(row)
+
+            def on_font_size(v, k=key):
+                apply(plots, k, int(v))
+                self._figure_apply_display_all(page)
+
+            spin.valueChanged.connect(on_font_size)
 
         layout.addStretch()
 
@@ -11558,7 +11791,7 @@ class MainWindow(QMainWindow):
         populate()
 
     def _figure_display_toggles(self, layout, plot_dict, enabled, on_change) -> None:
-        """Build + wire the show axes/names/indices/sample-name checkboxes."""
+        """Build + wire the display checkboxes and the three font sizes."""
         layout.addWidget(QLabel("Display"))
         for label, key in (
             ("Show axes", "show_axes"),
@@ -11576,6 +11809,32 @@ class MainWindow(QMainWindow):
 
             cb.toggled.connect(toggle)
             layout.addWidget(cb)
+
+        layout.addWidget(QLabel("Font sizes"))
+        for label, key, default in (
+            ("Axis names", "axis_name_font_size", 11),
+            ("Indices", "index_font_size", 10),
+            ("Sample name", "sample_name_font_size", 9),
+        ):
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            h.addWidget(QLabel(label))
+            spin = _NoWheelSpinBox()
+            spin.setRange(6, 32)
+            spin.setSuffix(" pt")
+            spin.setValue(int(plot_dict.get(key, default) or default))
+            spin.setEnabled(enabled)
+            h.addWidget(spin)
+            h.addStretch()
+            layout.addWidget(row)
+
+            def on_size(value, k=key):
+                plot_dict[k] = int(value)
+                on_change()
+
+            spin.valueChanged.connect(on_size)
 
     def _figure_range_row(self, plot_dict: dict, axis: str, plot_widget,
                           enabled: bool, on_commit=None, auto_checked: bool = True) -> QWidget:
@@ -12083,7 +12342,9 @@ class MainWindow(QMainWindow):
 
         self._figure_display_toggles(
             layout, preview, enabled,
-            on_change=lambda: self._scaling_render_preview(page),
+            on_change=lambda: self._figure_apply_display_options(
+                preview, plot_widget
+            ),
         )
         layout.addStretch()
 
@@ -13198,12 +13459,15 @@ class MainWindow(QMainWindow):
         decimals_spin.valueChanged.connect(on_decimals_changed)
 
     def _pick_items_dialog(self, title, items, selected,
-                           placeholder="Filter...") -> list | None:
+                           placeholder="Filter...", reorder=False,
+                           summary=None) -> list | None:
         """Reusable multi-select dialog.
 
         Filter box, tri-state "Select all" over the currently visible rows,
         checkable rows with Shift-range toggling and a
-        "<selected>/<available>" counter. Returns the checked labels in `items`
+        "<selected>/<available>" counter. With `reorder` the rows can be
+        dragged into a new order, and `summary(checked_count)` supplies an
+        extra line under the counter. Returns the checked labels in list
         order, or None when the dialog is cancelled.
         """
         selected = set(selected or [])
@@ -13229,6 +13493,13 @@ class MainWindow(QMainWindow):
         item_list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
+        if reorder:
+            item_list.setDragDropMode(
+                QAbstractItemView.DragDropMode.InternalMove
+            )
+            item_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+            item_list.setDragEnabled(True)
+            item_list.setToolTip("Drag rows to change their order")
         item_list.setStyleSheet(
             "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
         )
@@ -13270,7 +13541,12 @@ class MainWindow(QMainWindow):
                 1 for item in visible
                 if item.checkState() == Qt.CheckState.Checked
             )
-            count_label.setText(f"{checked}/{len(visible)}")
+            text = f"{checked}/{len(visible)}"
+            if summary is not None:
+                extra = summary(checked)
+                if extra:
+                    text += f"    ·    {extra}"
+            count_label.setText(text)
             if not visible or checked == 0:
                 state = Qt.CheckState.Unchecked
             elif checked == len(visible):
@@ -18138,7 +18414,13 @@ class MainWindow(QMainWindow):
 
         self._figure_display_toggles(
             lay, plot_dict, enabled,
-            on_change=lambda: self._seg_render_preview(page),
+            on_change=lambda: (
+                self._figure_apply_display_options(
+                    plot_dict, getattr(page, "_seg_preview_plot", None)
+                )
+                if getattr(page, "_seg_preview_plot", None) is not None
+                else self._seg_render_preview(page)
+            ),
         )
         lay.addStretch(1)
 
@@ -30975,7 +31257,10 @@ class MainWindow(QMainWindow):
 
         self._figure_display_toggles(
             layout, preview, enabled,
-            on_change=lambda: self._gating_on_preview_change(page),
+            on_change=lambda: (
+                self._figure_apply_display_options(preview, plot_widget),
+                self._gating_mark_dirty(page),
+            ),
         )
 
         show_labels_cb = QCheckBox("Show gate labels")
