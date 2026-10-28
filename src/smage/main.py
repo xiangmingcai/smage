@@ -49,6 +49,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -76,6 +77,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QRubberBand,
     QScrollArea,
     QSizePolicy,
@@ -1847,6 +1849,46 @@ def _settings_path() -> Path:
     return _settings_dir() / _SETTINGS_FILENAME
 
 
+def _debug_log(message: str) -> None:
+    """Append a line to %APPDATA%\\Smage\\debug.log (diagnostics only)."""
+    try:
+        _settings_dir().mkdir(parents=True, exist_ok=True)
+        with (_settings_dir() / "debug.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
+    except OSError:
+        pass
+
+
+def _log_exception(exc: BaseException) -> None:
+    """Append a traceback to %APPDATA%\\Smage\\error.log (pythonw has no console)."""
+    import traceback
+
+    try:
+        _settings_dir().mkdir(parents=True, exist_ok=True)
+        with (_settings_dir() / "error.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}]\n")
+            fh.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    except OSError:
+        pass
+
+
+def _install_excepthook() -> None:
+    """Log uncaught exceptions instead of losing them in a windowless app."""
+
+    def hook(exc_type, exc, tb):
+        try:
+            _settings_dir().mkdir(parents=True, exist_ok=True)
+            import traceback
+
+            with (_settings_dir() / "error.log").open("a", encoding="utf-8") as fh:
+                fh.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}]\n")
+                fh.write("".join(traceback.format_exception(exc_type, exc, tb)))
+        except OSError:
+            pass
+
+    sys.excepthook = hook
+
+
 def _merge_settings(defaults, loaded):
     out = copy.deepcopy(defaults)
     if not isinstance(loaded, dict):
@@ -2064,6 +2106,16 @@ def _row_priorities(indices, seed: int = 42):
         x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
         x = x ^ (x >> np.uint64(31))
     return (x >> np.uint64(11)).astype(np.float64) * (1.0 / 9007199254740992.0)
+
+
+def _figure_default_size(ptype: str | None) -> list:
+    """Default card size: scatter/histogram are square, image is wider.
+
+    All three share the same height (400), so a row of new plots lines up.
+    """
+    if ptype in ("scatter", "histogram"):
+        return [400, 400]
+    return [440, 400]
 
 
 def _stable_sample_selection(keep, max_points: int, seed: int = 42):
@@ -3636,47 +3688,56 @@ class _DoubleClickFilter(QObject):
         return False
 
 
-class _PlotDragHandle(QFrame):
-    """Title bar of a plot card (drag-to-move is handled by the card proxy)."""
-
-    def __init__(self, title: str) -> None:
-        super().__init__()
-        self.setObjectName("plotTitle")
-        self.setStyleSheet(
-            "#plotTitle { background: #eef2f7; border: none; border-radius: 3px; }"
-        )
-        self.setCursor(Qt.CursorShape.SizeAllCursor)
-        tb = QHBoxLayout(self)
-        tb.setContentsMargins(6, 3, 6, 3)
-        tb.setSpacing(4)
-        tb.addWidget(QLabel(f"<b>{title}</b>"))
-        tb.addStretch()
-        hint = QLabel("⋮⋮")
-        hint.setStyleSheet("color: #9aa0a6;")
-        tb.addWidget(hint)
-
-
 class _CardProxy(QGraphicsProxyWidget):
-    """A card proxy that supports dragging the card by its title bar."""
+    """A card proxy: drag anywhere on the card to move it, double-click to focus.
 
-    TITLE_HEIGHT = 30
-    # Pixels the pointer must travel before a title-bar click becomes a drag,
-    # so a plain click never reorders the cards.
+    Once a card is focused its wheel/drag act on the plot content instead
+    (handled by the canvas view), so moving it again means leaving focus first.
+    """
+
+    # Pixels the pointer must travel before a click becomes a drag, so a plain
+    # click never reorders the cards.
     DRAG_THRESHOLD = 6
+    # The bottom-left corner of a card holds the plot's own "A"/"F" buttons;
+    # presses there go through to the plot instead of starting a card drag.
+    BUTTON_SIZE = 44
 
-    def __init__(self, on_select, on_drop, on_drag=None, on_drag_end=None) -> None:
+    def __init__(self, on_select, on_drop, on_drag=None, on_drag_end=None,
+                 on_focus=None, on_context=None) -> None:
         super().__init__()
         self._on_select = on_select
         self._on_drop = on_drop
         self._on_drag = on_drag
         self._on_drag_end = on_drag_end
+        self._on_focus = on_focus
+        self._on_context = on_context
         self._dragging = False
         self._moved = False
         self._press_scene = None
         self._start_pos = None
 
+    def _on_plot_buttons(self, pos) -> bool:
+        """True when the press lands on the plot's own corner buttons."""
+        widget = self.widget()
+        if widget is None:
+            return False
+        return (
+            pos.y() >= widget.height() - self.BUTTON_SIZE
+            and pos.x() <= self.BUTTON_SIZE
+        )
+
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and event.pos().y() <= self.TITLE_HEIGHT:
+        if event.button() == Qt.MouseButton.RightButton and self._on_context:
+            pos = event.screenPos()
+            if hasattr(pos, "toPoint"):  # QPointF on some bindings
+                pos = pos.toPoint()
+            self._on_context(pos)
+            event.accept()
+            return
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self._on_plot_buttons(event.pos())
+        ):
             self._dragging = True
             self._moved = False
             self._press_scene = event.scenePos()
@@ -3686,6 +3747,21 @@ class _CardProxy(QGraphicsProxyWidget):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._on_focus is not None
+            and not self._on_plot_buttons(event.pos())
+        ):
+            # Cancel the drag the second click started, then focus the plot.
+            self._dragging = False
+            self._moved = False
+            self.setZValue(0)
+            self._on_focus()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         if self._dragging and event.buttons() & Qt.MouseButton.LeftButton:
@@ -3840,7 +3916,7 @@ class _FigureCard(QFrame):
     _SELECTED = "#plotCard { background: #ffffff; border: 2px solid #4285f4; border-radius: 6px; }"
     _FOCUSED = "#plotCard { background: #ffffff; border: 2px solid #34a853; border-radius: 6px; }"
 
-    def __init__(self, title: str, plot_widget, index: int, select_callback,
+    def __init__(self, plot_widget, index: int, select_callback,
                  side_widget=None) -> None:
         super().__init__()
         self._index = index
@@ -3853,10 +3929,8 @@ class _FigureCard(QFrame):
         self.setMinimumSize(200, 200)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, 4, 6, 6)
-        lay.setSpacing(4)
-        self._title_bar = _PlotDragHandle(title)
-        lay.addWidget(self._title_bar)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(0)
         if side_widget is not None:
             body = QWidget()
             bh = QHBoxLayout(body)
@@ -3899,6 +3973,180 @@ class _FigureCard(QFrame):
     def set_focused(self, focused: bool) -> None:
         self._focused = focused
         self._apply_style()
+
+
+class _FigurePermuteDialog(QDialog):
+    """Generate copies of one plot across files, an axis or filters.
+
+    Only one dimension per run (as in OMIQ): run it again on the results to
+    build a grid of, say, parameters × files.
+    """
+
+    FILE = "file"
+    X_AXIS = "x"
+    Y_AXIS = "y"
+    FILTER = "filter"
+
+    def __init__(self, parent, plot_type, files, columns, filters) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Permute")
+        self.resize(560, 560)
+        self._files = list(files)
+        self._columns = list(columns)
+        self._filters = list(filters)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+
+        lay.addWidget(QLabel("<b>Permute by</b>"))
+        radios = QGridLayout()
+        radios.setHorizontalSpacing(18)
+        radios.setVerticalSpacing(4)
+        # Radios sharing a parent are auto-exclusive in Qt, so the dimension
+        # and layout choices need separate groups or one clears the other.
+        self._dimension_group = QButtonGroup(self)
+        self._layout_group = QButtonGroup(self)
+        self._radios = {}
+        specs = [
+            (self.FILE, "File", bool(self._files)),
+            (self.X_AXIS, "X axis", plot_type != "image" and bool(self._columns)),
+            (self.Y_AXIS, "Y axis", plot_type == "scatter" and bool(self._columns)),
+            (self.FILTER, "Filter", bool(self._filters)),
+        ]
+        for i, (key, label, enabled) in enumerate(specs):
+            radio = QRadioButton(label)
+            radio.setEnabled(bool(enabled))
+            radio.toggled.connect(lambda checked: checked and self._reload_values())
+            self._dimension_group.addButton(radio)
+            radios.addWidget(radio, i // 2, i % 2)
+            self._radios[key] = radio
+        lay.addLayout(radios)
+
+        lay.addWidget(QLabel("<b>Values</b>"))
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda _t: self._apply_filter())
+        lay.addWidget(self.search)
+
+        self.values_list = QListWidget()
+        self.values_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        self.values_list.itemChanged.connect(lambda _i: self._update_preview())
+        lay.addWidget(self.values_list, 1)
+
+        pick_row = QHBoxLayout()
+        all_btn = QPushButton("Select all")
+        all_btn.clicked.connect(lambda _=False: self._check_all(True))
+        none_btn = QPushButton("Clear")
+        none_btn.clicked.connect(lambda _=False: self._check_all(False))
+        pick_row.addWidget(all_btn)
+        pick_row.addWidget(none_btn)
+        pick_row.addStretch()
+        lay.addLayout(pick_row)
+
+        lay.addWidget(QLabel("<b>Layout</b>"))
+        self.same_row_radio = QRadioButton("Same row")
+        self.new_row_radio = QRadioButton("New row")
+        self._layout_group.addButton(self.same_row_radio)
+        self._layout_group.addButton(self.new_row_radio)
+        self.same_row_radio.setChecked(True)
+        lay.addWidget(self.same_row_radio)
+        lay.addWidget(self.new_row_radio)
+
+        self.preview = QLabel("")
+        self.preview.setStyleSheet("color: #6b7785;")
+        self.preview.setWordWrap(True)
+        lay.addWidget(self.preview)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.ok_btn = QPushButton("Permute")
+        self.ok_btn.setDefault(True)
+        self.ok_btn.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.ok_btn)
+        lay.addLayout(buttons)
+
+        for key, radio in self._radios.items():
+            if radio.isEnabled():
+                radio.setChecked(True)
+                break
+        self._reload_values()
+
+    # -- values --------------------------------------------------------
+    def _reload_values(self) -> None:
+        dimension = self.dimension()
+        self.values_list.blockSignals(True)
+        self.values_list.clear()
+        if dimension == self.FILE:
+            for path, name in self._files:
+                self._add_item(str(name or path), (path, name))
+        elif dimension in (self.X_AXIS, self.Y_AXIS):
+            for name in self._columns:
+                self._add_item(str(name), name)
+        elif dimension == self.FILTER:
+            for label, payload in self._filters:
+                self._add_item(str(label), dict(payload))
+        self.values_list.blockSignals(False)
+        self._apply_filter()
+
+    def _add_item(self, text: str, payload) -> None:
+        item = QListWidgetItem(text)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Unchecked)
+        item.setData(Qt.ItemDataRole.UserRole, payload)
+        self.values_list.addItem(item)
+
+    def _apply_filter(self) -> None:
+        query = self.search.text().strip().lower()
+        for i in range(self.values_list.count()):
+            item = self.values_list.item(i)
+            item.setHidden(bool(query) and query not in item.text().lower())
+        self._update_preview()
+
+    def _check_all(self, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self.values_list.blockSignals(True)
+        for i in range(self.values_list.count()):
+            item = self.values_list.item(i)
+            if not item.isHidden():
+                item.setCheckState(state)
+        self.values_list.blockSignals(False)
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        count = len(self.values())
+        ready = count > 0 and bool(self.dimension())
+        self.ok_btn.setEnabled(ready)
+        if count:
+            self.preview.setText(
+                f"{count} new plot(s) will be created; the template stays."
+            )
+        else:
+            self.preview.setText("Select at least one value.")
+
+    # -- results -------------------------------------------------------
+    def dimension(self) -> str:
+        for key, radio in self._radios.items():
+            if radio.isChecked():
+                return key
+        return ""
+
+    def values(self) -> list:
+        out = []
+        for i in range(self.values_list.count()):
+            item = self.values_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                out.append(item.data(Qt.ItemDataRole.UserRole))
+        return out
+
+    def new_row(self) -> bool:
+        return self.new_row_radio.isChecked()
 
 
 class _FigureLegendWidget(QFrame):
@@ -8341,6 +8589,8 @@ class MainWindow(QMainWindow):
         import pyqtgraph as pg
         plot_widget = pg.PlotWidget(plotItem=_make_fit_plot_item())
         plot_widget.setBackground(_plot_background())
+        # The card's own right-click menu replaces pyqtgraph's.
+        plot_widget.getPlotItem().setMenuEnabled(False)
         plot_widget.showGrid(x=True, y=True, alpha=0.2)
         plot_widget.getPlotItem().setAxisItems({
             "bottom": _make_sci_axis("bottom"),
@@ -8371,17 +8621,16 @@ class MainWindow(QMainWindow):
     def _figure_new_card(self, page, plot_dict) -> int:
         """Create a plot card for one plot, wrap it in a proxy, and render."""
         plot_widget = self._figure_make_plot_widget(plot_dict)
-        title = plot_dict.get("title") or plot_dict.get("type", "Plot").title()
 
         index = len(page._fig_cards)
         size = plot_dict.get("size")
         if size is None:
-            size = [440, 340]
+            size = _figure_default_size(plot_dict.get("type"))
             plot_dict["size"] = list(size)
         w, h = int(size[0]), int(size[1])
 
         card = _FigureCard(
-            title, plot_widget, index,
+            plot_widget, index,
             select_callback=lambda i: self._figure_select(page, i),
             side_widget=(
                 self._figure_attach_legend(plot_widget)
@@ -8393,13 +8642,18 @@ class MainWindow(QMainWindow):
             on_drop=lambda pos: self._figure_reorder(page, card.index(), pos),
             on_drag=lambda pos: self._figure_drag_preview(page, card.index(), pos),
             on_drag_end=lambda: self._figure_clear_drop_marker(page),
+            on_focus=lambda: self._figure_focus(page, card.index()),
+            on_context=lambda pos: self._figure_card_context_menu(
+                page, card.index(), pos
+            ),
         )
         proxy.setWidget(card)
         proxy.resize(w, h)
         page._fig_scene.addItem(proxy)
         card._proxy = proxy
 
-        # Clicking the plot (not just the title bar) also selects the card.
+        # Select / focus on clicks that reach the plot itself (the "A"/"F"
+        # corner buttons and the legend); the card proxy handles the rest.
         click_filter = _ClickFilter(
             lambda ctrl: self._figure_card_clicked(page, card.index(), ctrl)
         )
@@ -8411,7 +8665,6 @@ class MainWindow(QMainWindow):
         # Double-click focuses the plot (wheel/drag act on its data).
         dbl_click_filter = _DoubleClickFilter(lambda: self._figure_focus(page, card.index()))
         card.installEventFilter(dbl_click_filter)
-        card._title_bar.installEventFilter(dbl_click_filter)
         plot_widget.viewport().installEventFilter(dbl_click_filter)
         page._fig_filters.append(dbl_click_filter)
 
@@ -8596,6 +8849,148 @@ class MainWindow(QMainWindow):
             self._figure_relayout(page)
             self._figure_mark_dirty(page)
 
+    def _figure_card_context_menu(self, page, index, global_pos) -> None:
+        """Right-click menu for a plot card (Duplicate / Delete / Permute)."""
+        if not (0 <= index < len(page._fig_cards)):
+            return
+        if index not in page._fig_selected:
+            self._figure_set_selection(page, [index])
+        selected = list(page._fig_selected)
+        menu = QMenu(self)
+        duplicate = menu.addAction("Duplicate")
+        delete = menu.addAction("Delete")
+        menu.addSeparator()
+        permute = menu.addAction("Permute…")
+        # Permute works on one template; with several selected it is ambiguous.
+        permute.setEnabled(len(selected) == 1)
+        permute.setToolTip(
+            "Select a single plot to permute it across files, an axis or filters"
+        )
+        _debug_log(f"card menu: index={index} selected={selected} plots={len(page._fig_plots)}")
+        chosen = menu.exec(global_pos)
+        _debug_log(f"card menu chose: {chosen.text() if chosen is not None else None}")
+        if chosen is None:
+            return
+        if chosen is duplicate:
+            self._figure_duplicate_selected(page)
+        elif chosen is delete:
+            self._figure_delete_selected(page)
+        elif chosen is permute:
+            self._figure_permute(page, selected[0])
+
+    def _figure_scroll_to(self, page, index) -> None:
+        """Make a card visible: new cards often land outside the viewport."""
+        view = getattr(page, "_fig_view", None)
+        if view is None or not (0 <= index < len(page._fig_cards)):
+            return
+        proxy = page._fig_cards[index].proxy()
+        if proxy is None:
+            return
+        view.ensureVisible(proxy, 48, 48)
+
+    def _figure_insert_plot(self, page, plot_dict, target: int) -> int:
+        """Create a card for `plot_dict` and place it at `target`."""
+        page._fig_plots.append(plot_dict)
+        index = self._figure_new_card(page, plot_dict)
+        target = max(0, min(int(target), len(page._fig_plots) - 1))
+        if target != index:
+            page._fig_plots.insert(target, page._fig_plots.pop(index))
+            page._fig_cards.insert(target, page._fig_cards.pop(index))
+            for i, card in enumerate(page._fig_cards):
+                card.set_index(i)
+            self._figure_relayout(page)
+        return target
+
+    def _figure_duplicate_selected(self, page) -> None:
+        """Copy every selected plot, inserting the copies to their right."""
+        indices = sorted(set(page._fig_selected))
+        if not indices:
+            return
+        target = indices[-1] + 1
+        for offset, index in enumerate(indices):
+            if not (0 <= index < len(page._fig_plots)):
+                continue
+            clone = copy.deepcopy(page._fig_plots[index])
+            clone["break_before"] = False
+            self._figure_insert_plot(page, clone, target + offset)
+        self._figure_mark_dirty(page)
+        self._figure_set_selection(
+            page, list(range(target, target + len(indices)))
+        )
+        self._figure_scroll_to(page, target)
+
+    def _figure_permute(self, page, index) -> None:
+        """Generate copies of one plot across a file/axis/filter dimension."""
+        if not (0 <= index < len(page._fig_plots)):
+            return
+        plot = page._fig_plots[index]
+        records = self._available_files(page._fig_task_id)
+        files = [
+            (rec.get("parquet"), rec.get("name"))
+            for rec in records
+            if rec.get("parquet")
+        ]
+        rec = self._figure_record(plot.get("file"))
+        columns = (
+            self._columns_for(rec.get("parquet"), page._fig_task_id) if rec else []
+        )
+        filters = self._figure_filter_options(page._fig_task_id)
+        _debug_log(
+            f"permute open: type={plot.get('type')} files={len(files)} "
+            f"columns={len(columns)} filters={len(filters)}"
+        )
+        dialog = _FigurePermuteDialog(
+            self, plot.get("type"), files, columns, filters
+        )
+        result = dialog.exec()
+        dimension = dialog.dimension()
+        values = dialog.values()
+        _debug_log(
+            f"permute result={int(result)} dim={dimension!r} values={len(values)} "
+            f"new_row={dialog.new_row()} accepted={result == QDialog.DialogCode.Accepted}"
+        )
+        if result != QDialog.DialogCode.Accepted:
+            return
+        if not dimension or not values:
+            QMessageBox.information(
+                self,
+                "Permute",
+                "No values were selected, so nothing was created.",
+            )
+            return
+        new_row = dialog.new_row()
+        target = index + 1
+        try:
+            for offset, value in enumerate(values):
+                clone = copy.deepcopy(plot)
+                if dimension == _FigurePermuteDialog.FILE:
+                    path, name = value
+                    clone["file"] = path
+                    clone["file_name"] = name
+                elif dimension == _FigurePermuteDialog.X_AXIS:
+                    clone["x"] = value
+                    clone["last_x"] = value
+                elif dimension == _FigurePermuteDialog.Y_AXIS:
+                    clone["y"] = value
+                    clone["last_y"] = value
+                elif dimension == _FigurePermuteDialog.FILTER:
+                    clone["filter"] = dict(value)
+                clone["break_before"] = bool(new_row)
+                self._figure_insert_plot(page, clone, target + offset)
+        except Exception as exc:  # noqa: BLE001
+            _log_exception(exc)
+            QMessageBox.critical(
+                self, "Permute", f"Could not create the plots:\n{exc}"
+            )
+            return
+        self._figure_mark_dirty(page)
+        self._figure_set_selection(page, list(range(target, target + len(values))))
+        self._figure_scroll_to(page, target)
+        _debug_log(
+            f"permute done: plots={len(page._fig_plots)} "
+            f"cards={len(page._fig_cards)} selected={page._fig_selected}"
+        )
+
     def _figure_delete_selected(self, page) -> None:
         """Delete every currently selected plot."""
         indices = sorted(
@@ -8645,7 +9040,6 @@ class MainWindow(QMainWindow):
         ) if rec else []
         x = columns[0] if columns else None
         y = columns[1] if len(columns) > 1 else x
-        count = sum(1 for p in page._fig_plots if p.get("type") == ptype)
         if ptype == "image":
             # Image plots default to coloring by the first non-coordinate channel.
             color_mode = "parameter"
@@ -8655,7 +9049,6 @@ class MainWindow(QMainWindow):
             color_param = x
         plot_dict = {
             "type": ptype,
-            "title": f"{ptype.title()} {count + 1}",
             "file": rec.get("parquet") if rec else None,
             "file_name": rec.get("name") if rec else None,
             "x": x,
@@ -8687,11 +9080,13 @@ class MainWindow(QMainWindow):
             "curve_color": (200, 40, 40),
             "solid_color": (0, 0, 200),
             "filter": None,
+            "size": _figure_default_size(ptype),
         }
         page._fig_plots.append(plot_dict)
         index = self._figure_new_card(page, plot_dict)
         self._figure_mark_dirty(page)
         self._figure_select(page, index)
+        self._figure_scroll_to(page, index)
 
     def _figure_filter_options(self, figure_task_id):
         """Return [(display_name, {"task_id":..,"gate_id":..}), ...] for gates
@@ -9918,8 +10313,6 @@ class MainWindow(QMainWindow):
         if item is not card.proxy():
             return False
         local = card.proxy().mapFromScene(scene_pos)
-        if local.y() <= _CardProxy.TITLE_HEIGHT:
-            return False  # title bar -> reorder, not pan
         # Corner buttons (bottom-left): "A" resets to settings range, "F" fits all.
         if local.y() >= card.height() - 40:
             if local.x() <= 21:
@@ -9941,7 +10334,7 @@ class MainWindow(QMainWindow):
         card = page._fig_cards[focused]
         vb = card.plot_widget().getPlotItem().getViewBox()
         rect = card.proxy().boundingRect()
-        plot_h = max(1.0, rect.height() - _CardProxy.TITLE_HEIGHT)
+        plot_h = max(1.0, rect.height())
         xr = page._fig_pan_range[0]
         yr = page._fig_pan_range[1]
         d = scene_pos - page._fig_pan_scene
@@ -30911,6 +31304,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     """Run the application."""
+    _install_excepthook()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_NAME)
