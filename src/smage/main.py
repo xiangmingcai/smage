@@ -28327,8 +28327,9 @@ class MainWindow(QMainWindow):
         """Return the set of gate ids to show for the current view mode."""
         active = page._gating_active_gate_id
         if active:
-            # Subset view: show only the gate's descendants (not the gate/ancestors).
-            return self._gating_descendant_ids(page, active)
+            # Subset view: show only this gate's direct children (the gates
+            # you can draw inside it), not their deeper descendants.
+            return {g["id"] for g in page._gating_gates if g.get("parent") == active}
         context = page._gating_context_gate_id
         if context:
             ctx = next((g for g in page._gating_gates if g["id"] == context), None)
@@ -28827,9 +28828,41 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         idx = item.data(0, Qt.ItemDataRole.UserRole)
-        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+        if idx is None or idx >= len(page._gating_gates):
             return
+        is_root = idx < 0
         menu = QMenu(tree)
+
+        # Copy / paste (paste inserts as a child of the clicked gate; the root
+        # node pastes as a top-level gate).
+        if not is_root:
+            copy_gate = QAction("Copy gate", menu)
+            copy_gate.triggered.connect(
+                lambda _=False: self._gating_copy_gate(page, idx)
+            )
+            menu.addAction(copy_gate)
+            copy_branch = QAction("Copy branch", menu)
+            copy_branch.triggered.connect(
+                lambda _=False: self._gating_copy_branch(page, idx)
+            )
+            menu.addAction(copy_branch)
+        paste_gate = QAction("Paste gate", menu)
+        paste_gate.setEnabled(bool(getattr(self, "_gating_clipboard_gate", None)))
+        paste_gate.triggered.connect(
+            lambda _=False: self._gating_paste_gate(page, idx)
+        )
+        menu.addAction(paste_gate)
+        paste_branch = QAction("Paste branch", menu)
+        paste_branch.setEnabled(bool(getattr(self, "_gating_clipboard_branch", None)))
+        paste_branch.triggered.connect(
+            lambda _=False: self._gating_paste_branch(page, idx)
+        )
+        menu.addAction(paste_branch)
+
+        if is_root:
+            menu.exec(tree.viewport().mapToGlobal(pos))
+            return
+
         ren_act = QAction("Rename", menu)
         ren_act.triggered.connect(lambda: self._gating_rename_gate(page, idx))
         menu.addAction(ren_act)
@@ -28947,6 +28980,122 @@ class MainWindow(QMainWindow):
         self._gating_mark_dirty(page)
         self._gating_rebuild_tree(page)
 
+    # ----- gating: copy / paste (global clipboard) -----------------------
+    def _gating_copy_nodes(self, page, ids) -> list:
+        """Deep-copy the gates whose id is in `ids` (kept in tree order)."""
+        return [
+            copy.deepcopy(g) for g in page._gating_gates if g.get("id") in ids
+        ]
+
+    def _gating_collect_single(self, page, gate) -> set:
+        """Ids for 'copy gate': the gate, its group members and boolean sources."""
+        ids = set()
+
+        def add(gid):
+            if not gid or gid in ids:
+                return
+            ids.add(gid)
+            g = next((gg for gg in page._gating_gates if gg.get("id") == gid), None)
+            if g is None:
+                return
+            for key in ("crosshair_id", "split_id", "skewed_id"):
+                group = g.get(key)
+                if group:
+                    for gg in page._gating_gates:
+                        if gg.get(key) == group:
+                            add(gg.get("id"))
+            for sid in _gate_source_ids(g):
+                add(sid)
+
+        add(gate.get("id"))
+        return ids
+
+    def _gating_collect_branch(self, page, gate) -> set:
+        """Ids for 'copy branch': the gate and all its descendants."""
+        ids = set()
+
+        def add_subtree(gid):
+            if not gid or gid in ids:
+                return
+            ids.add(gid)
+            for g in page._gating_gates:
+                if g.get("parent") == gid:
+                    add_subtree(g.get("id"))
+
+        add_subtree(gate.get("id"))
+        return ids
+
+    def _gating_copy_gate(self, page, idx) -> None:
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        ids = self._gating_collect_single(page, page._gating_gates[idx])
+        self._gating_clipboard_gate = self._gating_copy_nodes(page, ids)
+        self.statusBar().showMessage("Gate copied")
+
+    def _gating_copy_branch(self, page, idx) -> None:
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        ids = self._gating_collect_branch(page, page._gating_gates[idx])
+        self._gating_clipboard_branch = self._gating_copy_nodes(page, ids)
+        self.statusBar().showMessage("Branch copied")
+
+    def _gating_paste_nodes(self, page, nodes, paste_parent_id) -> int:
+        """Append copied `nodes` as children of `paste_parent_id`; return count."""
+        if not nodes:
+            return 0
+        nodes = copy.deepcopy(nodes)
+        id_map = {g["id"]: uuid4().hex[:8] for g in nodes}
+        group_map = {}
+        for g in nodes:
+            for key in ("crosshair_id", "split_id", "skewed_id"):
+                gid = g.get(key)
+                if gid and gid not in group_map:
+                    group_map[gid] = uuid4().hex[:8]
+        for g in nodes:
+            g["id"] = id_map[g["id"]]
+            parent = g.get("parent")
+            g["parent"] = id_map[parent] if parent in id_map else paste_parent_id
+            source = g.get("source")
+            if source in id_map:
+                g["source"] = id_map[source]
+            sources = g.get("sources")
+            if sources:
+                g["sources"] = [id_map[s] for s in sources if s in id_map]
+            for key in ("crosshair_id", "split_id", "skewed_id"):
+                gid = g.get(key)
+                if gid in group_map:
+                    g[key] = group_map[gid]
+        page._gating_gates.extend(nodes)
+        return len(nodes)
+
+    def _gating_paste_gate(self, page, idx) -> None:
+        nodes = getattr(self, "_gating_clipboard_gate", None)
+        parent_id = (
+            page._gating_gates[idx]["id"]
+            if isinstance(idx, int) and 0 <= idx < len(page._gating_gates)
+            else None
+        )
+        count = self._gating_paste_nodes(page, nodes, parent_id)
+        if count:
+            self._gating_reload_rois(page)
+            self._gating_update_roi_visibility(page)
+            self._gating_rebuild_tree(page)
+            self._gating_mark_dirty(page)
+
+    def _gating_paste_branch(self, page, idx) -> None:
+        nodes = getattr(self, "_gating_clipboard_branch", None)
+        parent_id = (
+            page._gating_gates[idx]["id"]
+            if isinstance(idx, int) and 0 <= idx < len(page._gating_gates)
+            else None
+        )
+        count = self._gating_paste_nodes(page, nodes, parent_id)
+        if count:
+            self._gating_reload_rois(page)
+            self._gating_update_roi_visibility(page)
+            self._gating_rebuild_tree(page)
+            self._gating_mark_dirty(page)
+
     def _gating_apply_selection(self, page, idx) -> None:
         """Apply a selection: `idx` is a gate index, or -1 for 'All Events'."""
         preview = page._gating_preview
@@ -28966,6 +29115,10 @@ class MainWindow(QMainWindow):
             preview["ymin"] = None
             preview["ymax"] = None
         self._gating_show_handles(page, idx if isinstance(idx, int) and idx >= 0 else -1)
+        # Update ROI/label visibility right away, so a single click shows the
+        # correct gates immediately (the data render is deferred to catch
+        # double-clicks).
+        self._gating_update_roi_visibility(page)
 
     def _gating_tree_item_for_index(self, page, idx):
         tree = page._gating_tree
@@ -28988,16 +29141,8 @@ class MainWindow(QMainWindow):
         idx = item.data(0, Qt.ItemDataRole.UserRole) if item else -1
         idx = idx if isinstance(idx, int) and idx >= 0 else -1
         self._gating_apply_selection(page, idx)
-        # Defer the (heavy) render so a double-click on the same item is
-        # detected first and can take over the view.
-        self._gating_cancel_pending_render(page)
-        page._gating_render_timer = QTimer()
-        page._gating_render_timer.setSingleShot(True)
-        page._gating_render_timer.setInterval(QApplication.doubleClickInterval())
-        page._gating_render_timer.timeout.connect(
-            lambda: self._gating_render_and_settings(page)
-        )
-        page._gating_render_timer.start()
+        # Render immediately (no double-click deferral, which felt sluggish).
+        self._gating_render_and_settings(page)
 
     def _gating_cancel_pending_render(self, page) -> None:
         timer = getattr(page, "_gating_render_timer", None)
