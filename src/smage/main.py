@@ -27705,6 +27705,16 @@ class MainWindow(QMainWindow):
         page._gating_tool_buttons = tool_buttons
         self._gating_update_tools(page)
 
+        # Image plots re-sample (LOD) when the user zooms/pans their data.
+        # `page` may be a _GatingState (Unmix), which is not a QObject, so the
+        # timer is parented to the plot widget instead.
+        img_refresh = QTimer(plot_widget)
+        img_refresh.setSingleShot(True)
+        img_refresh.setInterval(30)
+        img_refresh.timeout.connect(lambda: self._gating_image_refresh(page))
+        viewbox.sigRangeChanged.connect(lambda *_: img_refresh.start())
+        page._gating_img_refresh_timer = img_refresh
+
         # Right: scatter settings.
         settings_panel = self._build_panel_frame()
         settings_lay = QVBoxLayout(settings_panel)
@@ -28998,6 +29008,12 @@ class MainWindow(QMainWindow):
     def _gating_render_and_settings(self, page) -> None:
         self._gating_render(page)
         self._gating_rebuild_settings(page)
+
+    def _gating_image_refresh(self, page) -> None:
+        """Re-sample the image LOD after the user zooms/pans the image view."""
+        if page._gating_preview.get("type") != "image":
+            return
+        self._gating_render(page)
 
     def _gating_rename_gate(self, page, idx) -> None:
         if idx is None or idx < 0 or idx >= len(page._gating_gates):
