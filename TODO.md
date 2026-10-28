@@ -55,6 +55,14 @@
 - [ ] 新列是 0/1，但在 Figure 里仍按连续色渲染；离散类别色见上面「渲染」分组。
 - [ ] 上游 Subsample 采样时，未采样到的行写 NaN（未评估），采样到的行里缺值写 0；确认发布前是否需要把这个规则写进提示文案。
 
+## 全局设置（Settings → Global Settings…）
+
+- [ ] **Dark 主题**：这次只做了字体大小 / 行密度 / 绘图区背景 / 窗口几何。完整的深色主题需要先把约 200 处内联的 `setStyleSheet("color: #…")` 抽成颜色 token，否则深色下会出现白底浅字。
+- [ ] **N×N 图采样点数**（`plot.nxn_max_points`，默认 5000）目前是占位参数，等 Figure 的 N×N 图实现后再接上；未编辑前会自动跟随「Scatter max points ÷ 10」。
+- [ ] 删除仍被已保存图表引用的自定义 colormap 时，渲染会静默回退到 viridis；确认是否需要提示。
+- [ ] 设置存放在 `%APPDATA%\Smage\settings.json`（与 `extensions.json` 同目录），不随项目走；确认是否需要「随项目覆盖」的能力。
+- [ ] 字体大小设置通过 `QApplication.setFont` + 主窗口 `setFont` 生效；少数写死 `font-size` 的内联样式不跟随，后续统一时一并处理。
+
 ## 发布准备
 
 - [ ] 打包为 Windows 可执行程序（PyInstaller 等）并验证 `pythonw` 启动方式；把 `data/icon/*.svg` 复制到 `src/smage/icons/` 一并打包（`_module_icon_dir()` 会优先读包内目录）。

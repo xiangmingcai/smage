@@ -27,7 +27,8 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import (
-    QEvent, QObject, QPointF, QRect, QRectF, QSize, QTimer, Qt, QUrl, Signal,
+    QByteArray, QEvent, QObject, QPointF, QRect, QRectF, QSize, QTimer, Qt,
+    QUrl, Signal,
 )
 from PySide6.QtGui import (
     QAction,
@@ -455,7 +456,7 @@ FIGURE_COLOR_MODES = [
 ]
 FIGURE_PALETTES = [
     "viridis", "plasma", "magma", "inferno", "cividis",
-    "turbo", "jet", "coolwarm", "grayscale",
+    "turbo", "jet", "coolwarm", "gray",
 ]
 
 # Distinct colours auto-assigned to image channels as they are overlaid.
@@ -1566,7 +1567,7 @@ def _default_gating_preview(rec, cols) -> dict:
         "last_y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
         "color_mode": "density",
         "color_param": None,
-        "palette": "viridis",
+        "palette": _default_palette(),
         "xmin": None,
         "xmax": None,
         "ymin": None,
@@ -1802,13 +1803,311 @@ class _GatingStatsWorker:
         return (generation, result)
 
 
-def _figure_colormap(name: str):
-    """Return a pyqtgraph ColorMap for a named palette, with a fallback."""
-    import pyqtgraph as pg
+# ----- global (user-level) settings -----------------------------------
+# Stored next to extensions.json in %APPDATA%\Smage: preferences follow the
+# user, not the project.
+_SETTINGS_FILENAME = "settings.json"
+
+GLOBAL_DEFAULT_SETTINGS = {
+    "appearance": {
+        "font_size": 9,
+        "density": "normal",
+        "plot_background": "white",
+        "remember_geometry": True,
+    },
+    "plot": {
+        # Points drawn per scatter plot (larger files are sampled).
+        "max_points": 50000,
+        # Placeholder for the future N-by-N plot grid: many small scatters at
+        # once, so it keeps fewer points. Kept at 1/10 of `max_points` unless
+        # the user edits it.
+        "nxn_max_points": 5000,
+        # Bins per axis used to estimate point density for colouring.
+        "density_grid": 200,
+        "default_colormap": "viridis",
+    },
+    "colormaps": [],
+    "window_geometry": "",
+}
+
+_GLOBAL_SETTINGS = None
+
+# Old palette names that no longer resolve, mapped to their replacement.
+_COLORMAP_ALIASES = {"grayscale": "gray"}
+
+
+def _settings_dir() -> Path:
+    import os
+
+    base = os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / "Smage"
+
+
+def _settings_path() -> Path:
+    return _settings_dir() / _SETTINGS_FILENAME
+
+
+def _merge_settings(defaults, loaded):
+    out = copy.deepcopy(defaults)
+    if not isinstance(loaded, dict):
+        return out
+    for key, value in loaded.items():
+        if isinstance(out.get(key), dict) and isinstance(value, dict):
+            out[key] = _merge_settings(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _global_settings() -> dict:
+    """The live settings dict (loads settings.json on first use)."""
+    global _GLOBAL_SETTINGS
+    if _GLOBAL_SETTINGS is None:
+        try:
+            loaded = json.loads(_settings_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = {}
+        _GLOBAL_SETTINGS = _merge_settings(GLOBAL_DEFAULT_SETTINGS, loaded)
+    return _GLOBAL_SETTINGS
+
+
+def _save_global_settings(settings: dict) -> None:
+    global _GLOBAL_SETTINGS
+    _GLOBAL_SETTINGS = settings
     try:
-        return pg.colormap.get(name)
+        _settings_dir().mkdir(parents=True, exist_ok=True)
+        _settings_path().write_text(
+            json.dumps(settings, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _setting(section: str, key: str, default=None):
+    return (_global_settings().get(section) or {}).get(key, default)
+
+
+def _default_palette() -> str:
+    name = _setting("plot", "default_colormap", "viridis")
+    return name if isinstance(name, str) and name else "viridis"
+
+
+def _plot_background() -> str:
+    """Plot canvas colour (white or a light grey that is easier on the eyes)."""
+    return "#f2f4f6" if _setting("appearance", "plot_background", "white") == "grey" else "w"
+
+
+def _app_stylesheet() -> str:
+    """APP_STYLE plus the optional compact-density rules."""
+    if _setting("appearance", "density", "normal") != "compact":
+        return APP_STYLE
+    return APP_STYLE + """
+/* compact UI density */
+QTreeView::item { padding: 0px; min-height: 18px; }
+QTableView::item { padding: 0px; min-height: 18px; }
+QHeaderView::section { padding: 1px 4px; }
+"""
+
+
+def _custom_colormaps() -> list:
+    """User-defined colormaps (only the well-formed ones)."""
+    maps = _global_settings().get("colormaps")
+    if not isinstance(maps, list):
+        return []
+    out = []
+    for entry in maps:
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("name"), str)
+            and entry.get("name")
+            and isinstance(entry.get("stops"), list)
+        ):
+            out.append(entry)
+    return out
+
+
+def _normalize_stops(stops) -> list:
+    """Validated ``[(position, (r, g, b)), ...]`` sorted by position."""
+    out = []
+    for item in stops or []:
+        try:
+            pos = float(item[0])
+            rgb = tuple(int(max(0, min(255, int(c)))) for c in item[1][:3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if len(rgb) != 3:
+            continue
+        out.append((min(1.0, max(0.0, pos)), rgb))
+    out.sort(key=lambda stop: stop[0])
+    return out
+
+
+def _colormap_from_stops(stops):
+    import pyqtgraph as pg
+
+    points = _normalize_stops(stops)
+    if len(points) < 2:
+        raise ValueError("a colormap needs at least two stops")
+    return pg.ColorMap(
+        [pos for pos, _ in points], [list(rgb) for _, rgb in points]
+    )
+
+
+_COLORMAP_GROUPS_CACHE = None
+_GRADIENT_CACHE = {}
+
+
+def _colormap_groups() -> list:
+    """``[(group_title, [name, ...]), ...]`` for every selectable colormap."""
+    import pyqtgraph as pg
+
+    global _COLORMAP_GROUPS_CACHE
+    if _COLORMAP_GROUPS_CACHE is None:
+        try:
+            mpl = sorted(pg.colormap.listMaps("matplotlib"))
+        except Exception:
+            mpl = []
+        try:
+            cet = sorted(n for n in pg.colormap.listMaps() if n not in mpl)
+        except Exception:
+            cet = []
+        _COLORMAP_GROUPS_CACHE = [
+            ("Standard", list(FIGURE_PALETTES)),
+            ("Custom", []),
+            ("Matplotlib", mpl),
+            ("ColorCET", cet),
+        ]
+    groups = [(title, list(names)) for title, names in _COLORMAP_GROUPS_CACHE]
+    groups[1] = ("Custom", [m["name"] for m in _custom_colormaps()])
+    return groups
+
+
+def _gradient_pixmap(lut, width: int, height: int):
+    """Paint a horizontal colour bar from a lookup table."""
+    import numpy as _np
+
+    pixmap = QPixmap(width, height)
+    pixmap.fill(QColor("#d8dee6"))
+    if lut is not None and len(lut):
+        lut = _np.asarray(lut)
+        painter = QPainter(pixmap)
+        for i in range(width):
+            value = lut[min(i, len(lut) - 1)]
+            painter.setPen(QColor(int(value[0]), int(value[1]), int(value[2])))
+            painter.drawLine(i, 0, i, height - 1)
+        painter.end()
+    return pixmap
+
+
+def _colormap_gradient_pixmap(name: str, width: int = 110, height: int = 14):
+    """A small bar showing the colormap's colours, for list/preview widgets."""
+    key = (name, width, height)
+    cached = _GRADIENT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        lut = _figure_colormap(name).getLookupTable(0.0, 1.0, max(2, width))
     except Exception:
-        return pg.ColorMap([0.0, 1.0], [(0, 0, 255), (255, 0, 0)])
+        lut = None
+    pixmap = _gradient_pixmap(lut, width, height)
+    _GRADIENT_CACHE[key] = pixmap
+    return pixmap
+
+
+def _colormap_name_taken(name: str) -> bool:
+    if not name:
+        return False
+    for _title, names in _colormap_groups():
+        if name in names:
+            return True
+    return False
+
+
+def _palette_names() -> list:
+    """Standard colormaps followed by the user's custom ones."""
+    names = list(FIGURE_PALETTES)
+    for entry in _custom_colormaps():
+        if entry["name"] not in names:
+            names.append(entry["name"])
+    return names
+
+
+def _figure_colormap(name: str):
+    """Return a pyqtgraph ColorMap for a palette name, with a fallback."""
+    import pyqtgraph as pg
+    if not isinstance(name, str) or not name:
+        name = "viridis"
+    name = _COLORMAP_ALIASES.get(name, name)
+    for entry in _custom_colormaps():
+        if entry.get("name") == name:
+            try:
+                return _colormap_from_stops(entry.get("stops"))
+            except Exception:
+                break
+    # Matplotlib maps must be requested from their own source: the default
+    # lookup raises FileNotFoundError for them.
+    for kwargs in ({}, {"source": "matplotlib"}):
+        try:
+            return pg.colormap.get(name, **kwargs)
+        except Exception:
+            continue
+    return pg.ColorMap([0.0, 1.0], [(0, 0, 255), (255, 0, 0)])
+
+
+def _row_priorities(indices, seed: int = 42):
+    """A deterministic pseudo-random priority in [0, 1) per row index."""
+    import numpy as np
+
+    x = np.asarray(indices, dtype=np.uint64) + np.uint64(int(seed) & 0xFFFFFFFF)
+    with np.errstate(over="ignore"):
+        x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        x = x ^ (x >> np.uint64(31))
+    return (x >> np.uint64(11)).astype(np.float64) * (1.0 / 9007199254740992.0)
+
+
+def _stable_sample_selection(keep, max_points: int, seed: int = 42):
+    """Boolean mask (over ``values[keep]``) of the rows to draw.
+
+    Every row gets a priority from its *absolute* row index, so a gate that
+    lets different rows through only adds/removes the rows near the cut-off
+    instead of re-drawing the whole cloud (what ``rng.choice`` does). Returns
+    ``None`` when every visible row fits.
+
+    Priorities are computed in chunks, so a file with tens of millions of
+    rows never needs a full-size float array.
+    """
+    import numpy as np
+
+    count = int(np.count_nonzero(keep))
+    if count <= max_points:
+        return None
+    selection = np.zeros(count, dtype=bool)
+    chunk = max(1_000_000, int(max_points) * 8)
+    best_priority = np.empty(0, dtype=np.uint64)
+    best_position = np.empty(0, dtype=np.int64)
+    position = 0
+    for start in range(0, keep.size, chunk):
+        block = keep[start:start + chunk]
+        inside = np.flatnonzero(block)
+        if inside.size == 0:
+            continue
+        priority = _row_priorities(inside + start, seed)
+        # Visible rows are contiguous in the compressed array.
+        compressed = np.arange(position, position + inside.size)
+        position += inside.size
+        if best_priority.size:
+            priority = np.concatenate([best_priority, priority])
+            compressed = np.concatenate([best_position, compressed])
+        if priority.size > max_points:
+            cut = np.argpartition(priority, max_points - 1)[:max_points]
+            priority, compressed = priority[cut], compressed[cut]
+        best_priority, best_position = priority, compressed
+    if best_position.size > max_points:
+        cut = np.argpartition(best_priority, max_points - 1)[:max_points]
+        best_position = best_position[cut]
+    selection[best_position] = True
+    return selection
 
 
 def _figure_image_layers(plot_dict: dict) -> list:
@@ -3927,6 +4226,572 @@ def _task_is_locked(task: dict) -> bool:
     return walk(task)
 
 
+class _CustomColormapDialog(QDialog):
+    """Create a custom colormap from a list of colour stops."""
+
+    def __init__(self, parent=None, start_name: str = "viridis") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("New Colormap")
+        self.resize(560, 470)
+        self._entry = None
+        self._rows = []  # [[position, [r, g, b]], ...]
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(6)
+        form.addWidget(QLabel("Name"), 0, 0)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("My colormap")
+        form.addWidget(self.name_edit, 0, 1)
+        form.addWidget(QLabel("Start from"), 1, 0)
+        self.start_combo = _NoWheelComboBox()
+        for name in _palette_names():
+            self.start_combo.addItem(name, name)
+        index = self.start_combo.findData(start_name)
+        self.start_combo.setCurrentIndex(index if index >= 0 else 0)
+        form.addWidget(self.start_combo, 1, 1)
+        lay.addLayout(form)
+
+        self.preview = QLabel()
+        self.preview.setFixedHeight(30)
+        lay.addWidget(self.preview)
+
+        lay.addWidget(QLabel("Stops (position 0–1 and colour)"))
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Position", "Color", ""])
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 120)
+        self.table.setColumnWidth(2, 90)
+        self.table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(self.table, 1)
+
+        add_btn = QPushButton("Add stop")
+        add_btn.clicked.connect(self._add_stop)
+        lay.addWidget(add_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.hint = QLabel("")
+        self.hint.setStyleSheet("color: #c0392b;")
+        self.hint.setWordWrap(True)
+        lay.addWidget(self.hint)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.ok_btn = QPushButton("OK")
+        self.ok_btn.setDefault(True)
+        self.ok_btn.clicked.connect(self._accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.ok_btn)
+        lay.addLayout(buttons)
+
+        self.name_edit.textChanged.connect(lambda _t: self._validate())
+        self.start_combo.currentIndexChanged.connect(lambda _i: self._load_start())
+        self._load_start()
+
+    # -- stops ---------------------------------------------------------
+    def _load_start(self) -> None:
+        name = self.start_combo.currentData()
+        rows = []
+        try:
+            cmap = _figure_colormap(name)
+            for pos, color in zip(list(cmap.pos), list(cmap.color)):
+                rows.append([float(pos), [int(c) for c in list(color)[:3]]])
+        except Exception:
+            rows = []
+        if len(rows) > 7:
+            # Built-in maps expand to 256 stops; keep a handful of samples so
+            # the editor stays usable (and the saved JSON stays small).
+            lut = cmap.getLookupTable(0.0, 1.0, 256)
+            rows = []
+            for i in range(7):
+                position = i / 6.0
+                color = lut[int(round(position * 255))]
+                rows.append([position, [int(c) for c in color[:3]]])
+        if len(rows) < 2:
+            rows = [[0.0, [0, 0, 0]], [1.0, [255, 255, 255]]]
+        self._rows = rows
+        self._rebuild_table()
+
+    def _color_at(self, position: float):
+        try:
+            cmap = _colormap_from_stops(self._rows)
+            lut = cmap.getLookupTable(0.0, 1.0, 256)
+            index = int(round(max(0.0, min(1.0, position)) * 255))
+            return [int(c) for c in lut[index][:3]]
+        except Exception:
+            return [0, 0, 0]
+
+    def _paint_swatch(self, button, rgb) -> None:
+        button.setStyleSheet(
+            f"background-color: rgb({rgb[0]},{rgb[1]},{rgb[2]}); "
+            "border: 1px solid #6b7785; border-radius: 3px;"
+        )
+
+    def _rebuild_table(self) -> None:
+        self.table.setRowCount(len(self._rows))
+        for i, (position, rgb) in enumerate(self._rows):
+            spin = _NoWheelDoubleSpinBox()
+            spin.setRange(0.0, 1.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.05)
+            spin.setValue(float(position))
+            spin.valueChanged.connect(
+                lambda value, row=i: self._set_position(row, value)
+            )
+            self.table.setCellWidget(i, 0, spin)
+
+            swatch = QPushButton()
+            swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+            swatch.clicked.connect(lambda _=False, row=i: self._pick_color(row))
+            self._paint_swatch(swatch, rgb)
+            self.table.setCellWidget(i, 1, swatch)
+
+            remove = QPushButton("Remove")
+            remove.setEnabled(len(self._rows) > 2)
+            remove.clicked.connect(lambda _=False, row=i: self._remove_stop(row))
+            self.table.setCellWidget(i, 2, remove)
+        self._update_preview()
+
+    def _set_position(self, row, value) -> None:
+        if 0 <= row < len(self._rows):
+            self._rows[row][0] = float(value)
+            self._update_preview()
+
+    def _pick_color(self, row) -> None:
+        if not (0 <= row < len(self._rows)):
+            return
+        rgb = self._rows[row][1]
+        chosen = QColorDialog.getColor(
+            QColor(rgb[0], rgb[1], rgb[2]), self, "Choose stop color"
+        )
+        if chosen.isValid():
+            self._rows[row][1] = [chosen.red(), chosen.green(), chosen.blue()]
+            self._rebuild_table()
+
+    def _add_stop(self) -> None:
+        rows = sorted(self._rows, key=lambda r: r[0])
+        position = 0.5
+        if len(rows) >= 2:
+            gaps = [
+                (rows[i + 1][0] - rows[i][0], i) for i in range(len(rows) - 1)
+            ]
+            _gap, i = max(gaps)
+            position = (rows[i][0] + rows[i + 1][0]) / 2.0
+        self._rows.append([position, self._color_at(position)])
+        self._rows.sort(key=lambda r: r[0])
+        self._rebuild_table()
+
+    def _remove_stop(self, row) -> None:
+        if len(self._rows) <= 2 or not (0 <= row < len(self._rows)):
+            return
+        del self._rows[row]
+        self._rebuild_table()
+
+    def _update_preview(self) -> None:
+        try:
+            lut = _colormap_from_stops(self._rows).getLookupTable(0.0, 1.0, 260)
+        except Exception:
+            lut = None
+        self.preview.setPixmap(_gradient_pixmap(lut, 260, 26))
+        self._validate()
+
+    # -- validation ----------------------------------------------------
+    def _validate(self) -> None:
+        name = self.name_edit.text().strip()
+        if not name:
+            message = "Enter a name for the colormap."
+        elif _colormap_name_taken(name):
+            message = f"“{name}” is already used by another colormap."
+        else:
+            message = ""
+        self.hint.setText(message)
+        self.ok_btn.setEnabled(not message)
+
+    def _accept(self) -> None:
+        self._entry = {
+            "name": self.name_edit.text().strip(),
+            "stops": [
+                [round(float(pos), 4), list(rgb)]
+                for pos, rgb in _normalize_stops(self._rows)
+            ],
+        }
+        self.accept()
+
+    def result_entry(self) -> dict:
+        return self._entry or {}
+
+
+class _ColormapPicker(QWidget):
+    """Searchable list of every colormap with swatches, preview and CRUD."""
+
+    selectionChanged = Signal(str)
+
+    def __init__(self, current: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self._current = current or _default_palette()
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search colormaps…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda _t: self.reload())
+        lay.addWidget(self.search)
+
+        self.list = QListWidget()
+        self.list.setUniformItemSizes(True)
+        self.list.setIconSize(QSize(110, 14))
+        self.list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        self.list.currentItemChanged.connect(self._on_current)
+        lay.addWidget(self.list, 1)
+
+        preview_row = QHBoxLayout()
+        self.preview = QLabel()
+        self.preview.setMinimumHeight(26)
+        preview_row.addWidget(self.preview, 1)
+        self.preview_name = QLabel("")
+        self.preview_name.setStyleSheet("color: #5a6673;")
+        preview_row.addWidget(self.preview_name)
+        lay.addLayout(preview_row)
+
+        buttons = QHBoxLayout()
+        self.new_btn = QPushButton("New custom…")
+        self.new_btn.clicked.connect(self._new_custom)
+        self.delete_btn = QPushButton("Delete custom")
+        self.delete_btn.clicked.connect(self._delete_custom)
+        buttons.addWidget(self.new_btn)
+        buttons.addWidget(self.delete_btn)
+        buttons.addStretch()
+        lay.addLayout(buttons)
+
+        self.reload()
+
+    # -- list ----------------------------------------------------------
+    def selected(self) -> str:
+        return self._current
+
+    def set_selected(self, name: str) -> None:
+        if name:
+            self._current = name
+            self.reload()
+
+    def reload(self) -> None:
+        query = self.search.text().strip().lower()
+        self.list.blockSignals(True)
+        self.list.clear()
+        target = None
+        for title, names in _colormap_groups():
+            shown = [n for n in names if not query or query in n.lower()]
+            if not shown:
+                continue
+            header = QListWidgetItem(title)
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            header.setForeground(QColor("#8a94a0"))
+            self.list.addItem(header)
+            for name in shown:
+                item = QListWidgetItem(_colormap_gradient_pixmap(name), name)
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                self.list.addItem(item)
+                if name == self._current:
+                    target = item
+        self.list.blockSignals(False)
+        if target is not None:
+            self.list.setCurrentItem(target)
+            self.list.scrollToItem(
+                target, QAbstractItemView.ScrollHint.PositionAtCenter
+            )
+        else:
+            self._show_preview(self._current)
+
+    def _show_preview(self, name: str) -> None:
+        try:
+            lut = _figure_colormap(name).getLookupTable(0.0, 1.0, 260)
+        except Exception:
+            lut = None
+        self.preview.setPixmap(_gradient_pixmap(lut, 260, 24))
+        self.preview_name.setText(name)
+        custom = {m["name"] for m in _custom_colormaps()}
+        self.delete_btn.setEnabled(name in custom)
+
+    def _on_current(self, current, _previous) -> None:
+        name = current.data(Qt.ItemDataRole.UserRole) if current else None
+        if not name:
+            return
+        self._current = name
+        self._show_preview(name)
+        self.selectionChanged.emit(name)
+
+    # -- custom colormaps ----------------------------------------------
+    def _new_custom(self) -> None:
+        dialog = _CustomColormapDialog(self, self._current)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        entry = dialog.result_entry()
+        if not entry.get("name"):
+            return
+        settings = _global_settings()
+        settings.setdefault("colormaps", []).append(entry)
+        _save_global_settings(settings)
+        _GRADIENT_CACHE.clear()
+        self._current = entry["name"]
+        self.reload()
+        self.selectionChanged.emit(self._current)
+
+    def _delete_custom(self) -> None:
+        name = self._current
+        settings = _global_settings()
+        maps = settings.setdefault("colormaps", [])
+        if not any(m.get("name") == name for m in maps):
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete Colormap",
+            f"Delete the custom colormap “{name}”?\n"
+            "Plots using it will fall back to viridis.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        settings["colormaps"] = [m for m in maps if m.get("name") != name]
+        _save_global_settings(settings)
+        _GRADIENT_CACHE.clear()
+        self._current = _default_palette()
+        self.reload()
+        self.selectionChanged.emit(self._current)
+
+
+class _GlobalSettingsDialog(QDialog):
+    """Global Settings: left tab list + right pages, applied on OK."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Global Settings")
+        self.resize(840, 620)
+        self._draft = copy.deepcopy(_global_settings())
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 10)
+        root.setSpacing(10)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+
+        self.tabs = QListWidget()
+        self.tabs.setFixedWidth(160)
+        self.tabs.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+            "QListWidget::item { padding: 7px 9px; }"
+            "QListWidget::item:selected { background: #e1ecf9; color: #1a4a76; }"
+        )
+        body.addWidget(self.tabs)
+
+        self.stack = QStackedWidget()
+        body.addWidget(self.stack, 1)
+        root.addLayout(body, 1)
+
+        self.tabs.addItem("Appearance")
+        self.tabs.addItem("Parameters")
+        self.stack.addWidget(self._appearance_page())
+        self.stack.addWidget(self._parameters_page())
+        self.tabs.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.tabs.setCurrentRow(0)
+
+        footer = QHBoxLayout()
+        restore = QPushButton("Restore Defaults")
+        restore.clicked.connect(self._restore_defaults)
+        footer.addWidget(restore)
+        footer.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(self._ok)
+        footer.addWidget(cancel)
+        footer.addWidget(ok)
+        root.addLayout(footer)
+
+    # -- pages ---------------------------------------------------------
+    def _page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        return page
+
+    def _hint(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet("color: #6b7785;")
+        label.setWordWrap(True)
+        return label
+
+    def _appearance_page(self) -> QWidget:
+        page = self._page()
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+
+        appearance = self._draft["appearance"]
+        form.addWidget(QLabel("Interface font size"), 0, 0)
+        self.font_size = QSpinBox()
+        self.font_size.setRange(8, 14)
+        self.font_size.setSuffix(" pt")
+        self.font_size.setValue(int(appearance.get("font_size", 9) or 9))
+        form.addWidget(self.font_size, 0, 1)
+        form.addWidget(
+            self._hint("Menus, labels and tables. Takes effect immediately."),
+            1, 0, 1, 2,
+        )
+
+        form.addWidget(QLabel("UI density"), 2, 0)
+        self.density = _NoWheelComboBox()
+        self.density.addItem("Normal", "normal")
+        self.density.addItem("Compact", "compact")
+        index = self.density.findData(appearance.get("density", "normal"))
+        self.density.setCurrentIndex(index if index >= 0 else 0)
+        form.addWidget(self.density, 2, 1)
+        form.addWidget(
+            self._hint("Compact shrinks tree and table rows so more fits on screen."),
+            3, 0, 1, 2,
+        )
+
+        form.addWidget(QLabel("Plot background"), 4, 0)
+        self.plot_background = _NoWheelComboBox()
+        self.plot_background.addItem("White", "white")
+        self.plot_background.addItem("Light grey", "grey")
+        index = self.plot_background.findData(
+            appearance.get("plot_background", "white")
+        )
+        self.plot_background.setCurrentIndex(index if index >= 0 else 0)
+        form.addWidget(self.plot_background, 4, 1)
+        form.addWidget(
+            self._hint("Canvas colour of every plot. The light grey is easier on the eyes."),
+            5, 0, 1, 2,
+        )
+
+        self.remember_geometry = QCheckBox("Remember window size and position")
+        self.remember_geometry.setChecked(
+            bool(appearance.get("remember_geometry", True))
+        )
+        form.addWidget(self.remember_geometry, 6, 0, 1, 2)
+
+        page.layout().addLayout(form)
+        page.layout().addStretch()
+        return page
+
+    def _parameters_page(self) -> QWidget:
+        page = self._page()
+        layout = page.layout()
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        plot = self._draft["plot"]
+
+        def add_spin(row, label, hint, value, low, high, step):
+            form.addWidget(QLabel(label), row * 2, 0)
+            spin = QSpinBox()
+            spin.setRange(low, high)
+            spin.setSingleStep(step)
+            spin.setGroupSeparatorShown(True)
+            spin.setValue(int(value))
+            form.addWidget(spin, row * 2, 1)
+            form.addWidget(self._hint(hint), row * 2 + 1, 0, 1, 2)
+            return spin
+
+        self.max_points = add_spin(
+            0, "Scatter max points",
+            "Larger files are sampled down to this many points per scatter plot.",
+            plot.get("max_points", 50000), 1000, 500000, 5000,
+        )
+        self.nxn_points = add_spin(
+            1, "N×N plot max points",
+            "Reserved for the future N×N plot grid: many small scatters at once, "
+            "so it keeps fewer points. Not used yet. Follows Scatter max points ÷ 10 "
+            "until you edit it here.",
+            plot.get("nxn_max_points", 5000), 500, 100000, 1000,
+        )
+        self.density_grid = add_spin(
+            2, "Density grid",
+            "Bins per axis used to estimate point density for colouring. "
+            "Higher is finer but slower.",
+            plot.get("density_grid", 200), 50, 500, 10,
+        )
+        layout.addLayout(form)
+
+        # N×N follows the scatter limit until the user edits it.
+        def on_max_points(value):
+            old_follow = max(500, int(self.max_points_previous / 10))
+            if self.nxn_points.value() == old_follow:
+                self.nxn_points.setValue(max(500, int(value / 10)))
+            self.max_points_previous = value
+
+        self.max_points_previous = self.max_points.value()
+        self.max_points.valueChanged.connect(on_max_points)
+
+        layout.addWidget(QLabel("Default colormap"))
+        self.picker = _ColormapPicker(plot.get("default_colormap", "viridis"))
+        layout.addWidget(self.picker, 1)
+        layout.addWidget(self._hint(
+            "Used when a new plot is created. Any colormap can still be chosen "
+            "per plot; 'More colormaps…' in a plot's Palette list opens this same list."
+        ))
+        return page
+
+    # -- actions -------------------------------------------------------
+    def _restore_defaults(self) -> None:
+        defaults = copy.deepcopy(GLOBAL_DEFAULT_SETTINGS)
+        if self.tabs.currentRow() == 0:
+            appearance = defaults["appearance"]
+            self.font_size.setValue(int(appearance["font_size"]))
+            self.density.setCurrentIndex(
+                max(0, self.density.findData(appearance["density"]))
+            )
+            self.plot_background.setCurrentIndex(
+                max(0, self.plot_background.findData(appearance["plot_background"]))
+            )
+            self.remember_geometry.setChecked(bool(appearance["remember_geometry"]))
+        else:
+            plot = defaults["plot"]
+            self.max_points.setValue(int(plot["max_points"]))
+            self.nxn_points.setValue(int(plot["nxn_max_points"]))
+            self.density_grid.setValue(int(plot["density_grid"]))
+            self.picker.set_selected(plot["default_colormap"])
+
+    def _ok(self) -> None:
+        live = _global_settings()
+        live["appearance"].update({
+            "font_size": int(self.font_size.value()),
+            "density": self.density.currentData() or "normal",
+            "plot_background": self.plot_background.currentData() or "white",
+            "remember_geometry": bool(self.remember_geometry.isChecked()),
+        })
+        live["plot"].update({
+            "max_points": int(self.max_points.value()),
+            "nxn_max_points": int(self.nxn_points.value()),
+            "density_grid": int(self.density_grid.value()),
+            "default_colormap": self.picker.selected(),
+        })
+        _save_global_settings(live)
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     """Main window: File/Help menu bar and a single tabbed workspace."""
 
@@ -3954,6 +4819,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
         self._build_menu_bar()
         self._build_main_area()
+        self._restore_window_geometry()
+        self._apply_appearance_settings()
         self.statusBar().showMessage("Ready")
 
     def closeEvent(self, event) -> None:
@@ -3978,6 +4845,7 @@ class MainWindow(QMainWindow):
                 return
         # Mask-edge images are temporary: drop this module's cache on exit.
         self._seg_clear_edge_cache()
+        self._save_window_geometry()
         event.accept()
 
     def _has_unsaved_module_changes(self) -> bool:
@@ -4029,8 +4897,140 @@ class MainWindow(QMainWindow):
         manage_ext_action.triggered.connect(self._open_extension_manager)
         ext_menu.addAction(manage_ext_action)
 
+        settings_menu = bar.addMenu("&Settings")
+        settings_action = QAction("Global Settings…", self)
+        settings_action.triggered.connect(self._open_settings)
+        settings_menu.addAction(settings_action)
+
         help_menu = bar.addMenu("&Help")
         help_menu.addAction(QAction("About Smage", self))
+
+    # ----- global settings -------------------------------------------
+    def _open_settings(self) -> None:
+        dialog = _GlobalSettingsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_appearance_settings()
+        self._refresh_plots_for_settings()
+
+    def _apply_appearance_settings(self) -> None:
+        """Re-apply font, row density and plot colours from the settings."""
+        import pyqtgraph as pg
+
+        app = QApplication.instance()
+        if app is None:
+            return
+        font = app.font()
+        font.setPointSize(int(_setting("appearance", "font_size", 9) or 9))
+        app.setFont(font)
+        # Qt only applies the application font to widgets created afterwards,
+        # so push it through the window (children inherit it).
+        self.setFont(font)
+        app.setStyleSheet(_app_stylesheet())
+        pg.setConfigOption("background", _plot_background())
+        for plot in self.findChildren(pg.PlotWidget):
+            plot.setBackground(_plot_background())
+
+    def _refresh_plots_for_settings(self) -> None:
+        """Re-render open plots so changed limits/colours show up right away."""
+        for index in range(self.tabs.count()):
+            page = self.tabs.widget(index)
+            try:
+                if hasattr(page, "_fig_plots") and hasattr(page, "_fig_cards"):
+                    self._figure_refresh_all(page)
+                elif hasattr(page, "_gating_plot_widget"):
+                    self._gating_render(page)
+                elif hasattr(page, "_area_plot"):
+                    self._area_render_plot(page)
+            except Exception:
+                continue
+
+    def _save_window_geometry(self) -> None:
+        settings = _global_settings()
+        if (settings.get("appearance") or {}).get("remember_geometry", True):
+            geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        else:
+            geometry = ""
+        settings["window_geometry"] = geometry
+        _save_global_settings(settings)
+
+    def _restore_window_geometry(self) -> None:
+        if not _setting("appearance", "remember_geometry", True):
+            return
+        geometry = _global_settings().get("window_geometry") or ""
+        if not geometry:
+            return
+        try:
+            self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+        except Exception:
+            pass
+
+    # ----- palette combos --------------------------------------------
+    def _populate_palette_combo(self, combo, current) -> None:
+        """Fill a palette combo with standard + custom maps and a 'More…' entry."""
+        for name in _palette_names():
+            if combo.findData(name) < 0:
+                combo.addItem(name, name)
+        self._add_more_colormaps(combo)
+        index = combo.findData(current)
+        if index < 0 and current:
+            combo.insertItem(0, str(current), str(current))
+            index = 0
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo._palette_previous = max(0, combo.currentIndex())
+
+    def _add_more_colormaps(self, combo) -> None:
+        combo.addItem("More colormaps…", "__more__")
+        combo._palette_previous = max(
+            0, combo.currentIndex()
+        ) if combo.currentIndex() >= 0 else 0
+        combo.currentIndexChanged.connect(
+            lambda index, c=combo: self._palette_more_guard(c, index)
+        )
+
+    def _palette_more_guard(self, combo, index: int) -> None:
+        """Keep the sentinel from reaching the caller's handler."""
+        if combo.itemData(index) != "__more__":
+            combo._palette_previous = index
+            return
+        previous = getattr(combo, "_palette_previous", 0)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(max(0, previous))
+        combo.blockSignals(False)
+        QTimer.singleShot(0, lambda: self._palette_pick_more(combo))
+
+    def _palette_pick_more(self, combo) -> None:
+        current = combo.itemData(combo.currentIndex())
+        name = self._pick_colormap(combo, current)
+        if not name:
+            return
+        index = combo.findData(name)
+        if index < 0:
+            index = max(0, combo.count() - 1)
+            combo.insertItem(index, name, name)
+        combo.setCurrentIndex(index)
+
+    def _pick_colormap(self, parent, current) -> str:
+        dialog = QDialog(parent)
+        dialog.setWindowTitle("Choose Colormap")
+        dialog.resize(620, 560)
+        lay = QVBoxLayout(dialog)
+        start = current if isinstance(current, str) else ""
+        picker = _ColormapPicker(start or _default_palette(), dialog)
+        lay.addWidget(picker, 1)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dialog.reject)
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(dialog.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+        lay.addLayout(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return ""
+        return picker.selected()
 
     # ----- extensions (external Python environments) ------------------
     def _ext_dir(self) -> Path:
@@ -7340,7 +8340,7 @@ class MainWindow(QMainWindow):
         """Create a scatter/histogram PlotWidget with sci axes and A/F buttons."""
         import pyqtgraph as pg
         plot_widget = pg.PlotWidget(plotItem=_make_fit_plot_item())
-        plot_widget.setBackground("w")
+        plot_widget.setBackground(_plot_background())
         plot_widget.showGrid(x=True, y=True, alpha=0.2)
         plot_widget.getPlotItem().setAxisItems({
             "bottom": _make_sci_axis("bottom"),
@@ -7665,7 +8665,7 @@ class MainWindow(QMainWindow):
             "color_mode": color_mode,
             "color_param": color_param,
             "last_color_param": color_param,
-            "palette": "viridis",
+            "palette": _default_palette(),
             "layers": (
                 [{"parameter": color_param, "color": (255, 255, 255), "name": str(color_param), "visible": True}]
                 if ptype == "image" and color_param else []
@@ -8544,45 +9544,54 @@ class MainWindow(QMainWindow):
             size = 4.0
             px_mode = True
 
+        # Colours are computed from every visible row (so density stays
+        # accurate), then the rows to draw are chosen once.
+        solid = None
+        cmap = None
+        values = None
         if mode == "solid":
             # Solid: every point shares one user-chosen color.
             solid = plot_dict.get("solid_color", (0, 0, 200))
-            self._figure_draw_colored_scatter(
-                plot_widget, x, y, None, None, size=size, px_mode=px_mode, solid_color=solid
-            )
         else:
-            cmap = _figure_colormap(plot_dict.get("palette", "viridis"))
+            cmap = _figure_colormap(plot_dict.get("palette") or _default_palette())
             if mode == "parameter" and color_param:
                 values = pd.to_numeric(df[color_param], errors="coerce").to_numpy(dtype="float64")[keep]
                 values = _apply_scale_transforms(values, transforms.get(color_param))
             else:
                 # Density: color each actual point by its local (binned) density,
                 # without painting empty regions of the plot.
-                hist, xe, ye = np.histogram2d(x, y, bins=200)
+                grid = max(20, int(_setting("plot", "density_grid", 200) or 200))
+                hist, xe, ye = np.histogram2d(x, y, bins=grid)
                 xi = np.clip(np.digitize(x, xe) - 1, 0, hist.shape[0] - 1)
                 yi = np.clip(np.digitize(y, ye) - 1, 0, hist.shape[1] - 1)
                 values = np.log1p(hist[xi, yi].astype(float))
-            self._figure_draw_colored_scatter(plot_widget, x, y, values, cmap, size=size, px_mode=px_mode)
+
+        # Sample the rows to draw. Priorities come from the absolute row
+        # index, so changing the gate keeps the picture stable.
+        max_points = max(1000, int(_setting("plot", "max_points", 50000) or 50000))
+        picked = _stable_sample_selection(keep, max_points)
+        if picked is not None:
+            x = x[picked]
+            y = y[picked]
+            if values is not None:
+                values = values[picked]
+
+        self._figure_draw_colored_scatter(
+            plot_widget, x, y, values, cmap, size=size, px_mode=px_mode,
+            solid_color=solid,
+        )
         self._figure_apply_ranges(plot_dict, plot_widget)
         self._figure_apply_display_options(plot_dict, plot_widget)
 
     def _figure_draw_colored_scatter(self, plot_widget, x, y, values, cmap,
-                                     max_points: int = 50000, size: float = 4,
-                                     px_mode: bool = True, solid_color=None) -> None:
+                                     size: float = 4, px_mode: bool = True,
+                                     solid_color=None) -> None:
         """Draw points colored by `values`, normalized through the colormap.
 
         When `solid_color` is given, every point uses that single color instead.
         """
         import numpy as np
         import pyqtgraph as pg
-
-        if x.size > max_points:
-            rng = np.random.default_rng(42)
-            idx = rng.choice(x.size, max_points, replace=False)
-            x = x[idx]
-            y = y[idx]
-            if values is not None:
-                values = values[idx]
 
         if solid_color is not None:
             brushes = pg.mkBrush(
@@ -9641,9 +10650,10 @@ class MainWindow(QMainWindow):
                 else:
                     layout.addWidget(QLabel("Palette"))
                     palette_combo = make_value_combo(
-                        [(p, p) for p in FIGURE_PALETTES],
-                        common(scatter_plots, "palette", "viridis"),
+                        [(p, p) for p in _palette_names()],
+                        common(scatter_plots, "palette", _default_palette()),
                     )
+                    self._add_more_colormaps(palette_combo)
                     layout.addWidget(palette_combo)
 
                     def on_palette(_=0):
@@ -9911,10 +10921,9 @@ class MainWindow(QMainWindow):
         else:
             layout.addWidget(QLabel("Palette"))
             palette_combo = _NoWheelComboBox()
-            palette_combo.addItems(FIGURE_PALETTES)
-            idx = palette_combo.findText(plot_dict.get("palette", "viridis"))
-            if idx >= 0:
-                palette_combo.setCurrentIndex(idx)
+            self._populate_palette_combo(
+                palette_combo, plot_dict.get("palette") or _default_palette()
+            )
             palette_combo.setEnabled(enabled)
             layout.addWidget(palette_combo)
 
@@ -10341,7 +11350,7 @@ class MainWindow(QMainWindow):
             "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
             "color_mode": "density",
             "color_param": None,
-            "palette": "viridis",
+            "palette": _default_palette(),
             "xmin": None,
             "xmax": None,
             "ymin": None,
@@ -10987,7 +11996,7 @@ class MainWindow(QMainWindow):
         plot_lay.setSpacing(6)
         plot_lay.addWidget(QLabel("<b>Spectrum</b>"))
         spectrum_plot = pg.PlotWidget()
-        spectrum_plot.setBackground("w")
+        spectrum_plot.setBackground(_plot_background())
         spectrum_plot.showGrid(x=True, y=True, alpha=0.2)
         spectrum_plot.getPlotItem().setAxisItems({
             "bottom": _make_rotated_axis("bottom"),
@@ -11670,10 +12679,9 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Distribution colormap"))
         cmap_combo = _NoWheelComboBox()
-        for name in ("viridis", "plasma", "inferno", "magma", "cividis", "turbo"):
-            cmap_combo.addItem(name, name)
-        cmap_index = cmap_combo.findData(cfg.get("colormap", "viridis"))
-        cmap_combo.setCurrentIndex(cmap_index if cmap_index >= 0 else 0)
+        self._populate_palette_combo(
+            cmap_combo, cfg.get("colormap") or _default_palette()
+        )
         cmap_combo.setEnabled(enabled)
         layout.addWidget(cmap_combo)
 
@@ -12050,10 +13058,9 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(QLabel("Colormap"), 1, 0)
         cmap_combo = _NoWheelComboBox()
-        for name in ("viridis", "plasma", "inferno", "magma", "cividis", "turbo"):
-            cmap_combo.addItem(name, name)
-        cmap_index = cmap_combo.findData(cfg["colormap"])
-        cmap_combo.setCurrentIndex(cmap_index if cmap_index >= 0 else 0)
+        self._populate_palette_combo(
+            cmap_combo, cfg.get("colormap") or _default_palette()
+        )
         cmap_combo.setEnabled(editable)
         grid.addWidget(cmap_combo, 1, 1, 1, 3)
 
@@ -13971,7 +14978,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
         lay.addWidget(QLabel("<b>Illumination mask</b>"))
-        plot = pg.PlotWidget(background="w")
+        plot = pg.PlotWidget(background=_plot_background())
         plot.getPlotItem().hideAxis("bottom")
         plot.getPlotItem().hideAxis("left")
         plot.getPlotItem().getViewBox().setAspectLocked(True)
@@ -14029,7 +15036,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
         lay.addWidget(QLabel(f"<b>{title}</b>"))
-        plot = pg.PlotWidget(background="w")
+        plot = pg.PlotWidget(background=_plot_background())
         plot.showGrid(x=True, y=True, alpha=0.2)
         plot.getPlotItem().setAxisItems({
             "bottom": _make_sci_axis("bottom"),
@@ -14069,7 +15076,7 @@ class MainWindow(QMainWindow):
             "y": sub.get("y"),
             "color_mode": "parameter",
             "color_param": sub.get("channel"),
-            "palette": "viridis",
+            "palette": _default_palette(),
             "show_axes": True,
             "show_axis_names": True,
             "show_indices": True,
@@ -14126,10 +15133,9 @@ class MainWindow(QMainWindow):
 
         settings.addWidget(QLabel("Palette"))
         palette_combo = _NoWheelComboBox()
-        for name in ("viridis", "plasma", "inferno", "magma", "cividis", "turbo"):
-            palette_combo.addItem(name, name)
-        idx = palette_combo.findData(plot_dict.get("palette"))
-        palette_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._populate_palette_combo(
+            palette_combo, plot_dict.get("palette") or _default_palette()
+        )
         palette_combo.setEnabled(enabled)
         settings.addWidget(palette_combo)
 
@@ -15131,7 +16137,7 @@ class MainWindow(QMainWindow):
             "color_mode": "parameter",
             "color_param": channel,
             "last_color_param": channel,
-            "palette": "viridis",
+            "palette": _default_palette(),
             "layers": (
                 [{
                     "parameter": channel,
@@ -16611,7 +17617,7 @@ class MainWindow(QMainWindow):
         bh = QHBoxLayout(body)
         bh.setContentsMargins(0, 0, 0, 0)
         bh.setSpacing(4)
-        plot = pg.PlotWidget(background="w")
+        plot = pg.PlotWidget(background=_plot_background())
         plot.showGrid(x=True, y=True, alpha=0.2)
         plot.getPlotItem().setAxisItems({
             "bottom": _make_sci_axis("bottom"),
@@ -23241,7 +24247,7 @@ class MainWindow(QMainWindow):
         params.setdefault("plot", {
             # "auto" picks Image for image files and Scatter for table files.
             "type": "auto",
-            "palette": "viridis",
+            "palette": _default_palette(),
             "point_size": 4.0,
         })
         params.setdefault("selected", None)
@@ -23480,8 +24486,10 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Palette"))
         palette = _NoWheelComboBox()
-        for name in FIGURE_PALETTES:
-            palette.addItem(name, name)
+        self._populate_palette_combo(
+            palette,
+            (page._area_params.get("plot") or {}).get("palette") or _default_palette(),
+        )
         palette.currentIndexChanged.connect(
             lambda _=0: self._area_on_plot_param(page)
         )
@@ -27757,7 +28765,7 @@ class MainWindow(QMainWindow):
         )
         plot_item = _make_fit_plot_item(viewbox=viewbox)
         plot_widget = pg.PlotWidget(plotItem=plot_item)
-        plot_widget.setBackground("w")
+        plot_widget.setBackground(_plot_background())
         plot_widget.showGrid(x=True, y=True, alpha=0.2)
         plot_widget.getPlotItem().setAxisItems({
             "bottom": _make_sci_axis("bottom"),
@@ -29906,7 +30914,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_NAME)
-    app.setStyleSheet(APP_STYLE)
+    font = app.font()
+    font.setPointSize(int(_setting("appearance", "font_size", 9) or 9))
+    app.setFont(font)
+    app.setStyleSheet(_app_stylesheet())
 
     window = MainWindow()
     window.show()
