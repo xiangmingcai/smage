@@ -1289,6 +1289,67 @@ def _gate_source_ids(gate):
     return []
 
 
+# Geometry fields that can differ per file (never the gate type or axes).
+_GATE_GEOMETRY_KEYS = {
+    "rect": ("pos", "size"),
+    "ellipse": ("pos", "size"),
+    "polygon": ("points",),
+    "quadrant": ("vx", "hy"),
+    "split": ("vx",),
+    "range": ("x1", "x2"),
+    "skewed_quadrant": ("center", "p_right", "p_up", "p_left", "p_down"),
+}
+
+
+def _gate_group_id(gate):
+    """The id whose geometry is shared across a group of gates.
+
+    Quadrant / split / skewed-quadrant gates come in groups bound to one
+    crosshair / line / ray set; their geometry is shared, so per-file
+    overrides are stored once per group instead of once per sub-gate.
+    """
+    for key in ("crosshair_id", "split_id", "skewed_id"):
+        if gate.get(key):
+            return gate[key]
+    return gate.get("id")
+
+
+def _gate_geometry(gate):
+    """The editable geometry fields of a gate (shape + position only)."""
+    keys = _GATE_GEOMETRY_KEYS.get(gate.get("type"), ())
+    out = {}
+    for key in keys:
+        value = gate.get(key)
+        if value is not None:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def _merge_gate_geometry(gate, geometry):
+    """Return a shallow copy of `gate` with `geometry` fields overlaid."""
+    out = dict(gate)
+    for key, value in (geometry or {}).items():
+        out[key] = copy.deepcopy(value)
+    return out
+
+
+def _resolve_gates_for_file(gates, per_file, file_key):
+    """Return a copy of `gates` with the given file's overrides merged in.
+
+    `per_file` maps a group id to ``{file_key: geometry}``. Files without an
+    override fall back to the shared geometry, so only divergent files are
+    stored.
+    """
+    if not per_file or not file_key:
+        return list(gates)
+    resolved = []
+    for gate in gates:
+        group = _gate_group_id(gate)
+        override = (per_file.get(group) or {}).get(file_key)
+        resolved.append(_merge_gate_geometry(gate, override) if override else dict(gate))
+    return resolved
+
+
 def _gate_needed_columns(gate, by_id):
     """Return the x/y column names needed to compute a gate's own mask."""
     cols = set()
@@ -3879,6 +3940,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """Warn before closing the app if any open module has unsaved changes."""
+        if getattr(self, "_import_running", False):
+            QMessageBox.warning(
+                self,
+                "Close Smage",
+                "A data import is still running.\nCancel it first, then close.",
+            )
+            event.ignore()
+            return
         if self._has_unsaved_module_changes():
             reply = QMessageBox.question(
                 self,
@@ -5865,8 +5934,8 @@ class MainWindow(QMainWindow):
         progress.close()
 
     def _run_import(self) -> None:
-        """Import each checked file: extract+rename columns, sample, write Parquet."""
-        if self.project is None:
+        """Import each checked file in a background thread (the UI stays live)."""
+        if self.project is None or getattr(self, "_import_running", False):
             return
         checked = [
             i for i in range(self.import_list.count())
@@ -5908,33 +5977,121 @@ class MainWindow(QMainWindow):
             )
             return
 
-        progress = QProgressDialog("Importing files...", "Cancel", 0, len(checked), self)
-        progress.setWindowTitle("Import")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setValue(0)
-
-        for step, i in enumerate(checked):
-            if progress.wasCanceled():
-                break
+        # Snapshot everything the worker needs so the user editing the Input
+        # list mid-import cannot change data underneath the thread.
+        jobs = []
+        for i in checked:
             entry = self._import_files[i]
+            jobs.append({
+                "index": i,
+                "path": entry["path"],
+                "id": entry.get("id"),
+                "name": Path(entry["path"]).name,
+                "parameters": list(entry.get("parameters") or []),
+                "sampling": entry.get("sampling", "full"),
+                "sampling_percent": entry.get("sampling_percent", 10),
+            })
+
+        self._import_running = True
+        self._import_cancel = False
+        self._import_jobs = jobs
+        self.peek_btn.setEnabled(False)
+        self.import_btn.setEnabled(False)
+
+        progress = QProgressDialog("Importing files…", "Cancel", 0, len(jobs), self)
+        progress.setWindowTitle("Import")
+        progress.setWindowModality(Qt.WindowModality.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.canceled.connect(self._cancel_import)
+        self._import_progress = progress
+
+        q = queue.Queue()
+        self._import_queue = q
+        self._import_thread = threading.Thread(
+            target=self._import_worker, args=(jobs, q), daemon=True
+        )
+        self._import_thread.start()
+
+        timer = QTimer(self)
+        timer.setInterval(100)
+        timer.timeout.connect(self._import_poll)
+        timer.start()
+        self._import_timer = timer
+
+    def _cancel_import(self) -> None:
+        """Cancel the running import (checked by the worker between files)."""
+        self._import_cancel = True
+
+    def _import_worker(self, jobs, q) -> None:
+        """Import the queued files one by one; results are posted to the queue."""
+        total = len(jobs)
+        for step, job in enumerate(jobs):
+            if self._import_cancel:
+                q.put(("cancelled", step, total))
+                return
+            name = job["name"]
+            q.put(("status", step, name))
             try:
-                out_path = self.project.data_dir / f"{entry['id']}.parquet"
+                out_path = self.project.data_dir / f"{job['id']}.parquet"
                 result = import_file(
-                    entry["path"],
-                    entry.get("parameters") or [],
-                    entry.get("sampling", "full"),
-                    entry.get("sampling_percent", 10),
+                    job["path"],
+                    job["parameters"],
+                    job["sampling"],
+                    job["sampling_percent"],
                     out_path,
                 )
+                # Build the image LOD sample index now, so Figure views open
+                # image files instantly (no first-open build).
+                if Path(job["path"]).suffix.lower() in (".tif", ".tiff"):
+                    last = [-1]
+
+                    def _idx_progress(f, _last=last, _step=step, _name=name):
+                        if self._import_cancel:
+                            return
+                        pct = int(round(f * 100))
+                        if pct != _last[0]:
+                            _last[0] = pct
+                            q.put(("idx", _step, _name, f))
+
+                    try:
+                        _build_image_index_files(str(out_path), _idx_progress)
+                    except Exception:
+                        pass  # Figure will fall back to a lazy build
+                q.put(("done", step, result, str(out_path)))
+            except Exception as exc:
+                q.put(("error", step, str(exc)))
+        q.put(("finished",))
+
+    def _import_poll(self) -> None:
+        """Apply worker results to the UI and the import state."""
+        q = getattr(self, "_import_queue", None)
+        progress = getattr(self, "_import_progress", None)
+        if q is None or progress is None:
+            return
+        finished = False
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            if kind == "status":
+                _step, name = msg[1], msg[2]
+                progress.setLabelText(f"Importing {name}…")
+            elif kind == "idx":
+                _step, name, frac = msg[1], msg[2], msg[3]
+                progress.setLabelText(
+                    f"Importing {name}: building image index… {int(round(frac * 100))}%"
+                )
+            elif kind == "done":
+                step, result, out_path = msg[1], msg[2], msg[3]
+                entry = self._import_files[self._import_jobs[step]["index"]]
                 entry["status"] = "processed"
                 entry["error"] = None
-                entry["imported"] = {
-                    "parquet": str(out_path),
-                    "rows": result["rows"],
-                }
-                # Publish column names to the lightweight index.
+                entry["imported"] = {"parquet": out_path, "rows": result["rows"]}
                 self._column_index[self._rel_data_key(out_path)] = result["columns"]
                 self.project.save_columns(self._column_index)
                 self._processed_files[:] = [
@@ -5943,34 +6100,45 @@ class MainWindow(QMainWindow):
                 self._processed_files.append({
                     "name": Path(entry["path"]).name,
                     "source": entry["path"],
-                    "parquet": str(out_path),
+                    "parquet": out_path,
                     "rows": result["rows"],
                 })
-                # Build the image LOD sample index now, so Figure views open
-                # image files instantly (no first-open build).
-                if Path(entry["path"]).suffix.lower() in (".tif", ".tiff"):
-                    name = Path(entry["path"]).name
-                    try:
-                        def _idx_progress(f, _name=name):
-                            progress.setLabelText(
-                                f"Importing {_name}: building image index… {int(f * 100)}%"
-                            )
-                            QApplication.processEvents()
-
-                        _build_image_index_files(str(out_path), _idx_progress)
-                    except Exception:
-                        pass  # Figure will fall back to a lazy build
-            except Exception as exc:
+                progress.setValue(step + 1)
+            elif kind == "error":
+                step, err = msg[1], msg[2]
+                entry = self._import_files[self._import_jobs[step]["index"]]
                 entry["status"] = "error"
-                entry["error"] = str(exc)
+                entry["error"] = err
                 entry["imported"] = None
-            progress.setValue(step + 1)
-            QApplication.processEvents()
+                progress.setValue(step + 1)
+            elif kind == "cancelled":
+                progress.setLabelText("Import cancelled.")
+                finished = True
+            elif kind == "finished":
+                finished = True
+        if not finished:
+            return
+        self._import_finish()
 
+    def _import_finish(self) -> None:
+        """Stop the import worker and refresh the Input / Processed panels."""
+        timer = getattr(self, "_import_timer", None)
+        if timer is not None:
+            timer.stop()
+            self._import_timer = None
+        self._import_queue = None
+        self._import_thread = None
+        self._import_jobs = None
+        self._import_running = False
+        progress = getattr(self, "_import_progress", None)
+        if progress is not None:
+            progress.close()
+            self._import_progress = None
+        self.peek_btn.setEnabled(True)
+        self.import_btn.setEnabled(True)
         self._persist_import_files()
         self._refresh_import_list()
         self._refresh_processed_panel()
-        progress.close()
 
     def _on_import_selection_changed(self) -> None:
         item = self.import_list.currentItem()
@@ -7517,7 +7685,7 @@ class MainWindow(QMainWindow):
             if task.get("type") != "gating":
                 continue
             module_name = task.get("name", "Gating")
-            for gate in task.get("params", {}).get("gates", []):
+            for gate in self._gating_gates_for(task):
                 options.append((
                     f"{module_name} → {gate.get('name', gate.get('id'))}",
                     {"task_id": task.get("id"), "gate_id": gate.get("id")},
@@ -7539,7 +7707,10 @@ class MainWindow(QMainWindow):
         gating_task = self._find_task_by_id(f.get("task_id"))
         if gating_task is None:
             return None, "Filter module not found"
-        gates = gating_task.get("params", {}).get("gates", [])
+        rec = self._figure_record(plot_dict.get("file"))
+        if rec is None:
+            return None, "No data file"
+        gates = self._gating_gates_for(gating_task, rec["parquet"])
         by_id = {g["id"]: g for g in gates}
         chain = []
         cur = by_id.get(f.get("gate_id"))
@@ -7551,9 +7722,6 @@ class MainWindow(QMainWindow):
         needed = set()
         for g in chain:
             needed |= _gate_needed_columns(g, by_id)
-        rec = self._figure_record(plot_dict.get("file"))
-        if rec is None:
-            return None, "No data file"
         filter_task = f.get("task_id")
         values = self._column_data(
             filter_task, rec["parquet"], list(needed)
@@ -7860,7 +8028,7 @@ class MainWindow(QMainWindow):
         gating_task = self._find_task_by_id(f.get("task_id"))
         if gating_task is None:
             return "Filter module not found"
-        gates = gating_task.get("params", {}).get("gates", [])
+        gates = self._gating_gates_for(gating_task, parquet_path)
         by_id = {g["id"]: g for g in gates}
         chain = []
         cur = by_id.get(f.get("gate_id"))
@@ -7955,7 +8123,7 @@ class MainWindow(QMainWindow):
                 if key not in pending:
                     pending[key] = True
                     gating_task = self._find_task_by_id(f.get("task_id"))
-                    gates = copy.deepcopy(gating_task.get("params", {}).get("gates", []))
+                    gates = self._gating_gates_for(gating_task, parquet_path)
                     stages = self._map_stages(f.get("task_id"))
                     base_columns = set(
                         self._column_index.get(
@@ -10543,6 +10711,8 @@ class MainWindow(QMainWindow):
         # Batch-alignment models and their per-file cluster assignments.
         self._ba_cache = {}
         self._ba_row_cache = {}
+        # Gating gate trees (stored in the module folder).
+        self._gating_store_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
         # Saved output can lock (or unlock) modules, so refresh the lock badges
         # and button states in the workflow tree.
@@ -17646,7 +17816,7 @@ class MainWindow(QMainWindow):
         ]
         multi = len(gating_tasks) > 1
         for task in gating_tasks:
-            gates = list((task.get("params") or {}).get("gates") or [])
+            gates = self._gating_gates_for(task)
             by_id = {g["id"]: g for g in gates}
             for gate in gates:
                 chain = _gate_chain(gates, gate["id"])
@@ -18140,8 +18310,13 @@ class MainWindow(QMainWindow):
             opt = by_key.get((rule.get("gate_task"), rule.get("gate_id")))
             if opt is None:
                 raise ValueError(f"gate not found for '{rule.get('name')}'")
+            gating_task = self._find_task_by_id(opt["gate_task"])
+            gates = (
+                self._gating_gates_for(gating_task, parquet_path)
+                if gating_task is not None else opt["gates"]
+            )
             mask = self._g2c_gate_mask(
-                opt["gate_task"], opt["gates"], opt["gate_id"], parquet_path
+                opt["gate_task"], gates, opt["gate_id"], parquet_path
             )
             if mask is None:
                 mask = np.zeros(n_full, dtype="int8")
@@ -27078,6 +27253,100 @@ class MainWindow(QMainWindow):
         return target
 
     # ----- gating module (map) -----------------------------------------
+    def _gating_store_path(self, task_def) -> Path | None:
+        """Where a Gating task's gate tree lives (its own module folder)."""
+        if self.project is None or not task_def.get("id"):
+            return None
+        return self.project.path / "Module" / str(task_def.get("id")) / "gates.json"
+
+    def _gating_store_load(self, task_def) -> dict:
+        """Load ``{files, gates, per_file}`` for a Gating task (cached).
+
+        Migrates a legacy project whose gates still live in ``params.gates``:
+        the gates are written out to ``gates.json`` once and the inline copy is
+        dropped.
+        """
+        import numpy as np  # noqa: F401  (kept for parity with other loaders)
+
+        cache = getattr(self, "_gating_store_cache", None)
+        if cache is None:
+            cache = {}
+            self._gating_store_cache = cache
+        path = self._gating_store_path(task_def)
+        key = str(path) if path is not None else None
+        if key is not None and key in cache:
+            return cache[key]
+
+        store = {"files": [], "gates": [], "per_file": {}}
+        loaded = False
+        if path is not None and path.is_file():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                store["files"] = list(data.get("files") or [])
+                store["gates"] = list(data.get("gates") or [])
+                store["per_file"] = dict(data.get("per_file") or {})
+                loaded = True
+            except (OSError, ValueError, TypeError):
+                store = {"files": [], "gates": [], "per_file": {}}
+
+        # Legacy inline gates (older projects): migrate once.
+        legacy = (task_def.get("params") or {}).get("gates")
+        if not loaded and isinstance(legacy, list):
+            store["gates"] = legacy
+            store["files"] = [
+                rec.get("parquet")
+                for rec in self._available_files(task_def.get("id"))
+            ]
+            self._gating_store_save(task_def, store)
+            params = task_def.setdefault("params", {})
+            params.pop("gates", None)
+
+        if key is not None:
+            if len(cache) > 32:
+                cache.clear()
+            cache[key] = store
+        return store
+
+    def _gating_store_save(self, task_def, store) -> None:
+        """Write a Gating task's gate tree to its module folder."""
+        path = self._gating_store_path(task_def)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "files": list(store.get("files") or []),
+            "gates": list(store.get("gates") or []),
+            "per_file": dict(store.get("per_file") or {}),
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        cache = getattr(self, "_gating_store_cache", None)
+        if cache is not None:
+            cache.pop(str(path), None)
+
+    def _gating_gates_for(self, task_def, parquet_path=None) -> list:
+        """The gate list of a Gating task, resolved for `parquet_path`.
+
+        Downstream consumers (Figure, Gate2Col) use this instead of reading
+        ``params.gates``, so per-file adjustments are honoured and the gate
+        tree no longer needs to live inside ``project.json``.
+        """
+        if (task_def.get("params") or {}).get("gates") and not self._gating_store_path(task_def):
+            # A legacy task without a store yet — fall back to inline gates.
+            return list(task_def.get("params", {}).get("gates") or [])
+        store = self._gating_store_load(task_def)
+        gates = store.get("gates") or []
+        if parquet_path is not None:
+            key = str(parquet_path)
+            # Gates only apply to the files selected in the module.
+            if key not in set(store.get("files") or []):
+                return []
+            return _resolve_gates_for_file(
+                gates, store.get("per_file") or {}, key
+            )
+        return list(gates)
+
     def _build_gating_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
         """Build the Gating page: gate tree (1) | gate area (3) | settings (2)."""
         page = QWidget()
@@ -27148,7 +27417,18 @@ class MainWindow(QMainWindow):
         page._gating_preview = preview
         page._gating_task_def = task_def
         page._gating_task_id = task_def.get("id")
-        page._gating_gates = params.setdefault("gates", [])
+        # The Gating module keeps its gate tree (files, gates, per-file
+        # overrides) in the module folder; Unmix's embedded trees stay inline.
+        page._gating_uses_store = task_def.get("type") == "gating"
+        if page._gating_uses_store:
+            store = self._gating_store_load(task_def)
+            page._gating_files = list(store.get("files") or [])
+            page._gating_gates = list(store.get("gates") or [])
+            page._gating_per_file = dict(store.get("per_file") or {})
+        else:
+            page._gating_files = []
+            page._gating_gates = params.setdefault("gates", [])
+            page._gating_per_file = {}
         page._gating_rois = []
         page._gating_labels = []
         page._gating_crosshairs = {}
@@ -27175,7 +27455,83 @@ class MainWindow(QMainWindow):
         page._gating_parent_id = None
         page._gating_save_btn = None
         page._gating_dirty = False
-        page._gating_snapshot = copy.deepcopy(params)
+        page._gating_snapshot = (
+            copy.deepcopy({
+                "files": page._gating_files,
+                "gates": page._gating_gates,
+                "per_file": page._gating_per_file,
+            })
+            if page._gating_uses_store
+            else copy.deepcopy(params)
+        )
+
+    def _gating_file_records(self, page) -> list:
+        """The selected files as (parquet, display-name) records."""
+        records = self._available_files(page._gating_task_id)
+        selected = set(page._gating_files or [])
+        return [
+            rec for rec in records if rec.get("parquet") in selected
+        ]
+
+    def _gating_refresh_files(self, page) -> None:
+        """Fill the left 'Data files' list and the right File combo's scope."""
+        if not getattr(page, "_gating_uses_store", False):
+            return
+        # Drop selected files that are no longer visible (hidden/renamed).
+        visible = {
+            rec.get("parquet") for rec in self._available_files(page._gating_task_id)
+        }
+        page._gating_files = [p for p in (page._gating_files or []) if p in visible]
+        box = getattr(page, "_gating_files_box", None)
+        if box is not None:
+            box.clear()
+            for path in page._gating_files:
+                box.addItem(self._comp_file_name(path, page._gating_task_id))
+        count = getattr(page, "_gating_files_count", None)
+        if count is not None:
+            count.setText(f"{len(page._gating_files)} file(s) selected")
+        # The preview file must be one of the selected files.
+        preview = page._gating_preview
+        if preview.get("file") not in page._gating_files and page._gating_files:
+            rec = next(
+                (r for r in self._available_files(page._gating_task_id)
+                 if r.get("parquet") == page._gating_files[0]), None
+            )
+            if rec is not None:
+                cols = self._columns_for(
+                    rec.get("parquet"), page._gating_task_id
+                )
+                preview["file"] = rec.get("parquet")
+                preview["file_name"] = rec.get("name")
+                if preview.get("x") not in cols:
+                    preview["x"] = None
+                if preview.get("y") not in cols:
+                    preview["y"] = None
+
+    def _gating_select_files(self, page) -> None:
+        """Pick the files this gate tree applies to."""
+        records = self._available_files(page._gating_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [
+            self._comp_file_name(p, page._gating_task_id)
+            for p in (page._gating_files or [])
+        ]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        page._gating_files = [by_name[n] for n in chosen if n in by_name]
+        # Per-file overrides for files no longer selected are dropped.
+        drop = set(page._gating_files or [])
+        for group, overrides in list(page._gating_per_file.items()):
+            page._gating_per_file[group] = {
+                f: g for f, g in overrides.items() if f in drop
+            }
+        self._gating_refresh_files(page)
+        self._gating_rebuild_settings(page)
+        self._gating_mark_dirty(page)
 
     def _gating_build_content(self, page, locked: bool) -> QWidget:
         """Build the gate tree | scatter | plot settings pane for `page`."""
@@ -27185,11 +27541,36 @@ class MainWindow(QMainWindow):
         cl.setContentsMargins(12, 12, 12, 12)
         cl.setSpacing(12)
 
-        # Left: gate tree (placeholder for now).
+        # Left: data files (top, 1 part) + gate tree (bottom, 3 parts). The
+        # files section only exists for the Gating module; Unmix's embedded
+        # trees have no file scope.
         tree_panel = self._build_panel_frame()
         tree_lay = QVBoxLayout(tree_panel)
         tree_lay.setContentsMargins(10, 10, 10, 10)
         tree_lay.setSpacing(6)
+
+        if page._gating_uses_store:
+            tree_lay.addWidget(QLabel("<b>Data files</b>"))
+            files_btn = QPushButton("Select files…")
+            files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            files_btn.setEnabled(not locked)
+            files_btn.clicked.connect(
+                lambda _=False: self._gating_select_files(page)
+            )
+            tree_lay.addWidget(files_btn)
+            files_box = QListWidget()
+            files_box.setStyleSheet(
+                "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+            )
+            files_box.setEnabled(not locked)
+            tree_lay.addWidget(files_box, 1)
+            page._gating_files_box = files_box
+            files_count = QLabel("")
+            files_count.setStyleSheet("color: #6b7785;")
+            tree_lay.addWidget(files_count)
+            page._gating_files_count = files_count
+
+        # Gates.
         tree_lay.addWidget(QLabel("<b>Gates</b>"))
         tree = QTreeWidget()
         tree.setHeaderHidden(True)
@@ -27199,7 +27580,7 @@ class MainWindow(QMainWindow):
             "QTreeWidget { background: #ffffff; border: none; }"
             "QTreeWidget::item:selected { background: #dbeafa; }"
         )
-        tree_lay.addWidget(tree, 1)
+        tree_lay.addWidget(tree, 3 if page._gating_uses_store else 1)
         page._gating_tree = tree
         tree.itemCollapsed.connect(
             lambda item: self._gating_on_collapse(page, item)
@@ -27310,6 +27691,7 @@ class MainWindow(QMainWindow):
         tree.itemDoubleClicked.connect(lambda item, col=0: self._gating_on_tree_double_clicked(page, item, col))
         tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         tree.customContextMenuRequested.connect(lambda pos: self._gating_tree_context_menu(page, pos))
+        self._gating_refresh_files(page)
         self._gating_load_rois(page)
         self._gating_rebuild_tree(page)
         self._gating_render(page)
@@ -27347,45 +27729,95 @@ class MainWindow(QMainWindow):
         for key, btn in page._gating_tool_buttons.items():
             btn.setChecked(key == tool)
 
-    def _gating_sync_gate(self, gate: dict, roi) -> None:
+    def _gating_file_key(self, page):
+        preview = getattr(page, "_gating_preview", None)
+        return preview.get("file") if isinstance(preview, dict) else None
+
+    def _gating_sync_gate(self, gate: dict, roi):
+        """Extract the geometry dict for a rect/ellipse/polygon ROI."""
         t = gate.get("type")
         if t in ("rect", "ellipse"):
-            gate["pos"] = [roi.pos().x(), roi.pos().y()]
-            gate["size"] = [roi.size().x(), roi.size().y()]
-        elif t == "polygon":
-            # Handles are in ROI-local coords; add the ROI position for absolute.
+            return {
+                "pos": [roi.pos().x(), roi.pos().y()],
+                "size": [roi.size().x(), roi.size().y()],
+            }
+        if t == "polygon":
             ox = roi.pos().x()
             oy = roi.pos().y()
-            gate["points"] = [[p.x() + ox, p.y() + oy] for p in roi.getState()["points"]]
+            return {
+                "points": [[p.x() + ox, p.y() + oy] for p in roi.getState()["points"]]
+            }
+        return {}
+
+    def _gating_apply_geometry(self, page, gate, geometry) -> None:
+        """Store one gate's geometry: shared, or the current file's override."""
+        group = _gate_group_id(gate)
+        if getattr(page, "_gating_uses_store", False) and group in page._gating_per_file:
+            file_key = self._gating_file_key(page)
+            if file_key:
+                page._gating_per_file.setdefault(group, {})[file_key] = copy.deepcopy(geometry)
+            return
+        for key, value in geometry.items():
+            gate[key] = copy.deepcopy(value)
+
+    def _gating_apply_group_geometry(self, page, group_id, geometry) -> None:
+        """Store a grouped gate's shared geometry (quadrant/split/skewed)."""
+        if getattr(page, "_gating_uses_store", False) and group_id in page._gating_per_file:
+            file_key = self._gating_file_key(page)
+            if file_key:
+                page._gating_per_file.setdefault(group_id, {})[file_key] = copy.deepcopy(geometry)
+            return
+        for g in page._gating_gates:
+            if _gate_group_id(g) == group_id:
+                for key, value in geometry.items():
+                    g[key] = copy.deepcopy(value)
 
     def _gating_on_roi_drag(self, page, gate, roi) -> None:
-        self._gating_sync_gate(gate, roi)
+        self._gating_apply_geometry(page, gate, self._gating_sync_gate(gate, roi))
         self._gating_refresh_tree_stats(page, affected={gate["id"]})
         self._gating_update_labels(page)
         self._gating_mark_dirty(page)
 
     def _gating_quadrant_sync(self, page, crosshair_id, key, line) -> None:
-        affected = set()
-        for g in page._gating_gates:
-            if g.get("crosshair_id") == crosshair_id:
-                g[key] = line.value()
-                affected.add(g["id"])
+        entry = page._gating_crosshairs.get(crosshair_id)
+        geometry = {}
+        if entry is not None and len(entry["lines"]) == 2:
+            vline, hline = entry["lines"]
+            geometry = {"vx": vline.value(), "hy": hline.value()}
+        affected = {
+            g["id"] for g in page._gating_gates
+            if g.get("crosshair_id") == crosshair_id
+        }
+        self._gating_apply_group_geometry(page, crosshair_id, geometry)
         self._gating_refresh_tree_stats(page, affected=affected)
         self._gating_update_labels(page)
         self._gating_mark_dirty(page)
 
     def _gating_split_sync(self, page, split_id, line) -> None:
-        affected = set()
-        for g in page._gating_gates:
-            if g.get("split_id") == split_id:
-                g["vx"] = line.value()
-                affected.add(g["id"])
+        affected = {
+            g["id"] for g in page._gating_gates
+            if g.get("split_id") == split_id
+        }
+        self._gating_apply_group_geometry(page, split_id, {"vx": line.value()})
         self._gating_refresh_tree_stats(page, affected=affected)
         self._gating_update_labels(page)
         self._gating_mark_dirty(page)
 
     def _gating_range_sync(self, page, gate, key, line) -> None:
-        gate[key] = line.value()
+        # Read both range lines from the on-screen items, so the stored
+        # geometry stays self-consistent for this file.
+        idx = next(
+            (i for i, g in enumerate(page._gating_gates) if g["id"] == gate["id"]),
+            -1,
+        )
+        geometry = None
+        if 0 <= idx < len(page._gating_rois) and len(page._gating_rois[idx]) == 2:
+            items = page._gating_rois[idx]
+            geometry = {"x1": items[0].value(), "x2": items[1].value()}
+        if geometry is None:
+            geometry = _gate_geometry(gate)
+            geometry[key] = line.value()
+        self._gating_apply_geometry(page, gate, geometry)
         self._gating_refresh_tree_stats(page, affected={gate["id"]})
         self._gating_update_labels(page)
         self._gating_mark_dirty(page)
@@ -27400,14 +27832,15 @@ class MainWindow(QMainWindow):
             return
         center = pts[0]
         keys = ("p_right", "p_up", "p_left", "p_down")
-        affected = set()
-        for g in page._gating_gates:
-            if g.get("skewed_id") == skewed_id:
-                g["center"] = [center.x(), center.y()]
-                for i, key in enumerate(keys):
-                    sp = pts[i + 1]
-                    g[key] = [sp.x(), sp.y()]
-                affected.add(g["id"])
+        geometry = {"center": [center.x(), center.y()]}
+        for i, key in enumerate(keys):
+            sp = pts[i + 1]
+            geometry[key] = [sp.x(), sp.y()]
+        affected = {
+            g["id"] for g in page._gating_gates
+            if g.get("skewed_id") == skewed_id
+        }
+        self._gating_apply_group_geometry(page, skewed_id, geometry)
         self._gating_refresh_tree_stats(page, affected=affected)
         self._gating_update_labels(page)
         self._gating_mark_dirty(page)
@@ -27603,7 +28036,9 @@ class MainWindow(QMainWindow):
             "xmin": xr[0], "xmax": xr[1],
             "ymin": yr[0], "ymax": yr[1],
         }
-        self._gating_sync_gate(gate, arg)
+        geometry = self._gating_sync_gate(gate, arg)
+        for key, value in geometry.items():
+            gate[key] = copy.deepcopy(value)
         self._gating_style_handles(arg)
         arg.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         arg.setAcceptHoverEvents(True)
@@ -27867,6 +28302,9 @@ class MainWindow(QMainWindow):
         show_labels = page._gating_preview.get("show_gate_labels", True)
         visible_ids = self._gating_visible_ids(page)
         show_percent = page._gating_preview.get("label_show_percent", True)
+        resolved = _resolve_gates_for_file(
+            gates, page._gating_per_file, self._gating_file_key(page)
+        )
         for i, gate in enumerate(gates):
             label = labels[i]
             if gate.get("type") in ("not", "and", "or"):
@@ -27880,7 +28318,7 @@ class MainWindow(QMainWindow):
                 label.setText(f"{name}\n{pct:.2f}%")
             else:
                 label.setText(name)
-            px, py = _gate_label_position(gate)
+            px, py = _gate_label_position(resolved[i])
             ox, oy = gate.get("label_offset") or [0.0, 0.0]
             label.setPos(px + ox, py + oy)
             xy_ok = gate.get("x") == x and gate.get("y") == y
@@ -27893,14 +28331,18 @@ class MainWindow(QMainWindow):
         page._gating_crosshairs = {}
         page._gating_split_lines = {}
         page._gating_skewed_lines = {}
-        for gate in page._gating_gates:
+        file_key = self._gating_file_key(page)
+        resolved = _resolve_gates_for_file(
+            page._gating_gates, page._gating_per_file, file_key
+        )
+        for gate, rgate in zip(page._gating_gates, resolved):
             items = []
             t = gate.get("type")
             try:
                 if t == "rect":
                     roi = pg.RectROI(
-                        (gate["pos"][0], gate["pos"][1]),
-                        (gate["size"][0], gate["size"][1]),
+                        (rgate["pos"][0], rgate["pos"][1]),
+                        (rgate["size"][0], rgate["size"][1]),
                         **_gate_roi_pens(),
                     )
                     self._gating_style_handles(roi)
@@ -27916,8 +28358,8 @@ class MainWindow(QMainWindow):
                     items = [roi]
                 elif t == "ellipse":
                     roi = pg.EllipseROI(
-                        (gate["pos"][0], gate["pos"][1]),
-                        (gate["size"][0], gate["size"][1]),
+                        (rgate["pos"][0], rgate["pos"][1]),
+                        (rgate["size"][0], rgate["size"][1]),
                         **_gate_roi_pens(),
                     )
                     self._gating_style_handles(roi)
@@ -27933,7 +28375,7 @@ class MainWindow(QMainWindow):
                     items = [roi]
                 elif t == "polygon":
                     roi = _GatePolygonROI(
-                        [tuple(p) for p in gate["points"]],
+                        [tuple(p) for p in rgate["points"]],
                         closed=True, **_gate_roi_pens(),
                     )
                     self._gating_style_handles(roi)
@@ -27952,8 +28394,8 @@ class MainWindow(QMainWindow):
                     if cid and cid not in page._gating_crosshairs:
                         pen = pg.mkPen(_GATE_PEN, width=2)
                         hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
-                        vline = pg.InfiniteLine(pos=gate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
-                        hline = pg.InfiniteLine(pos=gate.get("hy", 0), angle=0, movable=True, pen=pen, hoverPen=hover)
+                        vline = pg.InfiniteLine(pos=rgate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
+                        hline = pg.InfiniteLine(pos=rgate.get("hy", 0), angle=0, movable=True, pen=pen, hoverPen=hover)
                         viewbox.addItem(vline)
                         viewbox.addItem(hline)
                         page._gating_crosshairs[cid] = {
@@ -27971,8 +28413,8 @@ class MainWindow(QMainWindow):
                 elif t == "range":
                     pen = pg.mkPen(_GATE_PEN, width=2)
                     hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
-                    vline1 = pg.InfiniteLine(pos=gate.get("x1", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
-                    vline2 = pg.InfiniteLine(pos=gate.get("x2", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
+                    vline1 = pg.InfiniteLine(pos=rgate.get("x1", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
+                    vline2 = pg.InfiniteLine(pos=rgate.get("x2", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
                     viewbox.addItem(vline1)
                     viewbox.addItem(vline2)
                     self._gating_setup_line(page, vline1, gate["id"])
@@ -27989,7 +28431,7 @@ class MainWindow(QMainWindow):
                     if sid and sid not in page._gating_split_lines:
                         pen = pg.mkPen(_GATE_PEN, width=2)
                         hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
-                        vline = pg.InfiniteLine(pos=gate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
+                        vline = pg.InfiniteLine(pos=rgate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
                         viewbox.addItem(vline)
                         page._gating_split_lines[sid] = {
                             "lines": [vline],
@@ -28003,13 +28445,13 @@ class MainWindow(QMainWindow):
                 elif t == "skewed_quadrant":
                     sid = gate.get("skewed_id")
                     if sid and sid not in page._gating_skewed_lines:
-                        cx, cy = gate.get("center", (0, 0))
+                        cx, cy = rgate.get("center", (0, 0))
                         roi = _SkewedQuadrantROI(
                             (cx, cy),
-                            gate.get("p_right", (cx, cy)),
-                            gate.get("p_up", (cx, cy)),
-                            gate.get("p_left", (cx, cy)),
-                            gate.get("p_down", (cx, cy)),
+                            rgate.get("p_right", (cx, cy)),
+                            rgate.get("p_up", (cx, cy)),
+                            rgate.get("p_left", (cx, cy)),
+                            rgate.get("p_down", (cx, cy)),
                             **_gate_roi_pens(),
                         )
                         self._gating_style_handles(roi)
@@ -28035,6 +28477,41 @@ class MainWindow(QMainWindow):
                 viewbox.addItem(item)
             self._gating_set_items_handles_visible(items, False)
             page._gating_rois.append(items)
+
+    def _gating_remove_rois(self, page) -> None:
+        """Remove every gate ROI/line from the ViewBox (labels are kept)."""
+        for items in page._gating_rois:
+            for item in items:
+                try:
+                    page._gating_viewbox.removeItem(item)
+                except Exception:
+                    pass
+        for entry in page._gating_crosshairs.values():
+            for line in entry["lines"]:
+                try:
+                    page._gating_viewbox.removeItem(line)
+                except Exception:
+                    pass
+        for entry in page._gating_split_lines.values():
+            for line in entry["lines"]:
+                try:
+                    page._gating_viewbox.removeItem(line)
+                except Exception:
+                    pass
+        for entry in page._gating_skewed_lines.values():
+            try:
+                page._gating_viewbox.removeItem(entry["roi"])
+            except Exception:
+                pass
+        page._gating_rois = []
+        page._gating_crosshairs = {}
+        page._gating_split_lines = {}
+        page._gating_skewed_lines = {}
+
+    def _gating_reload_rois(self, page) -> None:
+        """Recreate gate items for the current file's per-file geometry."""
+        self._gating_remove_rois(page)
+        self._gating_load_rois(page)
 
     def _gating_delete_selected(self, page) -> None:
         items = page._gating_tree.selectedItems()
@@ -28110,6 +28587,11 @@ class MainWindow(QMainWindow):
             page._gating_active_gate_id = None
         if page._gating_parent_id in to_delete:
             page._gating_parent_id = None
+        # Drop per-file overrides for gates that no longer exist.
+        used_groups = {_gate_group_id(g) for g in page._gating_gates}
+        for group in list(page._gating_per_file.keys()):
+            if group not in used_groups:
+                page._gating_per_file.pop(group, None)
         self._gating_rebuild_tree(page)
         self._gating_mark_dirty(page)
 
@@ -28146,16 +28628,19 @@ class MainWindow(QMainWindow):
 
     def _gating_compute_mask(self, page, gate_id, parquet_path):
         """Return the AND mask of a gate and all its ancestors (on transformed data)."""
-        by_id = {g["id"]: g for g in page._gating_gates}
+        gates = _resolve_gates_for_file(
+            page._gating_gates, page._gating_per_file, str(parquet_path)
+        )
+        by_id = {g["id"]: g for g in gates}
         needed = set()
-        for g in page._gating_gates:
+        for g in gates:
             needed |= _gate_needed_columns(g, by_id)
         values = self._column_data(
             page._gating_task_id, parquet_path, list(needed)
         )
         try:
             return _compute_gate_filter_mask(
-                page._gating_gates, gate_id, parquet_path, {},
+                gates, gate_id, parquet_path, {},
                 existing=set(values), extra=values,
             )
         except Exception:
@@ -28202,6 +28687,34 @@ class MainWindow(QMainWindow):
         ren_act.triggered.connect(lambda: self._gating_rename_gate(page, idx))
         menu.addAction(ren_act)
 
+        # Per-file editing (only for the Gating module, and only geometry).
+        if getattr(page, "_gating_uses_store", False):
+            gate = page._gating_gates[idx]
+            if gate.get("type") not in ("not", "and", "or"):
+                group = _gate_group_id(gate)
+                per_file_on = group in page._gating_per_file
+                menu.addSeparator()
+                perfile_act = QAction("Per-file gate", menu)
+                perfile_act.setCheckable(True)
+                perfile_act.setChecked(per_file_on)
+                perfile_act.setToolTip(
+                    "Adjust this gate's position and size separately for each "
+                    "file. Its type stays the same."
+                )
+                perfile_act.triggered.connect(
+                    lambda _=False: self._gating_toggle_per_file(page, idx)
+                )
+                menu.addAction(perfile_act)
+                unify_act = QAction("Apply one file to all…", menu)
+                unify_act.setToolTip(
+                    "Copy this gate's shape from one selected file to every "
+                    "selected file."
+                )
+                unify_act.triggered.connect(
+                    lambda _=False: self._gating_unify_gate(page, idx)
+                )
+                menu.addAction(unify_act)
+
         # Unmix extends this menu with "Set as spectrum" (and re-set).
         extra_menu = getattr(page, "_gating_spectrum_menu", None)
         if extra_menu is not None:
@@ -28237,6 +28750,55 @@ class MainWindow(QMainWindow):
         del_all.triggered.connect(lambda: self._gating_delete_gate(page, idx, cascade=True))
         menu.addAction(del_all)
         menu.exec(tree.viewport().mapToGlobal(pos))
+
+    def _gating_toggle_per_file(self, page, idx) -> None:
+        """Enable/disable per-file editing for one gate (its type never changes)."""
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        gate = page._gating_gates[idx]
+        group = _gate_group_id(gate)
+        if group in page._gating_per_file:
+            page._gating_per_file.pop(group, None)
+        else:
+            page._gating_per_file[group] = {}
+        self._gating_reload_rois(page)
+        self._gating_update_labels(page)
+        self._gating_mark_dirty(page)
+
+    def _gating_unify_gate(self, page, idx) -> None:
+        """Copy one selected file's shape for this gate to every selected file."""
+        if idx is None or idx < 0 or idx >= len(page._gating_gates):
+            return
+        gate = page._gating_gates[idx]
+        group = _gate_group_id(gate)
+        files = page._gating_files or []
+        if not files:
+            QMessageBox.information(
+                self, "Apply one file to all",
+                "Select data files first."
+            )
+            return
+        names = [self._comp_file_name(p, page._gating_task_id) for p in files]
+        chosen_name, ok = QInputDialog.getItem(
+            self, "Apply one file to all",
+            "Copy this gate's shape from:", names, 0, False,
+        )
+        if not ok:
+            return
+        file_key = files[names.index(chosen_name)]
+        resolved = _resolve_gates_for_file(
+            [gate], page._gating_per_file, file_key
+        )[0]
+        geometry = _gate_geometry(resolved)
+        for g in page._gating_gates:
+            if _gate_group_id(g) == group:
+                for key, value in geometry.items():
+                    g[key] = copy.deepcopy(value)
+        page._gating_per_file.pop(group, None)
+        self._gating_reload_rois(page)
+        self._gating_update_labels(page)
+        self._gating_mark_dirty(page)
+        self._gating_rebuild_tree(page)
 
     def _gating_apply_selection(self, page, idx) -> None:
         """Apply a selection: `idx` is a gate index, or -1 for 'All Events'."""
@@ -28417,7 +28979,11 @@ class MainWindow(QMainWindow):
         if not parquet_path or not page._gating_gates:
             page._gating_last_stats = {}
             return
-        gates = copy.deepcopy(page._gating_gates)
+        # Resolve the current file's per-file geometry, so the percentages
+        # reflect the gate shapes this file actually uses.
+        gates = _resolve_gates_for_file(
+            page._gating_gates, page._gating_per_file, str(parquet_path)
+        )
         stages = self._map_stages(page._gating_task_id)
         base_columns = set(
             self._column_index.get(self._rel_data_key(parquet_path), [])
@@ -28607,6 +29173,9 @@ class MainWindow(QMainWindow):
         plot_widget = page._gating_plot_widget
 
         records = self._available_files(page._gating_task_id)
+        if getattr(page, "_gating_uses_store", False):
+            selected = set(page._gating_files or [])
+            records = [r for r in records if r.get("parquet") in selected]
         rec = self._figure_record(preview.get("file"))
         columns = self._columns_for(
             rec.get("parquet"), page._gating_task_id
@@ -28706,27 +29275,36 @@ class MainWindow(QMainWindow):
         def on_file_changed():
             preview["file"] = file_combo.currentData()
             preview["file_name"] = file_combo.currentText()
-            page._gating_active_gate_id = None
-            page._gating_context_gate_id = None
-            page._gating_parent_id = None
-            # Keep the last-used x/y; blank them if this file lacks them.
+            # Keep the current gate hierarchy (subset / editing context) when
+            # switching files; only the axes may need to follow the new file.
             new_rec = self._figure_record(preview["file"])
             new_cols = self._columns_for(
                 new_rec.get("parquet"), page._gating_task_id
             ) if new_rec else []
-            preview["x"] = (
-                preview.get("last_x") if preview.get("last_x") in new_cols else None
-            )
-            preview["y"] = (
-                preview.get("last_y") if preview.get("last_y") in new_cols else None
-            )
+            gate_id = page._gating_active_gate_id or page._gating_context_gate_id
+            gate = next(
+                (g for g in page._gating_gates if g["id"] == gate_id), None
+            ) if gate_id else None
+            if gate is not None and gate.get("x") and gate.get("y"):
+                preview["x"] = gate["x"]
+                preview["y"] = gate["y"]
+            else:
+                preview["x"] = (
+                    preview.get("last_x") if preview.get("last_x") in new_cols else None
+                )
+                preview["y"] = (
+                    preview.get("last_y") if preview.get("last_y") in new_cols else None
+                )
             # Keep the visible range when switching files.
             vb = page._gating_viewbox
             xr, yr = vb.viewRange()
+            self._gating_reload_rois(page)
             self._gating_render(page)
             vb.setXRange(xr[0], xr[1], padding=0)
             vb.setYRange(yr[0], yr[1], padding=0)
-            self._gating_refresh_tree_stats(page)
+            # Clear the previous file's statistics and recompute for this one.
+            page._gating_last_stats = {}
+            self._gating_rebuild_tree(page)
             self._gating_mark_dirty(page)
             self._gating_rebuild_settings(page)
         file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
@@ -28761,11 +29339,26 @@ class MainWindow(QMainWindow):
 
     def _gating_save_now(self, page) -> None:
         params = page._gating_task_def.setdefault("params", {})
-        params["gates"] = page._gating_gates
         params["preview"] = page._gating_preview
+        if page._gating_uses_store:
+            self._gating_store_save(page._gating_task_def, {
+                "files": page._gating_files,
+                "gates": page._gating_gates,
+                "per_file": page._gating_per_file,
+            })
+        else:
+            params["gates"] = page._gating_gates
         if self.project is not None:
             self.project.save()
-        page._gating_snapshot = copy.deepcopy(page._gating_task_def.get("params", {}))
+        page._gating_snapshot = (
+            copy.deepcopy({
+                "files": page._gating_files,
+                "gates": page._gating_gates,
+                "per_file": page._gating_per_file,
+            })
+            if page._gating_uses_store
+            else copy.deepcopy(page._gating_task_def.get("params", {}))
+        )
         page._gating_dirty = False
         self._gating_update_save_btn(page)
         self.statusBar().showMessage("Gating saved")
@@ -28835,7 +29428,18 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            page._gating_task_def["params"] = page._gating_snapshot
+            if page._gating_uses_store:
+                page._gating_files = list(
+                    (page._gating_snapshot or {}).get("files") or []
+                )
+                page._gating_gates = list(
+                    (page._gating_snapshot or {}).get("gates") or []
+                )
+                page._gating_per_file = dict(
+                    (page._gating_snapshot or {}).get("per_file") or {}
+                )
+            else:
+                page._gating_task_def["params"] = page._gating_snapshot
         self._gating_cleanup(page)
         self._close_module_page(page)
 
