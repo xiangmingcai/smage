@@ -1300,6 +1300,24 @@ _GATE_GEOMETRY_KEYS = {
     "skewed_quadrant": ("center", "p_right", "p_up", "p_left", "p_down"),
 }
 
+# Display state captured on a gate when it is drawn, so clicking the gate later
+# restores the plot type, colour mode and colour parameters it was drawn with.
+_GATING_DISPLAY_KEYS = (
+    "color_mode", "color_param", "palette", "solid_color",
+    "point_size", "fixed_point_size",
+    "image_channel",
+    "bins", "hist_mode", "hist_color", "curve_color",
+)
+
+
+def _gating_display_snapshot(preview):
+    """Capture the display state (plot colouring) currently shown in the preview."""
+    return {
+        key: copy.deepcopy(preview.get(key))
+        for key in _GATING_DISPLAY_KEYS
+        if preview.get(key) is not None
+    }
+
 
 def _gate_group_id(gate):
     """The id whose geometry is shared across a group of gates.
@@ -1375,10 +1393,10 @@ def _gate_own_mask(gate, by_id, get_col, transforms, existing):
         if src is None:
             return None
         sx, sy = src.get("x"), src.get("y")
-        if not sx or not sy or sx not in existing or sy not in existing:
+        if not sx or sx not in existing or (sy and sy not in existing):
             return None
         x = _apply_scale_transforms(get_col(sx), transforms.get(sx))
-        y = _apply_scale_transforms(get_col(sy), transforms.get(sy))
+        y = _apply_scale_transforms(get_col(sy), transforms.get(sy)) if sy else None
         return ~_gate_mask(x, y, src)
     if gate.get("type") in ("and", "or"):
         combine_and = gate.get("type") == "and"
@@ -1388,10 +1406,10 @@ def _gate_own_mask(gate, by_id, get_col, transforms, existing):
             if src is None:
                 continue
             sx, sy = src.get("x"), src.get("y")
-            if not sx or not sy or sx not in existing or sy not in existing:
+            if not sx or sx not in existing or (sy and sy not in existing):
                 continue
             x = _apply_scale_transforms(get_col(sx), transforms.get(sx))
-            y = _apply_scale_transforms(get_col(sy), transforms.get(sy))
+            y = _apply_scale_transforms(get_col(sy), transforms.get(sy)) if sy else None
             sm = _gate_mask(x, y, src)
             if result is None:
                 result = sm
@@ -1401,10 +1419,10 @@ def _gate_own_mask(gate, by_id, get_col, transforms, existing):
                 result = result | sm
         return result
     x_name, y_name = gate.get("x"), gate.get("y")
-    if not x_name or not y_name or x_name not in existing or y_name not in existing:
+    if not x_name or x_name not in existing or (y_name and y_name not in existing):
         return None
     x = _apply_scale_transforms(get_col(x_name), transforms.get(x_name))
-    y = _apply_scale_transforms(get_col(y_name), transforms.get(y_name))
+    y = _apply_scale_transforms(get_col(y_name), transforms.get(y_name)) if y_name else None
     return _gate_mask(x, y, gate)
 
 
@@ -8050,8 +8068,13 @@ class MainWindow(QMainWindow):
 
     def _figure_render_image(self, plot_dict: dict, plot_widget,
                              column_transforms=None, task_id=None,
-                             extra_stages=None) -> None:
-        """Render an Image plot as a raster (LOD pyramid), ImageJ-style."""
+                             extra_stages=None, row_mask=None) -> None:
+        """Render an Image plot as a raster (LOD pyramid), ImageJ-style.
+
+        `row_mask` is an optional boolean/uint8 array aligned to the image's
+        pixel rows; pixels it marks False are hidden (used by Gating's subset
+        view to show only the points inside the active gate).
+        """
         import numpy as np
         self._figure_update_image_legend(plot_widget, [])
         rec = self._figure_record(plot_dict.get("file"))
@@ -8106,10 +8129,19 @@ class MainWindow(QMainWindow):
         hpx = max(1, plot_widget.height())
         spacing = max(1e-12, min((x1 - x0) / wpx, (y1 - y0) / hpx))
 
-        # Resolve the filter mask (computed in a background worker, cached).
+        # Resolve the subset/filter mask (computed in a background worker, cached).
         mask_ent = None
+        if row_mask is not None:
+            # Gating subset view: hide pixels the active gate excludes.
+            height = int(round(manifest["ymax"] - manifest["ymin"] + 1))
+            width = int(round(manifest["xmax"] - manifest["xmin"] + 1))
+            m = np.asarray(row_mask, dtype=np.uint8)
+            if m.size == height * width:
+                mask_2d = m.reshape(int(height), int(width))
+                blocks = [info["block"] for info in manifest.get("levels", [])]
+                mask_ent = {"mask_2d": mask_2d, "levels": _pool_mask(mask_2d, blocks)}
         f = plot_dict.get("filter")
-        if f:
+        if mask_ent is None and f:
             sig = (f.get("task_id"), f.get("gate_id"))
             key = (parquet_path, sig)
             cache = getattr(self, "_image_filter_cache", {})
@@ -8453,6 +8485,10 @@ class MainWindow(QMainWindow):
         import pandas as pd
 
         plot_widget.clear()
+        # A scatter render removes any cached image item; invalidate the image
+        # state so the next image render re-adds it.
+        plot_widget._img_fitted = False
+        plot_widget._img_path = None
         rec = self._figure_record(plot_dict.get("file"))
         x_name = plot_dict.get("x")
         y_name = plot_dict.get("y")
@@ -8581,6 +8617,9 @@ class MainWindow(QMainWindow):
         import pyqtgraph as pg
 
         plot_widget.clear()
+        # Same as scatter: invalidate any cached image item.
+        plot_widget._img_fitted = False
+        plot_widget._img_path = None
         rec = self._figure_record(plot_dict.get("file"))
         x_name = plot_dict.get("x")
         if not rec:
@@ -27414,6 +27453,7 @@ class MainWindow(QMainWindow):
             # Backfill last-used axis parameters for older projects.
             preview.setdefault("last_x", preview.get("x"))
             preview.setdefault("last_y", preview.get("y"))
+            preview.setdefault("type", "scatter")
         page._gating_preview = preview
         page._gating_task_def = task_def
         page._gating_task_id = task_def.get("id")
@@ -27663,6 +27703,7 @@ class MainWindow(QMainWindow):
         page._gating_overlay_box = overlay_box
         page._gating_tool = None
         page._gating_tool_buttons = tool_buttons
+        self._gating_update_tools(page)
 
         # Right: scatter settings.
         settings_panel = self._build_panel_frame()
@@ -27728,6 +27769,92 @@ class MainWindow(QMainWindow):
         page._gating_viewbox.set_gate_tool(tool)
         for key, btn in page._gating_tool_buttons.items():
             btn.setChecked(key == tool)
+
+    def _gating_update_tools(self, page) -> None:
+        """Enable only the gate tools that make sense for the current plot type."""
+        ptype = page._gating_preview.get("type", "scatter")
+        allowed = {
+            "scatter": ("rect", "ellipse", "polygon", "quadrant",
+                        "skewed_quadrant", "split", "range"),
+            "image": ("rect", "ellipse", "polygon"),
+            "histogram": ("range", "split"),
+        }.get(ptype, ())
+        for key, btn in page._gating_tool_buttons.items():
+            btn.setEnabled(key in allowed and not page._gating_locked)
+        if page._gating_tool not in allowed:
+            self._gating_set_tool(page, None)
+
+    def _gating_set_plot_type(self, page, ptype) -> None:
+        """Switch the gating view between scatter / image / histogram.
+
+        The current gate hierarchy is kept: when the user has double-clicked
+        into a gate, the new view still shows only the points inside that gate.
+        """
+        preview = page._gating_preview
+        if preview.get("type") == ptype:
+            return
+        preview["type"] = ptype
+        rec = self._figure_record(preview.get("file"))
+        cols = self._columns_for(
+            rec.get("parquet"), page._gating_task_id
+        ) if rec else []
+        gate_id = page._gating_active_gate_id or page._gating_context_gate_id
+        gate = next(
+            (g for g in page._gating_gates if g["id"] == gate_id), None
+        ) if gate_id else None
+
+        if ptype == "image":
+            preview["last_x"] = preview.get("last_x") or preview.get("x")
+            preview["last_y"] = preview.get("last_y") or preview.get("y")
+            preview["x"] = "x" if "x" in cols else None
+            preview["y"] = "y" if "y" in cols else None
+        elif ptype == "histogram":
+            preview["last_x"] = preview.get("last_x") or preview.get("x")
+            x = gate.get("x") if gate is not None and gate.get("x") else preview.get("last_x")
+            preview["x"] = x if x in cols else (cols[0] if cols else None)
+            preview["y"] = None
+        else:
+            if gate is not None and gate.get("x") and gate.get("y"):
+                preview["x"] = gate["x"]
+                preview["y"] = gate["y"]
+            else:
+                preview["x"] = (
+                    preview.get("last_x") if preview.get("last_x") in cols
+                    else (cols[0] if cols else None)
+                )
+                preview["y"] = (
+                    preview.get("last_y") if preview.get("last_y") in cols
+                    else (cols[1] if len(cols) > 1 else (cols[0] if cols else None))
+                )
+        self._gating_update_tools(page)
+        self._gating_reload_rois(page)
+        self._gating_render(page)
+        self._gating_rebuild_settings(page)
+        self._gating_mark_dirty(page)
+
+    def _gating_restore_gate_display(self, page, gate) -> None:
+        """Restore the plot type, axes, range and colour state a gate was drawn in."""
+        preview = page._gating_preview
+        plot_type_changed = False
+        ptype = gate.get("plot_type")
+        if ptype in ("scatter", "image", "histogram") and preview.get("type") != ptype:
+            preview["type"] = ptype
+            plot_type_changed = True
+        # Boolean gates (and/or) carry no axes of their own; leave the current
+        # ones. Histogram gates store y=None on purpose, so an `in` check keeps
+        # that working while skipping gates that never define a y axis.
+        if "x" in gate:
+            preview["x"] = gate.get("x")
+        if "y" in gate:
+            preview["y"] = gate.get("y")
+        for key in ("xmin", "xmax", "ymin", "ymax"):
+            if gate.get(key) is not None:
+                preview[key] = gate[key]
+        for key, value in (gate.get("display") or {}).items():
+            preview[key] = copy.deepcopy(value)
+        if plot_type_changed:
+            self._gating_update_tools(page)
+            self._gating_reload_rois(page)
 
     def _gating_file_key(self, page):
         preview = getattr(page, "_gating_preview", None)
@@ -27879,6 +28006,8 @@ class MainWindow(QMainWindow):
                     "x": preview.get("x"),
                     "y": preview.get("y"),
                     "parent": page._gating_parent_id,
+                    "plot_type": preview.get("type", "scatter"),
+                    "display": _gating_display_snapshot(preview),
                     "xmin": xr[0], "xmax": xr[1],
                     "ymin": yr[0], "ymax": yr[1],
                 }
@@ -27908,6 +28037,8 @@ class MainWindow(QMainWindow):
                 "x1": x1,
                 "x2": x2,
                 "parent": page._gating_parent_id,
+                "plot_type": preview.get("type", "scatter"),
+                "display": _gating_display_snapshot(preview),
                 "xmin": xr[0], "xmax": xr[1],
                 "ymin": yr[0], "ymax": yr[1],
             }
@@ -27958,6 +28089,8 @@ class MainWindow(QMainWindow):
                     "x": preview.get("x"),
                     "y": preview.get("y"),
                     "parent": page._gating_parent_id,
+                    "plot_type": preview.get("type", "scatter"),
+                    "display": _gating_display_snapshot(preview),
                     "xmin": xr[0], "xmax": xr[1],
                     "ymin": yr[0], "ymax": yr[1],
                 }
@@ -28005,6 +28138,8 @@ class MainWindow(QMainWindow):
                     "x": preview.get("x"),
                     "y": preview.get("y"),
                     "parent": page._gating_parent_id,
+                    "plot_type": preview.get("type", "scatter"),
+                    "display": _gating_display_snapshot(preview),
                     "xmin": xr[0], "xmax": xr[1],
                     "ymin": yr[0], "ymax": yr[1],
                 }
@@ -28033,6 +28168,8 @@ class MainWindow(QMainWindow):
             "x": preview.get("x"),
             "y": preview.get("y"),
             "parent": page._gating_parent_id,
+            "plot_type": preview.get("type", "scatter"),
+            "display": _gating_display_snapshot(preview),
             "xmin": xr[0], "xmax": xr[1],
             "ymin": yr[0], "ymax": yr[1],
         }
@@ -28142,10 +28279,7 @@ class MainWindow(QMainWindow):
             page._gating_active_gate_id = gate["id"]
             page._gating_context_gate_id = None
             page._gating_parent_id = gate["id"]
-            if gate.get("x"):
-                preview["x"] = gate["x"]
-            if gate.get("y"):
-                preview["y"] = gate["y"]
+            self._gating_restore_gate_display(page, gate)
         self._gating_render(page)
         self._gating_rebuild_settings(page)
         tree = page._gating_tree
@@ -28299,6 +28433,7 @@ class MainWindow(QMainWindow):
                 pass
         x = page._gating_preview.get("x")
         y = page._gating_preview.get("y")
+        plot_type = page._gating_preview.get("type", "scatter")
         show_labels = page._gating_preview.get("show_gate_labels", True)
         visible_ids = self._gating_visible_ids(page)
         show_percent = page._gating_preview.get("label_show_percent", True)
@@ -28323,7 +28458,8 @@ class MainWindow(QMainWindow):
             label.setPos(px + ox, py + oy)
             xy_ok = gate.get("x") == x and gate.get("y") == y
             hier_ok = gate.get("id") in visible_ids
-            label.setVisible(show_labels and xy_ok and hier_ok)
+            type_ok = gate.get("plot_type", "scatter") == plot_type
+            label.setVisible(show_labels and xy_ok and hier_ok and type_ok)
 
     def _gating_load_rois(self, page) -> None:
         viewbox = page._gating_viewbox
@@ -28335,8 +28471,12 @@ class MainWindow(QMainWindow):
         resolved = _resolve_gates_for_file(
             page._gating_gates, page._gating_per_file, file_key
         )
+        plot_type = page._gating_preview.get("type", "scatter")
         for gate, rgate in zip(page._gating_gates, resolved):
             items = []
+            if gate.get("plot_type", "scatter") != plot_type:
+                page._gating_rois.append(items)
+                continue
             t = gate.get("type")
             try:
                 if t == "rect":
@@ -28667,10 +28807,7 @@ class MainWindow(QMainWindow):
             page._gating_context_gate_id = None
             # New gates drawn inside this subset become children of this gate.
             page._gating_parent_id = gate["id"]
-            if gate.get("x"):
-                preview["x"] = gate["x"]
-            if gate.get("y"):
-                preview["y"] = gate["y"]
+            self._gating_restore_gate_display(page, gate)
         self._gating_render(page)
         self._gating_rebuild_settings(page)
 
@@ -28808,14 +28945,7 @@ class MainWindow(QMainWindow):
             gate = page._gating_gates[idx]
             page._gating_context_gate_id = gate["id"]
             page._gating_parent_id = gate.get("parent")
-            if gate.get("x"):
-                preview["x"] = gate["x"]
-            if gate.get("y"):
-                preview["y"] = gate["y"]
-            preview["xmin"] = gate.get("xmin")
-            preview["xmax"] = gate.get("xmax")
-            preview["ymin"] = gate.get("ymin")
-            preview["ymax"] = gate.get("ymax")
+            self._gating_restore_gate_display(page, gate)
         else:
             page._gating_context_gate_id = None
             page._gating_parent_id = None
@@ -29110,23 +29240,41 @@ class MainWindow(QMainWindow):
         self._gating_refresh_tree_stats(page)
 
     def _gating_render(self, page) -> None:
-        """Render the gating scatter for the current view mode."""
-        transforms = {}
+        """Render the gating plot for the current view mode (scatter/image/histogram)."""
         rec = self._figure_record(page._gating_preview.get("file"))
         preview = page._gating_preview
+        plot_widget = page._gating_plot_widget
+        viewbox = page._gating_viewbox
+        plot_type = preview.get("type", "scatter")
 
-        # Show a gray overlay when the current file lacks x/y parameters.
+        # Undo image-view locks (aspect / auto-range) when leaving image mode.
+        if plot_type != "image":
+            viewbox.setAspectLocked(False)
+
         cols = self._columns_for(
             rec.get("parquet"), page._gating_task_id
         ) if rec else []
-        missing = [
-            str(n) for n in (preview.get("x"), preview.get("y"))
-            if n and n not in cols
-        ]
-        if missing:
-            page._gating_overlay_box.setText(
-                "Parameter not in this file:\n" + ", ".join(missing)
-            )
+
+        # Show a gray overlay when this plot type cannot display the file.
+        overlay_text = None
+        if rec is None:
+            overlay_text = "No data file"
+        elif plot_type == "image":
+            ent = self._ensure_image_index(rec.get("parquet"))
+            if ent is None or ent.get("manifest") is None:
+                overlay_text = (
+                    "This file is not an image.\n"
+                    "Image view needs an imported image (TIFF)."
+                )
+        else:
+            axes = [preview.get("x")] if plot_type == "histogram" else [
+                preview.get("x"), preview.get("y")
+            ]
+            missing = [str(n) for n in axes if n and n not in cols]
+            if missing:
+                overlay_text = "Parameter not in this file:\n" + ", ".join(missing)
+        if overlay_text:
+            page._gating_overlay_box.setText(overlay_text)
             page._gating_overlay.show()
         else:
             page._gating_overlay.hide()
@@ -29135,26 +29283,46 @@ class MainWindow(QMainWindow):
         active = page._gating_active_gate_id
         context = page._gating_context_gate_id
         if active:
-            # Subset view: show only the double-clicked gate's points.
             if rec:
                 mask = self._gating_compute_mask(page, active, rec["parquet"])
         elif context:
-            # Editing context: show the parent's points (not the gate's own).
             if rec:
                 mask = self._gating_context_mask(page, context, rec["parquet"])
         # Preserve the current view range for the subset view (don't auto-fit).
         preserved = None
-        if active:
-            preserved = page._gating_viewbox.viewRange()
-        self._figure_render_scatter(
-            page._gating_preview, page._gating_plot_widget,
-            column_transforms=transforms, mask=mask,
-            task_id=page._gating_task_id,
-        )
+        if active and plot_type != "image":
+            preserved = viewbox.viewRange()
+
+        if plot_type == "image":
+            plot_dict = dict(preview)
+            channel = preview.get("image_channel")
+            available = [c for c in cols if c not in ("x", "y")]
+            if not channel or channel not in available:
+                channel = available[0] if available else None
+            if channel:
+                preview["image_channel"] = channel
+                plot_dict["image_channel"] = channel
+                plot_dict["layers"] = [{
+                    "parameter": channel,
+                    "color": (255, 255, 255),
+                    "name": str(channel),
+                }]
+            self._figure_render_image(
+                plot_dict, plot_widget, task_id=page._gating_task_id,
+                row_mask=mask,
+            )
+        elif plot_type == "histogram":
+            self._figure_render_histogram(
+                preview, plot_widget, mask=mask, task_id=page._gating_task_id
+            )
+        else:
+            self._figure_render_scatter(
+                preview, plot_widget, mask=mask, task_id=page._gating_task_id
+            )
         if preserved is not None:
             xr, yr = preserved
-            page._gating_viewbox.setXRange(xr[0], xr[1], padding=0)
-            page._gating_viewbox.setYRange(yr[0], yr[1], padding=0)
+            viewbox.setXRange(xr[0], xr[1], padding=0)
+            viewbox.setYRange(yr[0], yr[1], padding=0)
         self._gating_update_roi_visibility(page)
 
     def _gating_param_combo(self, columns, current, enabled):
@@ -29192,33 +29360,56 @@ class MainWindow(QMainWindow):
         file_combo.setEnabled(enabled)
         layout.addWidget(self._file_nav_row(file_combo, enabled))
 
-        layout.addWidget(QLabel("X parameter"))
-        x_combo = self._gating_param_combo(columns, preview.get("x"), enabled)
-        layout.addWidget(x_combo)
+        layout.addWidget(QLabel("Plot type"))
+        type_combo = _NoWheelComboBox()
+        type_combo.addItem("Scatter", "scatter")
+        type_combo.addItem("Image", "image")
+        type_combo.addItem("Histogram", "histogram")
+        idx = type_combo.findData(preview.get("type", "scatter"))
+        type_combo.setCurrentIndex(max(0, idx))
+        type_combo.setEnabled(enabled)
+        layout.addWidget(type_combo)
 
-        layout.addWidget(QLabel("Y parameter"))
-        y_combo = self._gating_param_combo(columns, preview.get("y"), enabled)
-        layout.addWidget(y_combo)
+        plot_type = preview.get("type", "scatter")
+        x_combo = y_combo = channel_combo = None
+        if plot_type == "image":
+            layout.addWidget(QLabel("Channel"))
+            channels = [c for c in columns if c not in ("x", "y")]
+            channel_combo = self._gating_param_combo(
+                channels, preview.get("image_channel"), enabled
+            )
+            layout.addWidget(channel_combo)
+        else:
+            layout.addWidget(QLabel("X parameter"))
+            x_combo = self._gating_param_combo(columns, preview.get("x"), enabled)
+            layout.addWidget(x_combo)
+            if plot_type == "scatter":
+                layout.addWidget(QLabel("Y parameter"))
+                y_combo = self._gating_param_combo(columns, preview.get("y"), enabled)
+                layout.addWidget(y_combo)
 
-        self._figure_scatter_color_settings(
-            layout, preview, plot_widget, columns, enabled,
-            on_change=lambda: self._gating_on_preview_change(page),
-            on_rebuild=lambda: (
-                self._gating_rebuild_settings(page),
-                self._gating_on_preview_change(page),
-            ),
-        )
+        if plot_type == "scatter":
+            self._figure_scatter_color_settings(
+                layout, preview, plot_widget, columns, enabled,
+                on_change=lambda: self._gating_on_preview_change(page),
+                on_rebuild=lambda: (
+                    self._gating_rebuild_settings(page),
+                    self._gating_on_preview_change(page),
+                ),
+            )
 
-        layout.addWidget(QLabel("X range"))
-        layout.addWidget(self._figure_range_row(
-            preview, "x", plot_widget, enabled,
-            on_commit=lambda: self._gating_mark_dirty(page),
-        ))
-        layout.addWidget(QLabel("Y range"))
-        layout.addWidget(self._figure_range_row(
-            preview, "y", plot_widget, enabled,
-            on_commit=lambda: self._gating_mark_dirty(page),
-        ))
+        if plot_type != "image":
+            layout.addWidget(QLabel("X range"))
+            layout.addWidget(self._figure_range_row(
+                preview, "x", plot_widget, enabled,
+                on_commit=lambda: self._gating_mark_dirty(page),
+            ))
+        if plot_type == "scatter":
+            layout.addWidget(QLabel("Y range"))
+            layout.addWidget(self._figure_range_row(
+                preview, "y", plot_widget, enabled,
+                on_commit=lambda: self._gating_mark_dirty(page),
+            ))
 
         self._figure_display_toggles(
             layout, preview, enabled,
@@ -29285,23 +29476,39 @@ class MainWindow(QMainWindow):
             gate = next(
                 (g for g in page._gating_gates if g["id"] == gate_id), None
             ) if gate_id else None
-            if gate is not None and gate.get("x") and gate.get("y"):
-                preview["x"] = gate["x"]
-                preview["y"] = gate["y"]
+            plot_type = preview.get("type", "scatter")
+            if plot_type == "image":
+                preview["x"] = "x" if "x" in new_cols else None
+                preview["y"] = "y" if "y" in new_cols else None
+            elif plot_type == "histogram":
+                if gate is not None and gate.get("x"):
+                    preview["x"] = gate["x"]
+                else:
+                    preview["x"] = (
+                        preview.get("last_x") if preview.get("last_x") in new_cols
+                        else (new_cols[0] if new_cols else None)
+                    )
+                preview["y"] = None
             else:
-                preview["x"] = (
-                    preview.get("last_x") if preview.get("last_x") in new_cols else None
-                )
-                preview["y"] = (
-                    preview.get("last_y") if preview.get("last_y") in new_cols else None
-                )
-            # Keep the visible range when switching files.
+                if gate is not None and gate.get("x") and gate.get("y"):
+                    preview["x"] = gate["x"]
+                    preview["y"] = gate["y"]
+                else:
+                    preview["x"] = (
+                        preview.get("last_x") if preview.get("last_x") in new_cols else None
+                    )
+                    preview["y"] = (
+                        preview.get("last_y") if preview.get("last_y") in new_cols else None
+                    )
+            # Keep the visible range when switching files (not for image view,
+            # which uses the image's own extent).
             vb = page._gating_viewbox
             xr, yr = vb.viewRange()
             self._gating_reload_rois(page)
             self._gating_render(page)
-            vb.setXRange(xr[0], xr[1], padding=0)
-            vb.setYRange(yr[0], yr[1], padding=0)
+            if plot_type != "image":
+                vb.setXRange(xr[0], xr[1], padding=0)
+                vb.setYRange(yr[0], yr[1], padding=0)
             # Clear the previous file's statistics and recompute for this one.
             page._gating_last_stats = {}
             self._gating_rebuild_tree(page)
@@ -29323,8 +29530,24 @@ class MainWindow(QMainWindow):
                 self._gating_render(page)
                 self._gating_mark_dirty(page)
             return handler
-        x_combo.currentTextChanged.connect(on_param("x"))
-        y_combo.currentTextChanged.connect(on_param("y"))
+        if x_combo is not None:
+            x_combo.currentTextChanged.connect(on_param("x"))
+        if y_combo is not None:
+            y_combo.currentTextChanged.connect(on_param("y"))
+        if channel_combo is not None:
+            channel_combo.currentTextChanged.connect(
+                lambda _=0: on_channel()
+            )
+
+        def on_channel():
+            preview["image_channel"] = channel_combo.currentData() or None
+            self._gating_render(page)
+            self._gating_mark_dirty(page)
+
+        def on_plot_type_changed():
+            self._gating_set_plot_type(page, type_combo.currentData() or "scatter")
+
+        type_combo.currentIndexChanged.connect(lambda _=0: on_plot_type_changed())
 
     def _gating_on_preview_change(self, page) -> None:
         """Re-render and mark dirty after a scatter setting change."""
