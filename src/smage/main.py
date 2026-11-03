@@ -4229,6 +4229,23 @@ def _format_number(value) -> str:
     return f"{value:.10g}"
 
 
+def _format_level(value) -> str:
+    """Image channel Min/Max: one decimal is all the precision needed."""
+    if value is None:
+        return ""
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _round_level(value):
+    try:
+        return round(float(value), 1)
+    except (TypeError, ValueError):
+        return None
+
+
 class _SelectAllFilter(QObject):
     """Select all text after a mouse click into the line edit."""
 
@@ -4439,7 +4456,9 @@ MODULE_KINDS = {
     "rename": "map",
     "compensation": "map",
     "illumination": "map",
-    "unmix": "map",
+    # Unmix can now generate image pyramids ("Unmix for image"), which locks
+    # its upstream modules; the parameter-only behaviour still works.
+    "unmix": "generate",
     "segmentation": "generate",
     "figure": "visualize",
     "feature": "generate",
@@ -9853,6 +9872,15 @@ class MainWindow(QMainWindow):
         cluster_cols = self._cluster_applied_columns(task_id, parquet_path) if task_id else {}
         # Data Clean 0/1 columns likewise come from their own image parquet.
         dc_cols = self._dc_applied_columns(task_id, parquet_path) if task_id else {}
+        # Precomputed unmixed channels from "Unmix for image" (usable ones and
+        # names whose saved pyramid is stale/missing).
+        if task_id:
+            unmix_cols, unmix_stale = self._unmix_image_outputs(task_id, parquet_path)
+        else:
+            unmix_cols, unmix_stale = {}, set()
+        # Channels whose stored pyramid cannot be read: reported as such
+        # instead of "parameter not in this file".
+        missing_pyramid = []
         for layer in layers:
             if layer.get("visible") is False:
                 continue
@@ -9877,7 +9905,10 @@ class MainWindow(QMainWindow):
                 rec = g2c_cols[channel]
                 chan, rect = self._g2c_raster(rec, (x0, x1, y0, y1), spacing)
                 if chan is None:
-                    unavailable.append(channel)
+                    if not self._stored_pyramid_ok(rec):
+                        missing_pyramid.append(channel)
+                    else:
+                        unavailable.append(channel)
                     continue
                 lo = 0.0
                 hi = float(chan.max()) if chan.size else 1.0
@@ -9890,7 +9921,10 @@ class MainWindow(QMainWindow):
                 rec = fup_cols[channel]
                 chan, rect = self._feature_up_raster(rec, (x0, x1, y0, y1), spacing)
                 if chan is None:
-                    unavailable.append(channel)
+                    if not self._stored_pyramid_ok(rec):
+                        missing_pyramid.append(channel)
+                    else:
+                        unavailable.append(channel)
                     continue
                 lo = float(np.nanmin(chan)) if chan.size else 0.0
                 hi = float(np.nanmax(chan)) if chan.size else 1.0
@@ -9903,7 +9937,10 @@ class MainWindow(QMainWindow):
                 rec = dimred_cols[channel]
                 chan, rect = self._dimred_raster(rec, (x0, x1, y0, y1), spacing)
                 if chan is None:
-                    unavailable.append(channel)
+                    if not self._stored_pyramid_ok(rec):
+                        missing_pyramid.append(channel)
+                    else:
+                        unavailable.append(channel)
                     continue
                 lo = float(np.nanmin(chan)) if chan.size else 0.0
                 hi = float(np.nanmax(chan)) if chan.size else 1.0
@@ -9916,7 +9953,10 @@ class MainWindow(QMainWindow):
                 rec = cluster_cols[channel]
                 chan, rect = self._cluster_raster(rec, (x0, x1, y0, y1), spacing)
                 if chan is None:
-                    unavailable.append(channel)
+                    if not self._stored_pyramid_ok(rec):
+                        missing_pyramid.append(channel)
+                    else:
+                        unavailable.append(channel)
                     continue
                 lo = float(np.nanmin(chan)) if chan.size else 0.0
                 hi = float(np.nanmax(chan)) if chan.size else 1.0
@@ -9929,13 +9969,36 @@ class MainWindow(QMainWindow):
                 rec = dc_cols[channel]
                 chan, rect = self._dc_raster(rec, (x0, x1, y0, y1), spacing)
                 if chan is None:
-                    unavailable.append(channel)
+                    if not self._stored_pyramid_ok(rec):
+                        missing_pyramid.append(channel)
+                    else:
+                        unavailable.append(channel)
                     continue
                 lo = 0.0
                 hi = 1.0
                 frac = None
                 raster_stages = None
                 cname = None
+            elif channel in unmix_cols:
+                rec = unmix_cols[channel]
+                chan, rect = self._unmix_raster(rec, (x0, x1, y0, y1), spacing)
+                if chan is None:
+                    if not self._stored_pyramid_ok(rec):
+                        missing_pyramid.append(channel)
+                    else:
+                        unavailable.append(channel)
+                    continue
+                lo = float(np.nanmin(chan)) if chan.size else 0.0
+                hi = float(np.nanmax(chan)) if chan.size else 1.0
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    lo, hi = 0.0, 1.0
+                frac = None
+                raster_stages = None
+                cname = None
+            elif channel in unmix_stale:
+                # The saved pyramid no longer matches the current matrix.
+                missing_pyramid.append(channel)
+                continue
             else:
                 # A column renamed by an upstream Rename module is reachable
                 # under its new name only.
@@ -10021,7 +10084,14 @@ class MainWindow(QMainWindow):
         if not rasters or ref_shape is None:
             img.setVisible(False)
             self._figure_update_image_legend(plot_widget, [])
-            if unavailable:
+            if missing_pyramid:
+                plot_widget.setTitle(
+                    "Image pyramid not found for: "
+                    + ", ".join(missing_pyramid)
+                    + " — please check",
+                    color="#c0392b", size="10pt",
+                )
+            elif unavailable:
                 plot_widget.setTitle(
                     "Parameter not available in this file: " + ", ".join(unavailable),
                     color="#c0392b", size="10pt",
@@ -10052,6 +10122,14 @@ class MainWindow(QMainWindow):
         img.setRect(ref_rect)
         img.setVisible(True)
         self._figure_apply_display_options(plot_dict, plot_widget)
+        if missing_pyramid:
+            # Some channels could not be drawn: say so in the plot itself.
+            plot_widget.setTitle(
+                "Image pyramid not found for: "
+                + ", ".join(missing_pyramid)
+                + " — please check",
+                color="#c0392b", size="10pt",
+            )
         self._figure_update_image_legend(
             plot_widget, rendered_layers,
             show=plot_dict.get("show_legend", True),
@@ -11727,14 +11805,14 @@ class MainWindow(QMainWindow):
         h.setSpacing(6)
         h.addWidget(QLabel("Min"))
         min_edit = QLineEdit()
-        min_edit.setText("" if min_val is None else _format_number(min_val))
+        min_edit.setText("" if min_val is None else _format_level(min_val))
         min_edit.setPlaceholderText("Auto")
         min_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
         min_edit.setEnabled(enabled)
         h.addWidget(min_edit, 1)
         h.addWidget(QLabel("Max"))
         max_edit = QLineEdit()
-        max_edit.setText("" if max_val is None else _format_number(max_val))
+        max_edit.setText("" if max_val is None else _format_level(max_val))
         max_edit.setPlaceholderText("Auto")
         max_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
         max_edit.setEnabled(enabled)
@@ -11796,7 +11874,8 @@ class MainWindow(QMainWindow):
 
         def on_edit() -> None:
             lo, hi = read_edits()
-            on_minmax(lo, hi)
+            on_minmax(_round_level(lo) if lo is not None else None,
+                      _round_level(hi) if hi is not None else None)
 
         min_edit.editingFinished.connect(on_edit)
         max_edit.editingFinished.connect(on_edit)
@@ -11806,9 +11885,10 @@ class MainWindow(QMainWindow):
             if values is None or values.size == 0:
                 return
             lo, hi = np.percentile(values, [0.5, 99.5])
-            min_edit.setText(_format_number(float(lo)))
-            max_edit.setText(_format_number(float(hi)))
-            on_minmax(float(lo), float(hi))
+            lo, hi = _round_level(lo), _round_level(hi)
+            min_edit.setText(_format_level(lo))
+            max_edit.setText(_format_level(hi))
+            on_minmax(lo, hi)
 
         auto_btn.clicked.connect(on_auto)
         load_values()
@@ -11905,15 +11985,16 @@ class MainWindow(QMainWindow):
             if values is None or values.size == 0:
                 return
             lo, hi = np.percentile(values, [0.5, 99.5])
-            layers[row]["min"] = float(lo)
-            layers[row]["max"] = float(hi)
+            lo, hi = _round_level(lo), _round_level(hi)
+            layers[row]["min"] = lo
+            layers[row]["max"] = hi
             plot_dict["layers"] = layers
             min_edit = table.cellWidget(row, 3)
             max_edit = table.cellWidget(row, 4)
             if isinstance(min_edit, QLineEdit):
-                min_edit.setText(_format_number(lo))
+                min_edit.setText(_format_level(lo))
             if isinstance(max_edit, QLineEdit):
-                max_edit.setText(_format_number(hi))
+                max_edit.setText(_format_level(hi))
             on_change()
 
         btn_row = QHBoxLayout()
@@ -12062,7 +12143,9 @@ class MainWindow(QMainWindow):
                 for col, key in ((3, "min"), (4, "max")):
                     edit = QLineEdit()
                     value = layer.get(key)
-                    edit.setText("" if value is None else _format_number(value))
+                    edit.setText(
+                        "" if value is None else _format_level(value)
+                    )
                     edit.setPlaceholderText("Auto")
                     edit.setAlignment(Qt.AlignmentFlag.AlignRight)
                     edit.setEnabled(enabled)
@@ -12079,10 +12162,10 @@ class MainWindow(QMainWindow):
                         if text == "":
                             layers[row].pop(key, None)
                         else:
-                            try:
-                                layers[row][key] = float(text)
-                            except ValueError:
+                            rounded = _round_level(text)
+                            if rounded is None:
                                 return
+                            layers[row][key] = rounded
                         plot_dict["layers"] = layers
                         on_change()
 
@@ -13230,6 +13313,297 @@ class MainWindow(QMainWindow):
             self._unmix_rebuild_signature_table(page)
         self._unmix_mark_dirty(page)
 
+    def _unmix_log(self, page, text: str) -> None:
+        """Append a line to the Unmix-for-image log (saved with the module)."""
+        log = getattr(page, "_unmix_image_log", None)
+        if log is not None:
+            log.appendPlainText(text)
+        lines = page._unmix_params.setdefault("image_log", [])
+        lines.append(str(text))
+        del lines[:-500]
+
+    def _unmix_output_signature(self, task_id, parquet_path, config) -> str:
+        """Fingerprint of the unmixing config an image output was made from."""
+        import numpy as np
+
+        payload = {
+            "task": task_id,
+            "file": str(parquet_path),
+            "columns": list(config.get("columns") or []),
+            "names": list(config.get("names") or []),
+            "matrix": np.round(
+                np.asarray(config.get("matrix"), dtype="float64"), 6
+            ).tolist(),
+            "method": config.get("method"),
+        }
+        return hashlib.md5(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _unmix_write_image_output(self, task_id, parquet_path, config) -> dict:
+        """Write one file's unmixed channels + their image pyramid."""
+        import numpy as np
+        import pandas as pd
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        names = list(config.get("names") or [])
+        columns = list(config.get("columns") or [])
+        matrix = np.asarray(config.get("matrix"), dtype="float64")
+        if not names or not columns:
+            raise ValueError("no unmixing signatures")
+        pf = pq.ParquetFile(parquet_path)
+        available = set(pf.schema_arrow.names)
+        missing = [c for c in columns if c not in available]
+        if missing:
+            raise ValueError("channel(s) not in this file: " + ", ".join(missing))
+        stem = Path(str(parquet_path)).stem
+        rel = f"Module/{task_id}/{stem}_unmix.parquet"
+        out_path = self.project.path / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = None
+        try:
+            for batch in pf.iter_batches(
+                batch_size=500_000, columns=["x", "y"] + columns
+            ):
+                df = batch.to_pandas()
+                values = np.column_stack([
+                    np.nan_to_num(
+                        pd.to_numeric(df[c], errors="coerce").to_numpy(
+                            dtype="float64"
+                        ),
+                        nan=0.0, posinf=0.0, neginf=0.0,
+                    )
+                    for c in columns
+                ])
+                unmixed = values @ matrix.T
+                data = {
+                    "x": df["x"].to_numpy(dtype="float64"),
+                    "y": df["y"].to_numpy(dtype="float64"),
+                }
+                for j, name in enumerate(names):
+                    data[name] = unmixed[:, j]
+                table = pa.Table.from_pandas(
+                    pd.DataFrame(data), preserve_index=False
+                )
+                if writer is None:
+                    writer = pq.ParquetWriter(str(out_path), table.schema)
+                writer.write_table(table)
+        finally:
+            if writer is not None:
+                writer.close()
+        _build_image_index_files(str(out_path))
+        return {
+            "path": rel,
+            "columns": names,
+            "kind": "image",
+            "signature": self._unmix_output_signature(
+                task_id, parquet_path, config
+            ),
+        }
+
+    def _unmix_start_image(self, page) -> None:
+        """Save, then generate the unmixed image channels of every sample."""
+        import queue as queue_module
+
+        if getattr(page, "_unmix_running", False):
+            return
+        params = page._unmix_params
+        samples = [p for p in (params.get("samples") or []) if p]
+        if not samples:
+            QMessageBox.information(
+                self, "Unmix for image",
+                "Select at least one sample under “Samples to be unmixed”.",
+            )
+            return
+        # The matrix that gets applied is the saved one.
+        self._unmix_save_now(page)
+        config = self._unmix_flow_config(page._unmix_task_def)
+        if config is None:
+            QMessageBox.information(
+                self, "Unmix for image",
+                "Add at least one complete signature to the matrix first.",
+            )
+            return
+        page._unmix_running = True
+        page._unmix_cancel = False
+        if getattr(page, "_unmix_image_btn", None) is not None:
+            page._unmix_image_btn.setEnabled(False)
+        self._unmix_log(
+            page, f"— Unmix for image: {len(samples)} file(s) selected —"
+        )
+        q = queue_module.Queue()
+        page._unmix_queue = q
+        page._unmix_thread = threading.Thread(
+            target=self._unmix_image_worker,
+            args=(page, q, config, samples),
+            daemon=True,
+        )
+        page._unmix_thread.start()
+        timer = QTimer(self)
+        timer.setInterval(100)
+        timer.timeout.connect(lambda: self._unmix_image_poll(page))
+        timer.start()
+        page._unmix_timer = timer
+
+    def _unmix_output_is_current(self, task_id, parquet_path, config, rec) -> bool:
+        """Whether a saved unmix output still matches the current matrix."""
+        if not isinstance(rec, dict) or not rec.get("path"):
+            return False
+        if rec.get("signature") != self._unmix_output_signature(
+            task_id, parquet_path, config
+        ):
+            return False
+        path = self.project.path / rec["path"]
+        if not path.is_file():
+            return False
+        return self._image_load_manifest(str(path)) is not None
+
+    def _unmix_image_worker(self, page, q, config, files) -> None:
+        """Background: generate one image pyramid per selected image file."""
+        task_id = page._unmix_task_id
+        outputs = dict(page._unmix_params.get("outputs") or {})
+        done = failed = skipped = unchanged = 0
+        try:
+            for i, path in enumerate(files):
+                if getattr(page, "_unmix_cancel", False):
+                    q.put(("log", "Cancelled."))
+                    break
+                label = Path(str(path)).name
+                if self._image_load_manifest(path) is None:
+                    q.put(("log", f"• skipped (not an image): {label}"))
+                    skipped += 1
+                    continue
+                if self._unmix_output_is_current(
+                    task_id, path, config, outputs.get(path)
+                ):
+                    # Nothing about the matrix changed: keep the saved output.
+                    q.put(("log", f"• already up to date, skipped: {label}"))
+                    unchanged += 1
+                    continue
+                try:
+                    outputs[path] = self._unmix_write_image_output(
+                        task_id, path, config
+                    )
+                    done += 1
+                    q.put(("log", f"✓ {label}  ({i + 1}/{len(files)})"))
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    q.put(("log", f"✗ {label}: {exc}"))
+            q.put(("done", outputs, done, failed, skipped, unchanged))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("error", str(exc)))
+
+    def _unmix_image_poll(self, page) -> None:
+        q = getattr(page, "_unmix_queue", None)
+        if q is None:
+            return
+        finished = False
+        error = None
+        counts = (0, 0, 0, 0)
+        outputs = None
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            if kind == "log":
+                self._unmix_log(page, msg[1])
+            elif kind == "done":
+                outputs = msg[1]
+                counts = (msg[2], msg[3], msg[4], msg[5])
+                finished = True
+            elif kind == "error":
+                error = msg[1]
+                finished = True
+        if not finished:
+            return
+        page._unmix_running = False
+        timer = getattr(page, "_unmix_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._unmix_timer = None
+        if getattr(page, "_unmix_image_btn", None) is not None:
+            page._unmix_image_btn.setEnabled(not page._unmix_locked)
+        if outputs is not None:
+            page._unmix_params["outputs"] = outputs
+            page._unmix_task_def["params"] = page._unmix_params
+            if counts[0] or counts[3]:
+                # Generated data exists: lock the upstream modules.
+                page._unmix_task_def["output"] = {"saved": True}
+            if self.project is not None:
+                self.project.save()
+            page._unmix_snapshot = copy.deepcopy(page._unmix_params)
+            page._unmix_dirty = False
+            self._unmix_update_save_btn(page)
+            self._refresh_workflow_tree()
+            self._module_saved(page)
+        if error:
+            self._unmix_log(page, f"✗ {error}")
+            QMessageBox.warning(self, "Unmix for image", error)
+        else:
+            done, failed, skipped, unchanged = counts
+            self._unmix_log(
+                page,
+                f"— Done: {done} generated, {unchanged} already up to date, "
+                f"{failed} failed, {skipped} skipped (not images) —",
+            )
+
+    def _unmix_image_outputs(self, task_id, parquet_path):
+        """Precomputed unmixed channels: (usable, stale names) for a file."""
+        if not task_id or not parquet_path or self.project is None:
+            return {}, set()
+        usable = {}
+        stale = set()
+        for task in self._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "unmix":
+                continue
+            params = task.get("params") or {}
+            rec = (params.get("outputs") or {}).get(parquet_path)
+            if not isinstance(rec, dict) or not rec.get("path"):
+                continue
+            names = list(rec.get("columns") or [])
+            config = self._unmix_flow_config(task)
+            path = self.project.path / rec["path"]
+            signature = (
+                self._unmix_output_signature(task.get("id"), parquet_path, config)
+                if config is not None else None
+            )
+            if (
+                config is None
+                or rec.get("signature") != signature
+                or not path.is_file()
+                or self._image_load_manifest(str(path)) is None
+            ):
+                stale.update(names)
+                continue
+            for name in names:
+                usable.setdefault(name, {
+                    "parquet": str(path), "channel": name, "kind": "image",
+                })
+        return usable, stale
+
+    def _stored_pyramid_ok(self, rec) -> bool:
+        """Whether a generated column's image pyramid can be read."""
+        if not isinstance(rec, dict) or not rec.get("parquet"):
+            return False
+        ent = self._ensure_image_index(rec["parquet"])
+        return bool(ent is not None and ent.get("manifest") is not None)
+
+    def _unmix_raster(self, rec, bbox, spacing):
+        """Return (scalar_2d, data_rect) for a precomputed unmixed channel."""
+        if not isinstance(rec, dict) or not rec.get("parquet"):
+            return None, None
+        ent = self._ensure_image_index(rec["parquet"])
+        if ent is None or ent.get("manifest") is None:
+            return None, None
+        crop, rect, _frac = self._image_raster(
+            rec["parquet"], ent["manifest"], bbox, spacing,
+            rec.get("channel"), None, None,
+        )
+        return crop, rect
+
     def _unmix_highlight_spectrum(self, page, spectrum_id) -> None:
         lst = page._unmix_spectra_list
         lst.blockSignals(True)
@@ -14013,10 +14387,17 @@ class MainWindow(QMainWindow):
         right = QSplitter(Qt.Orientation.Vertical)
         right.setChildrenCollapsible(False)
         right.addWidget(self._unmix_matrix_panel(page))
-        right.addWidget(self._unmix_matrix_settings_panel(page))
+        lower = QSplitter(Qt.Orientation.Horizontal)
+        lower.setChildrenCollapsible(False)
+        lower.addWidget(self._unmix_image_panel(page))
+        lower.addWidget(self._unmix_matrix_settings_panel(page))
+        lower.setStretchFactor(0, 1)
+        lower.setStretchFactor(1, 1)
+        lower.setSizes([400, 400])
+        right.addWidget(lower)
         right.setStretchFactor(0, 3)
         right.setStretchFactor(1, 1)
-        right.setSizes([560, 220])
+        right.setSizes([560, 260])
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -14256,7 +14637,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(6)
 
         head = QHBoxLayout()
-        head.addWidget(QLabel("<b>Samples</b>"))
+        head.addWidget(QLabel("<b>Samples to be unmixed</b>"))
         head.addStretch()
         all_btn = QPushButton("All")
         none_btn = QPushButton("None")
@@ -14282,6 +14663,15 @@ class MainWindow(QMainWindow):
         )
         page._unmix_samples_list = samples_list
         lay.addWidget(samples_list, 1)
+        return panel
+
+    def _unmix_image_panel(self, page) -> QWidget:
+        """Unmixing method, the "Unmix for image" action and its log."""
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Unmixing</b>"))
 
         method_row = QHBoxLayout()
         method_row.addWidget(QLabel("Unmixing method"))
@@ -14297,6 +14687,28 @@ class MainWindow(QMainWindow):
         )
         method_row.addWidget(method_combo, 1)
         lay.addLayout(method_row)
+
+        run_btn = QPushButton("Unmix for image")
+        run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        run_btn.setEnabled(not page._unmix_locked)
+        run_btn.setToolTip(
+            "Precompute the unmixed channels of every selected image file "
+            "and save them as image pyramids for downstream image plots"
+        )
+        run_btn.clicked.connect(lambda _=False: self._unmix_start_image(page))
+        lay.addWidget(run_btn)
+        page._unmix_image_btn = run_btn
+
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        for line in page._unmix_params.get("image_log") or []:
+            log.appendPlainText(str(line))
+        lay.addWidget(log, 1)
+        page._unmix_image_log = log
         return panel
 
     # ----- unmix: signature table --------------------------------------
