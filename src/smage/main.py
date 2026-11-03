@@ -2257,8 +2257,8 @@ def _figure_image_layers(plot_dict: dict) -> list:
         "color": tuple(color),
         "name": str(param),
         "visible": True,
-        "min": None,
-        "max": None,
+        "min": plot_dict.get("image_min"),
+        "max": plot_dict.get("image_max"),
     }]
 
 
@@ -12314,11 +12314,13 @@ class MainWindow(QMainWindow):
             palette_combo.currentIndexChanged.connect(on_palette)
 
     def _figure_channel_values(self, task_id, parquet_path, channel,
-                               max_points: int = 200000):
+                               max_points: int = 200000, extra_stages=None):
         """Sampled finite values of one image channel (for its histogram)."""
         import numpy as np
 
-        values = self._column_data(task_id, parquet_path, [channel]).get(channel)
+        values = self._column_data(
+            task_id, parquet_path, [channel], extra_stages=extra_stages
+        ).get(channel)
         if values is None:
             return None
         values = np.asarray(values, dtype="float64")
@@ -12329,7 +12331,8 @@ class MainWindow(QMainWindow):
         return values
 
     def _image_level_controls(self, layout, channel, min_val, max_val, enabled,
-                              on_minmax, task_id, parquet_path) -> None:
+                              on_minmax, task_id, parquet_path,
+                              extra_stages=None) -> None:
         """Min/Max inputs + signal histogram + Auto set for one image channel.
 
         `on_minmax(lo, hi)` is called with the parsed bounds (None means auto)
@@ -12383,7 +12386,9 @@ class MainWindow(QMainWindow):
             if not channel or parquet_path is None:
                 hist_plot.clear()
                 return
-            values = self._figure_channel_values(task_id, parquet_path, channel)
+            values = self._figure_channel_values(
+                task_id, parquet_path, channel, extra_stages=extra_stages
+            )
             if values is None or values.size == 0:
                 hist_plot.clear()
                 return
@@ -16709,6 +16714,9 @@ class MainWindow(QMainWindow):
             set_btn.setEnabled(editable and bool(new_channel))
             set_btn.setToolTip("" if new_channel else "Select the channel first")
             self._illum_reset_plot_defaults(page, sub)
+            rebuild_levels = getattr(page, "_illum_rebuild_levels", None)
+            if rebuild_levels is not None:
+                rebuild_levels()
             self._illum_render_preview(page)
             self._illum_mark_dirty(page)
 
@@ -16716,6 +16724,9 @@ class MainWindow(QMainWindow):
             def handler():
                 sub[key] = combo.currentData()
                 self._illum_reset_plot_defaults(page, sub)
+                rebuild_levels = getattr(page, "_illum_rebuild_levels", None)
+                if rebuild_levels is not None:
+                    rebuild_levels()
                 self._illum_render_preview(page)
                 self._illum_mark_dirty(page)
             return handler
@@ -16878,12 +16889,22 @@ class MainWindow(QMainWindow):
             sub["tile_w"] = int(tile_w.value())
             sub["tile_h"] = int(tile_h.value())
             hint.setText(self._illum_divisibility_hint(sub))
+            cleared = False
             if sub.get("mask"):
                 sub["mask"] = None
                 sub["mask_source"] = None
                 self._illum_drop_mask_file(page._illum_task_id, sub)
                 status.setText("Parameters changed — recalculate the mask.")
+                cleared = True
             self._illum_mark_dirty(page)
+            if cleared:
+                # The correction is gone now; redraw the mask panel and both
+                # previews (which also redraws the tile grid).
+                self._illum_render_mask(page, sub)
+                self._illum_render_preview(page)
+            else:
+                # Only the overlay changes: skip re-running the correction.
+                self._illum_update_tile_grid(page)
 
         def on_bin(value):
             sub["bin"] = int(value)
@@ -17051,7 +17072,7 @@ class MainWindow(QMainWindow):
         page._illum_settings_layout = settings
 
         plot_dict = {
-            "type": "scatter",
+            "type": sub.get("plot_type") or "scatter",
             "file": (sub.get("files") or [None])[0],
             "file_name": None,
             "x": sub.get("x"),
@@ -17064,6 +17085,9 @@ class MainWindow(QMainWindow):
             "show_indices": True,
             "show_sample_name": True,
             "show_tile_grid": True,
+            # Image display levels, shared by the Before and After plots.
+            "image_min": sub.get("plot_image_min"),
+            "image_max": sub.get("plot_image_max"),
         }
         page._illum_plot = plot_dict
         page._illum_plot_settings_built = True
@@ -17094,6 +17118,61 @@ class MainWindow(QMainWindow):
         file_combo.setEnabled(enabled)
         settings.addWidget(file_combo)
         plot_dict["file_name"] = file_combo.currentText()
+
+        # Image display levels (Min/Max, signal histogram, Auto set). The same
+        # bounds drive the Before and After plots, which share `plot_dict`.
+        levels_host = QWidget()
+        levels_host.setStyleSheet("background: transparent;")
+        levels_lay = QVBoxLayout(levels_host)
+        levels_lay.setContentsMargins(0, 0, 0, 0)
+        levels_lay.setSpacing(6)
+        settings.addWidget(levels_host)
+
+        def clear_levels() -> None:
+            while levels_lay.count():
+                entry = levels_lay.takeAt(0)
+                widget = entry.widget()
+                if widget is not None:
+                    widget.deleteLater()
+
+        def on_levels(lo, hi) -> None:
+            sub["plot_image_min"] = lo
+            sub["plot_image_max"] = hi
+            plot_dict["image_min"] = lo
+            plot_dict["image_max"] = hi
+            self._illum_mark_dirty(page)
+            self._illum_render_preview(page)
+
+        def rebuild_levels() -> None:
+            import numpy as np  # noqa: F401
+
+            clear_levels()
+            is_image = plot_dict.get("type") == "image"
+            levels_host.setVisible(is_image)
+            if not is_image:
+                return
+            rec = self._figure_record(plot_dict.get("file"))
+            path = rec.get("parquet") if rec else None
+            try:
+                index = page._illum_submodules.index(sub)
+            except ValueError:
+                index = len(page._illum_submodules)
+            stages = self._illum_preview_stages(
+                page, page._illum_submodules[: index + 1]
+            )
+            self._image_level_controls(
+                levels_lay,
+                plot_dict.get("color_param"),
+                sub.get("plot_image_min"),
+                sub.get("plot_image_max"),
+                enabled,
+                on_levels,
+                page._illum_task_id,
+                path,
+                extra_stages=stages,
+            )
+
+        page._illum_rebuild_levels = rebuild_levels
 
         columns = []
         rec = self._figure_record(plot_dict.get("file"))
@@ -17129,11 +17208,14 @@ class MainWindow(QMainWindow):
 
         def on_type():
             plot_dict["type"] = type_combo.currentData()
+            sub["plot_type"] = plot_dict["type"]
+            rebuild_levels()
             refresh()
 
         def on_file():
             plot_dict["file"] = file_combo.currentData()
             plot_dict["file_name"] = file_combo.currentText()
+            rebuild_levels()
             refresh()
 
         def on_param(key, combo):
@@ -17159,6 +17241,7 @@ class MainWindow(QMainWindow):
         y_combo.currentTextChanged.connect(on_param("y", y_combo))
         palette_combo.currentIndexChanged.connect(lambda _=0: on_palette())
         grid_box.toggled.connect(on_grid)
+        rebuild_levels()
         return panel
 
     def _illum_sub_stage(self, sub):
