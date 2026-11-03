@@ -1308,7 +1308,7 @@ _GATE_GEOMETRY_KEYS = {
 _GATING_DISPLAY_KEYS = (
     "color_mode", "color_param", "palette", "solid_color",
     "point_size", "fixed_point_size",
-    "image_channel",
+    "image_channel", "image_min", "image_max",
     "bins", "hist_mode", "hist_color", "curve_color",
 )
 
@@ -2180,6 +2180,8 @@ def _figure_image_layers(plot_dict: dict) -> list:
                 "color": tuple(layer.get("color", (255, 255, 255))),
                 "name": str(layer.get("name") or param),
                 "visible": bool(layer.get("visible", True)),
+                "min": layer.get("min"),
+                "max": layer.get("max"),
             })
         return out
     param = plot_dict.get("color_param")
@@ -2191,6 +2193,8 @@ def _figure_image_layers(plot_dict: dict) -> list:
         "color": tuple(color),
         "name": str(param),
         "visible": True,
+        "min": None,
+        "max": None,
     }]
 
 
@@ -9910,6 +9914,17 @@ class MainWindow(QMainWindow):
                     hi = float(np.nanmax(chan))
             if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
                 lo, hi = 0.0, 1.0
+            # Per-channel brightness/contrast: a user-set min/max overrides the
+            # automatic range for this layer. Either bound may be set alone.
+            user_min = layer.get("min")
+            user_max = layer.get("max")
+            try:
+                if user_min is not None:
+                    lo = float(user_min)
+                if user_max is not None:
+                    hi = float(user_max)
+            except (TypeError, ValueError):
+                pass
             if hi > lo:
                 norm = (chan.astype("float64") - lo) / (hi - lo)
             else:
@@ -10661,6 +10676,7 @@ class MainWindow(QMainWindow):
                     self._figure_rebuild_settings(page),
                     self._figure_apply_change(page, index, plot_dict),
                 ),
+                task_id=page._fig_task_id,
             )
 
         if plot_dict.get("type") == "histogram":
@@ -11487,14 +11503,16 @@ class MainWindow(QMainWindow):
         return combo
 
     def _figure_scatter_color_settings(self, layout, plot_dict, plot_widget, columns,
-                                       enabled, on_change, on_rebuild) -> None:
+                                       enabled, on_change, on_rebuild,
+                                       task_id=None) -> None:
         """Build + wire color mode/param, palette/solid, and point-size rows.
 
         Shared by the Figure and Scaling scatter settings panels.
         """
         if plot_dict.get("type") == "image":
             self._figure_image_layer_settings(
-                layout, plot_dict, columns, enabled, on_change, on_rebuild
+                layout, plot_dict, columns, enabled, on_change, on_rebuild,
+                task_id=task_id,
             )
             return
 
@@ -11607,20 +11625,145 @@ class MainWindow(QMainWindow):
                 on_change()
             palette_combo.currentIndexChanged.connect(on_palette)
 
+    def _figure_channel_values(self, task_id, parquet_path, channel,
+                               max_points: int = 200000):
+        """Sampled finite values of one image channel (for its histogram)."""
+        import numpy as np
+
+        values = self._column_data(task_id, parquet_path, [channel]).get(channel)
+        if values is None:
+            return None
+        values = np.asarray(values, dtype="float64")
+        values = values[np.isfinite(values)]
+        if values.size > max_points:
+            rng = np.random.default_rng(42)
+            values = values[rng.choice(values.size, max_points, replace=False)]
+        return values
+
+    def _image_level_controls(self, layout, channel, min_val, max_val, enabled,
+                              on_minmax, task_id, parquet_path) -> None:
+        """Min/Max inputs + signal histogram + Auto set for one image channel.
+
+        `on_minmax(lo, hi)` is called with the parsed bounds (None means auto)
+        whenever the user edits a bound or presses Auto set.
+        """
+        import numpy as np
+        import pyqtgraph as pg
+
+        state = {"values": None}
+
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        h.addWidget(QLabel("Min"))
+        min_edit = QLineEdit()
+        min_edit.setText("" if min_val is None else _format_number(min_val))
+        min_edit.setPlaceholderText("Auto")
+        min_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        min_edit.setEnabled(enabled)
+        h.addWidget(min_edit, 1)
+        h.addWidget(QLabel("Max"))
+        max_edit = QLineEdit()
+        max_edit.setText("" if max_val is None else _format_number(max_val))
+        max_edit.setPlaceholderText("Auto")
+        max_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        max_edit.setEnabled(enabled)
+        h.addWidget(max_edit, 1)
+        layout.addWidget(row)
+
+        hist_plot = pg.PlotWidget()
+        hist_plot.setBackground(_plot_background())
+        hist_plot.showGrid(x=True, y=True, alpha=0.2)
+        hist_plot.setMinimumHeight(100)
+        hist_plot.setMaximumHeight(160)
+        hist_plot.setMouseEnabled(False, False)
+        hist_plot.setMenuEnabled(False)
+        hist_plot.hideAxis("left")
+        layout.addWidget(hist_plot)
+
+        auto_btn = QPushButton("Auto set")
+        auto_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        auto_btn.setEnabled(enabled)
+        auto_btn.setToolTip(
+            "Set Min/Max to the channel's 0.5% and 99.5% percentiles"
+        )
+        layout.addWidget(auto_btn)
+
+        def load_values() -> None:
+            state["values"] = None
+            if not channel or parquet_path is None:
+                hist_plot.clear()
+                return
+            values = self._figure_channel_values(task_id, parquet_path, channel)
+            if values is None or values.size == 0:
+                hist_plot.clear()
+                return
+            state["values"] = values
+            hist, edges = np.histogram(values, bins=200)
+            hist_plot.clear()
+            hist_plot.plot(
+                edges, hist, stepMode="center",
+                fillLevel=0, brush=(90, 140, 220, 120),
+                pen=pg.mkPen((50, 90, 160), width=1),
+            )
+            hist_plot.setTitle(str(channel), color="#5a6673", size="8pt")
+
+        def read_edits():
+            lo = hi = None
+            text = min_edit.text().strip()
+            if text:
+                try:
+                    lo = float(text)
+                except ValueError:
+                    pass
+            text = max_edit.text().strip()
+            if text:
+                try:
+                    hi = float(text)
+                except ValueError:
+                    pass
+            return lo, hi
+
+        def on_edit() -> None:
+            lo, hi = read_edits()
+            on_minmax(lo, hi)
+
+        min_edit.editingFinished.connect(on_edit)
+        max_edit.editingFinished.connect(on_edit)
+
+        def on_auto(_=False) -> None:
+            values = state["values"]
+            if values is None or values.size == 0:
+                return
+            lo, hi = np.percentile(values, [0.5, 99.5])
+            min_edit.setText(_format_number(float(lo)))
+            max_edit.setText(_format_number(float(hi)))
+            on_minmax(float(lo), float(hi))
+
+        auto_btn.clicked.connect(on_auto)
+        load_values()
+
     def _figure_image_layer_settings(self, layout, plot_dict, columns, enabled,
-                                     on_change, on_rebuild) -> None:
-        """Build the image channel table (show / parameter / colour / name)."""
+                                     on_change, on_rebuild, task_id=None) -> None:
+        """Build the image channel table (show / parameter / colour / min / max / name)."""
         layout.addWidget(QLabel("Channels"))
         table = QTableWidget()
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["Show", "Parameter", "Color", "Name"])
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(
+            ["Show", "Parameter", "Color", "Min", "Max", "Name"]
+        )
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         table.setColumnWidth(0, 44)
         table.setColumnWidth(2, 48)
+        table.setColumnWidth(3, 66)
+        table.setColumnWidth(4, 66)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(30)
         table.setMinimumHeight(120)
@@ -11630,6 +11773,79 @@ class MainWindow(QMainWindow):
             "QTableWidget::item:selected { background: #dbeafa; }"
         )
         layout.addWidget(table, 1)
+
+        # Channel signal histogram: helps pick sensible Min/Max levels.
+        import numpy as np
+        import pyqtgraph as pg
+
+        rec = self._figure_record(plot_dict.get("file"))
+        parquet_path = rec.get("parquet") if rec else None
+        hist_state = {"row": None, "values": None}
+
+        hist_plot = pg.PlotWidget()
+        hist_plot.setBackground(_plot_background())
+        hist_plot.showGrid(x=True, y=True, alpha=0.2)
+        hist_plot.setMinimumHeight(110)
+        hist_plot.setMaximumHeight(170)
+        hist_plot.setMouseEnabled(False, False)
+        hist_plot.setMenuEnabled(False)
+        hist_plot.hideAxis("left")
+        layout.addWidget(hist_plot)
+
+        auto_btn = QPushButton("Auto set")
+        auto_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        auto_btn.setEnabled(enabled)
+        auto_btn.setToolTip(
+            "Set Min/Max to the channel's 0.5% and 99.5% percentiles"
+        )
+        layout.addWidget(auto_btn)
+
+        def update_histogram(row) -> None:
+            layers = _figure_image_layers(plot_dict)
+            if row < 0 or row >= len(layers):
+                hist_plot.clear()
+                hist_state["row"] = None
+                hist_state["values"] = None
+                return
+            channel = layers[row].get("parameter")
+            hist_state["row"] = row
+            hist_state["values"] = None
+            if not channel or parquet_path is None:
+                hist_plot.clear()
+                return
+            values = self._figure_channel_values(task_id, parquet_path, channel)
+            if values is None or values.size == 0:
+                hist_plot.clear()
+                return
+            hist_state["values"] = values
+            hist, edges = np.histogram(values, bins=200)
+            hist_plot.clear()
+            hist_plot.plot(
+                edges, hist, stepMode="center",
+                fillLevel=0, brush=(90, 140, 220, 120),
+                pen=pg.mkPen((50, 90, 160), width=1),
+            )
+            hist_plot.setTitle(str(channel), color="#5a6673", size="8pt")
+
+        def on_auto_set(_=False) -> None:
+            layers = _figure_image_layers(plot_dict)
+            row = hist_state["row"]
+            if row is None or row >= len(layers):
+                return
+            values = hist_state["values"]
+            if values is None or values.size == 0:
+                return
+            lo, hi = np.percentile(values, [0.5, 99.5])
+            layers[row]["min"] = float(lo)
+            layers[row]["max"] = float(hi)
+            plot_dict["layers"] = layers
+            min_edit = table.cellWidget(row, 3)
+            max_edit = table.cellWidget(row, 4)
+            if isinstance(min_edit, QLineEdit):
+                min_edit.setText(_format_number(lo))
+            if isinstance(max_edit, QLineEdit):
+                max_edit.setText(_format_number(hi))
+            on_change()
 
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add")
@@ -11686,7 +11902,7 @@ class MainWindow(QMainWindow):
                 layers[row]["visible"] = (
                     item.checkState() == Qt.CheckState.Checked
                 )
-            elif col == 3:
+            elif col == 5:
                 layers[row]["name"] = item.text()
             else:
                 return
@@ -11773,13 +11989,44 @@ class MainWindow(QMainWindow):
                 cbtn.clicked.connect(lambda _=False, row=i: on_pick_color(row))
                 table.setCellWidget(i, 2, cbtn)
 
+                # Min / Max: empty means "auto" (the channel's natural range).
+                for col, key in ((3, "min"), (4, "max")):
+                    edit = QLineEdit()
+                    value = layer.get(key)
+                    edit.setText("" if value is None else _format_number(value))
+                    edit.setPlaceholderText("Auto")
+                    edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+                    edit.setEnabled(enabled)
+                    edit.setStyleSheet(
+                        "QLineEdit { background: #ffffff; border: 1px solid #d0d7e2; "
+                        "border-radius: 3px; padding: 1px 4px; }"
+                    )
+
+                    def on_minmax(_=False, row=i, key=key, edit=edit):
+                        layers = _figure_image_layers(plot_dict)
+                        if row >= len(layers):
+                            return
+                        text = edit.text().strip()
+                        if text == "":
+                            layers[row].pop(key, None)
+                        else:
+                            try:
+                                layers[row][key] = float(text)
+                            except ValueError:
+                                return
+                        plot_dict["layers"] = layers
+                        on_change()
+
+                    edit.editingFinished.connect(on_minmax)
+                    table.setCellWidget(i, col, edit)
+
                 name_item = QTableWidgetItem(str(layer.get("name") or param or ""))
                 name_item.setFlags(
                     Qt.ItemFlag.ItemIsEnabled
                     | Qt.ItemFlag.ItemIsSelectable
                     | Qt.ItemFlag.ItemIsEditable
                 )
-                table.setItem(i, 3, name_item)
+                table.setItem(i, 5, name_item)
             table.blockSignals(False)
             table.resizeRowsToContents()
 
@@ -11787,8 +12034,15 @@ class MainWindow(QMainWindow):
         add_btn.clicked.connect(on_add)
         remove_btn.clicked.connect(on_remove)
         show_legend.toggled.connect(on_show_legend)
+        table.currentCellChanged.connect(
+            lambda r, _c, _pr, _pc: update_histogram(r)
+        )
+        auto_btn.clicked.connect(on_auto_set)
 
         populate()
+        # Show the first channel's histogram right away.
+        if table.rowCount():
+            update_histogram(0)
 
     def _figure_display_toggles(self, layout, plot_dict, enabled, on_change) -> None:
         """Build + wire the display checkboxes and the three font sizes."""
@@ -12333,6 +12587,7 @@ class MainWindow(QMainWindow):
                 self._scaling_rebuild_settings(page),
                 self._scaling_render_preview(page),
             ),
+            task_id=page._scaling_task_id,
         )
 
         layout.addWidget(QLabel("X range"))
@@ -18381,6 +18636,7 @@ class MainWindow(QMainWindow):
                 self._seg_refresh_plot_settings(page),
                 self._seg_render_preview(page),
             ),
+            task_id=page._seg_task_id,
         )
 
         lay.addWidget(QLabel("Mask display"))
@@ -31150,6 +31406,8 @@ class MainWindow(QMainWindow):
                     "parameter": channel,
                     "color": (255, 255, 255),
                     "name": str(channel),
+                    "min": preview.get("image_min"),
+                    "max": preview.get("image_max"),
                 }]
             self._figure_render_image(
                 plot_dict, plot_widget, task_id=page._gating_task_id,
@@ -31223,6 +31481,16 @@ class MainWindow(QMainWindow):
                 channels, preview.get("image_channel"), enabled
             )
             layout.addWidget(channel_combo)
+            self._image_level_controls(
+                layout, preview.get("image_channel"),
+                preview.get("image_min"), preview.get("image_max"),
+                enabled,
+                on_minmax=lambda lo, hi: self._gating_set_image_levels(
+                    page, lo, hi
+                ),
+                task_id=page._gating_task_id,
+                parquet_path=rec.get("parquet") if rec else None,
+            )
         else:
             layout.addWidget(QLabel("X parameter"))
             x_combo = self._gating_param_combo(columns, preview.get("x"), enabled)
@@ -31240,6 +31508,7 @@ class MainWindow(QMainWindow):
                     self._gating_rebuild_settings(page),
                     self._gating_on_preview_change(page),
                 ),
+                task_id=page._gating_task_id,
             )
 
         if plot_type != "image":
@@ -31383,18 +31652,28 @@ class MainWindow(QMainWindow):
             y_combo.currentTextChanged.connect(on_param("y"))
         if channel_combo is not None:
             channel_combo.currentTextChanged.connect(
-                lambda _=0: on_channel()
+                lambda text, _c=channel_combo: on_channel(text)
             )
 
-        def on_channel():
-            preview["image_channel"] = channel_combo.currentData() or None
+        def on_channel(text):
+            preview["image_channel"] = text or None
             self._gating_render(page)
+            # Rebuild settings so the channel histogram follows the new channel.
+            self._gating_rebuild_settings(page)
             self._gating_mark_dirty(page)
 
         def on_plot_type_changed():
             self._gating_set_plot_type(page, type_combo.currentData() or "scatter")
 
         type_combo.currentIndexChanged.connect(lambda _=0: on_plot_type_changed())
+
+    def _gating_set_image_levels(self, page, lo, hi) -> None:
+        """Store the image channel's display Min/Max and re-render (visual only)."""
+        preview = page._gating_preview
+        preview["image_min"] = lo
+        preview["image_max"] = hi
+        self._gating_render(page)
+        self._gating_mark_dirty(page)
 
     def _gating_on_preview_change(self, page) -> None:
         """Re-render and mark dirty after a scatter setting change."""
