@@ -903,6 +903,30 @@ def _inverse_scale_value(value: float, configs) -> float:
     return out
 
 
+def _round_value_candidates(low: float, high: float) -> list:
+    """Round data values (…, 1, 2, 5, 10, 20, 50, …) inside [low, high]."""
+    import math
+
+    if not math.isfinite(low) or not math.isfinite(high) or high <= low:
+        return []
+    out = [0.0] if low <= 0.0 <= high else []
+    top = max(abs(low), abs(high))
+    bottom = min(abs(low), abs(high))
+    if top <= 0:
+        return sorted(out)
+    start = math.floor(math.log10(bottom)) if bottom > 0 else 0
+    end = math.ceil(math.log10(top))
+    if end - start > 12:
+        start = end - 12
+    for exponent in range(start, end + 1):
+        for mantissa in (1.0, 2.0, 5.0):
+            value = mantissa * (10.0 ** exponent)
+            for signed in (value, -value):
+                if low <= signed <= high and signed not in out:
+                    out.append(signed)
+    return sorted(out)
+
+
 def _nice_ticks(low: float, high: float, count: int = 6) -> list:
     """Round tick values (1/2/5 steps) covering [low, high]."""
     import math
@@ -3042,19 +3066,24 @@ def _make_sci_axis(orientation: str):
             if specs is None:
                 return specs
             axisSpec, tickSpecs, textSpecs = specs
-            # Anchor each tick at the spine so it points outward without crossing.
+            # Anchor each tick at the spine so it points outward without crossing,
+            # and draw the ticks a little heavier than the axis line.
+            tick_pen = pg.mkPen("#000000", width=2)
             if self.orientation in ("left", "right"):
                 spine = axisSpec[1].x()
-                tickSpecs = [(pen, pg.Point(spine, p1.y()), p2)
-                             for pen, p1, p2 in tickSpecs]
+                tickSpecs = [(tick_pen, pg.Point(spine, p1.y()), p2)
+                             for _pen, p1, p2 in tickSpecs]
             else:
                 spine = axisSpec[1].y()
-                tickSpecs = [(pen, pg.Point(p1.x(), spine), p2)
-                             for pen, p1, p2 in tickSpecs]
+                tickSpecs = [(tick_pen, pg.Point(p1.x(), spine), p2)
+                             for _pen, p1, p2 in tickSpecs]
             return axisSpec, tickSpecs, textSpecs
 
     ax = _SciAxis(orientation)
     ax.setStyle(tickLength=5)  # positive -> outward
+    # Axis line, ticks and tick labels in black.
+    ax.setPen(pg.mkPen("#000000", width=2))
+    ax.setTextPen(pg.mkPen("#000000"))
     return ax
 
 
@@ -3063,6 +3092,15 @@ def _make_rotated_axis(orientation: str = "bottom"):
     import pyqtgraph as pg
 
     class _RotatedAxis(pg.AxisItem):
+        def generateDrawSpecs(self, p):
+            specs = super().generateDrawSpecs(p)
+            if specs is None:
+                return specs
+            axisSpec, tickSpecs, textSpecs = specs
+            tick_pen = pg.mkPen("#000000", width=2)
+            tickSpecs = [(tick_pen, p1, p2) for _pen, p1, p2 in tickSpecs]
+            return axisSpec, tickSpecs, textSpecs
+
         def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
             p.setRenderHint(p.RenderHint.Antialiasing, False)
             p.setRenderHint(p.RenderHint.TextAntialiasing, True)
@@ -3092,6 +3130,8 @@ def _make_rotated_axis(orientation: str = "bottom"):
 
     ax = _RotatedAxis(orientation)
     ax.setStyle(tickLength=5)
+    ax.setPen(pg.mkPen("#000000", width=2))
+    ax.setTextPen(pg.mkPen("#000000"))
     return ax
 
 
@@ -10254,7 +10294,7 @@ class MainWindow(QMainWindow):
         img.setVisible(True)
         self._figure_apply_display_options(plot_dict, plot_widget)
         for axis in ("bottom", "left"):
-            plot_widget.getPlotItem().getAxis(axis).setTicks(None)
+            self._figure_set_original_ticks(plot_widget, axis, None)
         if missing_pyramid:
             # Some channels could not be drawn: say so in the plot itself.
             plot_widget.setTitle(
@@ -10586,7 +10626,7 @@ class MainWindow(QMainWindow):
             ),
             x,
         )
-        plot_widget.getPlotItem().getAxis("left").setTicks(None)
+        self._figure_set_original_ticks(plot_widget, "left", None)
 
     def _figure_apply_ranges(self, plot_dict: dict, plot_widget) -> None:
         """Apply manual/auto X and Y ranges from the plot settings."""
@@ -10704,27 +10744,72 @@ class MainWindow(QMainWindow):
                 configs.append(config)
         extra = (column_transforms or {}).get(column) or []
         configs.extend(extra)
-        return configs
+        # Only log10 / arcsinh move the values; a linear config leaves the
+        # axis untouched (pyqtgraph's own ticks are the right ones there).
+        return [
+            config for config in configs
+            if (config or {}).get("method") in ("log10", "arcsinh")
+        ]
+
+    def _figure_original_tick_state(self, plot_widget) -> dict:
+        """Per-plot state for axes whose ticks show untransformed values."""
+        state = getattr(plot_widget, "_orig_ticks", None)
+        if state is not None:
+            return state
+        state = {"bottom": None, "left": None}
+        plot_widget._orig_ticks = state
+        timer = QTimer(plot_widget)
+        timer.setSingleShot(True)
+        timer.setInterval(40)
+        timer.timeout.connect(
+            lambda: self._figure_refresh_original_ticks(plot_widget)
+        )
+        state["timer"] = timer
+        # Zooming / panning re-picks the ticks for the visible range.
+        plot_widget.getPlotItem().getViewBox().sigRangeChanged.connect(
+            lambda *_: timer.start()
+        )
+        return state
 
     def _figure_set_original_ticks(self, plot_widget, orientation, configs,
-                                   values) -> None:
+                                   values=None) -> None:
         """Label axis ticks with the *untransformed* values of a scaled column.
 
-        The points stay in transformed space; only the tick text shows the
-        original numbers (arcsinh / log10 axes, like FlowJo).
+        The points stay in transformed space; the tick text shows original
+        numbers (arcsinh / log10 axes, like FlowJo) and is recomputed for the
+        visible range whenever the view is zoomed or panned.
         """
+        state = self._figure_original_tick_state(plot_widget)
+        state[orientation] = list(configs) if configs else None
+        self._figure_update_original_axis(plot_widget, orientation)
+        # The view range may still settle after this render: refresh shortly.
+        timer = state.get("timer")
+        if timer is not None:
+            timer.start()
+
+    def _figure_refresh_original_ticks(self, plot_widget) -> None:
+        state = getattr(plot_widget, "_orig_ticks", None)
+        if not state:
+            return
+        self._figure_update_original_axis(plot_widget, "bottom")
+        self._figure_update_original_axis(plot_widget, "left")
+
+    def _figure_update_original_axis(self, plot_widget, orientation) -> None:
+        """Rebuild one axis' ticks from the currently visible range."""
         import numpy as np
 
+        state = getattr(plot_widget, "_orig_ticks", None) or {}
+        configs = state.get(orientation)
         axis = plot_widget.getPlotItem().getAxis(orientation)
-        if not configs or values is None or len(values) == 0:
+        if not configs:
             axis.setTicks(None)
             return
         try:
-            lo = float(np.nanmin(values))
-            hi = float(np.nanmax(values))
+            (x0, x1), (y0, y1) = plot_widget.getPlotItem().getViewBox().viewRange()
         except (TypeError, ValueError):
             axis.setTicks(None)
             return
+        lo, hi = (x0, x1) if orientation == "bottom" else (y0, y1)
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             axis.setTicks(None)
             return
@@ -10738,15 +10823,67 @@ class MainWindow(QMainWindow):
             axis.setTicks(None)
             return
         ticks = []
-        for value in _nice_ticks(original_lo, original_hi, 6):
+        # Place the ticks evenly along the *displayed* (transformed) axis, then
+        # snap each to a round data value. A uniform step in the original
+        # domain bunches up under log10 / arcsinh.
+        candidates = []
+        for value in _round_value_candidates(original_lo, original_hi):
             position = float(
                 np.asarray(_apply_scale_transforms(
                     np.asarray([value], dtype="float64"), configs
                 ))[0]
             )
-            if np.isfinite(position):
-                ticks.append((position, _format_sci(value)))
-        axis.setTicks([ticks] if ticks else None)
+            if np.isfinite(position) and lo <= position <= hi:
+                candidates.append((position, value))
+        targets = [
+            lo + (hi - lo) * i / 5.0 for i in range(6)
+        ]
+        used = set()
+        majors = []  # (position, data value)
+        for target in targets:
+            best = None
+            for position, value in candidates:
+                if value in used:
+                    continue
+                if best is None or abs(position - target) < abs(best[0] - target):
+                    best = (position, value)
+            if best is not None:
+                used.add(best[1])
+                majors.append(best)
+        if len(majors) < 3:
+            # Too few round values in view: fall back to a uniform data step.
+            majors = []
+            for value in _nice_ticks(original_lo, original_hi, 6):
+                position = float(
+                    np.asarray(_apply_scale_transforms(
+                        np.asarray([value], dtype="float64"), configs
+                    ))[0]
+                )
+                if np.isfinite(position):
+                    majors.append((position, value))
+        majors.sort(key=lambda item: item[0])
+        if not majors:
+            axis.setTicks(None)
+            return
+        # Minor ticks: five even steps *in the data domain* between adjacent
+        # labels, mapped through the transform. They end up unevenly spaced on
+        # screen, which shows the axis is nonlinear.
+        minors = []
+        for (p0, v0), (p1, v1) in zip(majors[:-1], majors[1:]):
+            span = v1 - v0
+            if span == 0:
+                continue
+            for step in range(1, 6):
+                value = v0 + span * step / 6.0
+                position = float(
+                    np.asarray(_apply_scale_transforms(
+                        np.asarray([value], dtype="float64"), configs
+                    ))[0]
+                )
+                if np.isfinite(position) and min(p0, p1) < position < max(p0, p1):
+                    minors.append((position, ""))
+        labels = [(position, _format_sci(value)) for position, value in majors]
+        axis.setTicks([labels, minors] if minors else [labels])
 
     def _figure_apply_change(self, page, index: int, plot_dict: dict) -> None:
         """Re-render a plot after a settings change (marks the page dirty)."""
