@@ -6520,7 +6520,155 @@ class MainWindow(QMainWindow):
         copied = copy.deepcopy(task_def)
         if not with_branch:
             copied["children"] = []
+        self._attach_gating_stores(copied)
         self._clipboard = copied
+
+    def _attach_gating_stores(self, task: dict) -> None:
+        """Stash the gate tree of every Gating task in a copied subtree.
+
+        A Gating module keeps its gate tree in ``Module/<id>/gates.json`` rather
+        than in ``project.json``, so a plain deepcopy would lose it.
+        """
+        stack = [task]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.get("children", []))
+            if node.get("type") != "gating" or self.project is None or not node.get("id"):
+                continue
+            store = self._gating_store_load(node)
+            if store.get("gates") or store.get("files") or store.get("per_file"):
+                node["_gating_store"] = copy.deepcopy(store)
+
+    def _restore_gating_stores(self, task: dict, mapping: dict | None = None) -> None:
+        """Write a pasted subtree's stashed gate trees to the new module ids."""
+        mapping = mapping or {}
+        stack = [task]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.get("children", []))
+            store = node.pop("_gating_store", None)
+            if not isinstance(store, dict):
+                continue
+            # Gate trees reference upstream data files; follow the pasted copy.
+            if mapping:
+                store["files"] = [
+                    self._remap_path_text(p, mapping)
+                    for p in (store.get("files") or [])
+                ]
+                store["per_file"] = {
+                    self._remap_path_text(path, mapping): overrides
+                    for path, overrides in (store.get("per_file") or {}).items()
+                }
+            # Files that belong to another upstream branch cannot apply here.
+            visible = {
+                rec.get("parquet")
+                for rec in self._available_files(node.get("id"))
+            }
+            if visible:
+                store["files"] = [
+                    p for p in (store.get("files") or []) if p in visible
+                ]
+            self._gating_store_save(node, store)
+
+    def _reset_pasted_outputs(self, task: dict) -> None:
+        """Start a pasted subtree from settings only — no generated results.
+
+        Generated data lives in ``Module/<task id>/`` and is never copied, so
+        the copy must not carry the records that describe it: a generate module
+        that still claims saved output would lock its new ancestors for files
+        that do not exist, and its output/log tables would list data nobody can
+        read. Settings (file selections, rules, keys, features…) are kept, so
+        every pasted module opens fully editable.
+        """
+        for node in self._walk_tasks(task):
+            params = node.get("params")
+            if isinstance(params, dict):
+                params.pop("log", None)
+            if _task_kind(node.get("type", "")) != "generate":
+                continue
+            node["output"] = {"saved": False}
+            if not isinstance(params, dict):
+                continue
+            if "outputs" in params:
+                params["outputs"] = {}
+            if node.get("type") == "segmentation":
+                # Per-file mask records and their signatures are generated too.
+                if "masks" in params:
+                    params["masks"] = {}
+                if "applied" in params:
+                    params["applied"] = {}
+
+    def _remap_pasted_paths(self, task: dict, mapping: dict) -> None:
+        """Rewrite ``Module/<old id>/…`` references in a pasted subtree.
+
+        A module's file selections, generated outputs, matches and per-file
+        overrides are stored as paths into the module folders of its upstream
+        tasks. When those upstream tasks are pasted along with it they get new
+        ids, so the paths must follow — otherwise the copy points at the
+        original branch (or at nothing, once that branch is deleted).
+        """
+        for node in self._walk_tasks(task):
+            params = node.get("params")
+            if isinstance(params, dict):
+                node["params"] = self._remap_path_value(params, mapping)
+
+    def _remap_path_value(self, value, mapping: dict):
+        """Recursively rewrite module-folder paths in params (keys and values)."""
+        if isinstance(value, dict):
+            return {
+                self._remap_path_text(key, mapping): self._remap_path_value(item, mapping)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._remap_path_value(item, mapping) for item in value]
+        if isinstance(value, str):
+            return self._remap_path_text(value, mapping)
+        return value
+
+    @staticmethod
+    def _remap_path_text(text: str, mapping: dict) -> str:
+        if not text or "Module" not in text:
+            return text
+        for old, new in mapping.items():
+            # Absolute and project-relative paths both contain this fragment.
+            text = text.replace(f"Module\\{old}\\", f"Module\\{new}\\")
+            text = text.replace(f"Module/{old}/", f"Module/{new}/")
+        return text
+
+    def _remap_pasted_refs(self, task: dict, mapping: dict) -> None:
+        """Point pasted modules at the pasted copies of their inputs.
+
+        Gate2Col rules reference the Gating task (and gate id) they convert.
+        When the Gating task is part of the pasted subtree it gets a new id,
+        so the rules must follow it. A Gate2Col pasted under a different
+        Gating task is re-attached through the gate id it still carries.
+        """
+        stack = [task]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.get("children", []))
+            if node.get("type") != "gate2col":
+                continue
+            rules = (node.get("params") or {}).get("rules") or []
+            chain = self._task_chain(node.get("id"))
+            gating_tasks = [
+                t for t in chain[:-1] if t.get("type") == "gating"
+            ]
+            known = {t.get("id") for t in gating_tasks}
+            gate_owner = {}
+            for owner in reversed(gating_tasks):  # nearest ancestor first
+                for gate in self._gating_gates_for(owner):
+                    gate_owner.setdefault(gate.get("id"), owner.get("id"))
+            for rule in rules:
+                current = rule.get("gate_task")
+                if current and str(current) in mapping:
+                    current = mapping[str(current)]
+                    rule["gate_task"] = current
+                if current in known:
+                    continue
+                gate_id = rule.get("gate_id")
+                if gate_id and gate_id in gate_owner:
+                    rule["gate_task"] = gate_owner[gate_id]
 
     def _paste_task(self, task_def: dict, with_branch: bool = False) -> None:
         """Paste a single task (or, with_branch, its whole branch) as a child."""
@@ -6529,17 +6677,30 @@ class MainWindow(QMainWindow):
         new_task = copy.deepcopy(self._clipboard)
         if not with_branch:
             new_task["children"] = []
-        self._reassign_ids(new_task)
+        mapping = {}
+        self._reassign_ids(new_task, mapping)
+        self._reset_pasted_outputs(new_task)
+        self._remap_pasted_paths(new_task, mapping)
         task_def.setdefault("children", []).append(new_task)
+        self._remap_pasted_refs(new_task, mapping)
+        self._restore_gating_stores(new_task, mapping)
         if self.project is not None:
             self.project.save()
         self._refresh_workflow_tree()
 
-    def _reassign_ids(self, task: dict) -> None:
-        """Give a task (and its subtree) fresh unique ids."""
-        task["id"] = f"{task.get('type', 'task')}-{uuid4().hex[:8]}"
+    def _reassign_ids(self, task: dict, mapping: dict | None = None) -> None:
+        """Give a task (and its subtree) fresh unique ids.
+
+        `mapping` collects ``{old id: new id}`` so cross-module references in
+        the pasted subtree can be rewritten.
+        """
+        old = task.get("id")
+        new = f"{task.get('type', 'task')}-{uuid4().hex[:8]}"
+        task["id"] = new
+        if mapping is not None and old:
+            mapping[str(old)] = new
         for child in task.get("children", []):
-            self._reassign_ids(child)
+            self._reassign_ids(child, mapping)
 
     def _rename_task(self, task_def: dict) -> None:
         """Rename a task."""
@@ -8481,11 +8642,15 @@ class MainWindow(QMainWindow):
         return stages
 
     def _column_data(self, task_id, parquet_path, names, extra_stages=None,
-                     row_filter=True) -> dict:
+                     row_filter=True, numeric=True) -> dict:
         """Column values as seen at `task_id`, with upstream map stages applied.
 
         When an upstream Subsample module samples this file, the returned
         arrays hold only the sampled rows (unless `row_filter` is off).
+
+        With ``numeric=False`` the values keep their stored dtype and only
+        rename stages apply — for identifier columns (matching keys, names)
+        where numeric coercion would turn text into NaN.
         """
         import pandas as pd
 
@@ -8509,6 +8674,8 @@ class MainWindow(QMainWindow):
             stages = renames + post
         if extra_stages:
             stages = stages + list(extra_stages)
+        if not numeric:
+            stages = [(kind, stage) for kind, stage in stages if kind == "rename"]
         if feature_output is not None:
             # Generated files are not in the import column index; their columns
             # were recorded when the module generated them.
@@ -8531,9 +8698,12 @@ class MainWindow(QMainWindow):
                 df = None
             if df is not None:
                 for column in base_cols:
-                    values[column] = pd.to_numeric(
-                        df[column], errors="coerce"
-                    ).to_numpy(dtype="float64")
+                    if numeric:
+                        values[column] = pd.to_numeric(
+                            df[column], errors="coerce"
+                        ).to_numpy(dtype="float64")
+                    else:
+                        values[column] = df[column].to_numpy()
         if task_id:
             # Mask columns exposed by an upstream Segmentation module are not
             # stored in the data file; they are resolved from the mask parquet.
@@ -10232,6 +10402,13 @@ class MainWindow(QMainWindow):
                 norm = (chan.astype("float64") - lo) / (hi - lo)
             else:
                 norm = np.zeros(chan.shape, dtype="float64")
+            # Pixels with no value (a Feature Up / Gate2Col mask outside its
+            # objects, for instance) must contribute nothing. Leaving NaN in
+            # would poison the additive composite below and black out every
+            # layer drawn before it — which is exactly what happened at deep
+            # zoom, where the raster is read from raw pixels and the
+            # background is NaN instead of the pyramid's 0.
+            norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
             norm = np.clip(norm, 0.0, 1.0)
             if frac is not None:
                 cov = (frac >= 0.5).astype("float64")
@@ -20503,6 +20680,18 @@ class MainWindow(QMainWindow):
                 f"{self._comp_file_name(parquet_path, page._feat_task_id)}: skipped {dropped} row(s) "
                 f"with an empty '{feature}' value"
             )
+        # A Segmentation mask labels objects 1..N and leaves the background 0.
+        # Aggregating label 0 would create a huge "background object" that then
+        # takes part in gating and gets painted over every background pixel
+        # downstream, so it is skipped.
+        if feature in self._seg_applied_columns(page._feat_task_id, parquet_path):
+            background = int((df[feature] == 0).sum())
+            if background:
+                df = df[df[feature] != 0]
+                warnings.append(
+                    f"{self._comp_file_name(parquet_path, page._feat_task_id)}: "
+                    f"skipped {background} background pixel(s) (mask label 0)"
+                )
         if df.empty:
             raise ValueError("no rows with a valid feature value")
 
@@ -20680,7 +20869,8 @@ class MainWindow(QMainWindow):
                 needed = set()
                 for g in chain:
                     needed |= _gate_needed_columns(g, by_id)
-                label = " -> ".join(g.get("name", g["id"]) for g in chain)
+                # Show at most three levels: grandparent -> parent -> this gate.
+                label = " -> ".join(g.get("name", g["id"]) for g in chain[-3:])
                 if multi:
                     label += f" ({task.get('name', '')})"
                 opts.append({
@@ -20813,15 +21003,28 @@ class MainWindow(QMainWindow):
             table.blockSignals(True)
             table.setRowCount(len(files))
             for i, path in enumerate(files):
-                item = QTableWidgetItem(self._comp_file_name(path, page._g2c_task_id))
+                missing = not Path(str(path)).is_file()
+                label = self._comp_file_name(path, page._g2c_task_id)
+                if missing:
+                    label += "  (missing)"
+                item = QTableWidgetItem(label)
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                if missing:
+                    item.setForeground(QColor("#c0392b"))
+                    item.setToolTip(
+                        "This file is no longer on disk — re-run the module that "
+                        "created it, or select files again."
+                    )
                 table.setItem(i, 0, item)
-                status = self._g2c_file_status(page, path)
+                status = "File missing" if missing else self._g2c_file_status(page, path)
                 sitem = QTableWidgetItem(status)
                 sitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                sitem.setForeground(
-                    QColor("#1a7f37") if status == "Converted" else QColor("#9aa0a6")
-                )
+                if missing:
+                    sitem.setForeground(QColor("#c0392b"))
+                else:
+                    sitem.setForeground(
+                        QColor("#1a7f37") if status == "Converted" else QColor("#9aa0a6")
+                    )
                 table.setItem(i, 1, sitem)
             table.blockSignals(False)
         count = getattr(page, "_g2c_count_label", None)
@@ -21090,6 +21293,11 @@ class MainWindow(QMainWindow):
                 if status is not None:
                     status.setText(f"Converting… {name}")
                 QApplication.processEvents()
+                if not Path(str(path)).is_file():
+                    outputs.pop(path, None)
+                    failed.append(f"{name}: file not found")
+                    self._g2c_log(page, f"✗ {name}: file not found — skipped")
+                    continue
                 try:
                     rel, columns, kind = self._g2c_compute_file(page, path)
                 except Exception as exc:  # noqa: BLE001
@@ -21730,8 +21938,34 @@ class MainWindow(QMainWindow):
         self._fup_mark_dirty(page)
         self._fup_log(page, "Matched files.")
 
+    def _fup_key_values(self, task_id, parquet_path, key):
+        """Identifier column values for matching, in their stored dtype.
+
+        Prefers the pipeline view (renames, virtual columns), then falls back
+        to the stored parquet column when the pipeline cannot expose it.
+        """
+        if not parquet_path or not key:
+            return None
+        try:
+            values = self._column_data(task_id, parquet_path, [key], numeric=False)
+            if values.get(key) is not None:
+                return values[key]
+        except Exception as exc:  # noqa: BLE001
+            _debug_log(
+                f"feature up: column_data failed for {key!r} in {parquet_path}: {exc!r}"
+            )
+        try:
+            import pandas as pd
+
+            frame = pd.read_parquet(parquet_path, columns=[key])
+            return frame[key].to_numpy()
+        except Exception as exc:  # noqa: BLE001
+            _debug_log(
+                f"feature up: key {key!r} unreadable in {parquet_path}: {exc!r}"
+            )
+        return None
+
     def _fup_fill_match_stats(self, page, row, from_path, to_path) -> None:
-        import numpy as np
         import pandas as pd
 
         table = getattr(page, "_fup_match_table", None)
@@ -21744,10 +21978,35 @@ class MainWindow(QMainWindow):
         key_to = params.get("key_to")
         if not from_path or not to_path or not key_from or not key_to:
             return
+
+        def unavailable(missing, key, reason=None):
+            for col in (2, 3):
+                item = QTableWidgetItem("—")
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setToolTip(
+                    reason
+                    or f"Column '{key}' could not be read from the {missing} file"
+                )
+                table.setItem(row, col, item)
+
+        for side, path in (("From", from_path), ("To", to_path)):
+            if not Path(str(path)).is_file():
+                unavailable(
+                    side, "",
+                    f"The {side} file is not on disk:\n{path}\n\n"
+                    "Re-run the module that produced it, or select another file.",
+                )
+                return
+
         try:
-            fv = self._column_data(page._fup_task_id, from_path, [key_from]).get(key_from)
-            tv = self._column_data(page._fup_task_id, to_path, [key_to]).get(key_to)
-            if fv is None or tv is None:
+            fv = self._fup_key_values(page._fup_task_id, from_path, key_from)
+            if fv is None:
+                unavailable("From", key_from)
+                return
+            tv = self._fup_key_values(page._fup_task_id, to_path, key_to)
+            if tv is None:
+                unavailable("To", key_to)
                 return
             fv = pd.Series(fv).dropna()
             tv = pd.Series(tv).dropna()
@@ -21770,8 +22029,9 @@ class MainWindow(QMainWindow):
                 if bad:
                     item.setForeground(QColor("#c0392b"))
                 table.setItem(row, col, item)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _debug_log(f"feature up match stats failed: {exc!r}")
+            unavailable("selected", key_from)
 
     def _fup_rebuild_match_row(self, page, row) -> None:
         table = getattr(page, "_fup_match_table", None)
@@ -21795,14 +22055,27 @@ class MainWindow(QMainWindow):
         table.setRowCount(0)
         table.setRowCount(len(from_files))
         for i, from_path in enumerate(from_files):
-            item = QTableWidgetItem(self._comp_file_name(from_path, page._fup_task_id))
+            from_missing = not Path(str(from_path)).is_file()
+            text = self._comp_file_name(from_path, page._fup_task_id)
+            if from_missing:
+                text += "  (missing)"
+            item = QTableWidgetItem(text)
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            if from_missing:
+                item.setForeground(QColor("#c0392b"))
+                item.setToolTip(
+                    "This file is no longer on disk — re-run the module that "
+                    "created it, or pick another From file."
+                )
             table.setItem(i, 0, item)
 
             combo = _NoWheelComboBox()
             combo.addItem("", None)
             for to_path in to_files:
-                combo.addItem(self._comp_file_name(to_path, page._fup_task_id), to_path)
+                label = self._comp_file_name(to_path, page._fup_task_id)
+                if not Path(str(to_path)).is_file():
+                    label += "  (missing)"
+                combo.addItem(label, to_path)
             cur = (params.get("matches") or {}).get(from_path)
             idx = combo.findData(cur)
             combo.setCurrentIndex(max(0, idx))
@@ -21966,11 +22239,13 @@ class MainWindow(QMainWindow):
         names = [(f.get("name") or f["source"]).strip() for f in features]
 
         # Build the From lookup table (key -> feature values); the first row
-        # wins when a key value repeats.
-        fv = self._column_data(page._fup_task_id, from_path, [key_from] + sources)
-        if key_from not in fv:
+        # wins when a key value repeats. Keys are read as stored (text keys
+        # must not be coerced to NaN); feature values are numeric.
+        from_keys = self._fup_key_values(page._fup_task_id, from_path, key_from)
+        if from_keys is None:
             raise ValueError(f"'{key_from}' is missing from the From file")
-        from_keys = pd.Series(fv[key_from])
+        fv = self._column_data(page._fup_task_id, from_path, sources)
+        from_keys = pd.Series(from_keys).astype("object")
         tmp = [f"__fup_src_{j}" for j in range(len(sources))]
         lf = pd.DataFrame({
             "__fup_key": from_keys,
@@ -21986,10 +22261,10 @@ class MainWindow(QMainWindow):
             )
         lf = lf.drop_duplicates(subset="__fup_key", keep="first")
 
-        tv = self._column_data(page._fup_task_id, to_path, [key_to]).get(key_to)
+        tv = self._fup_key_values(page._fup_task_id, to_path, key_to)
         if tv is None:
             raise ValueError(f"'{key_to}' is missing from the To file")
-        merged = pd.DataFrame({"__fup_key": pd.Series(tv)}).merge(
+        merged = pd.DataFrame({"__fup_key": pd.Series(tv).astype("object")}).merge(
             lf, on="__fup_key", how="left"
         )
         row_vals = {}
