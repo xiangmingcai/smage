@@ -3132,16 +3132,35 @@ def _make_fit_plot_item(viewbox=None):
 
 _GATE_PEN = "#000000"
 _GATE_HOVER_PEN = "#444444"
+_GATE_COLOR_DEFAULT = "#000000"
 _POLY_CLOSE_RADIUS = 12  # pixels: click this close to the first anchor to close
 
 
-def _gate_roi_pens() -> dict:
-    """Pens for a gate ROI: blue edge, darker+thicker blue on hover."""
+def _gate_color(preview) -> str:
+    """The user's gate drawing colour (defaults to black)."""
+    color = (preview or {}).get("gate_color")
+    return color if isinstance(color, str) and color else _GATE_COLOR_DEFAULT
+
+
+def _gate_hover_color(color: str) -> str:
+    """A shifted shade of `color` used when the cursor is over a gate."""
+    qcolor = QColor(color)
+    if not qcolor.isValid():
+        return _GATE_HOVER_PEN
+    if qcolor.lightness() > 128:
+        return qcolor.darker(150).name()
+    return qcolor.lighter(170).name()
+
+
+def _gate_roi_pens(color: str | None = None) -> dict:
+    """Pens for a gate ROI: the gate colour, a shifted shade on hover."""
+    base = color or _GATE_COLOR_DEFAULT
+    hover = _gate_hover_color(base)
     return dict(
-        pen=pg.mkPen(_GATE_PEN, width=2),
-        hoverPen=pg.mkPen(_GATE_HOVER_PEN, width=3),
-        handlePen=pg.mkPen(_GATE_PEN, width=1),
-        handleHoverPen=pg.mkPen(_GATE_HOVER_PEN, width=2),
+        pen=pg.mkPen(base, width=2),
+        hoverPen=pg.mkPen(hover, width=3),
+        handlePen=pg.mkPen(base, width=1),
+        handleHoverPen=pg.mkPen(hover, width=2),
     )
 
 
@@ -3164,6 +3183,8 @@ class _GateViewBox(pg.ViewBox):
         super().__init__(*args, **kwargs)
         self._on_gate_created = on_gate_created
         self._on_empty_click = on_empty_click
+        # Colour used while drawing gates (kept in sync with the settings).
+        self.gate_color = _GATE_COLOR_DEFAULT
         self._tool = None  # "rect" | "ellipse" | "polygon" | ...
         self._start = None
         self._preview = None
@@ -3309,18 +3330,18 @@ class _GateViewBox(pg.ViewBox):
         if self._range_anchor is None:
             self._range_anchor = pg.InfiniteLine(
                 pos=self._range_x1, angle=90, movable=False,
-                pen=pg.mkPen(_GATE_PEN, width=2, style=Qt.PenStyle.DashLine),
+                pen=pg.mkPen(self.gate_color, width=2, style=Qt.PenStyle.DashLine),
             )
             self.addItem(self._range_anchor)
         if self._range_band is None:
             self._range_band = self._make_preview_item(
-                pen=pg.mkPen(_GATE_PEN, width=2, style=Qt.PenStyle.DashLine),
+                pen=pg.mkPen(self.gate_color, width=2, style=Qt.PenStyle.DashLine),
             )
             self.addItem(self._range_band)
         if self._range_arrow is None:
             self._range_arrow = pg.ArrowItem(
                 angle=0, headLen=10, tipAngle=30, tailLen=None,
-                brush=pg.mkBrush(_GATE_PEN), pen=None, pxMode=True,
+                brush=pg.mkBrush(self.gate_color), pen=None, pxMode=True,
             )
             self.addItem(self._range_arrow)
         x0, y0 = self._range_x1, self._range_y1
@@ -3351,7 +3372,9 @@ class _GateViewBox(pg.ViewBox):
             if self._first_highlight is not None:
                 self.removeItem(self._first_highlight)
                 self._first_highlight = None
-            roi = _GatePolygonROI(pts, closed=True, **_gate_roi_pens())
+            roi = _GatePolygonROI(
+                pts, closed=True, **_gate_roi_pens(self.gate_color)
+            )
             self.addItem(roi)
             self._on_gate_created("polygon", roi)
         else:
@@ -3383,20 +3406,20 @@ class _GateViewBox(pg.ViewBox):
     def _ensure_polygon_items(self) -> None:
         if self._preview is None:
             self._preview = self._make_preview_item(
-                pen=pg.mkPen(_GATE_PEN, width=2),
-                symbol="o", symbolSize=9, symbolBrush=_GATE_PEN,
+                pen=pg.mkPen(self.gate_color, width=2),
+                symbol="o", symbolSize=9, symbolBrush=self.gate_color,
             )
             self.addItem(self._preview)
         if self._rubber is None:
             self._rubber = self._make_preview_item(
-                pen=pg.mkPen(_GATE_PEN, width=1, style=Qt.PenStyle.DashLine),
+                pen=pg.mkPen(self.gate_color, width=1, style=Qt.PenStyle.DashLine),
             )
             self.addItem(self._rubber)
         if self._first_highlight is None:
             self._first_highlight = self._make_preview_item(
                 pen=None,
                 symbol="o", symbolSize=15,
-                symbolPen=pg.mkPen(_GATE_HOVER_PEN, width=2.5),
+                symbolPen=pg.mkPen(_gate_hover_color(self.gate_color), width=2.5),
                 symbolBrush=pg.mkBrush(None),
             )
             self.addItem(self._first_highlight)
@@ -3431,8 +3454,8 @@ class _GateViewBox(pg.ViewBox):
 
     def _make_shape(self, tool, pos, size):
         if tool == "ellipse":
-            return pg.EllipseROI(pos, size, **_gate_roi_pens())
-        return pg.RectROI(pos, size, **_gate_roi_pens())
+            return pg.EllipseROI(pos, size, **_gate_roi_pens(self.gate_color))
+        return pg.RectROI(pos, size, **_gate_roi_pens(self.gate_color))
 
 
 class _GatePolygonROI(pg.PolyLineROI):
@@ -8439,6 +8462,30 @@ class MainWindow(QMainWindow):
             elif item.layout() is not None:
                 self._clear_layout(item.layout())
 
+    def _settings_scroll(self, layout):
+        """The QScrollArea that contains a settings layout, if there is one."""
+        widget = layout.parentWidget() if hasattr(layout, "parentWidget") else None
+        while widget is not None:
+            if isinstance(widget, QScrollArea):
+                return widget
+            widget = widget.parentWidget()
+        return None
+
+    def _clear_settings_layout(self, layout) -> None:
+        """Clear a settings layout without losing the panel's scroll position.
+
+        Rebuilding briefly shrinks the content, which clamps the scroll bar to
+        the bottom; the old offset is restored once the new widgets exist.
+        """
+        scroll = self._settings_scroll(layout)
+        if scroll is None:
+            self._clear_layout(layout)
+            return
+        value = scroll.verticalScrollBar().value()
+        self._clear_layout(layout)
+        bar = scroll.verticalScrollBar()
+        QTimer.singleShot(0, lambda: bar.setValue(value))
+
     def _build_figure_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
         """Build the Figure page: Figures canvas (3) | Settings (1)."""
         page = QWidget()
@@ -9890,13 +9937,35 @@ class MainWindow(QMainWindow):
                 raster_stages = None
                 cname = None
             else:
-                if channel not in color_cols:
-                    # Only parameters produced by an Unmix module can be rendered.
+                # A column renamed by an upstream Rename module is reachable
+                # under its new name only.
+                renamed_away = any(
+                    kind == "rename"
+                    and _rename_applies(stage, parquet_path)
+                    and channel in stage["map"]
+                    and stage["map"][channel] != channel
+                    for kind, stage in stages
+                )
+                if channel in color_cols:
+                    if renamed_away:
+                        unavailable.append(channel)
+                        continue
+                else:
+                    # Channels produced by an upstream map stage are renderable
+                    # too: Unmix output names and columns renamed by a Rename
+                    # module (the raster pipeline maps the name back to the
+                    # stored column).
                     produced = any(
                         kind == "unmix" and channel in stage["names"]
                         for kind, stage in stages
                     )
-                    if not produced:
+                    renamed = any(
+                        kind == "rename"
+                        and channel in stage["map"].values()
+                        and _rename_applies(stage, parquet_path)
+                        for kind, stage in stages
+                    )
+                    if not (produced or renamed):
                         unavailable.append(channel)
                         continue
                 raster_stages = stages if _pipeline_touches(stages, channel) else None
@@ -10586,7 +10655,7 @@ class MainWindow(QMainWindow):
     def _figure_rebuild_settings_single(self, page) -> None:
         """Rebuild the right-hand settings panel for a single selected plot."""
         layout = page._fig_settings_layout
-        self._clear_layout(layout)
+        self._clear_settings_layout(layout)
         index = page._fig_selected[0] if page._fig_selected else -1
         if index < 0 or index >= len(page._fig_plots):
             hint = QLabel("Add a plot to see its settings.")
@@ -10950,7 +11019,7 @@ class MainWindow(QMainWindow):
         when they differ; setting a field applies it to every selected plot.
         """
         layout = page._fig_settings_layout
-        self._clear_layout(layout)
+        self._clear_settings_layout(layout)
         indices = page._fig_selected
         plots = [page._fig_plots[i] for i in indices if 0 <= i < len(page._fig_plots)]
         if not plots:
@@ -12550,7 +12619,7 @@ class MainWindow(QMainWindow):
 
     def _scaling_rebuild_settings(self, page) -> None:
         layout = page._scaling_settings_layout
-        self._clear_layout(layout)
+        self._clear_settings_layout(layout)
         preview = page._scaling_preview
         enabled = not page._scaling_locked
         plot_widget = page._scaling_plot_widget
@@ -12873,6 +12942,15 @@ class MainWindow(QMainWindow):
             "QListWidget { background: #ffffff; border: none; }"
             "QListWidget::item:selected { background: #dbeafa; }"
         )
+        # Drag rows to change the order the spectra are quantified in.
+        spectra_list.setDragDropMode(
+            QAbstractItemView.DragDropMode.InternalMove
+        )
+        spectra_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        spectra_list.setDragEnabled(not page._unmix_locked)
+        spectra_list.model().rowsMoved.connect(
+            lambda *_: self._unmix_reorder_spectra(page)
+        )
         list_lay.addWidget(spectra_list, 1)
         spectra_list.itemClicked.connect(
             lambda item: self._unmix_select_spectrum(
@@ -13131,6 +13209,26 @@ class MainWindow(QMainWindow):
         lst.blockSignals(False)
         if active is not None:
             self._unmix_highlight_spectrum(page, active["id"])
+
+    def _unmix_reorder_spectra(self, page) -> None:
+        """Adopt the order the spectra list was dragged into."""
+        lst = page._unmix_spectra_list
+        order = [
+            lst.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(lst.count())
+        ]
+        by_id = {s["id"]: s for s in page._unmix_spectra}
+        reordered = [by_id[sid] for sid in order if sid in by_id]
+        if len(reordered) != len(page._unmix_spectra):
+            return  # a partial view: keep the stored order
+        page._unmix_spectra[:] = reordered
+        active = page._unmix_active_spectrum
+        if active is not None:
+            self._unmix_highlight_spectrum(page, active["id"])
+        # The signature editor's dropdowns list the spectra in this order.
+        if getattr(page, "_unmix_signature_table", None) is not None:
+            self._unmix_rebuild_signature_table(page)
+        self._unmix_mark_dirty(page)
 
     def _unmix_highlight_spectrum(self, page, spectrum_id) -> None:
         lst = page._unmix_spectra_list
@@ -13572,7 +13670,7 @@ class MainWindow(QMainWindow):
     def _unmix_rebuild_spectrum_settings(self, page) -> None:
         """Build the module-wide spectrum settings (one set for all spectra)."""
         layout = page._unmix_spectrum_settings_layout
-        self._clear_layout(layout)
+        self._clear_settings_layout(layout)
         enabled = not page._unmix_locked
         cfg = page._unmix_spectrum_cfg
         self._unmix_sync_spectrum_params(page)
@@ -15531,7 +15629,7 @@ class MainWindow(QMainWindow):
     # --- right side
     def _illum_rebuild_right(self, page) -> None:
         host = page._illum_right_host
-        self._clear_layout(host.layout())
+        self._clear_settings_layout(host.layout())
         sub = self._illum_selected_sub(page)
         page._illum_plot = None
         if sub is None:
@@ -17320,7 +17418,7 @@ class MainWindow(QMainWindow):
     def _seg_rebuild_method_panel(self, page) -> None:
         """Swap the second panel between method params and the mask-input table."""
         host = page._seg_method_host
-        self._clear_layout(host.layout())
+        self._clear_settings_layout(host.layout())
         method = page._seg_params.get("method")
         if method == "mask_input":
             self._seg_mask_input_panel(page, host)
@@ -18607,7 +18705,7 @@ class MainWindow(QMainWindow):
         host = getattr(page, "_seg_settings_host", None)
         if host is None:
             return
-        self._clear_layout(host.layout())
+        self._clear_settings_layout(host.layout())
         lay = host.layout()
         enabled = not page._seg_locked
         plot_dict = self._seg_plot_dict(page)
@@ -29463,9 +29561,18 @@ class MainWindow(QMainWindow):
         page._gating_files = [p for p in (page._gating_files or []) if p in visible]
         box = getattr(page, "_gating_files_box", None)
         if box is not None:
+            box.blockSignals(True)
             box.clear()
+            current = page._gating_preview.get("file")
             for path in page._gating_files:
-                box.addItem(self._comp_file_name(path, page._gating_task_id))
+                item = QListWidgetItem(
+                    self._comp_file_name(path, page._gating_task_id)
+                )
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                box.addItem(item)
+                if path == current:
+                    box.setCurrentItem(item)
+            box.blockSignals(False)
         count = getattr(page, "_gating_files_count", None)
         if count is not None:
             count.setText(f"{len(page._gating_files)} file(s) selected")
@@ -29542,6 +29649,11 @@ class MainWindow(QMainWindow):
                 "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
             )
             files_box.setEnabled(not locked)
+            files_box.itemClicked.connect(
+                lambda item: self._gating_switch_file(
+                    page, item.data(Qt.ItemDataRole.UserRole)
+                )
+            )
             tree_lay.addWidget(files_box, 1)
             page._gating_files_box = files_box
             files_count = QLabel("")
@@ -29686,6 +29798,9 @@ class MainWindow(QMainWindow):
         self._gating_rebuild_tree(page)
         self._gating_render(page)
         self._gating_rebuild_settings(page)
+        # Gates are drawn with the saved colour; make sure every item picked
+        # it up (lines created before the colour was known, handles, …).
+        self._gating_apply_gate_color(page)
         return content
 
     def _gating_make_plot(self, page):
@@ -29694,6 +29809,7 @@ class MainWindow(QMainWindow):
             on_gate_created=lambda tool, roi: self._gating_add_gate(page, tool, roi),
             on_empty_click=lambda: self._gating_deselect(page),
         )
+        viewbox.gate_color = _gate_color(page._gating_preview)
         plot_item = _make_fit_plot_item(viewbox=viewbox)
         plot_widget = pg.PlotWidget(plotItem=plot_item)
         plot_widget.setBackground(_plot_background())
@@ -29928,12 +30044,13 @@ class MainWindow(QMainWindow):
 
     def _gating_add_gate(self, page, tool, arg) -> None:
         preview = page._gating_preview
+        gate_color = _gate_color(preview)
         xr, yr = page._gating_viewbox.viewRange()
         if tool == "quadrant":
             x0, y0 = arg
             crosshair_id = uuid4().hex[:8]
-            pen = pg.mkPen(_GATE_PEN, width=2)
-            hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+            pen = pg.mkPen(_gate_color(preview), width=2)
+            hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
             vline = pg.InfiniteLine(pos=x0, angle=90, movable=True, pen=pen, hoverPen=hover)
             hline = pg.InfiniteLine(pos=y0, angle=0, movable=True, pen=pen, hoverPen=hover)
             page._gating_viewbox.addItem(vline)
@@ -29991,8 +30108,8 @@ class MainWindow(QMainWindow):
                 "xmin": xr[0], "xmax": xr[1],
                 "ymin": yr[0], "ymax": yr[1],
             }
-            pen = pg.mkPen(_GATE_PEN, width=2)
-            hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+            pen = pg.mkPen(_gate_color(preview), width=2)
+            hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
             vline1 = pg.InfiniteLine(pos=x1, angle=90, movable=True, pen=pen, hoverPen=hover)
             vline2 = pg.InfiniteLine(pos=x2, angle=90, movable=True, pen=pen, hoverPen=hover)
             page._gating_viewbox.addItem(vline1)
@@ -30018,8 +30135,8 @@ class MainWindow(QMainWindow):
         if tool == "split":
             x0, _ = arg
             split_id = uuid4().hex[:8]
-            pen = pg.mkPen(_GATE_PEN, width=2)
-            hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+            pen = pg.mkPen(_gate_color(preview), width=2)
+            hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
             vline = pg.InfiniteLine(pos=x0, angle=90, movable=True, pen=pen, hoverPen=hover)
             page._gating_viewbox.addItem(vline)
             page._gating_split_lines[split_id] = {
@@ -30060,7 +30177,7 @@ class MainWindow(QMainWindow):
             cx, cy = center
             skewed_id = uuid4().hex[:8]
             roi = _SkewedQuadrantROI(
-                center, p_right, p_up, p_left, p_down, **_gate_roi_pens(),
+                center, p_right, p_up, p_left, p_down, **_gate_roi_pens(gate_color),
             )
             self._gating_style_handles(roi)
             roi.setAcceptHoverEvents(True)
@@ -30421,6 +30538,7 @@ class MainWindow(QMainWindow):
         resolved = _resolve_gates_for_file(
             page._gating_gates, page._gating_per_file, file_key
         )
+        gate_color = _gate_color(page._gating_preview)
         plot_type = page._gating_preview.get("type", "scatter")
         for gate, rgate in zip(page._gating_gates, resolved):
             items = []
@@ -30433,7 +30551,7 @@ class MainWindow(QMainWindow):
                     roi = pg.RectROI(
                         (rgate["pos"][0], rgate["pos"][1]),
                         (rgate["size"][0], rgate["size"][1]),
-                        **_gate_roi_pens(),
+                        **_gate_roi_pens(gate_color),
                     )
                     self._gating_style_handles(roi)
                     roi.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
@@ -30450,7 +30568,7 @@ class MainWindow(QMainWindow):
                     roi = pg.EllipseROI(
                         (rgate["pos"][0], rgate["pos"][1]),
                         (rgate["size"][0], rgate["size"][1]),
-                        **_gate_roi_pens(),
+                        **_gate_roi_pens(gate_color),
                     )
                     self._gating_style_handles(roi)
                     roi.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
@@ -30466,7 +30584,7 @@ class MainWindow(QMainWindow):
                 elif t == "polygon":
                     roi = _GatePolygonROI(
                         [tuple(p) for p in rgate["points"]],
-                        closed=True, **_gate_roi_pens(),
+                        closed=True, **_gate_roi_pens(gate_color),
                     )
                     self._gating_style_handles(roi)
                     roi.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
@@ -30482,8 +30600,8 @@ class MainWindow(QMainWindow):
                 elif t == "quadrant":
                     cid = gate.get("crosshair_id")
                     if cid and cid not in page._gating_crosshairs:
-                        pen = pg.mkPen(_GATE_PEN, width=2)
-                        hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+                        pen = pg.mkPen(_gate_color(preview), width=2)
+                        hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
                         vline = pg.InfiniteLine(pos=rgate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
                         hline = pg.InfiniteLine(pos=rgate.get("hy", 0), angle=0, movable=True, pen=pen, hoverPen=hover)
                         viewbox.addItem(vline)
@@ -30501,8 +30619,8 @@ class MainWindow(QMainWindow):
                         )
                     items = []
                 elif t == "range":
-                    pen = pg.mkPen(_GATE_PEN, width=2)
-                    hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+                    pen = pg.mkPen(_gate_color(preview), width=2)
+                    hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
                     vline1 = pg.InfiniteLine(pos=rgate.get("x1", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
                     vline2 = pg.InfiniteLine(pos=rgate.get("x2", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
                     viewbox.addItem(vline1)
@@ -30519,8 +30637,8 @@ class MainWindow(QMainWindow):
                 elif t == "split":
                     sid = gate.get("split_id")
                     if sid and sid not in page._gating_split_lines:
-                        pen = pg.mkPen(_GATE_PEN, width=2)
-                        hover = pg.mkPen(_GATE_HOVER_PEN, width=3)
+                        pen = pg.mkPen(_gate_color(preview), width=2)
+                        hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
                         vline = pg.InfiniteLine(pos=rgate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
                         viewbox.addItem(vline)
                         page._gating_split_lines[sid] = {
@@ -30542,7 +30660,7 @@ class MainWindow(QMainWindow):
                             rgate.get("p_up", (cx, cy)),
                             rgate.get("p_left", (cx, cy)),
                             rgate.get("p_down", (cx, cy)),
-                            **_gate_roi_pens(),
+                            **_gate_roi_pens(gate_color),
                         )
                         self._gating_style_handles(roi)
                         roi.setAcceptHoverEvents(True)
@@ -31437,7 +31555,7 @@ class MainWindow(QMainWindow):
 
     def _gating_rebuild_settings(self, page) -> None:
         layout = page._gating_settings_layout
-        self._clear_layout(layout)
+        self._clear_settings_layout(layout)
         preview = page._gating_preview
         enabled = not page._gating_locked
         plot_widget = page._gating_plot_widget
@@ -31532,6 +31650,21 @@ class MainWindow(QMainWindow):
             ),
         )
 
+        layout.addWidget(QLabel("Gate color"))
+        gate_color_btn = QPushButton()
+        gate_color_btn.setFixedSize(60, 22)
+        gate_color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        gate_color_btn.setEnabled(enabled)
+        gate_color_btn.setToolTip("Colour of the gate outlines")
+        gate_color_btn.setStyleSheet(
+            f"background-color: {_gate_color(preview)}; "
+            "border: 1px solid #6b7785; border-radius: 3px;"
+        )
+        gate_color_btn.clicked.connect(
+            lambda _=False: self._gating_pick_gate_color(page, gate_color_btn)
+        )
+        layout.addWidget(gate_color_btn)
+
         show_labels_cb = QCheckBox("Show gate labels")
         show_labels_cb.setChecked(bool(preview.get("show_gate_labels", True)))
         show_labels_cb.setEnabled(enabled)
@@ -31580,56 +31713,9 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
         def on_file_changed():
-            preview["file"] = file_combo.currentData()
-            preview["file_name"] = file_combo.currentText()
-            # Keep the current gate hierarchy (subset / editing context) when
-            # switching files; only the axes may need to follow the new file.
-            new_rec = self._figure_record(preview["file"])
-            new_cols = self._columns_for(
-                new_rec.get("parquet"), page._gating_task_id
-            ) if new_rec else []
-            gate_id = page._gating_active_gate_id or page._gating_context_gate_id
-            gate = next(
-                (g for g in page._gating_gates if g["id"] == gate_id), None
-            ) if gate_id else None
-            plot_type = preview.get("type", "scatter")
-            if plot_type == "image":
-                preview["x"] = "x" if "x" in new_cols else None
-                preview["y"] = "y" if "y" in new_cols else None
-            elif plot_type == "histogram":
-                if gate is not None and gate.get("x"):
-                    preview["x"] = gate["x"]
-                else:
-                    preview["x"] = (
-                        preview.get("last_x") if preview.get("last_x") in new_cols
-                        else (new_cols[0] if new_cols else None)
-                    )
-                preview["y"] = None
-            else:
-                if gate is not None and gate.get("x") and gate.get("y"):
-                    preview["x"] = gate["x"]
-                    preview["y"] = gate["y"]
-                else:
-                    preview["x"] = (
-                        preview.get("last_x") if preview.get("last_x") in new_cols else None
-                    )
-                    preview["y"] = (
-                        preview.get("last_y") if preview.get("last_y") in new_cols else None
-                    )
-            # Keep the visible range when switching files (not for image view,
-            # which uses the image's own extent).
-            vb = page._gating_viewbox
-            xr, yr = vb.viewRange()
-            self._gating_reload_rois(page)
-            self._gating_render(page)
-            if plot_type != "image":
-                vb.setXRange(xr[0], xr[1], padding=0)
-                vb.setYRange(yr[0], yr[1], padding=0)
-            # Clear the previous file's statistics and recompute for this one.
-            page._gating_last_stats = {}
-            self._gating_rebuild_tree(page)
-            self._gating_mark_dirty(page)
-            self._gating_rebuild_settings(page)
+            self._gating_switch_file(
+                page, file_combo.currentData(), file_combo.currentText()
+            )
         file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
 
         def on_param(attr):
@@ -31679,6 +31765,139 @@ class MainWindow(QMainWindow):
         """Re-render and mark dirty after a scatter setting change."""
         self._gating_render(page)
         self._gating_mark_dirty(page)
+
+    def _gating_pick_gate_color(self, page, button=None) -> None:
+        """Choose the colour used to draw every gate outline."""
+        preview = page._gating_preview
+        chosen = QColorDialog.getColor(
+            QColor(_gate_color(preview)), self, "Gate color"
+        )
+        if not chosen.isValid():
+            return
+        preview["gate_color"] = chosen.name()
+        if button is not None:
+            button.setStyleSheet(
+                f"background-color: {chosen.name()}; "
+                "border: 1px solid #6b7785; border-radius: 3px;"
+            )
+        self._gating_apply_gate_color(page)
+        self._gating_mark_dirty(page)
+
+    def _gating_apply_gate_color(self, page) -> None:
+        """Re-pen every gate item with the current gate colour."""
+        color = _gate_color(page._gating_preview)
+        hover = _gate_hover_color(color)
+        viewbox = getattr(page, "_gating_viewbox", None)
+        if viewbox is not None:
+            viewbox.gate_color = color
+        pen = pg.mkPen(color, width=2)
+        hover_pen = pg.mkPen(hover, width=3)
+        handle_pen = pg.mkPen(color, width=1)
+        handle_hover_pen = pg.mkPen(hover, width=2)
+
+        def repen(item) -> None:
+            if isinstance(item, pg.InfiniteLine):
+                item.setPen(pen)
+                item.setHoverPen(hover_pen)
+                return
+            try:
+                item.setPen(pen)
+                item.setHoverPen(hover_pen)
+            except (AttributeError, TypeError):
+                pass
+            # pyqtgraph handles are Handle objects (not QGraphicsItems): they
+            # keep their pens as attributes, so set those and repaint.
+            for handle in getattr(item, "handles", []):
+                widget = handle.get("item") if isinstance(handle, dict) else handle
+                if widget is None:
+                    continue
+                try:
+                    widget.pen = handle_pen
+                    widget.hoverPen = handle_hover_pen
+                    widget.currentPen = handle_pen
+                    widget.update()
+                except (AttributeError, TypeError):
+                    pass
+
+        for items in page._gating_rois:
+            for item in items:
+                repen(item)
+        for entry in page._gating_crosshairs.values():
+            for line in entry.get("lines", []):
+                repen(line)
+        for entry in getattr(page, "_gating_split_lines", {}).values():
+            for line in entry.get("lines", []):
+                repen(line)
+        for entry in getattr(page, "_gating_skewed_lines", {}).values():
+            roi = entry.get("roi")
+            if roi is not None:
+                repen(roi)
+
+    def _gating_switch_file(self, page, path, name=None) -> None:
+        """Show `path` in the gating plot, keeping the gate hierarchy.
+
+        Called from the left data-file list and from the plot settings File
+        combo; the chosen file is part of the saved preview state.
+        """
+        if not path:
+            return
+        preview = page._gating_preview
+        rec = self._figure_record(path)
+        if name is None and rec is not None:
+            name = rec.get("name")
+        if preview.get("file") == path and name in (None, preview.get("file_name")):
+            return
+        preview["file"] = path
+        preview["file_name"] = name
+        # Keep the current gate hierarchy (subset / editing context) when
+        # switching files; only the axes may need to follow the new file.
+        new_cols = self._columns_for(path, page._gating_task_id)
+        gate_id = page._gating_active_gate_id or page._gating_context_gate_id
+        gate = next(
+            (g for g in page._gating_gates if g["id"] == gate_id), None
+        ) if gate_id else None
+        plot_type = preview.get("type", "scatter")
+        if plot_type == "image":
+            preview["x"] = "x" if "x" in new_cols else None
+            preview["y"] = "y" if "y" in new_cols else None
+            channels = [c for c in new_cols if c not in ("x", "y")]
+            if preview.get("image_channel") not in channels:
+                preview["image_channel"] = channels[0] if channels else None
+        elif plot_type == "histogram":
+            if gate is not None and gate.get("x"):
+                preview["x"] = gate["x"]
+            else:
+                preview["x"] = (
+                    preview.get("last_x") if preview.get("last_x") in new_cols
+                    else (new_cols[0] if new_cols else None)
+                )
+            preview["y"] = None
+        else:
+            if gate is not None and gate.get("x") and gate.get("y"):
+                preview["x"] = gate["x"]
+                preview["y"] = gate["y"]
+            else:
+                preview["x"] = (
+                    preview.get("last_x") if preview.get("last_x") in new_cols else None
+                )
+                preview["y"] = (
+                    preview.get("last_y") if preview.get("last_y") in new_cols else None
+                )
+        # Keep the visible range when switching files (not for image view,
+        # which uses the image's own extent).
+        vb = page._gating_viewbox
+        xr, yr = vb.viewRange()
+        self._gating_reload_rois(page)
+        self._gating_render(page)
+        if plot_type != "image":
+            vb.setXRange(xr[0], xr[1], padding=0)
+            vb.setYRange(yr[0], yr[1], padding=0)
+        # Clear the previous file's statistics and recompute for this one.
+        page._gating_last_stats = {}
+        self._gating_rebuild_tree(page)
+        self._gating_mark_dirty(page)
+        self._gating_rebuild_settings(page)
+        self._gating_refresh_files(page)
 
     def _gating_mark_dirty(self, page) -> None:
         page._gating_dirty = True
