@@ -885,6 +885,46 @@ def _apply_scale_transforms(x, configs):
     return x
 
 
+def _inverse_scale_value(value: float, configs) -> float:
+    """Map a transformed value back to the original data value."""
+    import math
+
+    out = float(value)
+    for config in reversed(list(configs or [])):
+        method = (config or {}).get("method", "linear")
+        if method == "log10":
+            out = math.copysign(10.0 ** abs(out), out) if out else 0.0
+        elif method == "arcsinh":
+            try:
+                cofactor = float((config or {}).get("param") or 5.0)
+            except (TypeError, ValueError):
+                cofactor = 5.0
+            out = math.copysign(math.sinh(abs(out)) * cofactor, out) if out else 0.0
+    return out
+
+
+def _nice_ticks(low: float, high: float, count: int = 6) -> list:
+    """Round tick values (1/2/5 steps) covering [low, high]."""
+    import math
+
+    span = high - low
+    if not math.isfinite(span) or span <= 0:
+        return []
+    raw = span / max(1, count - 1)
+    exponent = math.floor(math.log10(raw))
+    base = raw / (10 ** exponent)
+    step = (1.0 if base <= 1 else 2.0 if base <= 2 else 5.0 if base <= 5 else 10.0)
+    step *= 10 ** exponent
+    if not math.isfinite(step) or step <= 0:
+        return []
+    value = math.ceil(low / step) * step
+    out = []
+    while value <= high + step * 1e-9 and len(out) < 60:
+        out.append(round(value, 12))
+        value += step
+    return out
+
+
 # --- Ordered map-module pipeline (Scale / Compensation / Unmix) -----------
 
 def _rename_applies(stage, parquet_path) -> bool:
@@ -2960,11 +3000,33 @@ _SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
 
 
 def _format_sci(value: float) -> str:
-    """Format a number as mantissa×10^exponent with a superscript exponent."""
+    """Mantissa×10^exponent (superscript); a mantissa of 1 is left out.
+
+    The mantissa is an integer when it is whole and otherwise has one decimal
+    ("2×10³", "1.5×10³", "10³" for 1000).
+    """
+    import math
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not math.isfinite(value):
+        return str(value)
     if value == 0:
         return "0"
-    mant, exp = f"{value:.1e}".split("e")
-    return f"{mant}×10{str(int(exp)).translate(_SUPERSCRIPT)}"
+    sign = "-" if value < 0 else ""
+    magnitude = abs(value)
+    exponent = int(math.floor(math.log10(magnitude)))
+    mantissa = round(magnitude / (10 ** exponent), 1)
+    if mantissa >= 10:  # 9.96 rounds to 10
+        mantissa /= 10
+        exponent += 1
+    text = str(int(mantissa)) if float(mantissa).is_integer() else f"{mantissa:.1f}"
+    superscript = str(exponent).translate(_SUPERSCRIPT)
+    if text == "1":
+        return f"{sign}10{superscript}"
+    return f"{sign}{text}×10{superscript}"
 
 
 def _make_sci_axis(orientation: str):
@@ -3840,6 +3902,7 @@ class _ZoomableGraphicsView(QGraphicsView):
         self.plot_pan_end_cb = None
         self.rubber_select_cb = None
         self.rubber_clear_cb = None
+        self.select_all_cb = None
         self._rubber_band = None
         self._rubber_origin = None
         self._rubber_ctrl = False
@@ -3923,6 +3986,14 @@ class _ZoomableGraphicsView(QGraphicsView):
             self.rubber_select_cb(scene_rect, self._rubber_ctrl)
 
     def keyPressEvent(self, event) -> None:
+        if (
+            event.key() == Qt.Key.Key_A
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and self.select_all_cb is not None
+        ):
+            self.select_all_cb()
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self.enter_callback is not None:
                 self.enter_callback()
@@ -4366,12 +4437,16 @@ class _SizeField(QWidget):
 
 
 class _LogStepSpinBox(QWidget):
-    """Narrow numeric field: text shown as typed; ▲/▼ step ×10 / ÷10."""
+    """Narrow numeric field: text shown as typed; ▲/▼ step ×10 / ÷10.
 
-    def __init__(self, value, on_change) -> None:
+    `decimals` fixes how many decimals are shown and stored (axis ranges use 1).
+    """
+
+    def __init__(self, value, on_change, decimals: int | None = None) -> None:
         super().__init__()
         self._value = value
         self._on_change = on_change
+        self._decimals = decimals
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         lay = QHBoxLayout(self)
@@ -4380,7 +4455,7 @@ class _LogStepSpinBox(QWidget):
 
         self.edit = QLineEdit()
         self.edit.setFixedWidth(64)
-        self.edit.setText(_format_number(value))
+        self.edit.setText(self._format(value))
         self.edit.editingFinished.connect(self._commit_edit)
         self.edit.returnPressed.connect(self._commit_edit)
         lay.addWidget(self.edit)
@@ -4404,6 +4479,22 @@ class _LogStepSpinBox(QWidget):
         btns.addWidget(self._down)
         lay.addLayout(btns)
 
+    def _format(self, value) -> str:
+        if self._decimals is not None and value is not None:
+            try:
+                return f"{float(value):.{self._decimals}f}"
+            except (TypeError, ValueError):
+                return _format_number(value)
+        return _format_number(value)
+
+    def _round(self, value):
+        if self._decimals is not None and value is not None:
+            try:
+                return round(float(value), self._decimals)
+            except (TypeError, ValueError):
+                return value
+        return value
+
     def value(self):
         return self._value
 
@@ -4414,7 +4505,7 @@ class _LogStepSpinBox(QWidget):
 
     def set_value(self, value) -> None:
         self._value = value
-        self.edit.setText(_format_number(value))
+        self.edit.setText(self._format(value))
 
     def _current_value(self) -> float:
         try:
@@ -4424,18 +4515,19 @@ class _LogStepSpinBox(QWidget):
 
     def _step(self, factor: float) -> None:
         base = 1.0 if self.edit.text().strip() == "" else self._current_value()
-        self._value = base * factor
-        self.edit.setText(_format_number(self._value))
+        self._value = self._round(base * factor)
+        self.edit.setText(self._format(self._value))
         if self._on_change is not None:
             self._on_change(self._value)
 
     def _commit_edit(self) -> None:
         text = self.edit.text().strip()
         try:
-            self._value = float(text)
+            self._value = self._round(float(text))
         except (ValueError, TypeError):
-            self.edit.setText(_format_number(self._value))
+            self.edit.setText(self._format(self._value))
             return
+        self.edit.setText(self._format(self._value))
         if self._on_change is not None:
             self._on_change(self._value)
 
@@ -8277,18 +8369,25 @@ class MainWindow(QMainWindow):
                 values[name] = float(np.median(arr))
         return values
 
-    def _map_stages(self, task_id) -> list:
+    def _map_stages(self, task_id, after=None) -> list:
         """Ordered Scale / Compensation / Unmix stages upstream of a task.
 
         Each module only declares its own input→output rule; this list is the
-        workflow order the data flows through.
+        workflow order the data flows through. With `after`, only the stages of
+        modules *below* that ancestor are returned (used for files produced by
+        a generate module, whose values already include what came before).
         """
         import numpy as np
 
         stages = []
         if not task_id:
             return stages
+        started = after is None
         for task in self._task_chain(task_id):
+            if not started:
+                if task.get("id") == after:
+                    started = True
+                continue
             if task.get("id") == task_id:
                 continue
             task_type = task.get("type")
@@ -8356,10 +8455,18 @@ class MainWindow(QMainWindow):
         stages = self._map_stages(task_id) if task_id else []
         feature_output = self._feature_output(parquet_path)
         if feature_output is not None:
-            # A Feature output was aggregated with the upstream value transforms
-            # already applied; renames are a name change, not a value change, so
-            # they must still be applied on top.
-            stages = [(kind, stage) for kind, stage in stages if kind == "rename"]
+            # A Feature output already contains every transform applied above
+            # the Feature module. Only the modules *between* it and the reader
+            # (e.g. a Scale placed after Feature) still apply, plus renames,
+            # which are a name change rather than a value change.
+            post = self._map_stages(
+                task_id, after=feature_output.get("feature_task")
+            ) if task_id else []
+            renames = [
+                (kind, stage) for kind, stage in stages
+                if kind == "rename" and (kind, stage) not in post
+            ]
+            stages = renames + post
         if extra_stages:
             stages = stages + list(extra_stages)
         if feature_output is not None:
@@ -8635,6 +8742,7 @@ class MainWindow(QMainWindow):
         canvas_view.plot_pan_end_cb = lambda: self._figure_plot_pan_end(page)
         canvas_view.rubber_select_cb = lambda rect, ctrl: self._figure_box_select(page, rect, ctrl)
         canvas_view.rubber_clear_cb = lambda: self._figure_clear_selection(page)
+        canvas_view.select_all_cb = lambda: self._figure_select_all(page)
 
         for plot_dict in page._fig_plots:
             self._figure_new_card(page, plot_dict)
@@ -9171,29 +9279,29 @@ class MainWindow(QMainWindow):
 
     def _figure_add_nxn(self, page) -> None:
         """Add a lower-triangle scatter matrix for a set of variables."""
-        record = None
-        if page._fig_selected:
-            index = page._fig_selected[0]
-            if 0 <= index < len(page._fig_plots):
-                record = self._figure_record(page._fig_plots[index].get("file"))
-        if record is None:
-            record = next(
-                (
-                    rec for rec in self._available_files(page._fig_task_id)
-                    if rec.get("parquet")
-                ),
-                None,
-            )
-        if record is None:
+        records = [
+            rec for rec in self._available_files(page._fig_task_id)
+            if rec.get("parquet")
+        ]
+        if not records:
             QMessageBox.information(
                 self, "Add N×N Plot", "No data file is available."
             )
             return
-        columns = self._columns_for(record.get("parquet"), page._fig_task_id)
+        # Candidate variables: everything visible to this Figure module, i.e.
+        # the union over every file (upstream generated columns included).
+        file_columns = {}
+        columns = []
+        for rec in records:
+            cols = self._columns_for(rec.get("parquet"), page._fig_task_id)
+            file_columns[rec.get("parquet")] = cols
+            for name in cols:
+                if name not in columns:
+                    columns.append(name)
         if len(columns) < 2:
             QMessageBox.information(
                 self, "Add N×N Plot",
-                f"{record.get('name') or 'This file'} has fewer than two variables.",
+                "This Figure module has fewer than two variables.",
             )
             return
 
@@ -9213,6 +9321,29 @@ class MainWindow(QMainWindow):
                 self, "Add N×N Plot", "Select at least two variables."
             )
             return
+        # Use the file that actually has every chosen variable: the selected
+        # plot's file when possible, otherwise the first one that fits.
+        record = None
+        if page._fig_selected:
+            index = page._fig_selected[0]
+            if 0 <= index < len(page._fig_plots):
+                candidate = self._figure_record(
+                    page._fig_plots[index].get("file")
+                )
+                path = candidate.get("parquet") if candidate else None
+                if path and all(c in file_columns.get(path, []) for c in chosen):
+                    record = candidate
+        if record is None:
+            record = next(
+                (
+                    rec for rec in records
+                    if all(
+                        c in file_columns.get(rec.get("parquet"), [])
+                        for c in chosen
+                    )
+                ),
+                records[0],
+            )
         total = len(chosen) * (len(chosen) - 1) // 2
         if total > 100:
             reply = QMessageBox.question(
@@ -10122,6 +10253,8 @@ class MainWindow(QMainWindow):
         img.setRect(ref_rect)
         img.setVisible(True)
         self._figure_apply_display_options(plot_dict, plot_widget)
+        for axis in ("bottom", "left"):
+            plot_widget.getPlotItem().getAxis(axis).setTicks(None)
         if missing_pyramid:
             # Some channels could not be drawn: say so in the plot itself.
             plot_widget.setTitle(
@@ -10312,6 +10445,22 @@ class MainWindow(QMainWindow):
         )
         self._figure_apply_ranges(plot_dict, plot_widget)
         self._figure_apply_display_options(plot_dict, plot_widget)
+        # Scaled axes keep the transformed points but show original tick values.
+        parquet = rec.get("parquet")
+        self._figure_set_original_ticks(
+            plot_widget, "bottom",
+            self._figure_axis_scale_configs(
+                task_id, parquet, x_name, column_transforms
+            ),
+            x,
+        )
+        self._figure_set_original_ticks(
+            plot_widget, "left",
+            self._figure_axis_scale_configs(
+                task_id, parquet, y_name, column_transforms
+            ),
+            y,
+        )
 
     def _figure_draw_colored_scatter(self, plot_widget, x, y, values, cmap,
                                      size: float = 4, px_mode: bool = True,
@@ -10430,6 +10579,14 @@ class MainWindow(QMainWindow):
 
         self._figure_apply_ranges(plot_dict, plot_widget)
         self._figure_apply_display_options(plot_dict, plot_widget)
+        self._figure_set_original_ticks(
+            plot_widget, "bottom",
+            self._figure_axis_scale_configs(
+                task_id, rec.get("parquet"), x_name, column_transforms
+            ),
+            x,
+        )
+        plot_widget.getPlotItem().getAxis("left").setTicks(None)
 
     def _figure_apply_ranges(self, plot_dict: dict, plot_widget) -> None:
         """Apply manual/auto X and Y ranges from the plot settings."""
@@ -10527,6 +10684,69 @@ class MainWindow(QMainWindow):
             )
         else:
             plot_item.setTitle(None)
+
+    def _figure_axis_scale_configs(self, task_id, parquet_path, column,
+                                   column_transforms=None) -> list:
+        """Scale transforms applied to `column` before this module sees it."""
+        if not column:
+            return []
+        stages = self._map_stages(task_id) if task_id else []
+        feat = self._feature_output(parquet_path)
+        if feat is not None and task_id:
+            post = self._map_stages(task_id, after=feat.get("feature_task"))
+            stages = [(k, st) for k, st in stages if k == "rename"] + post
+        configs = []
+        for kind, stage in stages:
+            if kind != "scale":
+                continue
+            config = stage["columns"].get(column)
+            if config:
+                configs.append(config)
+        extra = (column_transforms or {}).get(column) or []
+        configs.extend(extra)
+        return configs
+
+    def _figure_set_original_ticks(self, plot_widget, orientation, configs,
+                                   values) -> None:
+        """Label axis ticks with the *untransformed* values of a scaled column.
+
+        The points stay in transformed space; only the tick text shows the
+        original numbers (arcsinh / log10 axes, like FlowJo).
+        """
+        import numpy as np
+
+        axis = plot_widget.getPlotItem().getAxis(orientation)
+        if not configs or values is None or len(values) == 0:
+            axis.setTicks(None)
+            return
+        try:
+            lo = float(np.nanmin(values))
+            hi = float(np.nanmax(values))
+        except (TypeError, ValueError):
+            axis.setTicks(None)
+            return
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            axis.setTicks(None)
+            return
+        original_lo = _inverse_scale_value(lo, configs)
+        original_hi = _inverse_scale_value(hi, configs)
+        if (
+            not np.isfinite(original_lo)
+            or not np.isfinite(original_hi)
+            or original_hi <= original_lo
+        ):
+            axis.setTicks(None)
+            return
+        ticks = []
+        for value in _nice_ticks(original_lo, original_hi, 6):
+            position = float(
+                np.asarray(_apply_scale_transforms(
+                    np.asarray([value], dtype="float64"), configs
+                ))[0]
+            )
+            if np.isfinite(position):
+                ticks.append((position, _format_sci(value)))
+        axis.setTicks([ticks] if ticks else None)
 
     def _figure_apply_change(self, page, index: int, plot_dict: dict) -> None:
         """Re-render a plot after a settings change (marks the page dirty)."""
@@ -10631,6 +10851,13 @@ class MainWindow(QMainWindow):
             hits = sorted(sel)
         self._figure_unfocus(page)
         self._figure_set_selection(page, hits)
+
+    def _figure_select_all(self, page) -> None:
+        """Select every plot (Ctrl+A on the canvas)."""
+        if not page._fig_cards:
+            return
+        self._figure_unfocus(page)
+        self._figure_set_selection(page, list(range(len(page._fig_cards))))
 
     def _figure_clear_selection(self, page) -> None:
         """Deselect every plot (a plain click on empty canvas)."""
@@ -12269,8 +12496,8 @@ class MainWindow(QMainWindow):
         if max_val is None:
             max_val = data_max
 
-        min_spin = _LogStepSpinBox(min_val, lambda v: commit())
-        max_spin = _LogStepSpinBox(max_val, lambda v: commit())
+        min_spin = _LogStepSpinBox(min_val, lambda v: commit(), decimals=1)
+        max_spin = _LogStepSpinBox(max_val, lambda v: commit(), decimals=1)
 
         def commit():
             if auto.isChecked():
@@ -12743,9 +12970,9 @@ class MainWindow(QMainWindow):
         )
 
         layout.addWidget(QLabel("X range"))
-        layout.addWidget(self._figure_range_row(preview, "x", plot_widget, enabled, auto_checked=False))
+        layout.addWidget(self._figure_range_row(preview, "x", plot_widget, enabled))
         layout.addWidget(QLabel("Y range"))
-        layout.addWidget(self._figure_range_row(preview, "y", plot_widget, enabled, auto_checked=False))
+        layout.addWidget(self._figure_range_row(preview, "y", plot_widget, enabled))
 
         self._figure_display_toggles(
             layout, preview, enabled,
@@ -13432,11 +13659,16 @@ class MainWindow(QMainWindow):
         self._unmix_log(
             page, f"— Unmix for image: {len(samples)} file(s) selected —"
         )
+        # Resolve the user-facing names here (the worker runs off the UI thread).
+        labels = {
+            path: self._comp_file_name(path, page._unmix_task_id)
+            for path in samples
+        }
         q = queue_module.Queue()
         page._unmix_queue = q
         page._unmix_thread = threading.Thread(
             target=self._unmix_image_worker,
-            args=(page, q, config, samples),
+            args=(page, q, config, samples, labels),
             daemon=True,
         )
         page._unmix_thread.start()
@@ -13459,9 +13691,10 @@ class MainWindow(QMainWindow):
             return False
         return self._image_load_manifest(str(path)) is not None
 
-    def _unmix_image_worker(self, page, q, config, files) -> None:
+    def _unmix_image_worker(self, page, q, config, files, labels=None) -> None:
         """Background: generate one image pyramid per selected image file."""
         task_id = page._unmix_task_id
+        labels = labels or {}
         outputs = dict(page._unmix_params.get("outputs") or {})
         done = failed = skipped = unchanged = 0
         try:
@@ -13469,7 +13702,7 @@ class MainWindow(QMainWindow):
                 if getattr(page, "_unmix_cancel", False):
                     q.put(("log", "Cancelled."))
                     break
-                label = Path(str(path)).name
+                label = labels.get(path) or Path(str(path)).name
                 if self._image_load_manifest(path) is None:
                     q.put(("log", f"• skipped (not an image): {label}"))
                     skipped += 1
@@ -15202,7 +15435,7 @@ class MainWindow(QMainWindow):
 
     # ----- compensation module (map) -----------------------------------
     def _build_compensation_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
-        """Build the Compensation page: files (1) | matrix (5)."""
+        """Build the Compensation page: matrix (5) | files (1)."""
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -15265,11 +15498,12 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._comp_files_panel(page))
+        # Matrix on the left; the file list (with "Set files") on the right.
         splitter.addWidget(self._comp_matrix_panel(page))
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 5)
-        splitter.setSizes([220, 1100])
+        splitter.addWidget(self._comp_files_panel(page))
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([1100, 220])
         row.addWidget(splitter, 1)
         layout.addWidget(content, 1)
 
