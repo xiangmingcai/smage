@@ -1299,6 +1299,39 @@ def _apply_scale_transforms(x, configs):
     return x
 
 
+def _forward_scale_value(value, configs):
+    """Map an original data value into the plot's (transformed) domain."""
+    import numpy as np
+
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    for config in (configs or []):
+        out = float(np.asarray(_apply_scale_transform(np.float64(out), config)))
+    return out
+
+
+def _make_original_axis(configs, orientation: str = "bottom"):
+    """Axis whose tick labels are shown in the original (pre-Scale) values."""
+    import pyqtgraph as pg
+
+    class _OriginalAxis(pg.AxisItem):
+        def tickStrings(self, values, scale, spacing):
+            out = []
+            for value in values:
+                original = _inverse_scale_value(value * scale, configs)
+                out.append(_format_sci(original))
+            return out
+
+    ax = _OriginalAxis(orientation)
+    ax.setPen(pg.mkPen("#000000", width=2))
+    ax.setTextPen(pg.mkPen("#000000"))
+    return ax
+
+
 def _inverse_scale_value(value: float, configs) -> float:
     """Map a transformed value back to the original data value."""
     import math
@@ -1470,6 +1503,12 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
     values = dict(values)
     for kind, stage in stages:
         if kind == "scale":
+            files = stage.get("files")
+            if (
+                files is not None and parquet_path is not None
+                and parquet_path not in files
+            ):
+                continue
             for column, config in stage["columns"].items():
                 if column in values:
                     values[column] = _apply_scale_transform(
@@ -5709,6 +5748,7 @@ class MainWindow(QMainWindow):
         self._pool_queued = set()
         self._pool_waiters = []
         self._pool_generation = 0
+        self._channel_range_cache = {}
         self._pool_failed = set()
         self._pool_jobs = None
         self._pool_results = None
@@ -6729,6 +6769,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
         self._pool_clear()
+        self._channel_range_cache = {}
         self._size_labels.clear()
         self._size_pending.clear()
         self._load_stored_sizes()
@@ -9294,7 +9335,12 @@ class MainWindow(QMainWindow):
                     if c.get("name")
                 }
                 if columns:
-                    stages.append(("scale", {"columns": columns}))
+                    files = params.get("files")
+                    stages.append(("scale", {
+                        "columns": columns,
+                        # None (legacy projects) means every file.
+                        "files": set(files) if files is not None else None,
+                    }))
             elif task_type == "compensation":
                 names = list(params.get("params") or [])
                 matrix = params.get("matrix") or []
@@ -12037,6 +12083,13 @@ class MainWindow(QMainWindow):
         for kind, stage in stages:
             if kind != "scale":
                 continue
+            files = stage.get("files")
+            if (
+                files is not None and parquet_path is not None
+                and parquet_path not in files
+            ):
+                # This Scale module does not apply to this file.
+                continue
             config = stage["columns"].get(column)
             if config:
                 configs.append(config)
@@ -12541,16 +12594,36 @@ class MainWindow(QMainWindow):
             layout.addWidget(QLabel("Curve color"))
             layout.addWidget(make_color_button("curve_color", (200, 40, 40)))
 
+        # Range inputs are shown in original values: map through this
+        # module's upstream Scale configs for each axis' column.
+        ptype = plot_dict.get("type")
+        file_path = plot_dict.get("file")
+        x_configs = (
+            self._figure_axis_scale_configs(
+                page._fig_task_id, file_path, plot_dict.get("x"),
+                page._fig_column_transforms,
+            ) if ptype in ("scatter", "histogram") else []
+        )
+        # Histograms show counts and images show pixel coordinates.
+        y_configs = (
+            self._figure_axis_scale_configs(
+                page._fig_task_id, file_path, plot_dict.get("y"),
+                page._fig_column_transforms,
+            ) if ptype == "scatter" else []
+        )
+
         # X range.
         layout.addWidget(QLabel("X range"))
         layout.addWidget(self._figure_range_row(
-            plot_dict, "x", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
+            plot_dict, "x", plot_widget, enabled,
+            lambda: self._figure_mark_dirty(page), configs=x_configs,
         ))
 
         # Y range (scatter/histogram/image: histograms show the Count axis).
         layout.addWidget(QLabel("Y range"))
         layout.addWidget(self._figure_range_row(
-            plot_dict, "y", plot_widget, enabled, lambda: self._figure_mark_dirty(page)
+            plot_dict, "y", plot_widget, enabled,
+            lambda: self._figure_mark_dirty(page), configs=y_configs,
         ))
 
         # Size (width/height in canvas units).
@@ -13435,8 +13508,9 @@ class MainWindow(QMainWindow):
             palette_combo.currentIndexChanged.connect(on_palette)
 
     def _figure_channel_values(self, task_id, parquet_path, channel,
-                               max_points: int = 200000, extra_stages=None):
-        """Sampled finite values of one image channel (for its histogram)."""
+                               max_points: int | None = 200000,
+                               extra_stages=None):
+        """Finite values of one image channel (sampled unless max_points=None)."""
         import numpy as np
 
         values = self._column_data(
@@ -13446,22 +13520,60 @@ class MainWindow(QMainWindow):
             return None
         values = np.asarray(values, dtype="float64")
         values = values[np.isfinite(values)]
-        if values.size > max_points:
+        if max_points is not None and values.size > max_points:
             rng = np.random.default_rng(42)
             values = values[rng.choice(values.size, max_points, replace=False)]
         return values
 
+    def _channel_full_range(self, task_id, parquet_path, channel,
+                            extra_stages=None):
+        """(min, max) over every finite value of a channel, or None.
+
+        Uses the same data path as the level histogram (upstream stages
+        applied) but never samples, so "Reset" shows the true full range.
+        Results are cached until the module saves or another project opens.
+        """
+        import numpy as np
+
+        if not parquet_path or not channel:
+            return None
+        key = (str(task_id or ""), str(parquet_path), str(channel))
+        cache = getattr(self, "_channel_range_cache", None)
+        if cache is None:
+            cache = {}
+            self._channel_range_cache = cache
+        if extra_stages is None and key in cache:
+            return cache[key]
+        values = self._figure_channel_values(
+            task_id, parquet_path, channel, max_points=None,
+            extra_stages=extra_stages,
+        )
+        if values is None or values.size == 0:
+            result = None
+        else:
+            result = (float(np.nanmin(values)), float(np.nanmax(values)))
+        if extra_stages is None:
+            if len(cache) > 32:
+                cache.clear()
+            cache[key] = result
+        return result
+
     def _image_level_controls(self, layout, channel, min_val, max_val, enabled,
                               on_minmax, task_id, parquet_path,
-                              extra_stages=None) -> None:
-        """Min/Max inputs + signal histogram + Auto set for one image channel.
+                              extra_stages=None, configs=None) -> None:
+        """Min/Max inputs + signal histogram + Auto set / Reset for a channel.
 
-        `on_minmax(lo, hi)` is called with the parsed bounds (None means auto)
-        whenever the user edits a bound or presses Auto set.
+        `on_minmax(lo, hi)` receives the bounds in PLOT units (None = auto);
+        the inputs and the histogram labels show ORIGINAL (pre-Scale) values,
+        converted through `configs`.
         """
         import numpy as np
         import pyqtgraph as pg
 
+        if configs is None:
+            configs = self._figure_axis_scale_configs(
+                task_id, parquet_path, channel
+            )
         state = {"values": None}
 
         row = QWidget()
@@ -13470,14 +13582,26 @@ class MainWindow(QMainWindow):
         h.setSpacing(6)
         h.addWidget(QLabel("Min"))
         min_edit = QLineEdit()
-        min_edit.setText("" if min_val is None else _format_level(min_val))
+        display_min = (
+            None if min_val is None
+            else _inverse_scale_value(min_val, configs)
+        )
+        min_edit.setText(
+            "" if display_min is None else _format_level(display_min)
+        )
         min_edit.setPlaceholderText("Auto")
         min_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
         min_edit.setEnabled(enabled)
         h.addWidget(min_edit, 1)
         h.addWidget(QLabel("Max"))
         max_edit = QLineEdit()
-        max_edit.setText("" if max_val is None else _format_level(max_val))
+        display_max = (
+            None if max_val is None
+            else _inverse_scale_value(max_val, configs)
+        )
+        max_edit.setText(
+            "" if display_max is None else _format_level(display_max)
+        )
         max_edit.setPlaceholderText("Auto")
         max_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
         max_edit.setEnabled(enabled)
@@ -13492,6 +13616,10 @@ class MainWindow(QMainWindow):
         hist_plot.setMouseEnabled(False, False)
         hist_plot.setMenuEnabled(False)
         hist_plot.hideAxis("left")
+        if configs:
+            hist_plot.getPlotItem().setAxisItems({
+                "bottom": _make_original_axis(configs),
+            })
         layout.addWidget(hist_plot)
 
         auto_btn = QPushButton("Auto set")
@@ -13501,6 +13629,12 @@ class MainWindow(QMainWindow):
             "Set Min/Max to the channel's 0.5% and 99.5% percentiles"
         )
         layout.addWidget(auto_btn)
+
+        reset_btn = QPushButton("Reset")
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.setEnabled(enabled)
+        reset_btn.setToolTip("Set Min/Max to the channel's full data range")
+        layout.addWidget(reset_btn)
 
         def load_values() -> None:
             state["values"] = None
@@ -13539,10 +13673,15 @@ class MainWindow(QMainWindow):
                     pass
             return lo, hi
 
+        def to_plot(value):
+            if value is None:
+                return None
+            rounded = _round_level(value)
+            return _forward_scale_value(rounded, configs)
+
         def on_edit() -> None:
             lo, hi = read_edits()
-            on_minmax(_round_level(lo) if lo is not None else None,
-                      _round_level(hi) if hi is not None else None)
+            on_minmax(to_plot(lo), to_plot(hi))
 
         min_edit.editingFinished.connect(on_edit)
         max_edit.editingFinished.connect(on_edit)
@@ -13553,11 +13692,37 @@ class MainWindow(QMainWindow):
                 return
             lo, hi = np.percentile(values, [0.5, 99.5])
             lo, hi = _round_level(lo), _round_level(hi)
-            min_edit.setText(_format_level(lo))
-            max_edit.setText(_format_level(hi))
+            min_edit.setText(
+                _format_level(_inverse_scale_value(lo, configs))
+            )
+            max_edit.setText(
+                _format_level(_inverse_scale_value(hi, configs))
+            )
+            on_minmax(lo, hi)
+
+        def on_reset(_=False) -> None:
+            bounds = self._channel_full_range(
+                task_id, parquet_path, channel, extra_stages=extra_stages
+            )
+            if bounds is None:
+                min_edit.setText("")
+                max_edit.setText("")
+                on_minmax(None, None)
+                self.statusBar().showMessage(
+                    "This channel has no finite values", 3000
+                )
+                return
+            lo, hi = _round_level(bounds[0]), _round_level(bounds[1])
+            min_edit.setText(
+                _format_level(_inverse_scale_value(lo, configs))
+            )
+            max_edit.setText(
+                _format_level(_inverse_scale_value(hi, configs))
+            )
             on_minmax(lo, hi)
 
         auto_btn.clicked.connect(on_auto)
+        reset_btn.clicked.connect(on_reset)
         load_values()
 
     def _figure_image_layer_settings(self, layout, plot_dict, columns, enabled,
@@ -13616,6 +13781,12 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(auto_btn)
 
+        reset_btn = QPushButton("Reset")
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.setEnabled(enabled)
+        reset_btn.setToolTip("Set Min/Max to the channel's full data range")
+        layout.addWidget(reset_btn)
+
         def update_histogram(row) -> None:
             layers = _figure_image_layers(plot_dict)
             if row < 0 or row >= len(layers):
@@ -13626,6 +13797,15 @@ class MainWindow(QMainWindow):
             channel = layers[row].get("parameter")
             hist_state["row"] = row
             hist_state["values"] = None
+            configs = self._figure_axis_scale_configs(
+                task_id, parquet_path, channel
+            )
+            hist_plot.getPlotItem().setAxisItems({
+                "bottom": (
+                    _make_original_axis(configs) if configs
+                    else pg.AxisItem("bottom")
+                ),
+            })
             if not channel or parquet_path is None:
                 hist_plot.clear()
                 return
@@ -13656,12 +13836,58 @@ class MainWindow(QMainWindow):
             layers[row]["min"] = lo
             layers[row]["max"] = hi
             plot_dict["layers"] = layers
+            configs = self._figure_axis_scale_configs(
+                task_id, parquet_path, layers[row].get("parameter")
+            )
             min_edit = table.cellWidget(row, 3)
             max_edit = table.cellWidget(row, 4)
             if isinstance(min_edit, QLineEdit):
-                min_edit.setText(_format_level(lo))
+                min_edit.setText(
+                    _format_level(_inverse_scale_value(lo, configs))
+                )
             if isinstance(max_edit, QLineEdit):
-                max_edit.setText(_format_level(hi))
+                max_edit.setText(
+                    _format_level(_inverse_scale_value(hi, configs))
+                )
+            on_change()
+
+        def on_reset(_=False) -> None:
+            layers = _figure_image_layers(plot_dict)
+            row = hist_state["row"]
+            if row is None or row >= len(layers):
+                return
+            channel = layers[row].get("parameter")
+            bounds = self._channel_full_range(task_id, parquet_path, channel)
+            min_edit = table.cellWidget(row, 3)
+            max_edit = table.cellWidget(row, 4)
+            if bounds is None:
+                layers[row]["min"] = None
+                layers[row]["max"] = None
+                plot_dict["layers"] = layers
+                if isinstance(min_edit, QLineEdit):
+                    min_edit.setText("")
+                if isinstance(max_edit, QLineEdit):
+                    max_edit.setText("")
+                on_change()
+                self.statusBar().showMessage(
+                    "This channel has no finite values", 3000
+                )
+                return
+            lo, hi = _round_level(bounds[0]), _round_level(bounds[1])
+            layers[row]["min"] = lo
+            layers[row]["max"] = hi
+            plot_dict["layers"] = layers
+            configs = self._figure_axis_scale_configs(
+                task_id, parquet_path, channel
+            )
+            if isinstance(min_edit, QLineEdit):
+                min_edit.setText(
+                    _format_level(_inverse_scale_value(lo, configs))
+                )
+            if isinstance(max_edit, QLineEdit):
+                max_edit.setText(
+                    _format_level(_inverse_scale_value(hi, configs))
+                )
             on_change()
 
         btn_row = QHBoxLayout()
@@ -13806,10 +14032,16 @@ class MainWindow(QMainWindow):
                 cbtn.clicked.connect(lambda _=False, row=i: on_pick_color(row))
                 table.setCellWidget(i, 2, cbtn)
 
-                # Min / Max: empty means "auto" (the channel's natural range).
+                # Min / Max: empty means "auto" (the channel's natural
+                # range). Stored in plot units, shown in original values.
+                row_configs = self._figure_axis_scale_configs(
+                    task_id, parquet_path, layer.get("parameter")
+                )
                 for col, key in ((3, "min"), (4, "max")):
                     edit = QLineEdit()
                     value = layer.get(key)
+                    if value is not None and row_configs:
+                        value = _inverse_scale_value(value, row_configs)
                     edit.setText(
                         "" if value is None else _format_level(value)
                     )
@@ -13821,7 +14053,8 @@ class MainWindow(QMainWindow):
                         "border-radius: 3px; padding: 1px 4px; }"
                     )
 
-                    def on_minmax(_=False, row=i, key=key, edit=edit):
+                    def on_minmax(_=False, row=i, key=key, edit=edit,
+                                  cfgs=row_configs):
                         layers = _figure_image_layers(plot_dict)
                         if row >= len(layers):
                             return
@@ -13832,7 +14065,9 @@ class MainWindow(QMainWindow):
                             rounded = _round_level(text)
                             if rounded is None:
                                 return
-                            layers[row][key] = rounded
+                            layers[row][key] = _forward_scale_value(
+                                rounded, cfgs
+                            )
                         plot_dict["layers"] = layers
                         on_change()
 
@@ -13857,6 +14092,7 @@ class MainWindow(QMainWindow):
             lambda r, _c, _pr, _pc: update_histogram(r)
         )
         auto_btn.clicked.connect(on_auto_set)
+        reset_btn.clicked.connect(on_reset)
 
         populate()
         # Show the first channel's histogram right away.
@@ -13910,12 +14146,27 @@ class MainWindow(QMainWindow):
             spin.valueChanged.connect(on_size)
 
     def _figure_range_row(self, plot_dict: dict, axis: str, plot_widget,
-                          enabled: bool, on_commit=None, auto_checked: bool = True) -> QWidget:
-        """Build an Auto/Min/Max row for one axis range."""
+                          enabled: bool, on_commit=None, auto_checked: bool = True,
+                          configs=None) -> QWidget:
+        """Build an Auto/Min/Max row for one axis range.
+
+        The spin boxes show the axis in ORIGINAL (pre-Scale) values even
+        though the plot itself draws transformed values: entries are mapped
+        through the column's scale configs on the way in and out.
+        """
         min_key = f"{axis}min"
         max_key = f"{axis}max"
         data_min = getattr(plot_widget, f"_data_{axis}min", None)
         data_max = getattr(plot_widget, f"_data_{axis}max", None)
+        if configs:
+            data_min = (
+                None if data_min is None
+                else _inverse_scale_value(data_min, configs)
+            )
+            data_max = (
+                None if data_max is None
+                else _inverse_scale_value(data_max, configs)
+            )
 
         row = QWidget()
         h = QHBoxLayout(row)
@@ -13931,6 +14182,10 @@ class MainWindow(QMainWindow):
 
         min_val = plot_dict.get(min_key)
         max_val = plot_dict.get(max_key)
+        if min_val is not None and configs:
+            min_val = _inverse_scale_value(min_val, configs)
+        if max_val is not None and configs:
+            max_val = _inverse_scale_value(max_val, configs)
         if min_val is None:
             min_val = data_min
         if max_val is None:
@@ -13946,8 +14201,12 @@ class MainWindow(QMainWindow):
                 min_spin.set_value(data_min)
                 max_spin.set_value(data_max)
             else:
-                plot_dict[min_key] = min_spin.value()
-                plot_dict[max_key] = max_spin.value()
+                plot_dict[min_key] = _forward_scale_value(
+                    min_spin.value(), configs
+                )
+                plot_dict[max_key] = _forward_scale_value(
+                    max_spin.value(), configs
+                )
             min_spin.set_enabled(enabled and not auto.isChecked())
             max_spin.set_enabled(enabled and not auto.isChecked())
             # A range change only affects the view, so apply the range directly
@@ -14001,8 +14260,275 @@ class MainWindow(QMainWindow):
         params["columns"] = merged
         return merged
 
+    def _scaling_load_files(self, task_def: dict) -> list:
+        """Selected data files of a Scale module (defaults to every file)."""
+        params = task_def.setdefault("params", {})
+        files = params.get("files")
+        if files is None:
+            # Nothing is scaled until the user picks the files explicitly.
+            files = []
+            params["files"] = []
+        return [str(p) for p in files]
+
+    def _scaling_union_columns(self, page) -> list:
+        """Columns of the selected files (union), sorted."""
+        columns = set()
+        for path in page._scaling_files or []:
+            columns |= set(self._columns_for(path, page._scaling_task_id))
+        return sorted(columns)
+
+    def _scaling_visible_configs(self, page) -> list:
+        """Configs whose column exists in at least one selected file."""
+        visible = set(self._scaling_union_columns(page))
+        return [c for c in page._scaling_columns if c.get("name") in visible]
+
+    def _scaling_refresh_files_box(self, page) -> None:
+        box = getattr(page, "_scaling_files_box", None)
+        if box is None:
+            return
+        box.blockSignals(True)
+        box.clear()
+        for path in page._scaling_files or []:
+            box.addItem(self._comp_file_name(path, page._scaling_task_id))
+        box.blockSignals(False)
+        count = getattr(page, "_scaling_files_count", None)
+        if count is not None:
+            count.setText(f"{len(page._scaling_files or [])} file(s) selected")
+
+    def _scaling_files_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Data files</b>"))
+        hint = QLabel(
+            "Only variables from these files are scaled by this module."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+
+        button = QPushButton("Select files…")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setEnabled(not page._scaling_locked)
+        button.clicked.connect(lambda _=False: self._scaling_select_files(page))
+        lay.addWidget(button)
+        page._scaling_files_btn = button
+
+        box = QListWidget()
+        box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        box.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        lay.addWidget(box, 1)
+        page._scaling_files_box = box
+
+        count = QLabel("")
+        count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(count)
+        page._scaling_files_count = count
+        self._scaling_refresh_files_box(page)
+        return panel
+
+    def _scaling_select_files(self, page) -> None:
+        records = self._available_files(page._scaling_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [
+            self._comp_file_name(path, page._scaling_task_id)
+            for path in (page._scaling_files or [])
+        ]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files..."
+        )
+        if chosen is None:
+            return
+        page._scaling_files = [
+            str(by_name[name]) for name in chosen if name in by_name
+        ]
+        self._scaling_refresh_files_box(page)
+        self._scaling_rebuild_visible(page)
+        self._scaling_mark_dirty(page)
+
+    def _scaling_rebuild_visible(self, page) -> None:
+        """Re-filter the table and the batch list to the selected files."""
+        page._scaling_rows = self._scaling_visible_configs(page)
+        self._scaling_populate_table(page)
+        self._scaling_rebuild_apply_list(page)
+        self._scaling_render_preview(page)
+        self._scaling_rebuild_settings(page)
+
+    def _scaling_apply_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Apply to columns</b>"))
+        hint = QLabel(
+            "Choose variables, fill in any of the fields, then Apply. "
+            "Empty fields keep their current value."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+
+        lay.addWidget(QLabel("Variables"))
+        select_btn = QPushButton("Select variables…")
+        select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        select_btn.setEnabled(not page._scaling_locked)
+        select_btn.clicked.connect(
+            lambda _=False: self._scaling_select_apply_vars(page)
+        )
+        lay.addWidget(select_btn)
+        page._scaling_apply_select = select_btn
+
+        listing = QListWidget()
+        listing.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        listing.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        listing.setEnabled(not page._scaling_locked)
+        lay.addWidget(listing, 1)
+        page._scaling_apply_list = listing
+        page._scaling_apply_vars = []
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        grid.addWidget(QLabel("Method"), 0, 0)
+        method = _NoWheelComboBox()
+        method.addItem("—", None)
+        for name in SCALING_METHODS:
+            method.addItem(name, name)
+        method.setEnabled(not page._scaling_locked)
+        grid.addWidget(method, 0, 1)
+        grid.addWidget(QLabel("Param"), 0, 2)
+        param = QLineEdit()
+        param.setPlaceholderText("unchanged")
+        param.setEnabled(False)
+        param.setStyleSheet(
+            "QLineEdit:disabled { background: #e0e0e0; color: #9ca3af; }"
+        )
+        grid.addWidget(param, 0, 3)
+        grid.addWidget(QLabel("Min"), 1, 0)
+        min_edit = QLineEdit()
+        min_edit.setPlaceholderText("unchanged")
+        min_edit.setEnabled(not page._scaling_locked)
+        grid.addWidget(min_edit, 1, 1)
+        grid.addWidget(QLabel("Max"), 1, 2)
+        max_edit = QLineEdit()
+        max_edit.setPlaceholderText("unchanged")
+        max_edit.setEnabled(not page._scaling_locked)
+        grid.addWidget(max_edit, 1, 3)
+        lay.addLayout(grid)
+        page._scaling_apply_method = method
+        page._scaling_apply_param = param
+        page._scaling_apply_min = min_edit
+        page._scaling_apply_max = max_edit
+
+        def on_method():
+            is_arcsinh = method.currentData() == "arcsinh"
+            param.setEnabled((not page._scaling_locked) and is_arcsinh)
+
+        method.currentIndexChanged.connect(lambda _=0: on_method())
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_btn.setEnabled(not page._scaling_locked)
+        apply_btn.clicked.connect(lambda _=False: self._scaling_apply_batch(page))
+        lay.addWidget(apply_btn)
+        page._scaling_apply_btn = apply_btn
+        return panel
+
+    def _scaling_select_apply_vars(self, page) -> None:
+        options = self._scaling_union_columns(page)
+        if not options:
+            QMessageBox.information(
+                self, "Apply", "Select data files first."
+            )
+            return
+        current = [
+            name for name in (page._scaling_apply_vars or [])
+            if name in options
+        ]
+        chosen = self._pick_items_dialog(
+            "Select variables", options, current, "Filter variables..."
+        )
+        if chosen is None:
+            return
+        page._scaling_apply_vars = list(chosen)
+        self._scaling_rebuild_apply_list(page)
+
+    def _scaling_rebuild_apply_list(self, page) -> None:
+        listing = getattr(page, "_scaling_apply_list", None)
+        if listing is None:
+            return
+        union = set(self._scaling_union_columns(page))
+        page._scaling_apply_vars = [
+            name for name in (getattr(page, "_scaling_apply_vars", []) or [])
+            if name in union
+        ]
+        listing.blockSignals(True)
+        listing.clear()
+        for name in page._scaling_apply_vars:
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            listing.addItem(item)
+        listing.blockSignals(False)
+
+    def _scaling_apply_batch(self, page) -> None:
+        """Copy the filled-in fields onto every ticked variable."""
+        names = set(getattr(page, "_scaling_apply_vars", []) or [])
+        if not names:
+            QMessageBox.information(
+                self, "Apply", "Select at least one variable first."
+            )
+            return
+        method = page._scaling_apply_method.currentData()
+        param_text = page._scaling_apply_param.text().strip()
+        min_text = page._scaling_apply_min.text().strip()
+        max_text = page._scaling_apply_max.text().strip()
+        if not any((method, param_text, min_text, max_text)):
+            QMessageBox.information(
+                self, "Apply", "Set at least one of Method / Param / Min / Max."
+            )
+            return
+        try:
+            param_value = float(param_text) if param_text else None
+        except ValueError:
+            QMessageBox.warning(self, "Apply", "Param must be a number.")
+            return
+        try:
+            min_value = int(float(min_text)) if min_text else None
+            max_value = int(float(max_text)) if max_text else None
+        except ValueError:
+            QMessageBox.warning(self, "Apply", "Min/Max must be numbers.")
+            return
+
+        for config in page._scaling_columns:
+            if config.get("name") not in names:
+                continue
+            if method:
+                config["method"] = method
+                if method != "arcsinh" and param_value is None:
+                    config["param"] = None
+            if param_value is not None:
+                config["param"] = param_value
+            if min_value is not None:
+                config["min"] = min_value
+            if max_value is not None:
+                config["max"] = max_value
+
+        self._scaling_populate_table(page)
+        self._scaling_mark_dirty(page)
+        self._scaling_render_preview(page)
+        self._scaling_rebuild_settings(page)
+        self.statusBar().showMessage(
+            f"Applied settings to {len(names)} column(s)", 3000
+        )
+
     def _build_scaling_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
-        """Build the Scale page: Columns table (2) | Preview (1)."""
+        """Build the Scale page: files+apply (1) | columns (2) | preview (1)."""
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -14034,13 +14560,32 @@ class MainWindow(QMainWindow):
         tl.addWidget(close_btn)
         layout.addWidget(bar)
 
+        page._scaling_task_def = task_def
+        page._scaling_task_id = task_def.get("id")
+        page._scaling_locked = locked
+        page._scaling_columns = self._scaling_load_config(task_def)
+        page._scaling_files = self._scaling_load_files(task_def)
+        page._scaling_rows = []
+        page._scaling_dirty = False
+        page._scaling_minmax_filled = set()
+        page._scaling_snapshot = copy.deepcopy(task_def.get("params", {}))
+
         content = QWidget()
         content.setStyleSheet("background: #f5f8fb;")
         cl = QHBoxLayout(content)
         cl.setContentsMargins(12, 12, 12, 12)
         cl.setSpacing(12)
 
-        # Left: columns table.
+        # Left: data files (top) + batch apply (bottom), equal heights.
+        left_split = QSplitter(Qt.Orientation.Vertical)
+        left_split.setChildrenCollapsible(False)
+        left_split.addWidget(self._scaling_files_panel(page))
+        left_split.addWidget(self._scaling_apply_panel(page))
+        left_split.setStretchFactor(0, 1)
+        left_split.setStretchFactor(1, 1)
+        left_split.setSizes([320, 320])
+
+        # Middle: columns table.
         colnames_panel = self._build_panel_frame()
         cll = QVBoxLayout(colnames_panel)
         cll.setContentsMargins(10, 10, 10, 10)
@@ -14069,6 +14614,13 @@ class MainWindow(QMainWindow):
         ) if rec else []
         page._scaling_preview = {
             "type": "scatter",
+            "image_channel": None,
+            "image_min": None,
+            "image_max": None,
+            "bins": 20,
+            "hist_mode": "histogram",
+            "hist_color": (0, 0, 200),
+            "curve_color": (200, 40, 40),
             "file": rec.get("parquet") if rec else None,
             "file_name": rec.get("name") if rec else None,
             "x": cols[0] if cols else None,
@@ -14096,6 +14648,12 @@ class MainWindow(QMainWindow):
         pl.setSpacing(6)
         pl.addWidget(QLabel("<b>Preview</b>"))
         plot_widget = self._figure_make_plot_widget(page._scaling_preview)
+        # The preview column is narrow: never let the plot demand more than
+        # the panel gives it (it used to be clipped on the right).
+        plot_widget.setMinimumSize(120, 120)
+        plot_widget.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
         # The preview is a normal interactive plot (unlike a figure card).
         plot_widget.getPlotItem().getViewBox().setMouseEnabled(True, True)
 
@@ -14139,27 +14697,31 @@ class MainWindow(QMainWindow):
         settings_scroll.setWidget(settings_host)
         pl.addWidget(settings_scroll, 2)
 
-        cl.addWidget(colnames_panel, 2)
-        cl.addWidget(preview_panel, 1)
+        # The three parts are drag-resizable (2 : 5 : 3 by default).
+        content_split = QSplitter(Qt.Orientation.Horizontal)
+        content_split.setChildrenCollapsible(False)
+        content_split.addWidget(left_split)
+        content_split.addWidget(colnames_panel)
+        content_split.addWidget(preview_panel)
+        content_split.setStretchFactor(0, 2)
+        content_split.setStretchFactor(1, 5)
+        content_split.setStretchFactor(2, 3)
+        content_split.setSizes([300, 750, 450])
+        cl.addWidget(content_split, 1)
         layout.addWidget(content, 1)
 
-        page._scaling_task_def = task_def
-        page._scaling_task_id = task_def.get("id")
-        page._scaling_columns = self._scaling_load_config(task_def)
         page._scaling_table = table
         page._scaling_plot_widget = plot_widget
         page._scaling_settings_layout = settings_layout
-        page._scaling_locked = locked
         page._scaling_overlay = overlay
         page._scaling_overlay_box = overlay_box
         page._scaling_save_btn = save_btn
-        page._scaling_dirty = False
-        page._scaling_minmax_filled = set()
-        page._scaling_snapshot = copy.deepcopy(task_def.get("params", {}))
         save_btn.clicked.connect(lambda _=False: self._scaling_save_now(page))
         self._scaling_update_save_btn(page)
 
+        page._scaling_rows = self._scaling_visible_configs(page)
         self._scaling_populate_table(page)
+        self._scaling_rebuild_apply_list(page)
         table.itemSelectionChanged.connect(lambda: self._scaling_on_selection(page))
         self._scaling_on_selection(page)
         return page
@@ -14171,7 +14733,7 @@ class MainWindow(QMainWindow):
         page._scaling_param_edits = {}
         page._scaling_min_edits = {}
         page._scaling_max_edits = {}
-        for row_idx, config in enumerate(page._scaling_columns):
+        for row_idx, config in enumerate(page._scaling_rows):
             table.insertRow(row_idx)
             name_item = QTableWidgetItem(config["name"])
             name_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
@@ -14261,7 +14823,9 @@ class MainWindow(QMainWindow):
         self._module_set_state(page, MODULE_STATE_MODIFIED)
 
     def _scaling_save_now(self, page) -> None:
-        page._scaling_task_def.setdefault("params", {})["columns"] = page._scaling_columns
+        params = page._scaling_task_def.setdefault("params", {})
+        params["columns"] = page._scaling_columns
+        params["files"] = list(page._scaling_files or [])
         if self.project is not None:
             self.project.save()
         page._scaling_snapshot = copy.deepcopy(page._scaling_task_def.get("params", {}))
@@ -14289,9 +14853,21 @@ class MainWindow(QMainWindow):
 
     def _scaling_on_selection(self, page) -> None:
         row = page._scaling_table.currentRow()
-        if row < 0 or row >= len(page._scaling_columns):
+        rows = getattr(page, "_scaling_rows", [])
+        if row < 0 or row >= len(rows):
             return
-        page._scaling_preview["x"] = page._scaling_columns[row]["name"]
+        name = rows[row]["name"]
+        preview = page._scaling_preview
+        # Clicking a variable drives the preview: x for scatter/histogram,
+        # the image channel for image plots. The user can still override
+        # either of them in the preview settings.
+        if preview.get("type") == "image":
+            preview["image_channel"] = name
+            # Every click shows the channel's default (auto) levels.
+            preview["image_min"] = None
+            preview["image_max"] = None
+        else:
+            preview["x"] = name
         self._scaling_autofill_minmax(page, row)
         self._scaling_render_preview(page)
         self._scaling_rebuild_settings(page)
@@ -14308,7 +14884,10 @@ class MainWindow(QMainWindow):
         if row_idx in page._scaling_minmax_filled:
             return
         page._scaling_minmax_filled.add(row_idx)
-        config = page._scaling_columns[row_idx]
+        rows = getattr(page, "_scaling_rows", page._scaling_columns)
+        if row_idx >= len(rows):
+            return
+        config = rows[row_idx]
         name = config.get("name")
         rec = self._figure_record(page._scaling_preview.get("file"))
         if not rec or not name:
@@ -14338,10 +14917,14 @@ class MainWindow(QMainWindow):
         cols = self._columns_for(
             rec.get("parquet"), page._scaling_task_id
         ) if rec else []
-        missing = [
-            str(n) for n in (preview.get("x"), preview.get("y"))
-            if n and n not in cols
-        ]
+        plot_type = preview.get("type", "scatter")
+        if plot_type == "image":
+            needed = [preview.get("image_channel")]
+        elif plot_type == "histogram":
+            needed = [preview.get("x")]
+        else:
+            needed = [preview.get("x"), preview.get("y")]
+        missing = [str(n) for n in needed if n and n not in cols]
         if missing:
             page._scaling_overlay_box.setText(
                 "Parameter not in this file:\n" + ", ".join(missing)
@@ -14349,23 +14932,77 @@ class MainWindow(QMainWindow):
             page._scaling_overlay.show()
         else:
             page._scaling_overlay.hide()
-        # Drive the preview axes from each column's min/max (if set).
+        # This module's current (possibly unsaved) scale configs, applied
+        # only to the files picked on the left.
+        selected = {str(p) for p in (page._scaling_files or [])}
+        transforms = {}
+        if str(preview.get("file")) in selected:
+            for c in page._scaling_columns:
+                if c.get("name"):
+                    transforms.setdefault(c["name"], []).append(c)
+
+        # Drive the preview axes from each column's min/max. Those are stored
+        # as ORIGINAL values, so they are mapped into plot units here.
         x_cfg = self._scaling_config_for(page, preview.get("x"))
         y_cfg = self._scaling_config_for(page, preview.get("y"))
-        preview["xmin"] = x_cfg.get("min") if x_cfg else None
-        preview["xmax"] = x_cfg.get("max") if x_cfg else None
-        preview["ymin"] = y_cfg.get("min") if y_cfg else None
-        preview["ymax"] = y_cfg.get("max") if y_cfg else None
-        # Upstream stages are applied by the data pipeline; this module's own
-        # current (possibly unsaved) config goes on top for the preview.
-        transforms = {}
-        for c in page._scaling_columns:
-            if c.get("name"):
-                transforms.setdefault(c["name"], []).append(c)
-        self._figure_render_scatter(
+
+        def plot_bound(config, key, column):
+            if not config or plot_type == "image":
+                return None
+            value = config.get(key)
+            if value is None:
+                return None
+            configs = self._figure_axis_scale_configs(
+                page._scaling_task_id, preview.get("file"), column, transforms
+            )
+            return _forward_scale_value(value, configs)
+
+        preview["xmin"] = plot_bound(x_cfg, "min", preview.get("x"))
+        preview["xmax"] = plot_bound(x_cfg, "max", preview.get("x"))
+        preview["ymin"] = (
+            plot_bound(y_cfg, "min", preview.get("y"))
+            if plot_type == "scatter" else None
+        )
+        preview["ymax"] = (
+            plot_bound(y_cfg, "max", preview.get("y"))
+            if plot_type == "scatter" else None
+        )
+
+        viewbox = page._scaling_plot_widget.getPlotItem().getViewBox()
+        if plot_type != "image":
+            viewbox.setAspectLocked(False)
+
+        if plot_type == "image":
+            plot_dict = dict(preview)
+            channel = preview.get("image_channel")
+            available = [c for c in cols if c not in ("x", "y")]
+            if not channel or channel not in available:
+                channel = available[0] if available else None
+            if channel:
+                preview["image_channel"] = channel
+                plot_dict["image_channel"] = channel
+                plot_dict["layers"] = [{
+                    "parameter": channel,
+                    "color": (255, 255, 255),
+                    "name": str(channel),
+                    "min": preview.get("image_min"),
+                    "max": preview.get("image_max"),
+                }]
+            self._figure_render_image(
+                plot_dict, page._scaling_plot_widget,
+                task_id=page._scaling_task_id,
+            )
+            return
+
+        self._figure_render(
             preview, page._scaling_plot_widget,
             column_transforms=transforms, task_id=page._scaling_task_id,
         )
+
+    def _scaling_set_image_levels(self, page, lo, hi) -> None:
+        page._scaling_preview["image_min"] = lo
+        page._scaling_preview["image_max"] = hi
+        self._scaling_render_preview(page)
 
     def _scaling_rebuild_settings(self, page) -> None:
         layout = page._scaling_settings_layout
@@ -14379,6 +15016,12 @@ class MainWindow(QMainWindow):
         columns = self._columns_for(
             rec.get("parquet"), page._scaling_task_id
         ) if rec else []
+        # Scale configs at this point: upstream scales plus this module's
+        # current (possibly unsaved) settings.
+        live_transforms = {}
+        for c in page._scaling_columns:
+            if c.get("name"):
+                live_transforms.setdefault(c["name"], []).append(c)
 
         layout.addWidget(QLabel("File"))
         file_combo = _NoWheelComboBox()
@@ -14391,28 +15034,79 @@ class MainWindow(QMainWindow):
         file_combo.setEnabled(enabled)
         layout.addWidget(file_combo)
 
-        layout.addWidget(QLabel("X parameter"))
-        x_combo = self._figure_param_combo(columns, preview.get("x"), enabled)
-        layout.addWidget(x_combo)
+        layout.addWidget(QLabel("Plot type"))
+        type_combo = _NoWheelComboBox()
+        type_combo.addItem("Scatter", "scatter")
+        type_combo.addItem("Histogram", "histogram")
+        type_combo.addItem("Image", "image")
+        idx = type_combo.findData(preview.get("type", "scatter"))
+        type_combo.setCurrentIndex(max(0, idx))
+        type_combo.setEnabled(enabled)
+        layout.addWidget(type_combo)
 
-        layout.addWidget(QLabel("Y parameter"))
-        y_combo = self._figure_param_combo(columns, preview.get("y"), enabled)
-        layout.addWidget(y_combo)
+        plot_type = preview.get("type", "scatter")
+        x_combo = y_combo = channel_combo = None
+        if plot_type == "image":
+            layout.addWidget(QLabel("Channel"))
+            channels = [c for c in columns if c not in ("x", "y")]
+            channel_combo = self._gating_param_combo(
+                channels, preview.get("image_channel"), enabled
+            )
+            layout.addWidget(channel_combo)
+            self._image_level_controls(
+                layout, preview.get("image_channel"),
+                preview.get("image_min"), preview.get("image_max"),
+                enabled,
+                on_minmax=lambda lo, hi: self._scaling_set_image_levels(
+                    page, lo, hi
+                ),
+                task_id=page._scaling_task_id,
+                parquet_path=rec.get("parquet") if rec else None,
+                configs=self._figure_axis_scale_configs(
+                    page._scaling_task_id,
+                    rec.get("parquet") if rec else None,
+                    preview.get("image_channel"),
+                    live_transforms,
+                ),
+            )
+        else:
+            layout.addWidget(QLabel("X parameter"))
+            x_combo = self._gating_param_combo(columns, preview.get("x"), enabled)
+            layout.addWidget(x_combo)
+            if plot_type == "scatter":
+                layout.addWidget(QLabel("Y parameter"))
+                y_combo = self._gating_param_combo(columns, preview.get("y"), enabled)
+                layout.addWidget(y_combo)
 
-        self._figure_scatter_color_settings(
-            layout, preview, plot_widget, columns, enabled,
-            on_change=lambda: self._scaling_render_preview(page),
-            on_rebuild=lambda: (
-                self._scaling_rebuild_settings(page),
-                self._scaling_render_preview(page),
-            ),
-            task_id=page._scaling_task_id,
-        )
+        if plot_type == "scatter":
+            self._figure_scatter_color_settings(
+                layout, preview, plot_widget, columns, enabled,
+                on_change=lambda: self._scaling_render_preview(page),
+                on_rebuild=lambda: (
+                    self._scaling_rebuild_settings(page),
+                    self._scaling_render_preview(page),
+                ),
+                task_id=page._scaling_task_id,
+            )
 
-        layout.addWidget(QLabel("X range"))
-        layout.addWidget(self._figure_range_row(preview, "x", plot_widget, enabled))
-        layout.addWidget(QLabel("Y range"))
-        layout.addWidget(self._figure_range_row(preview, "y", plot_widget, enabled))
+        if plot_type != "image":
+            layout.addWidget(QLabel("X range"))
+            layout.addWidget(self._figure_range_row(
+                preview, "x", plot_widget, enabled,
+                configs=self._figure_axis_scale_configs(
+                    page._scaling_task_id, preview.get("file"),
+                    preview.get("x"), live_transforms,
+                ),
+            ))
+        if plot_type == "scatter":
+            layout.addWidget(QLabel("Y range"))
+            layout.addWidget(self._figure_range_row(
+                preview, "y", plot_widget, enabled,
+                configs=self._figure_axis_scale_configs(
+                    page._scaling_task_id, preview.get("file"),
+                    preview.get("y"), live_transforms,
+                ),
+            ))
 
         self._figure_display_toggles(
             layout, preview, enabled,
@@ -14422,6 +15116,21 @@ class MainWindow(QMainWindow):
         )
         layout.addStretch()
 
+        def on_type():
+            preview["type"] = type_combo.currentData()
+            if preview["type"] == "image" and not preview.get("image_channel"):
+                row = page._scaling_table.currentRow()
+                rows = getattr(page, "_scaling_rows", [])
+                if 0 <= row < len(rows):
+                    preview["image_channel"] = rows[row]["name"]
+            elif preview["type"] != "image" and not preview.get("x"):
+                row = page._scaling_table.currentRow()
+                rows = getattr(page, "_scaling_rows", [])
+                if 0 <= row < len(rows):
+                    preview["x"] = rows[row]["name"]
+            self._scaling_rebuild_settings(page)
+            self._scaling_render_preview(page)
+
         def on_file_changed():
             preview["file"] = file_combo.currentData()
             preview["file_name"] = file_combo.currentText()
@@ -14430,19 +15139,32 @@ class MainWindow(QMainWindow):
                 new_rec.get("parquet"), page._scaling_task_id
             ) if new_rec else []
             preview["x"] = new_cols[0] if new_cols else None
-            preview["y"] = new_cols[1] if len(new_cols) > 1 else (new_cols[0] if new_cols else None)
+            preview["y"] = (
+                new_cols[1] if len(new_cols) > 1
+                else (new_cols[0] if new_cols else None)
+            )
             preview["color_param"] = preview["x"]
+            channels = [c for c in new_cols if c not in ("x", "y")]
+            preview["image_channel"] = channels[0] if channels else None
+            preview["image_min"] = None
+            preview["image_max"] = None
             self._scaling_render_preview(page)
             self._scaling_rebuild_settings(page)
-        file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
 
         def on_param(attr):
             def handler(value):
                 preview[attr] = value
                 self._scaling_render_preview(page)
             return handler
-        x_combo.currentTextChanged.connect(on_param("x"))
-        y_combo.currentTextChanged.connect(on_param("y"))
+
+        file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
+        type_combo.currentIndexChanged.connect(lambda _=0: on_type())
+        if x_combo is not None:
+            x_combo.currentTextChanged.connect(on_param("x"))
+        if y_combo is not None:
+            y_combo.currentTextChanged.connect(on_param("y"))
+        if channel_combo is not None:
+            channel_combo.currentTextChanged.connect(on_param("image_channel"))
 
     # ----- open-module registry & save->update propagation --------------
     def _module_register(self, task_id, task_type, page) -> None:
@@ -14478,6 +15200,7 @@ class MainWindow(QMainWindow):
         """Mark a module as saved and push updates to its open downstream modules."""
         # Any saved change can alter the data flowing downstream.
         self._pool_clear()
+        self._channel_range_cache = {}
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
         self._stage_cache = {}
@@ -28270,6 +28993,17 @@ class MainWindow(QMainWindow):
         ))
         page._area_point_size = size
 
+        # Image display levels (Min/Max, histogram, Auto set, Reset).
+        levels_host = QWidget()
+        levels_host.setStyleSheet("background: transparent;")
+        levels_lay = QVBoxLayout(levels_host)
+        levels_lay.setContentsMargins(0, 0, 0, 0)
+        levels_lay.setSpacing(6)
+        sl.addWidget(levels_host)
+        page._area_levels_host = levels_host
+        page._area_levels_lay = levels_lay
+        page._area_levels_sig = None
+
         note = QLabel("Amber cells are the regions counted as tissue (density above the threshold).")
         note.setStyleSheet("color: gray;")
         note.setWordWrap(True)
@@ -29119,11 +29853,69 @@ class MainWindow(QMainWindow):
         self._area_render_plot(page)
         self._area_mark_dirty(page)
 
+    def _area_resolved_plot_type(self, page, path=None):
+        params = page._area_params
+        plot_cfg = params.get("plot") or {}
+        path = path if path is not None else params.get("selected")
+        if not path:
+            return None
+        is_image = self._image_load_manifest(path) is not None
+        ptype = plot_cfg.get("type") or "auto"
+        if ptype == "auto":
+            ptype = "image" if is_image else "scatter"
+        if ptype == "image" and not is_image:
+            ptype = "scatter"
+        return ptype
+
+    def _area_set_image_levels(self, page, lo, hi) -> None:
+        path = page._area_params.get("selected")
+        if not path:
+            return
+        cfg = self._area_row_cfg(page, path)
+        cfg["image_min"] = lo
+        cfg["image_max"] = hi
+        self._area_render_plot(page)
+        self._area_mark_dirty(page)
+
+    def _area_rebuild_levels(self, page) -> None:
+        """Min/Max / histogram / Auto set / Reset for an image preview."""
+        lay = getattr(page, "_area_levels_lay", None)
+        host = getattr(page, "_area_levels_host", None)
+        if lay is None or host is None:
+            return
+        params = page._area_params
+        path = params.get("selected")
+        ptype = self._area_resolved_plot_type(page, path)
+        cfg = self._area_row_cfg(page, path) if path else {}
+        sig = (cfg or {}).get("signal")
+        locked = bool(getattr(page, "_area_locked", False))
+        signature = (path, sig if ptype == "image" else None, ptype, locked)
+        if signature == getattr(page, "_area_levels_sig", None):
+            return
+        page._area_levels_sig = signature
+        while lay.count():
+            entry = lay.takeAt(0)
+            widget = entry.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if ptype != "image" or not path or not sig:
+            host.setVisible(False)
+            return
+        host.setVisible(True)
+        self._image_level_controls(
+            lay, sig, cfg.get("image_min"), cfg.get("image_max"),
+            not locked,
+            on_minmax=lambda lo, hi: self._area_set_image_levels(page, lo, hi),
+            task_id=page._area_task_id,
+            parquet_path=path,
+        )
+
     def _area_render_plot(self, page) -> None:
         pw = page._area_plot
         params = page._area_params
         plot_cfg = params.get("plot") or {}
         path = params.get("selected")
+        self._area_rebuild_levels(page)
         if not path:
             pw.clear()
             pw.setTitle("Select a file row to preview", color="#808080", size="10pt")
@@ -29165,6 +29957,8 @@ class MainWindow(QMainWindow):
                     "parameter": sig_name,
                     "color": (255, 255, 255),
                     "name": str(sig_name),
+                    "min": cfg.get("image_min"),
+                    "max": cfg.get("image_max"),
                 }]
                 self._figure_render_image(plot_dict, pw, task_id=page._area_task_id)
             else:
@@ -34360,12 +35154,20 @@ class MainWindow(QMainWindow):
             layout.addWidget(self._figure_range_row(
                 preview, "x", plot_widget, enabled,
                 on_commit=lambda: self._gating_mark_dirty(page),
+                configs=self._figure_axis_scale_configs(
+                    page._gating_task_id, preview.get("file"),
+                    preview.get("x"),
+                ),
             ))
         if plot_type == "scatter":
             layout.addWidget(QLabel("Y range"))
             layout.addWidget(self._figure_range_row(
                 preview, "y", plot_widget, enabled,
                 on_commit=lambda: self._gating_mark_dirty(page),
+                configs=self._figure_axis_scale_configs(
+                    page._gating_task_id, preview.get("file"),
+                    preview.get("y"),
+                ),
             ))
 
         self._figure_display_toggles(
