@@ -27,8 +27,8 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import (
-    QByteArray, QEvent, QObject, QPointF, QRect, QRectF, QSize, QTimer, Qt,
-    QUrl, Signal,
+    QByteArray, QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, QTimer,
+    Qt, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QAction,
@@ -104,40 +104,50 @@ import pyqtgraph as pg
 APP_NAME = "Smage"
 
 
-class _ModuleButton(QFrame):
-    """Add-Module tile: icon above a centred, word-wrapped name.
-
-    QToolButton only draws one line of text, so a two-word module name would be
-    elided; this tile breaks the name at the space and keeps both lines
-    centred under the icon.
-    """
+class _ModuleChip(QFrame):
+    """One module node in the add-module mind map (icon + name pill)."""
 
     clicked = Signal()
 
-    def __init__(self, pixmap: QPixmap, text: str, parent=None) -> None:
+    def __init__(self, mtype: str, name: str, color: str, parent=None) -> None:
         super().__init__(parent)
-        self.setObjectName("moduleTile")
+        self.setObjectName("moduleChip")
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(name)
+        self.setFixedHeight(30)
         self.setStyleSheet(
-            "QFrame#moduleTile { background: #ffffff; border: 1px solid #dbe3ec;"
-            " border-radius: 7px; }"
-            "QFrame#moduleTile:hover { border-color: #5aa0e0;"
-            " background: #f4f9ff; }"
+            "QFrame#moduleChip { background: #ffffff; border: 1px solid #cfd9e6;"
+            " border-radius: 15px; }"
+            f"QFrame#moduleChip:hover {{ border-color: {color};"
+            " background: #f2f8ff; }}"
         )
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, 9, 6, 7)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 2, 9, 2)
         lay.setSpacing(5)
         icon = QLabel()
-        icon.setPixmap(pixmap)
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = _module_icon_pixmap(mtype, 16)
+        if pixmap is not None:
+            icon.setPixmap(pixmap)
+            icon.setFixedSize(16, 16)
+        else:
+            icon.setPixmap(_dot_pixmap(color))
+            icon.setFixedSize(12, 12)
+        # Clicks belong to the pill: children must not swallow or forward them.
+        icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         lay.addWidget(icon)
-        label = QLabel(text)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setWordWrap(True)
+        label = QLabel(name)
         label.setStyleSheet("color: #2c3a48; font-size: 9pt;")
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         lay.addWidget(label)
-        lay.addStretch(1)
+
+    def mousePressEvent(self, event) -> None:
+        # Accept the press so it does not bubble up to the overlay, which
+        # would dismiss the map before the release can produce a click.
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if (
@@ -146,6 +156,222 @@ class _ModuleButton(QFrame):
         ):
             self.clicked.emit()
         super().mouseReleaseEvent(event)
+
+
+class _AddModuleOverlay(QWidget):
+    """Full-window mind map shown when a task's "+" button is pressed.
+
+    A short line leaves the button, fans out into one horizontal line per
+    module group, and each group's modules follow as a chain of pills. Picking
+    a pill or clicking anywhere else closes the map.
+    """
+
+    STUB = 22          # horizontal line leaving the "+"
+    FAN_DX = 22        # horizontal span of the diagonal fan
+    LABEL_STUB = 16    # short horizontal lead-in before a category name
+    LABEL_GAP = 6      # gap between a category name and its connector lines
+    CHIP_GAP = 10      # short connector between two pills
+    CHIP_H = 30
+    LINE_GAP = 10      # connector between wrapped pill lines
+    ROW_GAP = 12
+
+    def __init__(self, window, anchor: QPoint, on_choose) -> None:
+        super().__init__(window)
+        self._on_choose = on_choose
+        self._anchor = anchor
+        self._rows = []
+        self.setGeometry(window.rect())
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # A resized window would leave the map anchored to a stale position.
+        window.installEventFilter(self)
+        self._label_font = QFont(self.font())
+        self._label_font.setPointSizeF(9.0)
+        self._label_font.setBold(True)
+        self._build()
+
+    # ----- layout ------------------------------------------------------
+    def _build(self) -> None:
+        metrics = QFontMetrics(self._label_font)
+        left = self._anchor.x() + self.STUB + self.FAN_DX + 10
+        right_limit = self.width() - 20
+        left = max(12, min(left, max(12, right_limit - 260)))
+
+        groups = []
+        for title, kinds in ADD_MODULE_GROUPS:
+            row_defs = ADD_MODULE_MAP_ROWS.get(title) or [list(kinds)]
+            rows_types = [list(row) for row in row_defs]
+            chips = []
+            for row_types in rows_types:
+                for mtype in row_types:
+                    name, color = TASK_TYPES[mtype]
+                    chip = _ModuleChip(mtype, name, color, self)
+                    chip.clicked.connect(lambda t=mtype: self._choose(t))
+                    chips.append(chip)
+            groups.append((title, rows_types, chips))
+
+        # All chip chains start at the same x, so short category names get a
+        # longer connector line and every row's first module lines up.
+        widest_label = max(
+            (metrics.horizontalAdvance(title) + 10 for title, _r, _c in groups),
+            default=0,
+        )
+        branch_x = left + widest_label + 6
+        x0 = branch_x + 12
+
+        rows = []
+        total_h = 0
+        for title, rows_types, chips in groups:
+            label_w = metrics.horizontalAdvance(title) + 10
+            lines = []
+            cursor = x0
+            chip_index = 0
+            for row_types in rows_types:
+                # A defined group row always starts its own line.
+                lines.append([])
+                cursor = x0
+                for _mtype in row_types:
+                    chip = chips[chip_index]
+                    chip_index += 1
+                    width = max(98, chip.sizeHint().width())
+                    if cursor + width > right_limit and lines[-1]:
+                        lines.append([])
+                        cursor = x0
+                    lines[-1].append((chip, cursor, width))
+                    cursor += width + self.CHIP_GAP
+            row_h = len(lines) * self.CHIP_H + (len(lines) - 1) * self.LINE_GAP
+            rows.append({
+                "title": title,
+                "label_x": left,
+                "label_w": label_w,
+                "branch_x": branch_x,
+                "x0": x0,
+                "lines": lines,
+                "h": row_h,
+                "y": 0,
+            })
+            total_h += row_h + self.ROW_GAP
+        total_h -= self.ROW_GAP
+
+        top = self._anchor.y() - total_h / 2.0
+        top = max(10.0, min(top, self.height() - total_h - 10.0))
+        y = top
+        for row in rows:
+            row["y"] = y
+            for line_index, line in enumerate(row["lines"]):
+                cy = y + line_index * (self.CHIP_H + self.LINE_GAP)
+                for chip, x, width in line:
+                    chip.setGeometry(
+                        int(x), int(cy), int(width), self.CHIP_H
+                    )
+                    chip.show()
+            y += row["h"] + self.ROW_GAP
+        self._rows = rows
+
+    # ----- painting ----------------------------------------------------
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(10, 18, 30, 56))
+
+        pen = QPen(QColor(108, 138, 172, 215))
+        pen.setWidthF(1.4)
+        painter.setPen(pen)
+        ax, ay = self._anchor.x(), self._anchor.y()
+        stub_end = QPointF(ax + self.STUB, ay)
+        painter.drawLine(QPointF(ax, ay), stub_end)
+
+        for row in self._rows:
+            first_y = row["y"] + self.CHIP_H / 2.0
+            fan_end = QPointF(row["label_x"] - self.LABEL_STUB, first_y)
+            painter.drawLine(stub_end, fan_end)
+            # Short horizontal lead-in so every category name sits on a line,
+            # with a space-sized gap before the text.
+            painter.drawLine(
+                fan_end, QPointF(row["label_x"] - self.LABEL_GAP, first_y)
+            )
+
+            painter.setFont(self._label_font)
+            painter.setPen(QColor("#46586d"))
+            painter.drawText(
+                QRect(
+                    int(row["label_x"]), int(first_y - 10),
+                    int(row["label_w"]), 20,
+                ),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                row["title"],
+            )
+            painter.setPen(pen)
+
+            for line_index, line in enumerate(row["lines"]):
+                cy = row["y"] + line_index * (self.CHIP_H + self.LINE_GAP) \
+                    + self.CHIP_H / 2.0
+                if not line:
+                    continue
+                text_end = row["label_x"] + row["label_w"] - 10
+                if len(row["lines"]) == 1:
+                    painter.drawLine(
+                        QPointF(text_end + self.LABEL_GAP, cy),
+                        QPointF(line[0][1] - 2, cy),
+                    )
+                else:
+                    # Split group: a bracket right after the label feeds every
+                    # line of the group.
+                    branch_x = row["branch_x"]
+                    if line_index == 0:
+                        last_cy = row["y"] + (len(row["lines"]) - 1) * (
+                            self.CHIP_H + self.LINE_GAP
+                        ) + self.CHIP_H / 2.0
+                        painter.drawLine(
+                            QPointF(text_end + self.LABEL_GAP, cy),
+                            QPointF(branch_x, cy),
+                        )
+                        painter.drawLine(
+                            QPointF(branch_x, cy), QPointF(branch_x, last_cy)
+                        )
+                    painter.drawLine(
+                        QPointF(branch_x, cy), QPointF(line[0][1] - 2, cy)
+                    )
+                for index in range(len(line) - 1):
+                    chip, x, width = line[index]
+                    next_x = line[index + 1][1]
+                    painter.drawLine(
+                        QPointF(x + width, cy), QPointF(next_x - 2, cy)
+                    )
+
+    # ----- interaction -------------------------------------------------
+    def _choose(self, mtype: str) -> None:
+        callback = self._on_choose
+        self._dismiss()
+        callback(mtype)
+
+    def _dismiss(self) -> None:
+        window = self.parentWidget()
+        if window is not None:
+            # Drop the window's reference before the C++ object goes away,
+            # otherwise the next "+" click would touch a deleted widget.
+            if getattr(window, "_add_module_overlay", None) is self:
+                window._add_module_overlay = None
+            window.removeEventFilter(self)
+        self.close()
+        self.deleteLater()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Resize:
+            self._dismiss()
+            return False
+        return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dismiss()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self._dismiss()
+            return
+        super().keyPressEvent(event)
 
 
 class _NoWheelComboBox(QComboBox):
@@ -392,14 +618,15 @@ TASK_TYPES = {
     "export": ("Export", "#66bb6a"),
 }
 
-# The Add-Module dialog lists the modules grouped by what they do, in roughly
-# workflow order. Each dialog row holds up to four buttons.
+# The Add-Module map lists the modules grouped by what they do, in roughly
+# workflow order. Each group occupies one horizontal line; a group listed in
+# ADD_MODULE_MAP_ROWS is split into the rows given there (in that order).
 ADD_MODULE_GROUPS = [
     ("Correct & transform", [
-        "scale",
-        "rename",
-        "compensation",
         "unmix",
+        "scale",
+        "compensation",
+        "rename",
         "illumination",
         "data_clean",
         "batch_align",
@@ -425,6 +652,13 @@ ADD_MODULE_GROUPS = [
         "export",
     ]),
 ]
+
+ADD_MODULE_MAP_ROWS = {
+    "Correct & transform": [
+        ["unmix", "scale", "compensation", "rename"],
+        ["illumination", "data_clean", "batch_align"],
+    ],
+}
 
 ADDABLE_TYPES = [kind for _title, kinds in ADD_MODULE_GROUPS for kind in kinds]
 
@@ -6490,7 +6724,9 @@ class MainWindow(QMainWindow):
             add_btn.setToolTip("Add child module")
             add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             if on_add_child is not None:
-                add_btn.clicked.connect(on_add_child)
+                add_btn.clicked.connect(
+                    lambda _=False, button=add_btn: on_add_child(button)
+                )
             buttons.addWidget(add_btn)
 
             lay.addLayout(buttons)
@@ -6929,7 +7165,7 @@ class MainWindow(QMainWindow):
             parent,
             name,
             color,
-            on_add_child=lambda checked=False, t=task_def: self._show_add_module_dialog(t),
+            on_add_child=lambda button=None, t=task_def: self._show_add_module_picker(t, button),
             on_actions=lambda checked=False, t=task_def, p=parent_task_def: self._show_actions_menu(t, p),
             task_type=task_type,
             task_id=task_def.get("id", ""),
@@ -6948,51 +7184,33 @@ class MainWindow(QMainWindow):
         for child in task_def.get("children", []):
             self._add_task_from_definition(item, child, task_def, force, live)
 
-    # ----- add-module dialog ----------------------------------------
-    def _show_add_module_dialog(self, parent_task_def: dict) -> None:
-        """Open the Add-Module dialog; the chosen module becomes a child task."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Add Module")
-        grid = QGridLayout(dialog)
-        grid.setContentsMargins(14, 12, 14, 14)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(4)
-
-        row = 0
-        for index, (title, kinds) in enumerate(ADD_MODULE_GROUPS):
-            if index:
-                spacer = QWidget()
-                spacer.setFixedHeight(6)
-                grid.addWidget(spacer, row, 0, 1, 4)
-                row += 1
-            heading = QLabel(title)
-            heading.setStyleSheet(
-                "color: #6b7785; font-weight: 600; font-size: 9pt;"
+    # ----- add-module picker ----------------------------------------
+    def _show_add_module_picker(self, parent_task_def: dict, anchor=None) -> None:
+        """Open the mind-map module picker next to the "+" that was pressed."""
+        if anchor is not None:
+            point = anchor.mapTo(
+                self, QPoint(anchor.width(), anchor.height() // 2)
             )
-            grid.addWidget(heading, row, 0, 1, 4)
-            row += 1
-            for i, mtype in enumerate(kinds):
-                name, _color = TASK_TYPES[mtype]
-                pixmap = _module_icon_pixmap(mtype, 30)
-                if pixmap is None:
-                    pixmap = _dot_pixmap(_color).scaled(
-                        30, 30, Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                # Two-word names go on two centred lines.
-                caption = name.replace(" ", "\n", 1)
-                btn = _ModuleButton(pixmap, caption)
-                btn.setFixedSize(112, 86)
-                btn.setToolTip(name)
-                btn.clicked.connect(
-                    lambda t=mtype: self._add_module(parent_task_def, t, dialog)
-                )
-                grid.addWidget(btn, row + i // 4, i % 4)
-            row += (len(kinds) + 3) // 4
+        else:
+            point = self.mapFromGlobal(QCursor.pos())
+        existing = getattr(self, "_add_module_overlay", None)
+        if existing is not None:
+            try:
+                existing._dismiss()
+            except RuntimeError:
+                # The wrapper outlived its C++ widget; just drop it.
+                pass
+            self._add_module_overlay = None
+        overlay = _AddModuleOverlay(
+            self, point,
+            lambda mtype: self._add_module(parent_task_def, mtype, None),
+        )
+        self._add_module_overlay = overlay
+        overlay.show()
+        overlay.raise_()
+        overlay.setFocus()
 
-        dialog.exec()
-
-    def _add_module(self, parent_task_def: dict, mtype: str, dialog: QDialog) -> None:
+    def _add_module(self, parent_task_def: dict, mtype: str, dialog=None) -> None:
         """Add a placeholder module of the given type as a child task."""
         name, _ = TASK_TYPES[mtype]
         new_task = {
@@ -7015,7 +7233,8 @@ class MainWindow(QMainWindow):
         if self.project is not None:
             self.project.save()
         self._refresh_workflow_tree()
-        dialog.accept()
+        if dialog is not None:
+            dialog.accept()
 
     # ----- module tabs ----------------------------------------------
     def _build_module_toolbar(self, name: str, page: QWidget, include_save: bool = True,
