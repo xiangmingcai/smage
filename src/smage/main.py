@@ -1780,6 +1780,9 @@ def _gate_mask(x, y, gate):
         x1 = min(gate["x1"], gate["x2"])
         x2 = max(gate["x1"], gate["x2"])
         return (x >= x1) & (x <= x2)
+    if t == "categorical":
+        # Col2Gate: the point's `x` (the chosen column) equals a category value.
+        return x == gate.get("value")
     if t == "split":
         vx = gate.get("vx", 0.0)
         if gate.get("side") == "left":
@@ -2086,6 +2089,15 @@ def _gate_label_position(gate):
     return ((xr[0] + xr[1]) / 2.0, (yr[0] + yr[1]) / 2.0)
 
 
+def _category_value_label(value) -> str:
+    """Render a Col2Gate category value for the gate name (``<prefix><value>``)."""
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return repr(value)
+    return str(value)
+
+
 def _default_gating_preview(rec, cols) -> dict:
     """A fresh scatter preview config for the gating tree (first file + axes)."""
     return {
@@ -2377,6 +2389,11 @@ GLOBAL_DEFAULT_SETTINGS = {
         # Bins per axis used to estimate point density for colouring.
         "density_grid": 200,
         "default_colormap": "viridis",
+    },
+    "gating": {
+        # Col2Gate refuses to build gates from a column with more categories
+        # than this (a continuous column would otherwise create thousands).
+        "col2gate_cate_max": 100,
     },
     "colormaps": [],
     "window_geometry": "",
@@ -5719,8 +5736,10 @@ class _GlobalSettingsDialog(QDialog):
 
         self.tabs.addItem("Appearance")
         self.tabs.addItem("Parameters")
+        self.tabs.addItem("Gating")
         self.stack.addWidget(self._appearance_page())
         self.stack.addWidget(self._parameters_page())
+        self.stack.addWidget(self._gating_page())
         self.tabs.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.tabs.setCurrentRow(0)
 
@@ -5864,6 +5883,30 @@ class _GlobalSettingsDialog(QDialog):
         ))
         return page
 
+    def _gating_page(self) -> QWidget:
+        page = self._page()
+        layout = page.layout()
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        gating = self._draft.get("gating") or {}
+
+        form.addWidget(QLabel("Col2Gate category max"), 0, 0)
+        self.col2gate_max = QSpinBox()
+        self.col2gate_max.setRange(1, 100000)
+        self.col2gate_max.setSingleStep(10)
+        self.col2gate_max.setGroupSeparatorShown(True)
+        self.col2gate_max.setValue(int(gating.get("col2gate_cate_max", 100)))
+        form.addWidget(self.col2gate_max, 0, 1)
+        form.addWidget(self._hint(
+            "The Col2Gate tool refuses to turn a column into gates when it has "
+            "more distinct values than this, so a continuous channel cannot "
+            "create thousands of gates."
+        ), 1, 0, 1, 2)
+        layout.addLayout(form)
+        layout.addStretch()
+        return page
+
     # -- actions -------------------------------------------------------
     def _restore_defaults(self) -> None:
         defaults = copy.deepcopy(GLOBAL_DEFAULT_SETTINGS)
@@ -5877,12 +5920,15 @@ class _GlobalSettingsDialog(QDialog):
                 max(0, self.plot_background.findData(appearance["plot_background"]))
             )
             self.remember_geometry.setChecked(bool(appearance["remember_geometry"]))
-        else:
+        elif self.tabs.currentRow() == 1:
             plot = defaults["plot"]
             self.max_points.setValue(int(plot["max_points"]))
             self.nxn_points.setValue(int(plot["nxn_max_points"]))
             self.density_grid.setValue(int(plot["density_grid"]))
             self.picker.set_selected(plot["default_colormap"])
+        else:
+            gating = defaults["gating"]
+            self.col2gate_max.setValue(int(gating["col2gate_cate_max"]))
 
     def _ok(self) -> None:
         live = _global_settings()
@@ -5898,6 +5944,9 @@ class _GlobalSettingsDialog(QDialog):
             "density_grid": int(self.density_grid.value()),
             "default_colormap": self.picker.selected(),
         })
+        live.setdefault("gating", {})["col2gate_cate_max"] = int(
+            self.col2gate_max.value()
+        )
         _save_global_settings(live)
         self.accept()
 
@@ -12202,9 +12251,10 @@ class MainWindow(QMainWindow):
             keep = np.isfinite(x) & np.isfinite(y)
             if mask is not None:
                 mask_values = np.asarray(mask, dtype=bool)
-                if mask_values.size == indices.size:
-                    keep = keep & mask_values
-                elif indices.size and int(indices.max()) < mask_values.size:
+                # The pool's columns are in `indices` order (a priority
+                # permutation, not natural order), so the full-data mask must
+                # be reindexed to align with them.
+                if indices.size and int(indices.max()) < mask_values.size:
                     keep = keep & mask_values[indices]
                 else:
                     pooled_mode = False
@@ -12444,9 +12494,8 @@ class MainWindow(QMainWindow):
             keep = np.isfinite(x)
             if mask is not None:
                 mask_values = np.asarray(mask, dtype=bool)
-                if mask_values.size == indices.size:
-                    keep = keep & mask_values
-                elif indices.size and int(indices.max()) < mask_values.size:
+                # Same as scatter: pooled columns are in `indices` order.
+                if indices.size and int(indices.max()) < mask_values.size:
                     keep = keep & mask_values[indices]
                 else:
                     pooled_mode = False
@@ -33798,7 +33847,20 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(on_clicked)
             tools_lay.addWidget(btn)
             tool_buttons[key] = btn
+        # Keep the drawing tools grouped on the left; Col2Gate sits alone at
+        # the far right.
         tools_lay.addStretch()
+        col2gate_btn = QPushButton("Col2Gate")
+        col2gate_btn.setToolTip(
+            "Create one gate per distinct value of a column"
+        )
+        col2gate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        col2gate_btn.setEnabled(not locked)
+        col2gate_btn.clicked.connect(
+            lambda _=False: self._gating_open_col2gate(page)
+        )
+        tools_lay.addWidget(col2gate_btn)
+        page._gating_col2gate_btn = col2gate_btn
         mid_lay.addWidget(tools, 1)
 
         plot_widget, viewbox = self._gating_make_plot(page)
@@ -34182,6 +34244,191 @@ class MainWindow(QMainWindow):
         prefixes = {"rect": "Rect", "ellipse": "Oval", "polygon": "Poly", "range": "Range"}
         count = sum(1 for g in page._gating_gates if g.get("type") == tool) + 1
         return f"{prefixes.get(tool, 'Gate')} {count}"
+
+    # ----- Col2Gate ------------------------------------------------------
+    def _gating_col2gate_parquets(self, page) -> list:
+        """The data files this gate tree applies to (Col2Gate's scope)."""
+        if page._gating_files:
+            return list(page._gating_files)
+        # Embedded gate trees (Unmix) have no file selection: every file the
+        # task can see is used.
+        return [
+            rec.get("parquet")
+            for rec in self._available_files(page._gating_task_id)
+        ]
+
+    def _gating_col2gate_columns(self, page) -> list:
+        """Union of every column across the gating module's data files."""
+        columns = []
+        seen = set()
+        for parquet in self._gating_col2gate_parquets(page):
+            for name in self._columns_for(parquet, page._gating_task_id):
+                if name not in seen:
+                    seen.add(name)
+                    columns.append(name)
+        return columns
+
+    def _gating_col2gate_counts(self, page, column) -> list:
+        """Return ``[(value, count), ...]`` for `column` across the selected files."""
+        from collections import Counter
+
+        import pandas as pd
+
+        counter = Counter()
+        for parquet in self._gating_col2gate_parquets(page):
+            values = self._column_data(
+                page._gating_task_id, parquet, [column], numeric=False
+            ).get(column)
+            if values is None or len(values) == 0:
+                continue
+            for value, count in pd.Series(values).dropna().value_counts().items():
+                native = value.item() if hasattr(value, "item") else value
+                counter[native] += int(count)
+
+        def sort_key(item):
+            value = item[0]
+            if isinstance(value, (int, float)):
+                return (0, value)
+            return (1, str(value))
+
+        return sorted(counter.items(), key=sort_key)
+
+    def _gating_open_col2gate(self, page) -> None:
+        """Open the Col2Gate dialog: turn one column's categories into gates."""
+        columns = self._gating_col2gate_columns(page)
+        if not columns:
+            QMessageBox.information(
+                self, "Col2Gate",
+                "No columns are available in the selected data files.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Col2Gate")
+        dialog.resize(720, 480)
+        root = QHBoxLayout(dialog)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        left.addWidget(QLabel("<b>Column</b>"))
+        col_combo = _NoWheelComboBox()
+        for name in columns:
+            col_combo.addItem(str(name))
+        left.addWidget(col_combo)
+        check_btn = QPushButton("Check")
+        check_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        left.addWidget(check_btn)
+        left.addStretch()
+
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Value", "Count"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        right.addWidget(table, 1)
+
+        prefix_label = QLabel("Prefix")
+        right.addWidget(prefix_label)
+        prefix_edit = QLineEdit("cate_")
+        right.addWidget(prefix_edit)
+        set_btn = QPushButton("Set as gates")
+        set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        right.addWidget(set_btn)
+
+        for widget in (table, prefix_label, prefix_edit, set_btn):
+            widget.setVisible(False)
+
+        root.addLayout(left, 0)
+        root.addLayout(right, 1)
+
+        state = {"rows": []}
+        cate_max = int(_setting("gating", "col2gate_cate_max", 100))
+
+        def on_check():
+            column = col_combo.currentText()
+            if not column:
+                return
+            counts = self._gating_col2gate_counts(page, column)
+            if len(counts) > cate_max:
+                for widget in (table, prefix_label, prefix_edit, set_btn):
+                    widget.setVisible(False)
+                QMessageBox.warning(
+                    dialog, "Col2Gate",
+                    f"Possible value count exceeds the allowed maximum "
+                    f"({cate_max}).\nCheck the column or choose another column.",
+                )
+                return
+            state["rows"] = counts
+            table.setRowCount(len(counts))
+            for row, (value, count) in enumerate(counts):
+                table.setItem(
+                    row, 0, QTableWidgetItem(_category_value_label(value))
+                )
+                table.setItem(row, 1, QTableWidgetItem(f"{count:,}"))
+            for widget in (table, prefix_label, prefix_edit, set_btn):
+                widget.setVisible(True)
+
+        def on_set():
+            counts = state.get("rows")
+            if not counts:
+                return
+            column = col_combo.currentText()
+            prefix = prefix_edit.text().strip()
+            reply = QMessageBox.question(
+                dialog, "Col2Gate",
+                f"Add {len(counts)} gate(s) under the current gate?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._gating_col2gate_generate(page, column, prefix, counts)
+            dialog.accept()
+
+        check_btn.clicked.connect(on_check)
+        set_btn.clicked.connect(on_set)
+        dialog.exec()
+
+    def _gating_col2gate_generate(self, page, column, prefix, counts) -> None:
+        """Create one ``<prefix><value>`` child gate per category value."""
+        preview = page._gating_preview
+        xr, yr = page._gating_viewbox.viewRange()
+        added = []
+        for value, _count in counts:
+            label = _category_value_label(value)
+            gate = {
+                "id": uuid4().hex[:8],
+                "name": f"{prefix}{label}",
+                "type": "categorical",
+                "x": column,
+                "y": None,
+                "value": value,
+                "parent": page._gating_parent_id,
+                "plot_type": preview.get("type", "scatter"),
+                "display": _gating_display_snapshot(preview),
+                "xmin": xr[0], "xmax": xr[1],
+                "ymin": yr[0], "ymax": yr[1],
+            }
+            page._gating_gates.append(gate)
+            page._gating_rois.append([])
+            added.append(gate)
+
+        page._gating_context_gate_id = added[-1]["id"] if added else None
+        self._gating_reload_rois(page)
+        self._gating_update_roi_visibility(page)
+        self._gating_rebuild_tree(page)
+        self._gating_mark_dirty(page)
+        runlog.action(
+            "gating.col2gate", module=str(page._gating_task_id),
+            column=str(column), gates=len(added),
+            parent=str(page._gating_parent_id or ""),
+        )
 
     def _gating_add_gate(self, page, tool, arg) -> None:
         """Create a gate and record the action in the session log."""
