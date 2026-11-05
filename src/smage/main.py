@@ -473,6 +473,14 @@ IMAGE_LAYER_COLORS = [
     (128, 0, 255),    # violet
 ]
 
+# Distinct line colours for the Unmix "Spectral curve" tab (one per signature).
+UNMIX_CURVE_COLORS = [
+    "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
+    "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f",
+    "#aec7e8", "#ff9896", "#98df8a", "#ffbb78", "#c5b0d5",
+    "#c49c94", "#f7b6d2", "#9edae5", "#dbdb8d", "#c7c7c7",
+]
+
 # Figure module histogram display modes.
 FIGURE_HISTOGRAM_MODES = [
     ("Histogram", "histogram"),
@@ -3082,6 +3090,43 @@ def _make_sci_axis(orientation: str):
     ax = _SciAxis(orientation)
     ax.setStyle(tickLength=5)  # positive -> outward
     # Axis line, ticks and tick labels in black.
+    ax.setPen(pg.mkPen("#000000", width=2))
+    ax.setTextPen(pg.mkPen("#000000"))
+    return ax
+
+
+def _make_fixed_axis(orientation: str, decimals: int = 1):
+    """Return an axis whose tick labels use plain decimals (no 1e+03 forms)."""
+    import pyqtgraph as pg
+
+    class _FixedAxis(pg.AxisItem):
+        def tickStrings(self, values, scale, spacing):
+            out = []
+            for value in values:
+                scaled = value * scale
+                if scaled == 0:
+                    scaled = 0.0  # avoid "-0.0"
+                out.append(f"{scaled:.{decimals}f}")
+            return out
+
+        def generateDrawSpecs(self, p):
+            specs = super().generateDrawSpecs(p)
+            if specs is None:
+                return specs
+            axisSpec, tickSpecs, textSpecs = specs
+            tick_pen = pg.mkPen("#000000", width=2)
+            if self.orientation in ("left", "right"):
+                spine = axisSpec[1].x()
+                tickSpecs = [(tick_pen, pg.Point(spine, p1.y()), p2)
+                             for _pen, p1, p2 in tickSpecs]
+            else:
+                spine = axisSpec[1].y()
+                tickSpecs = [(tick_pen, pg.Point(p1.x(), spine), p2)
+                             for _pen, p1, p2 in tickSpecs]
+            return axisSpec, tickSpecs, textSpecs
+
+    ax = _FixedAxis(orientation)
+    ax.setStyle(tickLength=5)
     ax.setPen(pg.mkPen("#000000", width=2))
     ax.setTextPen(pg.mkPen("#000000"))
     return ax
@@ -13506,7 +13551,7 @@ class MainWindow(QMainWindow):
         self._unmix_rebuild_spectrum_settings(page)
         self._unmix_rebuild_signature_table(page)
         self._unmix_rebuild_sample_list(page)
-        self._unmix_render_matrix(page)
+        self._unmix_refresh_matrix_views(page)
         active_spectrum = page._unmix_params.get("active_spectrum")
         if any(s["id"] == active_spectrum for s in page._unmix_spectra):
             self._unmix_select_spectrum(page, active_spectrum)
@@ -13857,7 +13902,7 @@ class MainWindow(QMainWindow):
         # The signature editor's dropdowns list the spectra in this order.
         if getattr(page, "_unmix_signature_table", None) is not None:
             self._unmix_rebuild_signature_table(page)
-        self._unmix_mark_dirty(page)
+        self._unmix_mark_dirty(page, data=False)
 
     def _unmix_log(self, page, text: str) -> None:
         """Append a line to the Unmix-for-image log (saved with the module)."""
@@ -14267,7 +14312,7 @@ class MainWindow(QMainWindow):
         self._unmix_rebuild_spectrum_list(page)
         self._unmix_select_spectrum(page, spectrum["id"], open_tree=False)
         self._unmix_rebuild_signature_table(page)
-        self._unmix_render_matrix(page)
+        self._unmix_refresh_matrix_views(page)
         self._unmix_mark_dirty(page)
 
     def _unmix_reset_spectrum_source(self, page, tree) -> None:
@@ -14311,7 +14356,7 @@ class MainWindow(QMainWindow):
         spectrum["gate_id"] = gate_id
         holder._gating_protected_gate_id = gate_id
         self._unmix_select_spectrum(page, spectrum["id"], open_tree=False)
-        self._unmix_render_matrix(page)
+        self._unmix_refresh_matrix_views(page)
         self._unmix_mark_dirty(page)
 
     def _unmix_spectrum_menu(self, page, holder, idx, menu) -> None:
@@ -14356,8 +14401,8 @@ class MainWindow(QMainWindow):
         self._unmix_rebuild_spectrum_list(page)
         self._unmix_render_spectrum_plot(page)
         self._unmix_rebuild_signature_table(page)
-        self._unmix_render_matrix(page)
-        self._unmix_mark_dirty(page)
+        self._unmix_refresh_matrix_views(page)
+        self._unmix_mark_dirty(page, data=False)
 
     def _unmix_copy_spectrum(self, page, spectrum) -> None:
         """Duplicate a spectrum, including an independent copy of its gate tree."""
@@ -14379,7 +14424,7 @@ class MainWindow(QMainWindow):
         self._unmix_rebuild_spectrum_list(page)
         self._unmix_select_spectrum(page, new_spectrum["id"], open_tree=False)
         self._unmix_rebuild_signature_table(page)
-        self._unmix_render_matrix(page)
+        self._unmix_refresh_matrix_views(page)
         self._unmix_mark_dirty(page)
 
     def _unmix_delete_spectrum(self, page, spectrum) -> None:
@@ -14406,7 +14451,7 @@ class MainWindow(QMainWindow):
             open_tree=False,
         )
         self._unmix_rebuild_signature_table(page)
-        self._unmix_render_matrix(page)
+        self._unmix_refresh_matrix_views(page)
         self._unmix_mark_dirty(page)
 
     def _unmix_spectrum_arrays(self, page, spectrum):
@@ -14728,7 +14773,7 @@ class MainWindow(QMainWindow):
 
         def on_decimals_changed(value):
             cfg["decimals"] = int(value)
-            self._unmix_render_matrix(page)
+            self._unmix_refresh_matrix_views(page)
             self._unmix_mark_dirty(page)
 
         update_color_button()
@@ -14962,13 +15007,33 @@ class MainWindow(QMainWindow):
         return w
 
     def _unmix_matrix_panel(self, page) -> QWidget:
-        """The matrix heatmap itself (rendered to an image)."""
+        """The matrix area: spectral matrix / curve / similarity sub-pages."""
         panel = self._build_panel_frame()
         lay = QVBoxLayout(panel)
-        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
-        lay.addWidget(QLabel("<b>Spectral matrix</b>"))
 
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.addTab(self._unmix_matrix_tab_page(page), "Spectral matrix")
+        tabs.addTab(self._unmix_curve_tab_page(page), "Spectral curve")
+        tabs.addTab(self._unmix_similarity_tab_page(page), "Similarity matrix")
+        lay.addWidget(tabs, 1)
+
+        page._unmix_matrix_tabs = tabs
+        page._unmix_matrix_tab_keys = ("matrix", "curve", "similarity")
+        key = page._unmix_params.get("matrix_tab")
+        if key not in page._unmix_matrix_tab_keys:
+            key = "matrix"
+        page._unmix_matrix_tab = key
+        tabs.blockSignals(True)
+        tabs.setCurrentIndex(page._unmix_matrix_tab_keys.index(key))
+        tabs.blockSignals(False)
+        tabs.currentChanged.connect(lambda index: self._unmix_on_matrix_tab(page, index))
+        return panel
+
+    def _unmix_matrix_tab_page(self, page) -> QWidget:
+        """Sub-page 1: the matrix heatmap (rendered to an image)."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(False)
         scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -14978,20 +15043,118 @@ class MainWindow(QMainWindow):
         label.setStyleSheet("background: #ffffff; color: #888888;")
         label.setText("Add a signature to build the matrix.")
         scroll.setWidget(label)
-        lay.addWidget(scroll, 1)
         page._unmix_matrix_label = label
         page._unmix_matrix_image = None
-        return panel
+        return scroll
+
+    def _unmix_curve_tab_page(self, page) -> QWidget:
+        """Sub-page 2: one normalized curve per signature."""
+        host = QWidget()
+        host.setStyleSheet("background: #ffffff;")
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        legend = QWidget()
+        legend.setStyleSheet("background: transparent;")
+        legend_lay = QGridLayout(legend)
+        legend_lay.setContentsMargins(0, 0, 0, 0)
+        legend_lay.setHorizontalSpacing(12)
+        legend_lay.setVerticalSpacing(4)
+        lay.addWidget(legend)
+
+        plot = pg.PlotWidget(background=_plot_background())
+        plot.showGrid(x=True, y=True, alpha=0.2)
+        plot.getPlotItem().setAxisItems({
+            "bottom": _make_rotated_axis("bottom"),
+            # Plain decimals: normalized intensities are small values and a
+            # scientific axis makes them hard to read.
+            "left": _make_fixed_axis("left", decimals=1),
+        })
+        plot.getPlotItem().setLabel("left", "Normalized intensity")
+        plot.getPlotItem().setLabel("bottom", "Channel")
+        lay.addWidget(plot, 1)
+
+        page._unmix_curve_legend = legend
+        page._unmix_curve_legend_lay = legend_lay
+        page._unmix_curve_plot = plot
+        return host
+
+    def _unmix_similarity_tab_page(self, page) -> QWidget:
+        """Sub-page 3: pairwise cosine similarity between the signatures."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll.setStyleSheet("background: #ffffff; border: none;")
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("background: #ffffff; color: #888888;")
+        label.setText("Add at least two signatures to compare them.")
+        scroll.setWidget(label)
+        page._unmix_similarity_label = label
+        page._unmix_similarity_image = None
+        return scroll
+
+    def _unmix_on_matrix_tab(self, page, index) -> None:
+        keys = getattr(page, "_unmix_matrix_tab_keys", ("matrix", "curve", "similarity"))
+        key = keys[index] if 0 <= index < len(keys) else "matrix"
+        page._unmix_matrix_tab = key
+        page._unmix_params["matrix_tab"] = key
+        self._unmix_rebuild_matrix_settings(page)
+        self._unmix_refresh_matrix_views(page)
 
     def _unmix_matrix_settings_panel(self, page) -> QWidget:
-        """Cell geometry, colours, number display and clipboard export."""
+        """Settings for the active matrix sub-page (content swaps with the tab)."""
         panel = self._build_panel_frame()
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
-        lay.addWidget(QLabel("<b>Matrix settings</b>"))
+        title = QLabel("<b>Matrix settings</b>")
+        lay.addWidget(title)
 
-        cfg = self._unmix_matrix_cfg(page)
+        # Scrollable so a long signature list (Curve settings) does not raise
+        # the panel's minimum height and freeze the splitter above it.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        host = QWidget()
+        host.setStyleSheet("background: transparent;")
+        host_lay = QVBoxLayout(host)
+        host_lay.setContentsMargins(0, 0, 6, 0)
+        host_lay.setSpacing(6)
+        scroll.setWidget(host)
+        lay.addWidget(scroll, 1)
+
+        page._unmix_matrix_settings_title = title
+        page._unmix_matrix_settings_lay = host_lay
+        self._unmix_rebuild_matrix_settings(page)
+        return panel
+
+    def _unmix_rebuild_matrix_settings(self, page) -> None:
+        lay = getattr(page, "_unmix_matrix_settings_lay", None)
+        if lay is None:
+            return
+        key = getattr(page, "_unmix_matrix_tab", "matrix")
+        title = getattr(page, "_unmix_matrix_settings_title", None)
+        if title is not None:
+            title.setText({
+                "matrix": "<b>Matrix settings</b>",
+                "curve": "<b>Curve settings</b>",
+                "similarity": "<b>Similarity settings</b>",
+            }.get(key, "<b>Matrix settings</b>"))
+        self._clear_layout(lay)
+        if key == "curve":
+            self._unmix_curve_settings_content(page, lay)
+        else:
+            self._unmix_grid_settings_content(page, lay, key)
+        lay.addStretch(1)
+
+    def _unmix_grid_settings_content(self, page, lay, section: str) -> None:
+        """Cell geometry, colours and number display for a matrix-style image."""
+        cfg = self._unmix_matrix_cfg(page, section)
         editable = not page._unmix_locked
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
@@ -15036,11 +15199,21 @@ class MainWindow(QMainWindow):
         color_btn.setEnabled(editable and not auto_color.isChecked())
         grid.addWidget(color_btn, 3, 1)
 
-        copy_btn = QPushButton("Copy matrix to clipboard")
+        copy_btn = QPushButton(
+            "Copy similarity to clipboard" if section == "similarity"
+            else "Copy matrix to clipboard"
+        )
         copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         grid.addWidget(copy_btn, 3, 2, 1, 2)
         lay.addLayout(grid)
-        lay.addStretch(1)
+
+        if section == "similarity":
+            hint = QLabel(
+                "Cosine similarity, fixed scale −1 … 1 (diverging colormap)."
+            )
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #6b7785;")
+            lay.addWidget(hint)
 
         def update_color_button():
             color = QColor(cfg["text_color"])
@@ -15052,8 +15225,8 @@ class MainWindow(QMainWindow):
             )
 
         def refresh():
-            self._unmix_render_matrix(page)
-            self._unmix_mark_dirty(page)
+            self._unmix_refresh_matrix_views(page)
+            self._unmix_mark_dirty(page, data=False)
 
         def on_width(value):
             cfg["cell_width"] = int(value)
@@ -15091,20 +15264,226 @@ class MainWindow(QMainWindow):
         show_numbers.toggled.connect(on_show_numbers)
         auto_color.toggled.connect(on_auto_color)
         color_btn.clicked.connect(lambda _=False: pick_color())
-        copy_btn.clicked.connect(lambda _=False: self._unmix_copy_matrix(page))
-
+        copy_btn.clicked.connect(
+            lambda _=False: (
+                self._unmix_copy_similarity(page) if section == "similarity"
+                else self._unmix_copy_matrix(page)
+            )
+        )
         update_color_button()
-        return panel
 
-    def _unmix_matrix_cfg(self, page) -> dict:
-        cfg = page._unmix_params.setdefault("matrix_settings", {})
-        cfg.setdefault("cell_width", 35)
-        cfg.setdefault("cell_height", 28)
-        cfg.setdefault("colormap", "viridis")
-        cfg.setdefault("show_numbers", True)
-        cfg.setdefault("auto_text_color", True)
-        cfg.setdefault("text_color", "#5b6b82")
+    def _unmix_curve_settings_content(self, page, lay) -> None:
+        """Line width and one colour per signature for the curve sub-page."""
+        cfg = self._unmix_matrix_cfg(page, "curve")
+        editable = not page._unmix_locked
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Line width"))
+        width_spin = _NoWheelSpinBox()
+        width_spin.setRange(1, 6)
+        width_spin.setValue(int(cfg.get("line_width", 2)))
+        width_spin.setEnabled(editable)
+        row.addWidget(width_spin)
+        row.addStretch()
+        lay.addLayout(row)
+
+        lay.addWidget(QLabel("Signatures (tick to draw)"))
+        rows = list(getattr(page, "_unmix_matrix", []) or [])
+        if not rows:
+            hint = QLabel("Add a signature to give it a colour.")
+            hint.setStyleSheet("color: #6b7785;")
+            lay.addWidget(hint)
+        colors = self._unmix_curve_colors(page, rows)
+        visible = cfg.setdefault("visible", {})
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        for i, row_def in enumerate(rows):
+            sid = str(row_def.get("id") or row_def.get("name") or "")
+            name = QCheckBox(str(row_def.get("name") or ""))
+            name.setToolTip(sid)
+            name.setChecked(bool(visible.get(sid, True)))
+            name.setEnabled(editable)
+
+            def on_visible(checked, sid=sid, button=None):
+                self._unmix_matrix_cfg(page, "curve").setdefault("visible", {})[
+                    sid
+                ] = bool(checked)
+                self._unmix_render_curve(page)
+                self._unmix_mark_dirty(page, data=False)
+
+            name.toggled.connect(on_visible)
+            grid.addWidget(name, i, 0)
+
+            def color_style(color):
+                qc = QColor(color)
+                text = "#ffffff" if qc.lightness() < 128 else "#000000"
+                return (
+                    f"QPushButton {{ background-color: {color}; color: {text}; "
+                    f"border: 1px solid #999; }}"
+                )
+
+            btn = QPushButton(colors.get(sid, ""))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(24)
+            btn.setEnabled(editable)
+            btn.setStyleSheet(color_style(colors.get(sid, "#ffffff")))
+
+            def pick_color(_=False, sid=sid, button=btn):
+                color = QColorDialog.getColor(
+                    QColor(button.text()), self, "Signature line colour"
+                )
+                if not color.isValid():
+                    return
+                self._unmix_matrix_cfg(page, "curve").setdefault("colors", {})[sid] = (
+                    color.name()
+                )
+                button.setText(color.name())
+                button.setStyleSheet(color_style(color.name()))
+                self._unmix_render_curve(page)
+                self._unmix_mark_dirty(page, data=False)
+
+            btn.clicked.connect(pick_color)
+            grid.addWidget(btn, i, 1)
+        lay.addLayout(grid)
+
+        reset_btn = QPushButton("Reset colours to defaults")
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.setEnabled(editable and bool(rows))
+
+        def reset_colors(_=False):
+            cfg["colors"] = {}
+            self._unmix_rebuild_matrix_settings(page)
+            self._unmix_render_curve(page)
+            self._unmix_mark_dirty(page, data=False)
+
+        reset_btn.clicked.connect(reset_colors)
+        lay.addWidget(reset_btn)
+
+        def on_width(value):
+            cfg["line_width"] = int(value)
+            self._unmix_render_curve(page)
+            self._unmix_mark_dirty(page, data=False)
+
+        width_spin.valueChanged.connect(on_width)
+
+    def _unmix_matrix_cfg(self, page, section: str = "matrix") -> dict:
+        """Display settings of one matrix sub-page (``matrix``/``curve``/
+        ``similarity``). Older projects stored the matrix keys at the top
+        level; they are migrated into the ``matrix`` section once."""
+        store = page._unmix_params.setdefault("matrix_settings", {})
+        legacy_keys = (
+            "cell_width", "cell_height", "colormap",
+            "show_numbers", "auto_text_color", "text_color",
+        )
+        legacy = {k: store.pop(k) for k in legacy_keys if k in store}
+        if legacy and not isinstance(store.get("matrix"), dict):
+            store["matrix"] = dict(legacy)
+        cfg = store.setdefault(section, {})
+        defaults = {
+            "matrix": {
+                "cell_width": 35,
+                "cell_height": 28,
+                "colormap": "viridis",
+                "show_numbers": True,
+                "auto_text_color": True,
+                "text_color": "#5b6b82",
+            },
+            "curve": {
+                "line_width": 2,
+                "colors": {},
+                "visible": {},
+            },
+            "similarity": {
+                "cell_width": 62,
+                "cell_height": 28,
+                "colormap": "coolwarm",
+                "show_numbers": True,
+                "auto_text_color": True,
+                "text_color": "#5b6b82",
+            },
+        }.get(section, {})
+        for key, value in defaults.items():
+            cfg.setdefault(key, value)
+        if section == "curve":
+            for key in ("colors", "visible"):
+                if not isinstance(cfg.get(key), dict):
+                    cfg[key] = {}
         return cfg
+
+    def _unmix_curve_colors(self, page, rows) -> dict:
+        """One stable line colour per signature ({signature id: #rrggbb})."""
+        import zlib
+
+        cfg = self._unmix_matrix_cfg(page, "curve")
+        saved = cfg.setdefault("colors", {})
+        palette = UNMIX_CURVE_COLORS
+        used = set()
+        out = {}
+        for row in rows:
+            sid = str(row.get("id") or row.get("name") or "")
+            color = saved.get(sid)
+            if not (isinstance(color, str) and color):
+                # Deterministic default: reordering or renaming keeps it, and
+                # unsaved sessions show the same colours.
+                base = zlib.crc32(sid.encode("utf-8"))
+                for step in range(len(palette)):
+                    candidate = palette[(base + step) % len(palette)]
+                    if candidate not in used:
+                        color = candidate
+                        break
+                else:
+                    color = palette[base % len(palette)]
+            out[sid] = color
+            used.add(color)
+        return out
+
+    def _unmix_similarity_values(self, page):
+        """(names, matrix) of pairwise cosine similarity between signatures.
+
+        Channels missing on either side are ignored (spectra are required to
+        share their channels, so this only guards against incomplete rows).
+        """
+        import numpy as np
+
+        _columns, rows = self._unmix_matrix_table_values(page)
+        names = [str(row.get("name", "")) for row, _values in rows]
+        vectors = [
+            np.asarray(values, dtype="float64") for _row, values in rows
+        ]
+        count = len(vectors)
+        matrix = np.full((count, count), np.nan, dtype="float64")
+        for i in range(count):
+            for j in range(i, count):
+                a, b = vectors[i], vectors[j]
+                ok = np.isfinite(a) & np.isfinite(b)
+                value = np.nan
+                if ok.any():
+                    va, vb = a[ok], b[ok]
+                    denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+                    if denom > 0:
+                        value = float(np.dot(va, vb) / denom)
+                matrix[i, j] = matrix[j, i] = value
+        return names, matrix
+
+    def _unmix_copy_similarity(self, page) -> None:
+        """Copy the similarity matrix as tab-separated text."""
+        import numpy as np
+
+        names, matrix = self._unmix_similarity_values(page)
+        if len(names) < 2:
+            QMessageBox.information(
+                self, "Copy similarity", "There is no similarity matrix to copy."
+            )
+            return
+        lines = ["\t".join(["Signature"] + names)]
+        for i, name in enumerate(names):
+            cells = [name] + [
+                f"{v:.4f}" if np.isfinite(v) else "" for v in matrix[i]
+            ]
+            lines.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Similarity matrix copied to clipboard")
 
     def _unmix_copy_matrix(self, page) -> None:
         """Copy the matrix as tab-separated text (pasteable into Excel)."""
@@ -15350,8 +15729,8 @@ class MainWindow(QMainWindow):
             return
         page._unmix_matrix[:] = [page._unmix_matrix[i] for i in order]
         self._unmix_rebuild_signature_table(page)
-        self._unmix_render_matrix(page)
-        self._unmix_mark_dirty(page)
+        self._unmix_refresh_matrix_views(page)
+        self._unmix_mark_dirty(page, data=False)
 
     def _unmix_signature_menu(self, page, pos) -> None:
         table = page._unmix_signature_table
@@ -15426,14 +15805,14 @@ class MainWindow(QMainWindow):
         }
         page._unmix_matrix.append(row)
         self._unmix_rebuild_signature_table(page)
-        self._unmix_render_matrix(page)
+        self._unmix_refresh_matrix_views(page)
         self._unmix_mark_dirty(page)
 
     def _unmix_remove_signature(self, page, index: int) -> None:
         if 0 <= index < len(page._unmix_matrix):
             del page._unmix_matrix[index]
             self._unmix_rebuild_signature_table(page)
-            self._unmix_render_matrix(page)
+            self._unmix_refresh_matrix_views(page)
             self._unmix_mark_dirty(page)
 
     def _unmix_unique_signature_name(self, page, base: str) -> str:
@@ -15451,7 +15830,7 @@ class MainWindow(QMainWindow):
         if row.get(key) == value:
             return
         row[key] = value
-        self._unmix_render_matrix(page)
+        self._unmix_refresh_matrix_views(page)
         self._unmix_mark_dirty(page)
 
     def _unmix_set_signature_name(self, page, row, edit) -> None:
@@ -15492,8 +15871,8 @@ class MainWindow(QMainWindow):
             )
         except ValueError:
             pass
-        self._unmix_render_matrix(page)
-        self._unmix_mark_dirty(page)
+        self._unmix_refresh_matrix_views(page)
+        self._unmix_mark_dirty(page, data=False)
 
     # ----- unmix: samples ----------------------------------------------
     def _unmix_rebuild_sample_list(self, page) -> None:
@@ -15572,30 +15951,19 @@ class MainWindow(QMainWindow):
             result.append((row, values))
         return columns, result
 
-    def _unmix_render_matrix(self, page) -> None:
-        """Paint the matrix as an image with rotated column names."""
+    def _unmix_paint_matrix_image(self, page, row_names, columns, values_rows,
+                                  cfg, lo, hi, decimals):
+        """Paint a labelled cell grid: row names left, channel names rotated below."""
         import numpy as np
 
-        label = page._unmix_matrix_label
-        columns, rows = self._unmix_matrix_table_values(page)
-        if not rows or not columns:
-            page._unmix_matrix_image = None
-            label.clear()
-            label.setText(
-                "Add a signature to build the matrix."
-                if not rows
-                else "No parameters selected."
-            )
-            return
-
-        cfg = self._unmix_matrix_cfg(page)
+        label = getattr(page, "_unmix_matrix_label", None)
+        base_font = label.font() if label is not None else QFont()
         cell_w = max(12, int(cfg["cell_width"]))
         cell_h = max(12, int(cfg["cell_height"]))
-        font = QFont(label.font())
+        font = QFont(base_font)
         font.setPixelSize(max(9, min(13, cell_h // 2 + 2)))
         metrics = QFontMetrics(font)
 
-        row_names = [row.get("name", "") for row, _ in rows]
         left = max((metrics.horizontalAdvance(n) for n in row_names), default=0)
         bottom = max((metrics.horizontalAdvance(c) for c in columns), default=0)
         left += 12
@@ -15603,7 +15971,7 @@ class MainWindow(QMainWindow):
         top = 8
         right = 8
         width = left + cell_w * len(columns) + right
-        height = top + cell_h * len(rows) + bottom
+        height = top + cell_h * len(values_rows) + bottom
 
         image = QImage(width, height, QImage.Format.Format_ARGB32)
         image.fill(QColor("#ffffff"))
@@ -15611,18 +15979,14 @@ class MainWindow(QMainWindow):
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         painter.setFont(font)
 
-        finite = [v for _r, values in rows for v in values if np.isfinite(v)]
-        lo = min(finite) if finite else 0.0
-        hi = max(finite) if finite else 0.0
         lut = _figure_colormap(cfg["colormap"]).getLookupTable(0.0, 1.0, 256)
         show_numbers = bool(cfg["show_numbers"])
-        decimals = int(page._unmix_spectrum_cfg.get("decimals", 2))
         auto_color = bool(cfg["auto_text_color"])
         fixed_text = QColor(cfg["text_color"])
         grid_pen = QPen(QColor(255, 255, 255, 140))
         grid_pen.setWidth(1)
 
-        for i, (_row, values) in enumerate(rows):
+        for i, values in enumerate(values_rows):
             y = top + i * cell_h
             for j, value in enumerate(values):
                 x = left + j * cell_w
@@ -15655,7 +16019,7 @@ class MainWindow(QMainWindow):
             )
 
         # Column names rotated -90°, ending just below the grid.
-        grid_bottom = top + cell_h * len(rows)
+        grid_bottom = top + cell_h * len(values_rows)
         shift = (metrics.ascent() - metrics.descent()) / 2.0
         for j, name in enumerate(columns):
             text_width = metrics.horizontalAdvance(name)
@@ -15667,16 +16031,146 @@ class MainWindow(QMainWindow):
             painter.drawText(0, 0, name)
             painter.restore()
         painter.end()
+        return image
+
+    def _unmix_render_matrix(self, page) -> None:
+        """Paint the matrix as an image with rotated column names."""
+        import numpy as np
+
+        label = page._unmix_matrix_label
+        columns, rows = self._unmix_matrix_table_values(page)
+        if not rows or not columns:
+            page._unmix_matrix_image = None
+            label.clear()
+            label.setText(
+                "Add a signature to build the matrix."
+                if not rows
+                else "No parameters selected."
+            )
+            return
+
+        cfg = self._unmix_matrix_cfg(page, "matrix")
+        finite = [v for _r, values in rows for v in values if np.isfinite(v)]
+        lo = min(finite) if finite else 0.0
+        hi = max(finite) if finite else 0.0
+        image = self._unmix_paint_matrix_image(
+            page,
+            [row.get("name", "") for row, _values in rows],
+            list(columns),
+            [values for _row, values in rows],
+            cfg,
+            lo,
+            hi,
+            int(page._unmix_spectrum_cfg.get("decimals", 2)),
+        )
 
         page._unmix_matrix_image = image
         label.setText("")
         label.setPixmap(QPixmap.fromImage(image))
         label.resize(image.size())
 
+    def _unmix_render_curve(self, page) -> None:
+        """One normalized curve per signature, with a wrapped legend above."""
+        import numpy as np
+
+        plot = getattr(page, "_unmix_curve_plot", None)
+        if plot is None:
+            return
+        item = plot.getPlotItem()
+        plot.clear()
+        legend_lay = getattr(page, "_unmix_curve_legend_lay", None)
+        if legend_lay is not None:
+            self._clear_layout(legend_lay)
+
+        columns, rows = self._unmix_matrix_table_values(page)
+        if not rows or not columns:
+            item.setTitle(
+                "Add a signature to build the curves.",
+                color="#888888", size="10pt",
+            )
+            return
+        item.setTitle(None)
+
+        cfg = self._unmix_matrix_cfg(page, "curve")
+        line_width = max(1, int(cfg.get("line_width", 2)))
+        colors = self._unmix_curve_colors(page, [row for row, _ in rows])
+        visible = cfg.get("visible") or {}
+
+        ticks = [(float(i), str(name)) for i, name in enumerate(columns)]
+        bottom = item.getAxis("bottom")
+        bottom.setTicks([ticks])
+        # Rotated labels need as much height as the widest channel name, or
+        # they are cut off and overlap the axis title.
+        font = bottom.style.get("tickFont") or bottom.font()
+        metrics = QFontMetrics(font)
+        widest = max(
+            (metrics.horizontalAdvance(str(name)) for name in columns), default=0
+        )
+        bottom.setHeight(min(int(widest) + 26, 260))
+        xs = np.arange(len(columns), dtype="float64")
+        entries = []
+        for row, values in rows:
+            y = np.asarray(values, dtype="float64")
+            if not np.isfinite(y).any():
+                continue
+            sid = str(row.get("id") or row.get("name") or "")
+            if not visible.get(sid, True):
+                continue
+            color = colors.get(sid, UNMIX_CURVE_COLORS[0])
+            plot.plot(
+                xs, y,
+                pen=pg.mkPen(color, width=line_width),
+                connect="finite",
+            )
+            entries.append((str(row.get("name") or sid), color))
+
+        if legend_lay is not None:
+            per_row = 6
+            for index, (name, color) in enumerate(entries):
+                chip = QLabel(
+                    f"<span style='color:{color}; font-size:13pt;'>■</span>"
+                    f" {name}"
+                )
+                chip.setTextFormat(Qt.TextFormat.RichText)
+                legend_lay.addWidget(chip, index // per_row, index % per_row)
+
+    def _unmix_render_similarity(self, page) -> None:
+        """Cosine similarity between the signatures, fixed scale −1 … 1."""
+        import numpy as np
+
+        label = getattr(page, "_unmix_similarity_label", None)
+        if label is None:
+            return
+        names, matrix = self._unmix_similarity_values(page)
+        if len(names) < 2:
+            page._unmix_similarity_image = None
+            label.clear()
+            label.setText(
+                "Add at least two signatures to compare them."
+                if names else "Add a signature to build the matrix."
+            )
+            return
+        cfg = self._unmix_matrix_cfg(page, "similarity")
+        image = self._unmix_paint_matrix_image(
+            page, list(names), list(names),
+            [list(row) for row in matrix],
+            cfg, -1.0, 1.0, 2,
+        )
+        page._unmix_similarity_image = image
+        label.setText("")
+        label.setPixmap(QPixmap.fromImage(image))
+        label.resize(image.size())
+
+    def _unmix_refresh_matrix_views(self, page) -> None:
+        """Redraw the three matrix sub-pages from the current signatures."""
+        self._unmix_render_matrix(page)
+        self._unmix_render_curve(page)
+        self._unmix_render_similarity(page)
+
     def _unmix_refresh_outputs(self, page) -> None:
         """Recompute everything derived from the spectra."""
         self._unmix_render_spectrum_plot(page)
-        self._unmix_render_matrix(page)
+        self._unmix_refresh_matrix_views(page)
 
     def _unmix_spectrum_vector(self, page, spectrum):
         """Return ({parameter: statistic}, error) for one spectrum, cached."""
@@ -15704,9 +16198,16 @@ class MainWindow(QMainWindow):
         cache[spectrum["id"]] = values
         return values, None
 
-    def _unmix_mark_dirty(self, page) -> None:
+    def _unmix_mark_dirty(self, page, data: bool = True) -> None:
+        """Mark the module modified.
+
+        `data=False` is for display-only settings (matrix/curve colours, cell
+        sizes, line width, visibility): the cached spectrum vectors stay valid,
+        so changing them does not re-read every channel of every sample file.
+        """
         page._unmix_dirty = True
-        page._unmix_spectrum_cache = {}
+        if data:
+            page._unmix_spectrum_cache = {}
         self._unmix_update_save_btn(page)
         self._module_set_state(page, MODULE_STATE_MODIFIED)
 
