@@ -166,7 +166,7 @@ class _AddModuleOverlay(QWidget):
     a pill or clicking anywhere else closes the map.
     """
 
-    STUB = 22          # horizontal line leaving the "+"
+    STUB = 100         # horizontal line leaving the "+"
     FAN_DX = 22        # horizontal span of the diagonal fan
     LABEL_STUB = 16    # short horizontal lead-in before a category name
     LABEL_GAP = 6      # gap between a category name and its connector lines
@@ -374,6 +374,60 @@ class _AddModuleOverlay(QWidget):
         super().keyPressEvent(event)
 
 
+class _HoverLabel(QLabel):
+    """Label with a light tooltip drawn by the app itself.
+
+    Native tooltips for widgets inside the tab bar come out dark on some
+    Windows themes while the workflow cards' tooltips stay light; this label
+    draws its own so the resource readouts always match the cards.
+    """
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(text, parent)
+        self._tip_text = ""
+        self._tip = QLabel(None, Qt.WindowType.ToolTip)
+        self._tip.setWindowFlags(
+            Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+        )
+        self._tip.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self._tip.setStyleSheet(
+            "QLabel { background-color: #ffffff; color: #2c3a48;"
+            " border: 1px solid #c9d3df; padding: 4px 6px; }"
+        )
+        self._tip.hide()
+
+    def set_tooltip(self, text: str) -> None:
+        self._tip_text = str(text or "")
+        if self._tip.isVisible():
+            self._tip.setText(self._tip_text)
+            self._tip.adjustSize()
+
+    def enterEvent(self, event) -> None:
+        if self._tip_text:
+            self._tip.setText(self._tip_text)
+            self._tip.adjustSize()
+            cursor = QCursor.pos()
+            position = cursor + QPoint(14, 18)
+            screen = QApplication.screenAt(cursor) or QApplication.primaryScreen()
+            if screen is not None:
+                area = screen.availableGeometry()
+                if position.x() + self._tip.width() > area.right():
+                    position.setX(area.right() - self._tip.width() - 4)
+                if position.y() + self._tip.height() > area.bottom():
+                    position.setY(cursor.y() - self._tip.height() - 8)
+            self._tip.move(position)
+            self._tip.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._tip.hide()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._tip.hide()
+        super().hideEvent(event)
+
+
 class _NoWheelComboBox(QComboBox):
     """A combo box that ignores the mouse wheel, so scrolling the page never
     accidentally changes the selection. Options are changed only by clicking."""
@@ -399,6 +453,7 @@ class _NoWheelDoubleSpinBox(QDoubleSpinBox):
 
 # Light-blue "tech" theme, loosely inspired by Positron's blue accents.
 APP_STYLE = """
+QToolTip { background-color: #ffffff; color: #2c3a48; border: 1px solid #c9d3df; padding: 4px 6px; }
 QMainWindow { background: #f5f8fb; }
 
 /* menu bar */
@@ -591,6 +646,123 @@ def _lock_pixmap(color: str = "#b58900", size: int = 14) -> QPixmap:
     painter.drawRoundedRect(QRectF(2.0, 5.0, size - 4.0, size - 5.0), 1.6, 1.6)
     painter.end()
     return pixmap
+
+
+def _format_bytes(size) -> str:
+    """Human-readable size (1.2 GB, 340 MB, 12 KB, 512 B)."""
+    try:
+        value = float(max(0, int(size)))
+    except (TypeError, ValueError):
+        return "—"
+    if value < 1024:
+        return f"{int(value)} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        value /= 1024.0
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if value < 100 else f"{value:.0f} {unit}"
+    return f"{value:.0f} TB"
+
+
+def _folder_size(path: Path):
+    """(bytes, file count) of a folder, walking it iteratively."""
+    import os
+
+    total = 0
+    count = 0
+    stack = [Path(path)]
+    while stack:
+        folder = stack.pop()
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                            count += 1
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total, count
+
+
+def _process_memory_bytes():
+    """Working set of this process (Windows), or None when unavailable."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        # K32GetProcessMemoryInfo is the Windows 7+ entry point; psapi.dll is
+        # the fallback for older systems.
+        for library in (kernel32, ctypes.windll.psapi):
+            function = getattr(library, "K32GetProcessMemoryInfo", None) or getattr(
+                library, "GetProcessMemoryInfo", None
+            )
+            if function is None:
+                continue
+            function.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(_ProcessMemoryCounters),
+                wintypes.DWORD,
+            ]
+            function.restype = wintypes.BOOL
+            if function(
+                kernel32.GetCurrentProcess(),
+                ctypes.byref(counters),
+                counters.cb,
+            ):
+                return int(counters.WorkingSetSize)
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _system_memory_bytes():
+    """(total, available) physical memory in bytes, or None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ullTotalPhys), int(status.ullAvailPhys)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # Known task types: type key -> (display name, color).
@@ -5544,6 +5716,20 @@ class MainWindow(QMainWindow):
         self._pool_timer = QTimer(self)
         self._pool_timer.setInterval(40)
         self._pool_timer.timeout.connect(self._pool_poll)
+        # Storage / memory readouts (tab corner + workflow cards).
+        self._module_sizes = {}     # task id -> (bytes, file count)
+        self._size_labels = {}      # task id -> the label on its card
+        self._size_pending = set()
+        self._size_jobs = None
+        self._size_results = None
+        self._size_worker = None
+        self._size_timer = QTimer(self)
+        self._size_timer.setInterval(150)
+        self._size_timer.timeout.connect(self._poll_module_sizes)
+        self._ram_timer = QTimer(self)
+        self._ram_timer.setInterval(30_000)
+        self._ram_timer.timeout.connect(self._refresh_memory_usage)
+        self._storage_total = 0
         # Workflow-tree expansion state, restored per project (see ui_state.json).
         self._tree_project = None
         self._tree_expanded = {}
@@ -6543,6 +6729,10 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
         self._pool_clear()
+        self._size_labels.clear()
+        self._size_pending.clear()
+        self._load_stored_sizes()
+        self._refresh_storage_usage()
         self._column_index = self.project.load_columns()
         self._reset_module_tabs()
         self._load_import_files()
@@ -6677,8 +6867,200 @@ class MainWindow(QMainWindow):
         self.tabs.setTabBar(_PinnedFirstTabBar())
         self.tabs.setMovable(True)
         self.setCentralWidget(self.tabs)
+        self._build_resource_indicator()
 
         self._build_workflow_tab()
+
+    # ----- storage / memory readouts ---------------------------------
+    def _build_resource_indicator(self) -> None:
+        """Project storage and process memory at the right of the tab bar."""
+        corner = QWidget()
+        corner.setStyleSheet("background: transparent;")
+        row = QHBoxLayout(corner)
+        row.setContentsMargins(0, 0, 10, 0)
+        row.setSpacing(14)
+        self._storage_label = _HoverLabel("Storage —")
+        self._storage_label.setStyleSheet("color: #6b7785; font-size: 9pt;")
+        self._storage_label.set_tooltip(
+            "Disk space used by this project (its data and module folders)"
+        )
+        self._ram_label = _HoverLabel("RAM —")
+        self._ram_label.setStyleSheet("color: #6b7785; font-size: 9pt;")
+        self._ram_label.set_tooltip("Memory used by the Smage process")
+        row.addWidget(self._storage_label)
+        row.addWidget(self._ram_label)
+        self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+        self._refresh_memory_usage()
+        self._ram_timer.start()
+
+    def _module_size_path(self, task_id):
+        """The folder whose size stands for a module (None without one)."""
+        if self.project is None or not task_id:
+            return None
+        import_task = self._import_task()
+        if import_task is not None and str(task_id) == str(import_task.get("id")):
+            # Imported data lives in the project's data folder.
+            return self.project.data_dir
+        return self.project.path / "Module" / str(task_id)
+
+    def _register_size_label(self, task_id, label) -> None:
+        key = str(task_id)
+        self._size_labels[key] = label
+        if key in self._module_sizes:
+            self._apply_module_size(key)
+        else:
+            self._schedule_module_size(key)
+
+    def _schedule_module_size(self, task_id) -> None:
+        """Measure a module folder in the background (cached until it saves)."""
+        path = self._module_size_path(task_id)
+        if path is None or not Path(path).is_dir():
+            self._forget_module_size(task_id)
+            return
+        key = str(task_id)
+        if key in self._size_pending:
+            return
+        self._size_pending.add(key)
+        self._start_size_worker()
+        self._size_jobs.put((key, str(path)))
+
+    def _start_size_worker(self) -> None:
+        import queue as queue_mod
+        import threading
+
+        if self._size_worker is not None:
+            return
+        if self._size_jobs is None:
+            self._size_jobs = queue_mod.Queue()
+            self._size_results = queue_mod.Queue()
+
+        def run() -> None:
+            while True:
+                job = self._size_jobs.get()
+                if job is None:
+                    break
+                task_id, path = job
+                try:
+                    size, count = _folder_size(path)
+                except Exception:  # noqa: BLE001
+                    size, count = 0, 0
+                self._size_results.put((task_id, size, count))
+
+        self._size_worker = threading.Thread(target=run, daemon=True)
+        self._size_worker.start()
+        self._size_timer.start()
+
+    def _poll_module_sizes(self) -> None:
+        import queue as queue_mod
+
+        if self._size_results is None:
+            return
+        changed = False
+        while True:
+            try:
+                task_id, size, count = self._size_results.get_nowait()
+            except queue_mod.Empty:
+                break
+            self._size_pending.discard(task_id)
+            self._module_sizes[task_id] = (size, count)
+            self._store_module_size(task_id, size, count)
+            self._apply_module_size(task_id)
+            changed = True
+        if changed:
+            if self.project is not None:
+                self.project.save()
+            self._refresh_storage_usage()
+
+    def _load_stored_sizes(self) -> None:
+        """Read the per-task folder sizes persisted in the project file."""
+        self._module_sizes.clear()
+        if self.project is None:
+            return
+
+        def walk(task) -> None:
+            storage = task.get("storage")
+            if isinstance(storage, dict) and "bytes" in storage:
+                try:
+                    size = int(storage.get("bytes") or 0)
+                    count = int(storage.get("files") or 0)
+                except (TypeError, ValueError):
+                    size = count = None
+                if size is not None and task.get("id"):
+                    self._module_sizes[str(task.get("id"))] = (size, count)
+            for child in task.get("children") or []:
+                walk(child)
+
+        for task in self.project.workflow.get("tasks", []):
+            walk(task)
+
+    def _store_module_size(self, task_id, size, count) -> None:
+        """Remember a module's folder size in its task definition."""
+        task = self._find_task_by_id(task_id)
+        if task is None:
+            return
+        task["storage"] = {"bytes": int(size), "files": int(count)}
+
+    def _forget_module_size(self, task_id) -> None:
+        """Drop a stored size whose folder no longer exists."""
+        key = str(task_id)
+        changed = key in self._module_sizes
+        self._module_sizes.pop(key, None)
+        if changed:
+            self._refresh_storage_usage()
+        if self.project is None:
+            return
+        task = self._find_task_by_id(key)
+        if task is not None and "storage" in task:
+            task.pop("storage", None)
+            self.project.save()
+
+    def _apply_module_size(self, task_id) -> None:
+        label = self._size_labels.get(str(task_id))
+        entry = self._module_sizes.get(str(task_id))
+        if label is None or entry is None:
+            return
+        size, count = entry
+        text = _format_bytes(size)
+        label.setText(text)
+        detail = f"{text} · {count:,} file(s)"
+        path = self._module_size_path(task_id)
+        if path is not None:
+            detail += f"\n{path}"
+        label.setToolTip(detail)
+        label.setVisible(True)
+
+    def _refresh_storage_usage(self) -> None:
+        total = sum(size for size, _count in self._module_sizes.values())
+        self._storage_total = total
+        label = getattr(self, "_storage_label", None)
+        if label is None:
+            return
+        label.setText(
+            f"Storage {_format_bytes(total)}" if self._module_sizes
+            else "Storage —"
+        )
+        if self.project is not None:
+            label.set_tooltip(
+                f"Disk space used by this project: {_format_bytes(total)}\n"
+                f"{self.project.path}"
+            )
+
+    def _refresh_memory_usage(self) -> None:
+        label = getattr(self, "_ram_label", None)
+        working = _process_memory_bytes()
+        if label is None:
+            return
+        label.setText(f"RAM {_format_bytes(working)}" if working else "RAM —")
+        system = _system_memory_bytes()
+        if working and system:
+            total, available = system
+            label.set_tooltip(
+                f"Smage memory: {_format_bytes(working)}\n"
+                f"System memory: {_format_bytes(available)} free "
+                f"of {_format_bytes(total)}"
+            )
+        else:
+            label.set_tooltip("Smage process working set")
 
     # ----- workflow tree --------------------------------------------
     def _build_workflow_tab(self) -> None:
@@ -6764,6 +7146,15 @@ class MainWindow(QMainWindow):
             buttons.addWidget(add_btn)
 
             lay.addLayout(buttons)
+
+            # Storage used by this module's own folder (hidden when it has none).
+            size_label = QLabel()
+            size_label.setStyleSheet("color: #6b7785; font-size: 8.5pt;")
+            size_label.setToolTip("Disk space used by this module's folder")
+            size_label.setVisible(False)
+            lay.addWidget(size_label)
+            if task_id:
+                self._register_size_label(task_id, size_label)
 
         if locked:
             lock_icon = QLabel()
@@ -7048,12 +7439,16 @@ class MainWindow(QMainWindow):
         import shutil
 
         for tid in task_ids:
+            self._module_sizes.pop(str(tid), None)
+            self._size_labels.pop(str(tid), None)
             try:
                 shutil.rmtree(
                     self.project.path / "Module" / str(tid), ignore_errors=True
                 )
             except Exception:  # noqa: BLE001
                 pass
+
+        self._refresh_storage_usage()
 
     def _delete_task(self, task_def: dict, parent_task_def, with_branch: bool = False) -> None:
         """Delete a single task (or, with_branch, its whole branch).
@@ -7176,6 +7571,7 @@ class MainWindow(QMainWindow):
         self._tree_restoring = True
         try:
             self.workflow_tree.clear()
+            self._size_labels.clear()
             root = self._add_task(None, "Workflow", ROOT_COLOR, is_root=True)
             root.setExpanded(True)
             if self.project is None:
@@ -14099,6 +14495,13 @@ class MainWindow(QMainWindow):
         # and button states in the workflow tree.
         self._refresh_workflow_tree()
         task_id = page.property("task_id")
+        if task_id:
+            path = self._module_size_path(task_id)
+            label = self._size_labels.get(str(task_id))
+            if path is not None and Path(path).is_dir():
+                self._schedule_module_size(task_id)
+            elif label is not None:
+                label.setVisible(False)
         for dtid in self._module_descendant_ids(task_id):
             reg = self._module_registry[dtid]
             self._module_refresh_from_upstream(reg["page"], dtid, reg["task_type"])
