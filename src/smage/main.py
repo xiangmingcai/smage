@@ -2468,6 +2468,23 @@ def _stable_sample_selection(keep, max_points: int, seed: int = 42):
     return selection
 
 
+_SCATTER_BRUSH_CACHE: dict = {}
+
+
+def _scatter_brush(r: int, g: int, b: int, alpha: int = 200):
+    """A shared QBrush for one colour (pyqtgraph caches one sprite per brush)."""
+    key = (r, g, b, alpha)
+    brush = _SCATTER_BRUSH_CACHE.get(key)
+    if brush is None:
+        import pyqtgraph as pg
+
+        if len(_SCATTER_BRUSH_CACHE) > 4096:
+            _SCATTER_BRUSH_CACHE.clear()
+        brush = pg.mkBrush(r, g, b, alpha)
+        _SCATTER_BRUSH_CACHE[key] = brush
+    return brush
+
+
 def _figure_image_layers(plot_dict: dict) -> list:
     """Return the normalized image colour layers of a plot dict.
 
@@ -5511,6 +5528,22 @@ class MainWindow(QMainWindow):
         self._updating_sample = False
         self._current_entry = None
         self._module_registry = {}
+        # Shared sampled-row pools + pooled columns for scatter/histogram
+        # rendering (Figure, Gating, Scale preview). See _pool_request.
+        self._pool_rows_cache = {}
+        self._pool_col_cache = {}
+        self._pool_col_order = []
+        self._pool_col_bytes = 0
+        self._pool_queued = set()
+        self._pool_waiters = []
+        self._pool_generation = 0
+        self._pool_failed = set()
+        self._pool_jobs = None
+        self._pool_results = None
+        self._pool_worker = None
+        self._pool_timer = QTimer(self)
+        self._pool_timer.setInterval(40)
+        self._pool_timer.timeout.connect(self._pool_poll)
         # Workflow-tree expansion state, restored per project (see ui_state.json).
         self._tree_project = None
         self._tree_expanded = {}
@@ -6509,6 +6542,7 @@ class MainWindow(QMainWindow):
             return
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
+        self._pool_clear()
         self._column_index = self.project.load_columns()
         self._reset_module_tabs()
         self._load_import_files()
@@ -9050,6 +9084,229 @@ class MainWindow(QMainWindow):
             name: values[name] for name in columns if name in values
         })
 
+    # ----- shared sampled-row pools (Figure / Gating / Scale) ------------
+    #
+    # Scatter-style views only ever draw a few thousand points out of files
+    # with millions of rows, yet they used to read and scan the whole column
+    # every time. A pool is the set of rows with the lowest stable-sampling
+    # priorities (the same rows the final sample would pick, in priority
+    # order), so density and the drawn points can be computed on ~1M rows
+    # instead of tens of millions. Column values are pooled in the
+    # background, once per file + task + column, and shared by every view.
+    _POOL_TIERS = (300_000, 1_000_000, 2_000_000)
+    _POOL_MAX_BYTES = 600 * 1024 * 1024
+
+    def _pool_tier(self) -> int:
+        limit = _setting("plot", "max_points", 50000)
+        need = max(300_000, int(limit or 50000) * 20)
+        for tier in self._POOL_TIERS:
+            if tier >= need:
+                return tier
+        return self._POOL_TIERS[-1]
+
+    def _pool_rows_cached(self, parquet_path, tier):
+        return self._pool_rows_cache.get((str(parquet_path), int(tier)))
+
+    def _pool_rows(self, parquet_path):
+        """Row indices of the pool (priority order), requesting them if needed."""
+        tier = self._pool_tier()
+        key = (str(parquet_path), tier)
+        cached = self._pool_rows_cache.get(key)
+        if cached is not None:
+            return cached
+        if ("rows", key) not in self._pool_failed:
+            self._pool_queue_job(("rows", key))
+        return None
+
+    def _pool_column(self, parquet_path, task_id, column):
+        key = (str(parquet_path), str(task_id or ""), str(column))
+        cached = self._pool_col_cache.get(key)
+        if cached is not None:
+            try:
+                self._pool_col_order.remove(key)
+            except ValueError:
+                pass
+            self._pool_col_order.append(key)
+            return cached
+        if ("col", key) not in self._pool_failed:
+            self._pool_queue_job(("col", key))
+        return None
+
+    def _pool_register(self, job, callback) -> None:
+        """Run `callback` when pooled data has progressed.
+
+        Waiters are fired once per poll, not per finished job: a plot that
+        still misses a column simply shows its placeholder and registers
+        again, instead of re-rendering once for every column that arrives.
+        """
+        self._pool_waiters.append(callback)
+
+    def _pool_queue_job(self, job) -> None:
+        job = (job[0], job[1], self._pool_generation)
+        if job in self._pool_queued:
+            return
+        self._pool_queued.add(job)
+        self._pool_start_worker()
+        self._pool_jobs.put(job)
+
+    def _pool_start_worker(self) -> None:
+        import queue as queue_mod
+        import threading
+
+        if self._pool_worker is not None:
+            return
+        if self._pool_jobs is None:
+            self._pool_jobs = queue_mod.Queue()
+            self._pool_results = queue_mod.Queue()
+
+        def run() -> None:
+            while True:
+                job = self._pool_jobs.get()
+                if job is None:
+                    break
+                try:
+                    kind, key, _generation = job
+                    if kind == "rows":
+                        parquet, tier = key
+                        value = self._pool_build_indices(parquet, tier)
+                        # Row indices are tiny; columns are stored by the GUI
+                        # thread so the memory budget stays accurate.
+                        self._pool_rows_cache[key] = value
+                    else:
+                        parquet, task_id, column = key
+                        value = self._pool_build_column(parquet, task_id, column)
+                    self._pool_results.put((True, job, value))
+                except Exception as exc:  # noqa: BLE001
+                    self._pool_results.put((False, job, exc))
+
+        self._pool_worker = threading.Thread(target=run, daemon=True)
+        self._pool_worker.start()
+        self._pool_timer.start()
+
+    def _pool_build_indices(self, parquet_path, tier):
+        import numpy as np
+
+        count = int(self._data_row_count(parquet_path) or 0)
+        if count <= 0:
+            raise ValueError("no rows in file")
+        if count <= tier:
+            indices = np.arange(count, dtype=np.int64)
+        else:
+            picked = _stable_sample_selection(
+                np.ones(count, dtype=bool), int(tier)
+            )
+            indices = np.flatnonzero(picked)
+        if indices.size <= 1:
+            return indices.astype(np.int64)
+        # Priority order: "first K kept rows" then equals the stable sample of
+        # K rows over the whole file.
+        order = np.argsort(_row_priorities(indices), kind="stable")
+        return indices[order].astype(np.int64)
+
+    def _pool_build_column(self, parquet_path, task_id, column):
+        import numpy as np
+
+        tier = self._pool_tier()
+        key = (str(parquet_path), tier)
+        indices = self._pool_rows_cache.get(key)
+        if indices is None:
+            indices = self._pool_build_indices(parquet_path, tier)
+            self._pool_rows_cache[key] = indices
+        values = self._column_data(task_id, parquet_path, [column])
+        array = values.get(column)
+        if array is None:
+            raise ValueError(f"'{column}' could not be read")
+        pooled = np.asarray(array, dtype="float64")[indices]
+        return pooled.astype("float32")
+
+    def _pool_poll(self) -> None:
+        import queue as queue_mod
+
+        if self._pool_results is None:
+            return
+        finished = []
+        while True:
+            try:
+                finished.append(self._pool_results.get_nowait())
+            except queue_mod.Empty:
+                break
+        generation = self._pool_generation
+        for ok, job, payload in finished:
+            self._pool_queued.discard(job)
+            if job[2] != generation:
+                # The pool was cleared while this job was running.
+                continue
+            if ok and job[0] == "col":
+                self._pool_store_column(job[1], payload)
+            if not ok:
+                self._pool_failed.add((job[0], job[1]))
+        # Run at most two waiters per poll so a burst of finished columns
+        # cannot re-render every waiting plot in one long pass. Waiters left
+        # over are served on later polls even when no new job has finished.
+        waiters, self._pool_waiters = self._pool_waiters, []
+        batch, rest = waiters[:2], waiters[2:]
+        if rest:
+            self._pool_waiters = rest + self._pool_waiters
+        for callback in batch:
+            try:
+                callback()
+            except RuntimeError:
+                # The plot widget went away while the data was loading.
+                pass
+
+    def _pool_store_column(self, key, array) -> None:
+        old = self._pool_col_cache.get(key)
+        if old is not None:
+            self._pool_col_bytes -= int(old.nbytes)
+            try:
+                self._pool_col_order.remove(key)
+            except ValueError:
+                pass
+        self._pool_col_cache[key] = array
+        self._pool_col_order.append(key)
+        self._pool_col_bytes += int(array.nbytes)
+        while self._pool_col_bytes > self._POOL_MAX_BYTES and len(self._pool_col_order) > 1:
+            oldest = self._pool_col_order.pop(0)
+            dropped = self._pool_col_cache.pop(oldest, None)
+            if dropped is not None:
+                self._pool_col_bytes -= int(dropped.nbytes)
+
+    def _pool_clear(self) -> None:
+        self._pool_generation += 1
+        self._pool_rows_cache.clear()
+        self._pool_col_cache.clear()
+        self._pool_col_order.clear()
+        self._pool_col_bytes = 0
+        self._pool_waiters.clear()
+        self._pool_failed.clear()
+        self._pool_queued.clear()
+
+    def _pool_ready(self, parquet_path, task_id, columns):
+        """(indices, {column: pooled array}) or None when the pool is pending."""
+        indices = self._pool_rows(parquet_path)
+        if indices is None:
+            return None
+        arrays = {}
+        for column in columns:
+            array = self._pool_column(parquet_path, task_id, column)
+            if array is None:
+                return None
+            arrays[column] = array
+        return indices, arrays
+
+    def _pool_pending_keys(self, parquet_path, task_id, columns):
+        """Job keys a render must wait for (excludes cached / failed ones)."""
+        tier = self._pool_tier()
+        path = str(parquet_path)
+        keys = []
+        if (path, tier) not in self._pool_rows_cache:
+            keys.append(("rows", (path, tier)))
+        for column in columns:
+            key = (path, str(task_id or ""), str(column))
+            if key not in self._pool_col_cache:
+                keys.append(("col", key))
+        return keys
+
     def _clear_layout(self, layout) -> None:
         """Remove and delete every widget/layout inside a layout."""
         while layout.count():
@@ -9109,6 +9366,17 @@ class MainWindow(QMainWindow):
             draft.setStyleSheet("color: #b58900; font-weight: bold;")
             tl.addWidget(draft)
         tl.addStretch()
+        page._fig_progress = QLabel("")
+        page._fig_progress.setStyleSheet("color: #6b7785;")
+        tl.addWidget(page._fig_progress)
+        page._fig_cancel_btn = QPushButton("Cancel")
+        page._fig_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        page._fig_cancel_btn.setToolTip("Stop drawing the queued plots")
+        page._fig_cancel_btn.setVisible(False)
+        page._fig_cancel_btn.clicked.connect(
+            lambda _=False: self._figure_cancel_rendering(page)
+        )
+        tl.addWidget(page._fig_cancel_btn)
         save_btn = QPushButton("Save")
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn = QPushButton("Close")
@@ -9904,8 +10172,8 @@ class MainWindow(QMainWindow):
 
         def step() -> None:
             queue = state["queue"]
-            batch = queue[:3]
-            del queue[:3]
+            batch = queue[:2]
+            del queue[:2]
             for i in batch:
                 if not (0 <= i < len(page._fig_plots) and i < len(page._fig_cards)):
                     continue
@@ -9918,12 +10186,19 @@ class MainWindow(QMainWindow):
                     )
                 except Exception as exc:  # noqa: BLE001
                     _log_exception(exc)
+            # Paint the visible cards now: letting Qt coalesce the paints
+            # would repaint every new card in one long blocking pass.
+            view = getattr(page, "_fig_view", None)
+            if view is not None:
+                view.viewport().repaint()
             done = state["total"] - len(queue)
+            self._figure_update_progress(page, done, state["total"])
             self.statusBar().showMessage(
                 f"Building plots: {done} / {state['total']}"
             )
             if not queue:
                 timer.stop()
+                self._figure_update_progress(page, 0, 0)
                 self.statusBar().showMessage("Plots ready", 3000)
 
         timer = QTimer(page)
@@ -9931,6 +10206,49 @@ class MainWindow(QMainWindow):
         timer.timeout.connect(step)
         page._fig_batch_timer = timer
         timer.start()
+
+    def _figure_update_progress(self, page, done, total) -> None:
+        label = getattr(page, "_fig_progress", None)
+        button = getattr(page, "_fig_cancel_btn", None)
+        if label is not None:
+            label.setText(f"Rendering {done} / {total}" if total else "")
+        if button is not None:
+            button.setVisible(bool(total))
+
+    def _figure_cancel_rendering(self, page) -> None:
+        """Stop the queued plot batch (plots already drawn stay)."""
+        timer = getattr(page, "_fig_batch_timer", None)
+        if timer is not None:
+            timer.stop()
+        state = getattr(page, "_fig_batch_state", None)
+        if state is not None:
+            for index in state["queue"]:
+                if 0 <= index < len(page._fig_cards):
+                    widget = page._fig_cards[index].plot_widget()
+                    widget._fig_cancelled = True
+                    widget.clear()
+                    widget.setTitle(
+                        "Cancelled", color="#6b7785", size="10pt"
+                    )
+            state["queue"].clear()
+        self._figure_update_progress(page, 0, 0)
+        self.statusBar().showMessage("Plot rendering cancelled", 3000)
+
+    def _figure_render_histogram_when_ready(self, plot_dict, plot_widget,
+                                            transforms, mask, task_id, stages) -> None:
+        if getattr(plot_widget, "_fig_cancelled", False):
+            return
+        self._figure_render_histogram(
+            plot_dict, plot_widget, transforms, mask, task_id, stages
+        )
+
+    def _figure_render_when_ready(self, plot_dict, plot_widget, transforms,
+                                  mask, task_id, stages) -> None:
+        if getattr(plot_widget, "_fig_cancelled", False):
+            return
+        self._figure_render_scatter(
+            plot_dict, plot_widget, transforms, mask, task_id, stages
+        )
 
     def _figure_filter_options(self, figure_task_id):
         """Return [(display_name, {"task_id":..,"gate_id":..}), ...] for gates
@@ -10825,6 +11143,7 @@ class MainWindow(QMainWindow):
         import pandas as pd
 
         plot_widget.clear()
+        plot_widget._fig_cancelled = False
         # A scatter render removes any cached image item; invalidate the image
         # state so the next image render re-adds it.
         plot_widget._img_fitted = False
@@ -10847,28 +11166,94 @@ class MainWindow(QMainWindow):
         if color_param and color_param not in columns:
             columns.append(color_param)
 
-        try:
-            df = self._read_columns(
-                rec["parquet"], columns, task_id, extra_stages=extra_stages
-            )
-        except Exception:
-            return
-        if x_name not in df.columns or y_name not in df.columns:
-            plot_widget.setTitle(
-                "Parameter not in this file", color="#c0392b", size="10pt"
-            )
-            return
+        limit = plot_dict.get("max_points") or _setting(
+            "plot", "max_points", 50000
+        )
+        max_points = max(1000, int(limit or 50000))
 
-        x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
-        y = pd.to_numeric(df[y_name], errors="coerce").to_numpy(dtype="float64")
-        x = _apply_scale_transforms(x, transforms.get(x_name))
-        y = _apply_scale_transforms(y, transforms.get(y_name))
-        keep = np.isfinite(x) & np.isfinite(y)
-        if mask is not None:
-            keep = keep & np.asarray(mask, dtype=bool)
-        x, y = x[keep], y[keep]
-        if x.size == 0:
-            return
+        # Pooled path: only `max_points` rows are ever drawn, so a fixed
+        # priority-ordered subset of the file is enough for the density map and
+        # the sample. Falls back to a full read when a column is unavailable
+        # or a filter leaves fewer rows than the plot would draw.
+        pooled_mode = False
+        indices = None
+        arrays = None
+        if extra_stages is None:
+            ready = self._pool_ready(rec["parquet"], task_id, columns)
+            if ready is None:
+                pending = self._pool_pending_keys(
+                    rec["parquet"], task_id, columns
+                )
+                if pending and not any(k in self._pool_failed for k in pending):
+                    self._pool_register(
+                        pending[0],
+                        lambda p=plot_dict, w=plot_widget,
+                               t=column_transforms, m=mask, tid=task_id,
+                               es=extra_stages:
+                        self._figure_render_when_ready(
+                            p, w, t, m, tid, es
+                        ),
+                    )
+                    plot_widget.setTitle(
+                        "Loading data…", color="#6b7785", size="10pt"
+                    )
+                    return
+            else:
+                indices, arrays = ready
+                pooled_mode = (
+                    x_name in arrays and y_name in arrays
+                    and (color_param is None or color_param in arrays)
+                )
+
+        if pooled_mode:
+            count = int(self._data_row_count(rec["parquet"]) or 0)
+            x = arrays[x_name].astype("float64")
+            y = arrays[y_name].astype("float64")
+            x = _apply_scale_transforms(x, transforms.get(x_name))
+            y = _apply_scale_transforms(y, transforms.get(y_name))
+            keep = np.isfinite(x) & np.isfinite(y)
+            if mask is not None:
+                mask_values = np.asarray(mask, dtype=bool)
+                if mask_values.size == indices.size:
+                    keep = keep & mask_values
+                elif indices.size and int(indices.max()) < mask_values.size:
+                    keep = keep & mask_values[indices]
+                else:
+                    pooled_mode = False
+            if pooled_mode:
+                kept = int(np.count_nonzero(keep))
+                if kept < max_points and indices.size < count:
+                    # Too few rows survived the filter: read everything so the
+                    # plot keeps its full point budget.
+                    pooled_mode = False
+
+        if pooled_mode:
+            x, y = x[keep], y[keep]
+            if x.size == 0:
+                return
+        else:
+            try:
+                df = self._read_columns(
+                    rec["parquet"], columns, task_id, extra_stages=extra_stages
+                )
+            except Exception:
+                return
+            if x_name not in df.columns or y_name not in df.columns:
+                plot_widget.setTitle(
+                    "Parameter not in this file", color="#c0392b", size="10pt"
+                )
+                return
+
+            x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
+            y = pd.to_numeric(df[y_name], errors="coerce").to_numpy(dtype="float64")
+            x = _apply_scale_transforms(x, transforms.get(x_name))
+            y = _apply_scale_transforms(y, transforms.get(y_name))
+            keep = np.isfinite(x) & np.isfinite(y)
+            if mask is not None:
+                keep = keep & np.asarray(mask, dtype=bool)
+            x, y = x[keep], y[keep]
+            if x.size == 0:
+                return
         # Cache the data range so the settings panel can pre-fill Auto values.
         plot_widget._data_xmin = float(x.min())
         plot_widget._data_xmax = float(x.max())
@@ -10889,36 +11274,60 @@ class MainWindow(QMainWindow):
         solid = None
         cmap = None
         values = None
+        density_mode = not (mode == "solid") and not (
+            mode == "parameter" and color_param
+        )
+        hist_xe_ye = None
         if mode == "solid":
             # Solid: every point shares one user-chosen color.
             solid = plot_dict.get("solid_color", (0, 0, 200))
         else:
             cmap = _figure_colormap(plot_dict.get("palette") or _default_palette())
-            if mode == "parameter" and color_param:
-                values = pd.to_numeric(df[color_param], errors="coerce").to_numpy(dtype="float64")[keep]
-                values = _apply_scale_transforms(values, transforms.get(color_param))
-            else:
-                # Density: color each actual point by its local (binned) density,
-                # without painting empty regions of the plot.
+            if density_mode:
                 grid = max(20, int(_setting("plot", "density_grid", 200) or 200))
-                hist, xe, ye = np.histogram2d(x, y, bins=grid)
+                if pooled_mode:
+                    # Density from a bounded sample of the pool; the lookup is
+                    # done after the drawn rows are chosen, so the per-plot
+                    # cost stays flat for 1M-row pools.
+                    step = max(1, x.size // 300_000)
+                    hist, xe, ye = np.histogram2d(x[::step], y[::step], bins=grid)
+                    hist_xe_ye = (hist, xe, ye)
+                else:
+                    hist, xe, ye = np.histogram2d(x, y, bins=grid)
+                    xi = np.clip(np.digitize(x, xe) - 1, 0, hist.shape[0] - 1)
+                    yi = np.clip(np.digitize(y, ye) - 1, 0, hist.shape[1] - 1)
+                    values = np.log1p(hist[xi, yi].astype(float))
+            else:
+                if pooled_mode:
+                    raw = arrays[color_param].astype("float64")[keep]
+                else:
+                    raw = pd.to_numeric(
+                        df[color_param], errors="coerce"
+                    ).to_numpy(dtype="float64")[keep]
+                values = _apply_scale_transforms(
+                    raw, transforms.get(color_param)
+                )
+
+        # Sample the rows to draw. Pool rows are already in priority order, so
+        # the first `max_points` kept rows are exactly the stable sample.
+        if pooled_mode:
+            if x.size > max_points:
+                x = x[:max_points]
+                y = y[:max_points]
+                if values is not None:
+                    values = values[:max_points]
+            if hist_xe_ye is not None:
+                hist, xe, ye = hist_xe_ye
                 xi = np.clip(np.digitize(x, xe) - 1, 0, hist.shape[0] - 1)
                 yi = np.clip(np.digitize(y, ye) - 1, 0, hist.shape[1] - 1)
                 values = np.log1p(hist[xi, yi].astype(float))
-
-        # Sample the rows to draw. Priorities come from the absolute row
-        # index, so changing the gate keeps the picture stable. A plot may
-        # carry its own limit (N×N matrix plots use a smaller one).
-        limit = plot_dict.get("max_points") or _setting(
-            "plot", "max_points", 50000
-        )
-        max_points = max(1000, int(limit or 50000))
-        picked = _stable_sample_selection(keep, max_points)
-        if picked is not None:
-            x = x[picked]
-            y = y[picked]
-            if values is not None:
-                values = values[picked]
+        else:
+            picked = _stable_sample_selection(keep, max_points)
+            if picked is not None:
+                x = x[picked]
+                y = y[picked]
+                if values is not None:
+                    values = values[picked]
 
         self._figure_draw_colored_scatter(
             plot_widget, x, y, values, cmap, size=size, px_mode=px_mode,
@@ -10954,8 +11363,8 @@ class MainWindow(QMainWindow):
         import pyqtgraph as pg
 
         if solid_color is not None:
-            brushes = pg.mkBrush(
-                int(solid_color[0]), int(solid_color[1]), int(solid_color[2]), 200
+            brushes = _scatter_brush(
+                int(solid_color[0]), int(solid_color[1]), int(solid_color[2])
             )
         else:
             lo = float(np.nanmin(values))
@@ -10966,7 +11375,12 @@ class MainWindow(QMainWindow):
                 hi = lo + 1.0
             norm = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
             rgba = cmap.map(norm, mode="byte")
-            brushes = [pg.mkBrush(int(r), int(g), int(b), 200) for r, g, b, _ in rgba]
+            # Reuse QBrush objects: pyqtgraph caches a sprite per brush
+            # *object*, so sharing them cuts the item build from hundreds of
+            # milliseconds to tens for 10k–50k points.
+            brushes = [
+                _scatter_brush(int(r), int(g), int(b)) for r, g, b, _ in rgba
+            ]
 
         scatter = _NoClickScatter(
             x=x, y=y, symbol="o", size=size, pen=None, brush=brushes,
@@ -10986,6 +11400,7 @@ class MainWindow(QMainWindow):
         import pyqtgraph as pg
 
         plot_widget.clear()
+        plot_widget._fig_cancelled = False
         # Same as scatter: invalidate any cached image item.
         plot_widget._img_fitted = False
         plot_widget._img_path = None
@@ -10997,23 +11412,69 @@ class MainWindow(QMainWindow):
         if not x_name:
             plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
             return
-        try:
-            df = self._read_columns(
-                rec["parquet"], [x_name], task_id, extra_stages=extra_stages
+        # Same pooled data as the scatter views: one column is plenty for a
+        # histogram, and the pool is already in memory for this file.
+        pooled_mode = False
+        indices = None
+        arrays = None
+        if extra_stages is None:
+            ready = self._pool_ready(rec["parquet"], task_id, [x_name])
+            if ready is None:
+                pending = self._pool_pending_keys(
+                    rec["parquet"], task_id, [x_name]
+                )
+                if pending and not any(k in self._pool_failed for k in pending):
+                    self._pool_register(
+                        pending[0],
+                        lambda p=plot_dict, w=plot_widget,
+                               t=column_transforms, m=mask, tid=task_id,
+                               es=extra_stages:
+                        self._figure_render_histogram_when_ready(
+                            p, w, t, m, tid, es
+                        ),
+                    )
+                    plot_widget.setTitle(
+                        "Loading data…", color="#6b7785", size="10pt"
+                    )
+                    return
+            else:
+                indices, arrays = ready
+                pooled_mode = x_name in arrays
+
+        if pooled_mode:
+            x = arrays[x_name].astype("float64")
+            x = _apply_scale_transforms(
+                x, (column_transforms or {}).get(x_name)
             )
-        except Exception:
-            return
-        if x_name not in df.columns:
-            plot_widget.setTitle(
-                "Parameter not in this file", color="#c0392b", size="10pt"
-            )
-            return
-        x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
-        x = _apply_scale_transforms(x, (column_transforms or {}).get(x_name))
-        keep = np.isfinite(x)
-        if mask is not None:
-            keep = keep & np.asarray(mask, dtype=bool)
-        x = x[keep]
+            keep = np.isfinite(x)
+            if mask is not None:
+                mask_values = np.asarray(mask, dtype=bool)
+                if mask_values.size == indices.size:
+                    keep = keep & mask_values
+                elif indices.size and int(indices.max()) < mask_values.size:
+                    keep = keep & mask_values[indices]
+                else:
+                    pooled_mode = False
+            if pooled_mode:
+                x = x[keep]
+        else:
+            try:
+                df = self._read_columns(
+                    rec["parquet"], [x_name], task_id, extra_stages=extra_stages
+                )
+            except Exception:
+                return
+            if x_name not in df.columns:
+                plot_widget.setTitle(
+                    "Parameter not in this file", color="#c0392b", size="10pt"
+                )
+                return
+            x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
+            x = _apply_scale_transforms(x, (column_transforms or {}).get(x_name))
+            keep = np.isfinite(x)
+            if mask is not None:
+                keep = keep & np.asarray(mask, dtype=bool)
+            x = x[keep]
         if x.size == 0:
             return
         plot_widget._data_xmin = float(x.min())
@@ -13620,6 +14081,7 @@ class MainWindow(QMainWindow):
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""
         # Any saved change can alter the data flowing downstream.
+        self._pool_clear()
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
         self._stage_cache = {}
