@@ -95,9 +95,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from smage import __version__ as APP_VERSION
 from smage.dimensions import parameter_names, read_dimensions
 from smage.importer import import_file
 from smage.project import Project
+from smage.runlog import runlog
 
 import pyqtgraph as pg
 
@@ -118,9 +120,9 @@ class _ModuleChip(QFrame):
         self.setFixedHeight(30)
         self.setStyleSheet(
             "QFrame#moduleChip { background: #ffffff; border: 1px solid #cfd9e6;"
-            " border-radius: 15px; }"
+            " border-radius: 15px; } "
             f"QFrame#moduleChip:hover {{ border-color: {color};"
-            " background: #f2f8ff; }}"
+            " background: #f2f8ff; }"
         )
         lay = QHBoxLayout(self)
         lay.setContentsMargins(8, 2, 9, 2)
@@ -1320,10 +1322,14 @@ def _make_original_axis(configs, orientation: str = "bottom"):
 
     class _OriginalAxis(pg.AxisItem):
         def tickStrings(self, values, scale, spacing):
+            import math
+
             out = []
             for value in values:
                 original = _inverse_scale_value(value * scale, configs)
-                out.append(_format_sci(original))
+                out.append(
+                    "" if not math.isfinite(original) else _format_sci(original)
+                )
             return out
 
     ax = _OriginalAxis(orientation)
@@ -1339,14 +1345,20 @@ def _inverse_scale_value(value: float, configs) -> float:
     out = float(value)
     for config in reversed(list(configs or [])):
         method = (config or {}).get("method", "linear")
-        if method == "log10":
-            out = math.copysign(10.0 ** abs(out), out) if out else 0.0
-        elif method == "arcsinh":
-            try:
-                cofactor = float((config or {}).get("param") or 5.0)
-            except (TypeError, ValueError):
-                cofactor = 5.0
-            out = math.copysign(math.sinh(abs(out)) * cofactor, out) if out else 0.0
+        try:
+            if method == "log10":
+                out = math.copysign(10.0 ** abs(out), out) if out else 0.0
+            elif method == "arcsinh":
+                try:
+                    cofactor = float((config or {}).get("param") or 5.0)
+                except (TypeError, ValueError):
+                    cofactor = 5.0
+                out = math.copysign(math.sinh(abs(out)) * cofactor, out) if out else 0.0
+        except (OverflowError, ValueError):
+            # The transformed value is too far out to map back (e.g. an axis
+            # auto-ranged to raw pixel coordinates under log10). Callers treat
+            # a non-finite result as "no original ticks".
+            return float("nan")
     return out
 
 
@@ -2167,12 +2179,14 @@ class _GatingStatsWorker:
     """Background worker that computes gate statistics with column/mask caches.
 
     The worker owns its caches so no shared mutable state is touched by the
-    main thread. Requests are queued FIFO; each carries a generation number so
-    the main thread can discard stale results.
+    main thread. Each request carries a generation number so the main thread
+    can discard stale results, and only the newest pending request is kept:
+    drawing gates quickly must not queue up a backlog of full recomputes.
     """
 
     def __init__(self):
-        self._req_q = queue.Queue()
+        self._cond = threading.Condition()
+        self._pending = None
         self._res_q = queue.Queue()
         self._stop = threading.Event()
         self._columns = {}   # {parquet_path: {col: float64 ndarray}}
@@ -2184,10 +2198,20 @@ class _GatingStatsWorker:
 
     def request(self, generation, parquet_path, gates, stages, base_columns,
                 affected, virtual=None, row_index=None):
-        self._req_q.put(
-            (generation, parquet_path, gates, stages, set(base_columns),
-             affected, dict(virtual or {}), row_index)
-        )
+        with self._cond:
+            prev = self._pending
+            if prev is not None:
+                # Coalesce with the request that has not started yet. A full
+                # recompute stays full; otherwise the affected gates merge.
+                if prev[5] is None or affected is None:
+                    affected = None
+                else:
+                    affected = set(prev[5]) | set(affected)
+            self._pending = (
+                generation, parquet_path, gates, stages, set(base_columns),
+                affected, dict(virtual or {}), row_index,
+            )
+            self._cond.notify()
 
     def poll(self):
         """Return any finished (generation, stats) results."""
@@ -2201,12 +2225,21 @@ class _GatingStatsWorker:
 
     def stop(self):
         self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
+
+    def _take_request(self):
+        with self._cond:
+            while self._pending is None and not self._stop.is_set():
+                self._cond.wait(0.2)
+            req = self._pending
+            self._pending = None
+            return req
 
     def _run(self):
         while not self._stop.is_set():
-            try:
-                req = self._req_q.get(timeout=0.2)
-            except queue.Empty:
+            req = self._take_request()
+            if req is None:
                 continue
             try:
                 res = self._compute(*req)
@@ -2381,6 +2414,10 @@ def _log_exception(exc: BaseException) -> None:
     import traceback
 
     try:
+        runlog.error("exception", exc=exc)
+    except Exception:  # the logger must never raise into its caller
+        pass
+    try:
         _settings_dir().mkdir(parents=True, exist_ok=True)
         with (_settings_dir() / "error.log").open("a", encoding="utf-8") as fh:
             fh.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}]\n")
@@ -2389,10 +2426,55 @@ def _log_exception(exc: BaseException) -> None:
         pass
 
 
+def _install_qt_message_handler() -> None:
+    """Route Qt warnings/criticals into the session log (deduplicated)."""
+    try:
+        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+    except ImportError:
+        return
+    seen = set()
+
+    def _dedup_key(mode, text):
+        import re
+
+        # Object addresses (0x…) differ per widget instance but the message is
+        # the same, so they are removed before deduplicating.
+        normalized = re.sub(r"0x[0-9a-fA-F]+", "0x…", text)
+        return (int(mode), normalized[:160])
+
+    def handler(mode, context, message) -> None:
+        try:
+            if mode in (QtMsgType.QtDebugMsg, QtMsgType.QtInfoMsg):
+                return
+            text = str(message).strip()
+            if not text:
+                return
+            key = _dedup_key(mode, text)
+            if key in seen or len(seen) > 200:
+                return
+            seen.add(key)
+            level = "error" if mode in (
+                QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg
+            ) else "warn"
+            getattr(runlog, level)(
+                "qt.message", text=text,
+                source=str(getattr(context, "file", "") or ""),
+                line=int(getattr(context, "line", 0) or 0),
+            )
+        except Exception:
+            pass
+
+    qInstallMessageHandler(handler)
+
+
 def _install_excepthook() -> None:
     """Log uncaught exceptions instead of losing them in a windowless app."""
 
     def hook(exc_type, exc, tb):
+        try:
+            runlog.error("exception", exc=exc)
+        except Exception:
+            pass
         try:
             _settings_dir().mkdir(parents=True, exist_ok=True)
             import traceback
@@ -3805,6 +3887,10 @@ class _GateViewBox(pg.ViewBox):
         self._range_anchor = None
         self._range_band = None
         self._range_arrow = None
+        # View range frozen while a click-drag gate is being drawn, plus the
+        # auto-range flags to restore afterwards.
+        self._draw_bounds = None
+        self._draw_auto = None
 
     def set_gate_tool(self, tool) -> None:
         self._cancel_preview()
@@ -3835,6 +3921,45 @@ class _GateViewBox(pg.ViewBox):
         self._polygon_pts = []
         self._range_x1 = None
         self._range_y1 = None
+        self._release_view()
+
+    def _freeze_view(self) -> None:
+        """Lock the view range while a gate is dragged out.
+
+        The growing preview shape must not resize the axes: without this the
+        auto-ranged view expands as the cursor moves past the edge.
+        """
+        if self._draw_bounds is not None:
+            return
+        self._draw_bounds = self.viewRange()
+        try:
+            auto = self.state["autoRange"]
+            self._draw_auto = (bool(auto[0]), bool(auto[1]))
+        except (KeyError, IndexError, TypeError):
+            self._draw_auto = (False, False)
+        self.disableAutoRange()
+
+    def _release_view(self) -> None:
+        """Restore the auto-range flags that were on before drawing."""
+        auto = self._draw_auto
+        self._draw_bounds = None
+        self._draw_auto = None
+        if auto is None:
+            return
+        if auto[0]:
+            self.enableAutoRange("x", True)
+        if auto[1]:
+            self.enableAutoRange("y", True)
+
+    def _clamp_to_bounds(self, point):
+        """Clamp a view coordinate to the frozen axes of the current drag."""
+        bounds = self._draw_bounds
+        if bounds is None:
+            return point
+        xr, yr = bounds
+        x = min(max(float(point.x()), min(xr)), max(xr))
+        y = min(max(float(point.y()), min(yr)), max(yr))
+        return pg.Point(x, y)
 
     def _pt(self, ev):
         return self.mapSceneToView(ev.scenePos())
@@ -3842,32 +3967,69 @@ class _GateViewBox(pg.ViewBox):
     # -- rectangle / ellipse (click-drag) -----------------------------------
     def mouseDragEvent(self, ev, axis=None) -> None:
         if self._tool in ("rect", "ellipse"):
-            if self._preview is None:
-                start = self.mapSceneToView(ev.buttonDownScenePos())
-                self._start = start
-                self._preview = self._make_shape(self._tool, (start.x(), start.y()), (0.0, 0.0))
-                self.addItem(self._preview)
-            p = self._pt(ev)
-            x0, y0 = self._start.x(), self._start.y()
-            x1, y1 = p.x(), p.y()
-            pos = (min(x0, x1), min(y0, y1))
-            size = (abs(x1 - x0), abs(y1 - y0))
-            self._preview.setPos(pos)
-            self._preview.setSize(size)
-            if ev.isFinish():
-                roi = self._preview
-                self._preview = None
-                self._start = None
-                if roi.size().x() > 0 and roi.size().y() > 0:
-                    self._on_gate_created(self._tool, roi)
-                else:
-                    self.removeItem(roi)
+            # Exceptions must never escape a Qt virtual override: PySide6
+            # terminates the whole application when that happens, which looks
+            # like a crash while the user is drawing a gate.
+            try:
+                self._drag_shape(ev)
+            except Exception as exc:  # noqa: BLE001
+                _log_exception(exc)
+                self._cancel_preview()
+                self._release_view()
             ev.accept()
             return
         super().mouseDragEvent(ev, axis)
 
+    def _drag_shape(self, ev) -> None:
+        """Update the rect/ellipse preview and finish the gate on release."""
+        if ev.isStart() and self._preview is not None:
+            # A previous drag never finished (e.g. the release happened
+            # outside the widget); start clean instead of reusing stale state.
+            self.removeItem(self._preview)
+            self._preview = None
+            self._start = None
+            self._release_view()
+        if self._preview is None:
+            self._freeze_view()
+            start = self._clamp_to_bounds(
+                self.mapSceneToView(ev.buttonDownScenePos())
+            )
+            self._start = start
+            self._preview = self._make_shape(
+                self._tool, (start.x(), start.y()), (0.0, 0.0)
+            )
+            self.addItem(self._preview, ignoreBounds=True)
+        p = self._clamp_to_bounds(self._pt(ev))
+        x0, y0 = self._start.x(), self._start.y()
+        x1, y1 = p.x(), p.y()
+        pos = (min(x0, x1), min(y0, y1))
+        size = (abs(x1 - x0), abs(y1 - y0))
+        self._preview.setPos(pos)
+        self._preview.setSize(size)
+        if ev.isFinish():
+            roi = self._preview
+            self._preview = None
+            self._start = None
+            try:
+                if roi.size().x() > 0 and roi.size().y() > 0:
+                    self._on_gate_created(self._tool, roi)
+                else:
+                    self.removeItem(roi)
+            finally:
+                self._release_view()
+
     # -- polygon / quadrant / split / range / skewed-quadrant ----------------
     def mouseClickEvent(self, ev) -> None:
+        try:
+            self._handle_click(ev)
+        except Exception as exc:  # noqa: BLE001
+            # Never let an exception escape into Qt (PySide6 aborts then).
+            _log_exception(exc)
+            self._cancel_preview()
+            self._release_view()
+            ev.accept()
+
+    def _handle_click(self, ev) -> None:
         if self._tool == "polygon" and ev.button() == Qt.MouseButton.RightButton:
             self._finish_polygon()
             ev.accept()
@@ -3941,18 +4103,18 @@ class _GateViewBox(pg.ViewBox):
                 pos=self._range_x1, angle=90, movable=False,
                 pen=pg.mkPen(self.gate_color, width=2, style=Qt.PenStyle.DashLine),
             )
-            self.addItem(self._range_anchor)
+            self.addItem(self._range_anchor, ignoreBounds=True)
         if self._range_band is None:
             self._range_band = self._make_preview_item(
                 pen=pg.mkPen(self.gate_color, width=2, style=Qt.PenStyle.DashLine),
             )
-            self.addItem(self._range_band)
+            self.addItem(self._range_band, ignoreBounds=True)
         if self._range_arrow is None:
             self._range_arrow = pg.ArrowItem(
                 angle=0, headLen=10, tipAngle=30, tailLen=None,
                 brush=pg.mkBrush(self.gate_color), pen=None, pxMode=True,
             )
-            self.addItem(self._range_arrow)
+            self.addItem(self._range_arrow, ignoreBounds=True)
         x0, y0 = self._range_x1, self._range_y1
         if mouse_pos is not None:
             self._range_band.setData([x0, mouse_pos[0]], [y0, mouse_pos[1]])
@@ -3984,24 +4146,28 @@ class _GateViewBox(pg.ViewBox):
             roi = _GatePolygonROI(
                 pts, closed=True, **_gate_roi_pens(self.gate_color)
             )
-            self.addItem(roi)
+            self.addItem(roi, ignoreBounds=True)
             self._on_gate_created("polygon", roi)
         else:
             self._cancel_preview()
 
     def hoverEvent(self, ev) -> None:
-        if self._tool == "polygon":
-            mouse_pos = None
-            if not ev.isExit() and self._polygon_pts:
-                p = self.mapSceneToView(ev.scenePos())
-                mouse_pos = (p.x(), p.y())
-            self._update_polygon_preview(mouse_pos)
-        elif self._tool == "range":
-            mouse_pos = None
-            if not ev.isExit() and self._range_x1 is not None:
-                p = self.mapSceneToView(ev.scenePos())
-                mouse_pos = (p.x(), p.y())
-            self._update_range_preview(mouse_pos)
+        try:
+            if self._tool == "polygon":
+                mouse_pos = None
+                if not ev.isExit() and self._polygon_pts:
+                    p = self.mapSceneToView(ev.scenePos())
+                    mouse_pos = (p.x(), p.y())
+                self._update_polygon_preview(mouse_pos)
+            elif self._tool == "range":
+                mouse_pos = None
+                if not ev.isExit() and self._range_x1 is not None:
+                    p = self.mapSceneToView(ev.scenePos())
+                    mouse_pos = (p.x(), p.y())
+                self._update_range_preview(mouse_pos)
+        except Exception as exc:  # noqa: BLE001
+            # A hover handler runs inside Qt; never let exceptions escape.
+            _log_exception(exc)
 
     def _make_preview_item(self, **kwargs) -> pg.PlotDataItem:
         """A visual-only PlotDataItem that never swallows mouse events."""
@@ -4018,12 +4184,12 @@ class _GateViewBox(pg.ViewBox):
                 pen=pg.mkPen(self.gate_color, width=2),
                 symbol="o", symbolSize=9, symbolBrush=self.gate_color,
             )
-            self.addItem(self._preview)
+            self.addItem(self._preview, ignoreBounds=True)
         if self._rubber is None:
             self._rubber = self._make_preview_item(
                 pen=pg.mkPen(self.gate_color, width=1, style=Qt.PenStyle.DashLine),
             )
-            self.addItem(self._rubber)
+            self.addItem(self._rubber, ignoreBounds=True)
         if self._first_highlight is None:
             self._first_highlight = self._make_preview_item(
                 pen=None,
@@ -4031,7 +4197,7 @@ class _GateViewBox(pg.ViewBox):
                 symbolPen=pg.mkPen(_gate_hover_color(self.gate_color), width=2.5),
                 symbolBrush=pg.mkBrush(None),
             )
-            self.addItem(self._first_highlight)
+            self.addItem(self._first_highlight, ignoreBounds=True)
 
     def _update_polygon_preview(self, mouse_pos=None) -> None:
         pts = self._polygon_pts
@@ -5128,6 +5294,17 @@ def _task_kind(task_type: str) -> str:
     return MODULE_KINDS.get(task_type, "map")
 
 
+def _count_tasks(tasks) -> int:
+    """Number of tasks in a workflow tree (modules of every depth)."""
+    total = 0
+    stack = list(tasks or [])
+    while stack:
+        task = stack.pop()
+        total += 1
+        stack.extend(task.get("children") or [])
+    return total
+
+
 # Open-module registry states: a module is unmodified, modified-but-unsaved, or
 # just saved (transient, used to trigger a downstream update before returning
 # to unmodified).
@@ -5725,6 +5902,276 @@ class _GlobalSettingsDialog(QDialog):
         self.accept()
 
 
+class _UIActionLogger(QObject):
+    """Turns user interactions into ``ACTION`` lines in the session log.
+
+    It is installed as an application-wide event filter and lazily connects to
+    each widget's own signal the first time the widget is shown.  That keeps
+    the instrumentation independent of how a panel is built (and rebuilt).
+    Nothing here may raise: the filter runs inside Qt's event dispatch.
+    """
+
+    _WATCH = frozenset({QEvent.Type.Show, QEvent.Type.Polish})
+
+    def __init__(self, window) -> None:
+        super().__init__(window)
+        self._window = window
+        self._last = {}
+        self._pages = {}
+        self._wheel_at = {}
+        self._action_logged = set()
+
+    # -- Qt event filter ---------------------------------------------------
+    def eventFilter(self, obj, event) -> bool:
+        try:
+            kind = event.type()
+            if kind in self._WATCH:
+                self._instrument(obj)
+            elif kind == QEvent.Type.Wheel:
+                self._log_wheel(obj, event)
+        except Exception as exc:  # noqa: BLE001
+            _log_exception(exc)
+        return False
+
+    def _log_wheel(self, obj, event) -> None:
+        """Log plot zooming (throttled: at most twice a second per widget)."""
+        import time
+
+        # Only zooming inside a plot (the viewport of a pyqtgraph view), not
+        # scrolling the settings panel's scroll bars.
+        parent = obj.parentWidget() if hasattr(obj, "parentWidget") else None
+        if not isinstance(parent, pg.GraphicsView):
+            return
+        page = self._pages.get(id(obj)) or self._page_name(obj)
+        if not page:
+            return
+        now = time.perf_counter()
+        if now - self._wheel_at.get(id(obj), 0.0) < 0.5:
+            return
+        self._wheel_at[id(obj)] = now
+        try:
+            delta = int(event.angleDelta().y())
+        except Exception:
+            delta = 0
+        runlog.action(
+            "plot.wheel", widget=type(obj).__name__, page=page, delta=delta
+        )
+
+    # -- descriptions ------------------------------------------------------
+    def _page_name(self, widget) -> str:
+        tabs = getattr(self._window, "tabs", None)
+        node = widget
+        while node is not None:
+            if tabs is not None:
+                try:
+                    index = tabs.indexOf(node)
+                except Exception:
+                    index = -1
+                if index >= 0:
+                    return tabs.tabText(index)
+            node = node.parentWidget()
+        return ""
+
+    @staticmethod
+    def _widget_text(widget) -> str:
+        for attr in ("text", "title", "placeholderText"):
+            getter = getattr(widget, attr, None)
+            if callable(getter):
+                try:
+                    value = getter()
+                except Exception:
+                    value = None
+                if value:
+                    return str(value)
+        return ""
+
+    def _describe(self, widget, extra=None) -> dict:
+        fields = {"widget": type(widget).__name__}
+        # The most recent page name wins: a settings panel may rebuild itself
+        # (detaching this widget) before the action is logged.
+        page = self._pages.get(id(widget)) or self._page_name(widget)
+        if page:
+            fields["page"] = page
+        text = self._widget_text(widget)
+        if text:
+            fields["text"] = text
+        try:
+            tip = widget.toolTip()
+        except Exception:
+            tip = ""
+        if tip and tip != text:
+            fields["tooltip"] = tip
+        try:
+            name = widget.objectName()
+        except Exception:
+            name = ""
+        if name:
+            fields["name"] = name
+        if extra:
+            fields.update({k: v for k, v in extra.items() if v is not None})
+        return fields
+
+    # -- instrumentation ---------------------------------------------------
+    def _instrument(self, obj) -> None:
+        import weakref
+
+        from PySide6.QtWidgets import (
+            QAbstractButton, QAbstractItemView, QComboBox, QDialog,
+            QDoubleSpinBox, QLineEdit, QSlider, QSpinBox, QTabWidget, QWidget,
+        )
+
+        if not isinstance(obj, QWidget):
+            return
+        try:
+            if obj.property("_smage_logged"):
+                return
+            obj.setProperty("_smage_logged", True)
+        except Exception:
+            return
+        try:
+            self._pages[id(obj)] = self._page_name(obj)
+        except Exception:
+            self._pages[id(obj)] = ""
+
+        # Spin boxes / editable combos own an internal line edit; the outer
+        # widget already logs their commits, so skip the child.
+        parent = obj.parentWidget()
+        if isinstance(obj, QLineEdit) and isinstance(
+            parent, (QSpinBox, QDoubleSpinBox, QComboBox)
+        ):
+            return
+
+        ref = weakref.ref(obj)
+
+        if isinstance(obj, QAbstractButton):
+            def on_click(_checked=False, ref=ref):
+                widget = ref()
+                if widget is None:
+                    return
+                extra = None
+                try:
+                    if widget.isCheckable():
+                        extra = {"checked": bool(widget.isChecked())}
+                except Exception:
+                    extra = None
+                runlog.action("button.click", **self._describe(widget, extra))
+            obj.clicked.connect(on_click)
+        elif isinstance(obj, QComboBox):
+            self._last[id(obj)] = obj.currentText()
+
+            def on_combo(index, ref=ref):
+                widget = ref()
+                if widget is None:
+                    return
+                old = self._last.get(id(widget), "")
+                new = widget.currentText()
+                if new == old:
+                    return
+                self._last[id(widget)] = new
+                runlog.action(
+                    "combo.change", **self._describe(widget, {"old": old, "new": new})
+                )
+            obj.currentIndexChanged.connect(on_combo)
+        elif isinstance(obj, (QSpinBox, QDoubleSpinBox)):
+            def on_value(ref=ref):
+                widget = ref()
+                if widget is None:
+                    return
+                runlog.action(
+                    "value.change", **self._describe(widget, {"value": widget.value()})
+                )
+            obj.editingFinished.connect(on_value)
+        elif isinstance(obj, QLineEdit):
+            def on_text(ref=ref):
+                widget = ref()
+                if widget is None:
+                    return
+                try:
+                    if widget.echoMode() == QLineEdit.EchoMode.Password:
+                        value = "***"
+                    else:
+                        value = widget.text()
+                except Exception:
+                    return
+                runlog.action("text.change", **self._describe(widget, {"value": value}))
+            obj.editingFinished.connect(on_text)
+        elif isinstance(obj, QAbstractItemView):
+            def on_item(index, ref=ref):
+                widget = ref()
+                if widget is None:
+                    return
+                value = ""
+                try:
+                    model = widget.model()
+                    data = model.data(index) if model is not None else None
+                    value = "" if data is None else str(data)
+                except Exception:
+                    value = ""
+                runlog.action(
+                    "item.click",
+                    **self._describe(widget, {
+                        "row": index.row(), "col": index.column(), "value": value,
+                    }),
+                )
+            obj.clicked.connect(on_item)
+        elif isinstance(obj, QTabWidget):
+            def on_tab(index, ref=ref):
+                widget = ref()
+                if widget is None:
+                    return
+                runlog.action(
+                    "tab.change",
+                    tab=widget.tabText(index), index=int(index),
+                )
+            obj.currentChanged.connect(on_tab)
+        elif isinstance(obj, QSlider):
+            def on_slider(ref=ref):
+                widget = ref()
+                if widget is None:
+                    return
+                runlog.action(
+                    "slider.change", **self._describe(widget, {"value": widget.value()})
+                )
+            obj.sliderReleased.connect(on_slider)
+        elif isinstance(obj, QDialog):
+            def on_dialog(result, ref=ref):
+                widget = ref()
+                if widget is None:
+                    return
+                runlog.action(
+                    "dialog.close",
+                    title=widget.windowTitle(),
+                    result=int(result),
+                )
+            obj.finished.connect(on_dialog)
+
+    def log_actions(self, menu) -> None:
+        """Log every QAction of a menu bar / menu when it is triggered."""
+        from PySide6.QtWidgets import QMenu, QMenuBar
+
+        if not isinstance(menu, (QMenu, QMenuBar)):
+            return
+        if id(menu) in self._action_logged:
+            return
+        self._action_logged.add(id(menu))
+        for action in menu.actions():
+            submenu = action.menu()
+            if submenu is not None:
+                self.log_actions(submenu)
+                continue
+            text = action.text().replace("&", "")
+            if not text:
+                continue
+            try:
+                title = menu.title().replace("&", "")
+            except Exception:
+                title = ""
+
+            def on_trigger(_checked=False, text=text, path=title):
+                runlog.action("menu.action", text=text, menu=path)
+            action.triggered.connect(on_trigger)
+
+
 class MainWindow(QMainWindow):
     """Main window: File/Help menu bar and a single tabbed workspace."""
 
@@ -5785,7 +6232,48 @@ class MainWindow(QMainWindow):
         self._build_main_area()
         self._restore_window_geometry()
         self._apply_appearance_settings()
+        # Session log: record user actions (see runlog.py). Installed after the
+        # UI exists so menu actions are known.
+        self._action_logger = _UIActionLogger(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._action_logger)
+        self._action_logger.log_actions(self.menuBar())
         self.statusBar().showMessage("Ready")
+
+    def _log_environment(self) -> dict:
+        """A compact environment snapshot for the session log header."""
+        import platform
+
+        info = {
+            "version": APP_VERSION,
+            "python": platform.python_version(),
+        }
+        try:
+            import PySide6
+            from PySide6.QtCore import qVersion
+
+            info["pyside"] = PySide6.__version__
+            info["qt"] = qVersion()
+        except Exception:
+            pass
+        try:
+            import numpy
+            import pandas
+
+            info["numpy"] = numpy.__version__
+            info["pandas"] = pandas.__version__
+        except Exception:
+            pass
+        try:
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                geo = screen.geometry()
+                info["screen"] = f"{geo.width()}x{geo.height()}@{screen.logicalDotsPerInch():.0f}dpi"
+        except Exception:
+            pass
+        info["os"] = f"{platform.system()} {platform.release()}"
+        return info
 
     def closeEvent(self, event) -> None:
         """Warn before closing the app if any open module has unsaved changes."""
@@ -5810,6 +6298,8 @@ class MainWindow(QMainWindow):
         # Mask-edge images are temporary: drop this module's cache on exit.
         self._seg_clear_edge_cache()
         self._save_window_geometry()
+        runlog.info("window.close")
+        runlog.stop("window closed")
         event.accept()
 
     def _has_unsaved_module_changes(self) -> bool:
@@ -6766,6 +7256,8 @@ class MainWindow(QMainWindow):
         except OSError as error:
             QMessageBox.warning(self, "New Project", f"Could not create project:\n{error}")
             return
+        runlog.start(self.project.path, self._log_environment())
+        runlog.info("project.new", path=str(self.project.path), name=self.project.name)
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
         self._pool_clear()
@@ -6790,6 +7282,12 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.warning(self, "Open Project", f"Could not open project:\n{error}")
             return
+        runlog.start(self.project.path, self._log_environment())
+        runlog.info(
+            "project.open", path=str(self.project.path),
+            name=self.project.name, samples=len(self.project.samples),
+            tasks=_count_tasks(self.project.workflow.get("tasks") or []),
+        )
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
         self._column_index = self.project.load_columns()
@@ -6829,6 +7327,9 @@ class MainWindow(QMainWindow):
             return
 
         self.project = new_project
+        runlog.start(self.project.path, self._log_environment())
+        runlog.info("project.save_as", path=str(self.project.path),
+                    name=self.project.name)
         # Reload the tree layout from the copied UI state on the next rebuild.
         self._tree_project = None
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
@@ -7694,6 +8195,10 @@ class MainWindow(QMainWindow):
         if _task_kind(mtype) == "generate":
             new_task["output"] = {"saved": False}
         parent_task_def.setdefault("children", []).append(new_task)
+        runlog.info(
+            "module.add", id=new_task["id"], type=mtype, name=name,
+            parent=str(parent_task_def.get("id") or ""),
+        )
         # Reveal the new module without expanding anything else: only its
         # ancestor path is forced open, every other node keeps its state.
         force = {str(new_task["id"])}
@@ -8335,6 +8840,12 @@ class MainWindow(QMainWindow):
         self._import_running = True
         self._import_cancel = False
         self._import_jobs = jobs
+        import time as _time
+        self._import_started = _time.perf_counter()
+        runlog.action(
+            "import.start", files=len(jobs),
+            names=[job["name"] for job in jobs],
+        )
         self.peek_btn.setEnabled(False)
         self.import_btn.setEnabled(False)
 
@@ -8468,8 +8979,21 @@ class MainWindow(QMainWindow):
             self._import_timer = None
         self._import_queue = None
         self._import_thread = None
+        jobs = self._import_jobs or []
         self._import_jobs = None
         self._import_running = False
+        if jobs:
+            import time as _time
+            failed = sum(
+                1 for job in jobs
+                if (self._import_files[job["index"]].get("status") == "error")
+            )
+            runlog.info(
+                "import.finish", files=len(jobs), errors=failed,
+                seconds=round(_time.perf_counter()
+                              - getattr(self, "_import_started",
+                                        _time.perf_counter()), 3),
+            )
         progress = getattr(self, "_import_progress", None)
         if progress is not None:
             progress.close()
@@ -10676,17 +11200,34 @@ class MainWindow(QMainWindow):
         self._figure_update_progress(page, 0, 0)
         self.statusBar().showMessage("Plot rendering cancelled", 3000)
 
+    def _figure_bump_render_token(self, plot_widget) -> int:
+        """Mark the plot's latest render request; older callbacks must not draw."""
+        token = int(getattr(plot_widget, "_fig_render_token", 0)) + 1
+        plot_widget._fig_render_token = token
+        return token
+
     def _figure_render_histogram_when_ready(self, plot_dict, plot_widget,
-                                            transforms, mask, task_id, stages) -> None:
+                                            transforms, mask, task_id, stages,
+                                            token=None) -> None:
         if getattr(plot_widget, "_fig_cancelled", False):
+            return
+        if token is not None and getattr(
+            plot_widget, "_fig_render_token", token
+        ) != token:
+            # The page switched plot type / file while the pool was loading.
             return
         self._figure_render_histogram(
             plot_dict, plot_widget, transforms, mask, task_id, stages
         )
 
     def _figure_render_when_ready(self, plot_dict, plot_widget, transforms,
-                                  mask, task_id, stages) -> None:
+                                  mask, task_id, stages, token=None) -> None:
         if getattr(plot_widget, "_fig_cancelled", False):
+            return
+        if token is not None and getattr(
+            plot_widget, "_fig_render_token", token
+        ) != token:
+            # The page switched plot type / file while the pool was loading.
             return
         self._figure_render_scatter(
             plot_dict, plot_widget, transforms, mask, task_id, stages
@@ -11075,6 +11616,7 @@ class MainWindow(QMainWindow):
         view to show only the points inside the active gate).
         """
         import numpy as np
+        self._figure_bump_render_token(plot_widget)
         self._figure_update_image_legend(plot_widget, [])
         rec = self._figure_record(plot_dict.get("file"))
         if not rec:
@@ -11581,11 +12123,15 @@ class MainWindow(QMainWindow):
 
     def _figure_render_scatter(self, plot_dict: dict, plot_widget, column_transforms=None,
                                mask=None, task_id=None, extra_stages=None) -> None:
+        import time as _time
         import numpy as np
         import pandas as pd
 
+        started = _time.perf_counter()
+
         plot_widget.clear()
         plot_widget._fig_cancelled = False
+        token = self._figure_bump_render_token(plot_widget)
         # A scatter render removes any cached image item; invalidate the image
         # state so the next image render re-adds it.
         plot_widget._img_fitted = False
@@ -11631,9 +12177,9 @@ class MainWindow(QMainWindow):
                         pending[0],
                         lambda p=plot_dict, w=plot_widget,
                                t=column_transforms, m=mask, tid=task_id,
-                               es=extra_stages:
+                               es=extra_stages, tk=token:
                         self._figure_render_when_ready(
-                            p, w, t, m, tid, es
+                            p, w, t, m, tid, es, tk
                         ),
                     )
                     plot_widget.setTitle(
@@ -11793,6 +12339,12 @@ class MainWindow(QMainWindow):
             ),
             y,
         )
+        elapsed = _time.perf_counter() - started
+        if elapsed >= 0.35:  # only renders slow enough to be felt
+            runlog.info(
+                "render.scatter", points=int(x.size), pooled=bool(pooled_mode),
+                task=str(task_id or ""), seconds=round(elapsed, 3),
+            )
 
     def _figure_draw_colored_scatter(self, plot_widget, x, y, values, cmap,
                                      size: float = 4, px_mode: bool = True,
@@ -11843,6 +12395,7 @@ class MainWindow(QMainWindow):
 
         plot_widget.clear()
         plot_widget._fig_cancelled = False
+        token = self._figure_bump_render_token(plot_widget)
         # Same as scatter: invalidate any cached image item.
         plot_widget._img_fitted = False
         plot_widget._img_path = None
@@ -11870,9 +12423,9 @@ class MainWindow(QMainWindow):
                         pending[0],
                         lambda p=plot_dict, w=plot_widget,
                                t=column_transforms, m=mask, tid=task_id,
-                               es=extra_stages:
+                               es=extra_stages, tk=token:
                         self._figure_render_histogram_when_ready(
-                            p, w, t, m, tid, es
+                            p, w, t, m, tid, es, tk
                         ),
                     )
                     plot_widget.setTitle(
@@ -15214,6 +15767,14 @@ class MainWindow(QMainWindow):
         # Gating gate trees (stored in the module folder).
         self._gating_store_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
+        saved_id = page.property("task_id")
+        if saved_id:
+            task_def = self._find_task_by_id(saved_id) or {}
+            runlog.info(
+                "module.saved", id=str(saved_id),
+                type=str(task_def.get("type") or ""),
+                name=str(task_def.get("name") or ""),
+            )
         # Saved output can lock (or unlock) modules, so refresh the lock badges
         # and button states in the workflow tree.
         self._refresh_workflow_tree()
@@ -33369,16 +33930,42 @@ class MainWindow(QMainWindow):
         if page._gating_tool not in allowed:
             self._gating_set_tool(page, None)
 
+    def _gating_default_axes(self, cols, preview) -> tuple:
+        """Pick X/Y parameters for a data plot of `cols`.
+
+        Image files store pixel positions in ``x``/``y``; a scatter of those
+        is just a picture of the sample, so they are used only when the file
+        has no other numeric columns. The last parameters the user chose win
+        when they still exist in the file.
+        """
+        usable = [c for c in cols if c not in ("x", "y")] or list(cols)
+
+        def pick(preferred, avoid):
+            for value in preferred:
+                if value in usable and value != avoid:
+                    return value
+            for column in usable:
+                if column != avoid:
+                    return column
+            return usable[0] if usable else None
+
+        x = pick((preview.get("last_x"), preview.get("x")), None)
+        y = pick((preview.get("last_y"), preview.get("y")), x)
+        return x, y
+
     def _gating_set_plot_type(self, page, ptype) -> None:
         """Switch the gating view between scatter / image / histogram.
 
         The current gate hierarchy is kept: when the user has double-clicked
         into a gate, the new view still shows only the points inside that gate.
+        Axes and view range remembered by the active gate are reused only when
+        that gate was drawn as the same kind of plot; otherwise the new view
+        starts from the last-used parameters and auto-fits.
         """
         preview = page._gating_preview
-        if preview.get("type") == ptype:
+        previous = preview.get("type", "scatter")
+        if previous == ptype:
             return
-        preview["type"] = ptype
         rec = self._figure_record(preview.get("file"))
         cols = self._columns_for(
             rec.get("parquet"), page._gating_task_id
@@ -33387,35 +33974,61 @@ class MainWindow(QMainWindow):
         gate = next(
             (g for g in page._gating_gates if g["id"] == gate_id), None
         ) if gate_id else None
+        # A gate remembers the plot type it was drawn in (boolean gates have
+        # none); its axes and ranges only make sense for that same type.
+        gate_type = gate.get("plot_type") if gate is not None else None
+        gate_axes_ok = gate is not None and gate_type in (None, ptype)
+        preview["type"] = ptype
 
         if ptype == "image":
-            preview["last_x"] = preview.get("last_x") or preview.get("x")
-            preview["last_y"] = preview.get("last_y") or preview.get("y")
+            if previous != "image":
+                # Remember the data axes so Scatter/Histogram can come back to
+                # them instead of the pixel columns.
+                preview["last_x"] = preview.get("x")
+                preview["last_y"] = preview.get("y")
             preview["x"] = "x" if "x" in cols else None
             preview["y"] = "y" if "y" in cols else None
+            channels = [c for c in cols if c not in ("x", "y")]
+            if preview.get("image_channel") not in channels:
+                preview["image_channel"] = channels[0] if channels else None
         elif ptype == "histogram":
-            preview["last_x"] = preview.get("last_x") or preview.get("x")
-            x = gate.get("x") if gate is not None and gate.get("x") else preview.get("last_x")
+            x = gate.get("x") if gate_axes_ok and gate.get("x") else None
+            if x not in cols:
+                x, _ = self._gating_default_axes(cols, preview)
             preview["x"] = x if x in cols else (cols[0] if cols else None)
             preview["y"] = None
         else:
-            if gate is not None and gate.get("x") and gate.get("y"):
+            if gate_axes_ok and gate.get("x") and gate.get("y"):
                 preview["x"] = gate["x"]
                 preview["y"] = gate["y"]
             else:
-                preview["x"] = (
-                    preview.get("last_x") if preview.get("last_x") in cols
-                    else (cols[0] if cols else None)
+                preview["x"], preview["y"] = self._gating_default_axes(
+                    cols, preview
                 )
-                preview["y"] = (
-                    preview.get("last_y") if preview.get("last_y") in cols
-                    else (cols[1] if len(cols) > 1 else (cols[0] if cols else None))
-                )
+
+        if ptype == "image" or previous == "image":
+            # Pixel-space ranges mean nothing in a data plot (and vice versa);
+            # fall back to auto-range unless the gate carries this type's range.
+            for key in ("xmin", "xmax", "ymin", "ymax"):
+                preview[key] = gate.get(key) if gate_axes_ok else None
+
+        if ptype != "image":
+            # The settings panel now shows these parameters, so "All Events"
+            # should return to them later.
+            page._gating_settings_x = preview.get("x")
+            page._gating_settings_y = preview.get("y")
+
         self._gating_update_tools(page)
         self._gating_reload_rois(page)
         self._gating_render(page)
         self._gating_rebuild_settings(page)
         self._gating_mark_dirty(page)
+        runlog.action(
+            "gating.plot_type", module=str(page._gating_task_id),
+            old=str(previous), new=str(ptype),
+            x=preview.get("x"), y=preview.get("y"),
+            active=str(page._gating_active_gate_id or ""),
+        )
 
     def _gating_restore_gate_display(self, page, gate) -> None:
         """Restore the plot type, axes, range and colour state a gate was drawn in."""
@@ -33426,12 +34039,14 @@ class MainWindow(QMainWindow):
             preview["type"] = ptype
             plot_type_changed = True
         # Boolean gates (and/or) carry no axes of their own; leave the current
-        # ones. Histogram gates store y=None on purpose, so an `in` check keeps
-        # that working while skipping gates that never define a y axis.
-        if "x" in gate:
-            preview["x"] = gate.get("x")
-        if "y" in gate:
-            preview["y"] = gate.get("y")
+        # ones. Histogram gates store y=None on purpose, so a histogram gate
+        # clears the y axis while gates that never define one are skipped.
+        if gate.get("x") is not None:
+            preview["x"] = gate["x"]
+        if gate.get("y") is not None:
+            preview["y"] = gate["y"]
+        elif gate.get("plot_type") == "histogram":
+            preview["y"] = None
         for key in ("xmin", "xmax", "ymin", "ymax"):
             if gate.get(key) is not None:
                 preview[key] = gate[key]
@@ -33485,7 +34100,13 @@ class MainWindow(QMainWindow):
                     g[key] = copy.deepcopy(value)
 
     def _gating_on_roi_drag(self, page, gate, roi) -> None:
-        self._gating_apply_geometry(page, gate, self._gating_sync_gate(gate, roi))
+        geometry = self._gating_sync_gate(gate, roi)
+        self._gating_apply_geometry(page, gate, geometry)
+        runlog.action(
+            "gating.gate_moved", module=str(page._gating_task_id),
+            gate=str(gate.get("id") or ""), type=str(gate.get("type") or ""),
+            pos=geometry.get("pos"), size=geometry.get("size"),
+        )
         self._gating_refresh_tree_stats(page, affected={gate["id"]})
         self._gating_update_labels(page)
         self._gating_mark_dirty(page)
@@ -33563,6 +34184,35 @@ class MainWindow(QMainWindow):
         return f"{prefixes.get(tool, 'Gate')} {count}"
 
     def _gating_add_gate(self, page, tool, arg) -> None:
+        """Create a gate and record the action in the session log."""
+        before = len(page._gating_gates)
+        try:
+            self._gating_add_gate_impl(page, tool, arg)
+        finally:
+            added = page._gating_gates[before:]
+            if added:
+                self._gating_log_gates(page, tool, added)
+
+    def _gating_log_gates(self, page, tool, gates) -> None:
+        preview = page._gating_preview
+        first = gates[0]
+        fields = {
+            "module": str(page._gating_task_id), "tool": str(tool),
+            "count": len(gates), "plot": str(preview.get("type")),
+            "x": preview.get("x"), "y": preview.get("y"),
+            "parent": str(first.get("parent") or ""),
+        }
+        if first.get("pos") is not None:
+            fields["pos"] = first.get("pos")
+            fields["size"] = first.get("size")
+        elif first.get("points") is not None:
+            fields["points"] = len(first.get("points") or [])
+        elif first.get("vx") is not None:
+            fields["vx"] = first.get("vx")
+            fields["hy"] = first.get("hy")
+        runlog.action("gating.gate_created", **fields)
+
+    def _gating_add_gate_impl(self, page, tool, arg) -> None:
         preview = page._gating_preview
         gate_color = _gate_color(preview)
         xr, yr = page._gating_viewbox.viewRange()
@@ -33573,8 +34223,8 @@ class MainWindow(QMainWindow):
             hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
             vline = pg.InfiniteLine(pos=x0, angle=90, movable=True, pen=pen, hoverPen=hover)
             hline = pg.InfiniteLine(pos=y0, angle=0, movable=True, pen=pen, hoverPen=hover)
-            page._gating_viewbox.addItem(vline)
-            page._gating_viewbox.addItem(hline)
+            page._gating_viewbox.addItem(vline, ignoreBounds=True)
+            page._gating_viewbox.addItem(hline, ignoreBounds=True)
             page._gating_crosshairs[crosshair_id] = {
                 "lines": [vline, hline],
                 "x": preview.get("x"),
@@ -33632,8 +34282,8 @@ class MainWindow(QMainWindow):
             hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
             vline1 = pg.InfiniteLine(pos=x1, angle=90, movable=True, pen=pen, hoverPen=hover)
             vline2 = pg.InfiniteLine(pos=x2, angle=90, movable=True, pen=pen, hoverPen=hover)
-            page._gating_viewbox.addItem(vline1)
-            page._gating_viewbox.addItem(vline2)
+            page._gating_viewbox.addItem(vline1, ignoreBounds=True)
+            page._gating_viewbox.addItem(vline2, ignoreBounds=True)
             self._gating_setup_line(page, vline1, gate["id"])
             self._gating_setup_line(page, vline2, gate["id"])
             vline1.sigPositionChangeFinished.connect(
@@ -33658,7 +34308,7 @@ class MainWindow(QMainWindow):
             pen = pg.mkPen(_gate_color(preview), width=2)
             hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
             vline = pg.InfiniteLine(pos=x0, angle=90, movable=True, pen=pen, hoverPen=hover)
-            page._gating_viewbox.addItem(vline)
+            page._gating_viewbox.addItem(vline, ignoreBounds=True)
             page._gating_split_lines[split_id] = {
                 "lines": [vline],
                 "x": preview.get("x"),
@@ -33792,13 +34442,21 @@ class MainWindow(QMainWindow):
 
     def _gating_set_items_handles_visible(self, items, visible: bool) -> None:
         """Show a gate's handles/nodes only when selected."""
+        from shiboken6 import isValid
+
         for item in items:
+            if not isValid(item):
+                continue
             if isinstance(item, pg.InfiniteLine):
                 # Lines have no separate handles; keep them movable/hoverable.
                 continue
-            else:
+            try:
                 for h in item.handles:
-                    h["item"].setVisible(visible)
+                    handle = h["item"]
+                    if isValid(handle):
+                        handle.setVisible(visible)
+            except (RuntimeError, AttributeError):
+                continue
 
     def _gating_show_handles(self, page, idx) -> None:
         """Show handles for the gate at `idx`, hiding every other gate's."""
@@ -33918,6 +34576,12 @@ class MainWindow(QMainWindow):
 
     def _gating_update_roi_visibility(self, page) -> None:
         """Show gates bound to the current (x, y) axes and gating-tree context."""
+        from shiboken6 import isValid
+
+        def set_visible(item, visible):
+            if isValid(item):
+                item.setVisible(visible)
+
         x = page._gating_preview.get("x")
         y = page._gating_preview.get("y")
         visible_ids = self._gating_visible_ids(page)
@@ -33942,24 +34606,24 @@ class MainWindow(QMainWindow):
             hier_ok = visible_ids is None or gate.get("id") in visible_ids
             visible = xy_ok and hier_ok
             for item in items:
-                item.setVisible(visible)
+                set_visible(item, visible)
         for cid, entry in page._gating_crosshairs.items():
             xy_ok = entry.get("x") == x and entry.get("y") == y
             hier_ok = visible_crosshairs is None or cid in visible_crosshairs
             visible = xy_ok and hier_ok
             for line in entry["lines"]:
-                line.setVisible(visible)
+                set_visible(line, visible)
         for sid, entry in page._gating_split_lines.items():
             xy_ok = entry.get("x") == x and entry.get("y") == y
             hier_ok = visible_splits is None or sid in visible_splits
             visible = xy_ok and hier_ok
             for line in entry["lines"]:
-                line.setVisible(visible)
+                set_visible(line, visible)
         for sid, entry in page._gating_skewed_lines.items():
             xy_ok = entry.get("x") == x and entry.get("y") == y
             hier_ok = visible_skewed is None or sid in visible_skewed
             visible = xy_ok and hier_ok
-            entry["roi"].setVisible(visible)
+            set_visible(entry["roi"], visible)
         self._gating_update_labels(page)
 
     def _gating_set_label_style(self, page, label) -> None:
@@ -34120,12 +34784,12 @@ class MainWindow(QMainWindow):
                 elif t == "quadrant":
                     cid = gate.get("crosshair_id")
                     if cid and cid not in page._gating_crosshairs:
-                        pen = pg.mkPen(_gate_color(preview), width=2)
-                        hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
+                        pen = pg.mkPen(gate_color, width=2)
+                        hover = pg.mkPen(_gate_hover_color(gate_color), width=3)
                         vline = pg.InfiniteLine(pos=rgate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
                         hline = pg.InfiniteLine(pos=rgate.get("hy", 0), angle=0, movable=True, pen=pen, hoverPen=hover)
-                        viewbox.addItem(vline)
-                        viewbox.addItem(hline)
+                        viewbox.addItem(vline, ignoreBounds=True)
+                        viewbox.addItem(hline, ignoreBounds=True)
                         page._gating_crosshairs[cid] = {
                             "lines": [vline, hline],
                             "x": gate.get("x"),
@@ -34139,12 +34803,12 @@ class MainWindow(QMainWindow):
                         )
                     items = []
                 elif t == "range":
-                    pen = pg.mkPen(_gate_color(preview), width=2)
-                    hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
+                    pen = pg.mkPen(gate_color, width=2)
+                    hover = pg.mkPen(_gate_hover_color(gate_color), width=3)
                     vline1 = pg.InfiniteLine(pos=rgate.get("x1", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
                     vline2 = pg.InfiniteLine(pos=rgate.get("x2", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
-                    viewbox.addItem(vline1)
-                    viewbox.addItem(vline2)
+                    viewbox.addItem(vline1, ignoreBounds=True)
+                    viewbox.addItem(vline2, ignoreBounds=True)
                     self._gating_setup_line(page, vline1, gate["id"])
                     self._gating_setup_line(page, vline2, gate["id"])
                     vline1.sigPositionChangeFinished.connect(
@@ -34157,10 +34821,10 @@ class MainWindow(QMainWindow):
                 elif t == "split":
                     sid = gate.get("split_id")
                     if sid and sid not in page._gating_split_lines:
-                        pen = pg.mkPen(_gate_color(preview), width=2)
-                        hover = pg.mkPen(_gate_hover_color(_gate_color(preview)), width=3)
+                        pen = pg.mkPen(gate_color, width=2)
+                        hover = pg.mkPen(_gate_hover_color(gate_color), width=3)
                         vline = pg.InfiniteLine(pos=rgate.get("vx", 0), angle=90, movable=True, pen=pen, hoverPen=hover)
-                        viewbox.addItem(vline)
+                        viewbox.addItem(vline, ignoreBounds=True)
                         page._gating_split_lines[sid] = {
                             "lines": [vline],
                             "x": gate.get("x"),
@@ -34201,8 +34865,15 @@ class MainWindow(QMainWindow):
                     items = []
             except (KeyError, IndexError, TypeError):
                 items = []
+            except Exception as exc:  # noqa: BLE001
+                # One broken gate must not abort the whole reload: that would
+                # leave `_gating_rois` out of sync with `_gating_gates`.
+                _log_exception(exc)
+                items = []
             for item in items:
-                viewbox.addItem(item)
+                # Gate outlines are annotations: they must never change
+                # the axes (auto-range fits the data only).
+                viewbox.addItem(item, ignoreBounds=True)
             self._gating_set_items_handles_visible(items, False)
             page._gating_rois.append(items)
 
@@ -34291,6 +34962,9 @@ class MainWindow(QMainWindow):
                 if g.get("parent") in to_delete:
                     g["parent"] = parent_id
 
+        deleted_names = [
+            g.get("name") for g in page._gating_gates if g["id"] in to_delete
+        ]
         indices = [i for i, g in enumerate(page._gating_gates) if g["id"] in to_delete]
         for i in reversed(indices):
             for item in page._gating_rois[i]:
@@ -34303,6 +34977,11 @@ class MainWindow(QMainWindow):
                     pass
             del page._gating_gates[i]
             del page._gating_rois[i]
+        runlog.action(
+            "gating.gate_deleted", module=str(page._gating_task_id),
+            gates=len(to_delete), cascade=bool(cascade),
+            names=deleted_names,
+        )
         self._gating_prune_crosshairs(page)
         # Keep the same hierarchy level in view when possible.
         if page._gating_context_gate_id in to_delete:
@@ -35026,10 +35705,20 @@ class MainWindow(QMainWindow):
         elif context:
             if rec:
                 mask = self._gating_context_mask(page, context, rec["parquet"])
-        # Preserve the current view range for the subset view (don't auto-fit).
+        # Preserve the current view range for the subset view (don't auto-fit),
+        # but only while the same axes are still shown: after a plot-type or
+        # parameter change the old range belongs to different data.
+        render_key = (
+            plot_type, preview.get("file"), preview.get("x"), preview.get("y"),
+            active, context,
+        )
         preserved = None
-        if active and plot_type != "image":
+        if (
+            active and plot_type != "image"
+            and getattr(page, "_gating_render_key", None) == render_key
+        ):
             preserved = viewbox.viewRange()
+        page._gating_render_key = render_key
 
         if plot_type == "image":
             plot_dict = dict(preview)
@@ -35375,6 +36064,7 @@ class MainWindow(QMainWindow):
             name = rec.get("name")
         if preview.get("file") == path and name in (None, preview.get("file_name")):
             return
+        old_file = str(preview.get("file") or "")
         preview["file"] = path
         preview["file_name"] = name
         # Keep the current gate hierarchy (subset / editing context) when
@@ -35385,6 +36075,9 @@ class MainWindow(QMainWindow):
             (g for g in page._gating_gates if g["id"] == gate_id), None
         ) if gate_id else None
         plot_type = preview.get("type", "scatter")
+        gate_type = gate.get("plot_type") if gate is not None else None
+        gate_axes_ok = gate is not None and gate_type in (None, plot_type)
+        old_axes = (preview.get("x"), preview.get("y"))
         if plot_type == "image":
             preview["x"] = "x" if "x" in new_cols else None
             preview["y"] = "y" if "y" in new_cols else None
@@ -35392,32 +36085,33 @@ class MainWindow(QMainWindow):
             if preview.get("image_channel") not in channels:
                 preview["image_channel"] = channels[0] if channels else None
         elif plot_type == "histogram":
-            if gate is not None and gate.get("x"):
-                preview["x"] = gate["x"]
-            else:
-                preview["x"] = (
-                    preview.get("last_x") if preview.get("last_x") in new_cols
-                    else (new_cols[0] if new_cols else None)
-                )
+            x = gate["x"] if gate_axes_ok and gate.get("x") else None
+            if x not in new_cols:
+                x, _ = self._gating_default_axes(new_cols, preview)
+            preview["x"] = x if x in new_cols else (
+                new_cols[0] if new_cols else None
+            )
             preview["y"] = None
         else:
-            if gate is not None and gate.get("x") and gate.get("y"):
+            if gate_axes_ok and gate.get("x") and gate.get("y"):
                 preview["x"] = gate["x"]
                 preview["y"] = gate["y"]
             else:
-                preview["x"] = (
-                    preview.get("last_x") if preview.get("last_x") in new_cols else None
-                )
-                preview["y"] = (
-                    preview.get("last_y") if preview.get("last_y") in new_cols else None
+                preview["x"], preview["y"] = self._gating_default_axes(
+                    new_cols, preview
                 )
         # Keep the visible range when switching files (not for image view,
-        # which uses the image's own extent).
+        # which uses the image's own extent), but only when the axes did not
+        # change with the file.
+        keep_view = (
+            plot_type != "image"
+            and (preview.get("x"), preview.get("y")) == old_axes
+        )
         vb = page._gating_viewbox
         xr, yr = vb.viewRange()
         self._gating_reload_rois(page)
         self._gating_render(page)
-        if plot_type != "image":
+        if keep_view:
             vb.setXRange(xr[0], xr[1], padding=0)
             vb.setYRange(yr[0], yr[1], padding=0)
         # Clear the previous file's statistics and recompute for this one.
@@ -35426,6 +36120,10 @@ class MainWindow(QMainWindow):
         self._gating_mark_dirty(page)
         self._gating_rebuild_settings(page)
         self._gating_refresh_files(page)
+        runlog.action(
+            "gating.file", module=str(page._gating_task_id),
+            old=old_file, new=str(path), type=str(plot_type),
+        )
 
     def _gating_mark_dirty(self, page) -> None:
         page._gating_dirty = True
@@ -35454,6 +36152,10 @@ class MainWindow(QMainWindow):
             })
             if page._gating_uses_store
             else copy.deepcopy(page._gating_task_def.get("params", {}))
+        )
+        runlog.info(
+            "gating.saved", module=str(page._gating_task_id),
+            gates=len(page._gating_gates), files=len(page._gating_files or []),
         )
         page._gating_dirty = False
         self._gating_update_save_btn(page)
@@ -35541,10 +36243,16 @@ class MainWindow(QMainWindow):
 
     def _open_module(self, task_id: str | None, task_type: str | None, name: str) -> None:
         """Open (or focus) the module tab for the given task (identified by id)."""
+        import time as _time
+
+        started = _time.perf_counter()
+        runlog.action("module.open_request", id=str(task_id or ""),
+                      type=str(task_type or ""), name=name)
         for index in range(1, self.tabs.count()):  # skip Workflow at index 0
             page = self.tabs.widget(index)
             if page.property("task_id") == task_id:
                 self.tabs.setCurrentIndex(index)
+                runlog.action("module.focus", id=str(task_id or ""))
                 return
 
         task_def = self._find_task_by_id(task_id)
@@ -35602,10 +36310,20 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(page)
         if task_id:
             self._module_register(task_id, task_type, page)
+        runlog.info(
+            "module.open", id=str(task_id or ""), type=str(task_type or ""),
+            name=name, locked=bool(locked),
+            seconds=round(_time.perf_counter() - started, 3),
+        )
 
     def _close_module_page(self, page: QWidget) -> None:
         """Close a module page's tab (never the Workflow tab)."""
         task_id = page.property("task_id")
+        task = self._find_task_by_id(task_id) if task_id else None
+        runlog.info(
+            "module.close", id=str(task_id or ""),
+            type=str((task or {}).get("type") or ""),
+        )
         if task_id:
             self._module_registry.pop(task_id, None)
         index = self.tabs.indexOf(page)
@@ -35616,6 +36334,7 @@ class MainWindow(QMainWindow):
 def main() -> int:
     """Run the application."""
     _install_excepthook()
+    _install_qt_message_handler()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_NAME)
