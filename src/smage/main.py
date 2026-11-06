@@ -6587,6 +6587,37 @@ class _ZoomPixmapLabel(QLabel):
         super().wheelEvent(event)
 
 
+def _fcs_safe_channel_names(columns) -> tuple:
+    """Channel names that are legal inside an FCS TEXT segment.
+
+    TEXT keywords are separated by ``/``, so a channel name containing it
+    would split into an empty keyword name (readers such as R's flowCore
+    reject the file). ``$`` marks a keyword and is stripped by readers, so it
+    is replaced too. Returns the safe names and one note per changed name.
+    """
+    names = []
+    notes = []
+    seen = {}
+
+    def clean(value) -> str:
+        text = str(value).replace("/", "_").replace("$", "_")
+        text = "".join(ch for ch in text if ch >= " ").strip()
+        return text or "channel"
+
+    for column in columns:
+        base = clean(column)
+        count = seen.get(base.casefold(), 0) + 1
+        seen[base.casefold()] = count
+        name = base if count == 1 else f"{base}_{count}"
+        if name != str(column):
+            notes.append(
+                f"channel '{column}' written as '{name}' "
+                "(FCS does not allow '/' or '$' in names)"
+            )
+        names.append(name)
+    return names, notes
+
+
 class _ExportCancelled(Exception):
     """Raised inside a running export job when the user stops it."""
 
@@ -32717,13 +32748,15 @@ class MainWindow(QMainWindow):
                     f"'{name}': {lost:,} non-numeric value(s) written as NaN"
                 )
             matrix[:, j] = converted.to_numpy(dtype="float64")
+        channel_names, name_notes = _fcs_safe_channel_names(columns)
+        notes.extend(name_notes)
         data = _array("f")
         data.frombytes(
             np.ascontiguousarray(matrix.reshape(-1), dtype="<f4").tobytes()
         )
         with open(target, "wb") as fh:
             flowio.create_fcs(
-                fh, data, list(columns), opt_channel_names=list(columns)
+                fh, data, channel_names, opt_channel_names=channel_names
             )
         notes.append("FCS stores 32-bit floats")
         return notes
