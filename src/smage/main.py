@@ -1292,6 +1292,33 @@ EXTENSION_DEFS = [
         "model": "2D_versatile_fluo",
         "desc": "StarDist star-convex cell segmentation on CPU",
     },
+    {
+        # FlowSOM (GPL-3.0) is never bundled with Smage: the user installs it
+        # into a separate Python environment and the Cluster module calls it
+        # as an external process.
+        "id": "flowsom",
+        "name": "FlowSOM",
+        "family": "flowsom",
+        "device": "cpu",
+        "pip": "flowsom",
+        "deps": ["scanpy"],
+        "runner": "flowsom_runner.py",
+        "desc": "FlowSOM clustering (SOM + consensus meta-clustering) "
+                "for the Cluster module",
+    },
+    {
+        # PARC brings native extensions (hnswlib, pybind11) that nothing else
+        # in Smage needs, so it also lives in an external environment.
+        "id": "parc",
+        "name": "PARC",
+        "family": "parc",
+        "device": "cpu",
+        "pip": "parc",
+        "deps": ["hnswlib"],
+        "runner": "parc_runner.py",
+        "desc": "PARC graph clustering (HDBSCAN + community detection) "
+                "for the Cluster module",
+    },
 ]
 
 
@@ -7711,8 +7738,11 @@ class MainWindow(QMainWindow):
             self._ext_worker_obj = worker
         return worker
 
-    def _open_extension_manager(self) -> None:
-        """Open the Extension Manager dialog (global, outside the workflow)."""
+    def _open_extension_manager(self, select: str | None = None) -> None:
+        """Open the Extension Manager dialog (global, outside the workflow).
+
+        ``select`` preselects an extension id (e.g. "flowsom").
+        """
         dlg = _ExtManagerDialog(
             self, lambda: getattr(self, "_ext_busy", False)
         )
@@ -7752,12 +7782,29 @@ class MainWindow(QMainWindow):
 
         list_widget.currentRowChanged.connect(show)
         if EXTENSION_DEFS:
-            list_widget.setCurrentRow(0)
+            index = 0
+            if select:
+                index = next(
+                    (
+                        i for i, entry in enumerate(EXTENSION_DEFS)
+                        if entry.get("id") == select
+                    ),
+                    0,
+                )
+            list_widget.setCurrentRow(index)
 
         # Stop the poll timer as soon as the manager is closed, so its callback
         # never touches widgets from a destroyed panel.
         dlg.finished.connect(lambda _=0: stop_timer())
         dlg.exec()
+        # The extension state may have changed: refresh the open modules that
+        # depend on FlowSOM (hints and the Calculate button).
+        for index in range(1, self.tabs.count()):
+            page = self.tabs.widget(index)
+            if hasattr(page, "_ba_flowsom_status"):
+                self._ba_update_flowsom_ext(page)
+            if hasattr(page, "_cluster_ext_hint"):
+                self._cluster_update_ext_state(page)
 
     def _ext_detail_panel(self, host, entry) -> None:
         """Build the detail panel for one extension in the manager."""
@@ -7771,9 +7818,12 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(QLabel(f"<b>{entry['name']}</b>"))
         lay.addWidget(QLabel(entry["desc"]))
+        components = list(dict.fromkeys(
+            [entry["pip"]] + list(entry.get("deps") or [])
+        ))
         lay.addWidget(QLabel(
             "Runs in a separate Python environment; Smage does not bundle "
-            "TensorFlow / PyTorch."
+            + " / ".join(components) + "."
         ))
         note = (
             "You don't have to use the buttons below — you can install "
@@ -30507,6 +30557,13 @@ class MainWindow(QMainWindow):
             "source": str(parquet_path),
             "stat": stat,
         }
+        # FlowSOM and PARC run in the user's extension environment; a new
+        # version can change the clusters, so old results become stale.
+        method = params.get("method")
+        if method in ("flowsom", "parc"):
+            payload["extension_version"] = (
+                self._ext_entry(method).get("version") or ""
+            )
         sample = self._subsample_sig(task_id, parquet_path)
         if sample:
             payload["sample"] = sample
@@ -30971,6 +31028,17 @@ class MainWindow(QMainWindow):
         page._cluster_name = name_edit
         page._cluster_warn = warn
 
+        # Shown when the selected method needs an external extension that is
+        # not configured (FlowSOM or PARC); Calculate is disabled meanwhile.
+        ext_hint = QLabel("")
+        ext_hint.setWordWrap(True)
+        ext_hint.setStyleSheet(
+            "color: #b58900; font-weight: bold; font-size: 8pt;"
+        )
+        ext_hint.setVisible(False)
+        lay.addWidget(ext_hint)
+        page._cluster_ext_hint = ext_hint
+
         calc_btn = QPushButton("Calculate")
         calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         calc_btn.setEnabled(False)
@@ -31017,6 +31085,29 @@ class MainWindow(QMainWindow):
             return
         page._cluster_params.setdefault(group, {})[key] = value
         self._cluster_mark_dirty(page)
+
+    def _cluster_update_ext_state(self, page) -> None:
+        """Warn when the selected method's external extension is missing.
+
+        FlowSOM and PARC run in the user's Python environment; there is no
+        setup shortcut — Calculate stays disabled until the extension is
+        installed from Extension → Manage Extensions.
+        """
+        method = page._cluster_params.get("method") or ""
+        missing = None
+        if method == "flowsom" and not self._ext_ready("flowsom"):
+            missing = "FlowSOM"
+        elif method == "parc" and not self._ext_ready("parc"):
+            missing = "PARC"
+        hint = getattr(page, "_cluster_ext_hint", None)
+        if hint is not None:
+            if missing:
+                hint.setText(
+                    f"{missing} extension is not configured. Install it in "
+                    "Extension → Manage Extensions before calculating."
+                )
+            hint.setVisible(bool(missing))
+        self._cluster_update_calc_btn(page)
 
     def _cluster_on_normalize(self, page) -> None:
         if getattr(page, "_cluster_updating", False):
@@ -31111,7 +31202,22 @@ class MainWindow(QMainWindow):
             and name
             and not self._cluster_name_conflict(page)
         )
-        page._cluster_calc_btn.setEnabled(ok and not page._cluster_locked)
+        method = str(params.get("method") or "")
+        missing = None
+        if method == "flowsom" and not self._ext_ready("flowsom"):
+            missing = "FlowSOM"
+        elif method == "parc" and not self._ext_ready("parc"):
+            missing = "PARC"
+        page._cluster_calc_btn.setEnabled(
+            ok and not page._cluster_locked and missing is None
+        )
+        if missing:
+            page._cluster_calc_btn.setToolTip(
+                f"Install the {missing} extension first "
+                "(Extension → Manage Extensions)."
+            )
+        else:
+            page._cluster_calc_btn.setToolTip("")
 
     def _cluster_refresh(self, page) -> None:
         params = page._cluster_params
@@ -31167,6 +31273,7 @@ class MainWindow(QMainWindow):
             method = params.get("method")
             page._cluster_kmeans_host.setVisible(method == "kmeans")
             page._cluster_flowsom_host.setVisible(method == "flowsom")
+            self._cluster_update_ext_state(page)
             page._cluster_phenograph_host.setVisible(method == "phenograph")
             page._cluster_leiden_host.setVisible(method == "leiden")
             page._cluster_dbscan_host.setVisible(method == "dbscan")
@@ -31237,23 +31344,13 @@ class MainWindow(QMainWindow):
         return X
 
     def _cluster_fit(self, method, cfg, X, seed):
-        """Fit the chosen clustering algorithm; return 1-based labels."""
-        import math
+        """Fit the chosen clustering algorithm; return 1-based labels.
 
+        FlowSOM is not handled here: it runs in the user's external Python
+        environment (see ``_cluster_fit_flowsom``), so Smage never imports it.
+        """
         import numpy as np
 
-        if method == "flowsom":
-            import flowsom as fs
-
-            nodes = int(cfg.get("nodes", 100))
-            xdim = int(math.isqrt(nodes)) or 1
-            ydim = max(1, math.ceil(nodes / xdim))
-            fsom = fs.FlowSOM(
-                X, n_clusters=int(cfg.get("k", 20)),
-                xdim=xdim, ydim=ydim, seed=seed,
-            )
-            labels = fsom.get_cell_data().obs["metaclustering"].to_numpy(dtype="int64")
-            return labels + 1
         if method == "kmeans":
             from sklearn.cluster import KMeans
 
@@ -31275,17 +31372,6 @@ class MainWindow(QMainWindow):
 
             model = AgglomerativeClustering(n_clusters=int(cfg.get("k", 20)))
             return model.fit_predict(X).astype("int64") + 1
-        if method == "parc":
-            from parc import PARC
-
-            model = PARC(
-                X,
-                knn=int(cfg.get("knn", 30)),
-                resolution_parameter=float(cfg.get("resolution", 1.0)),
-                random_seed=seed,
-            )
-            model.run_PARC()
-            return np.asarray(model.labels, dtype="int64") + 1
         # PhenoGraph and Leiden build a kNN graph first (scanpy).
         import scanpy as sc
         import anndata as ad
@@ -31303,6 +31389,173 @@ class MainWindow(QMainWindow):
         # PhenoGraph ≈ kNN graph + Louvain community detection.
         sc.tl.louvain(adata, resolution=1.0, random_state=seed)
         return adata.obs["louvain"].to_numpy(dtype="int64") + 1
+
+    def _run_extension_process(self, page, q, argv, cancel_flag,
+                               name="Extension") -> None:
+        """Run an external extension command, streaming its output.
+
+        Cancel kills the process promptly, even while it prints nothing.
+        """
+        import subprocess
+
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        lines = queue.Queue()
+
+        def reader():
+            for raw in proc.stdout:
+                lines.put(raw)
+            lines.put(None)
+
+        threading.Thread(target=reader, daemon=True).start()
+        try:
+            while True:
+                try:
+                    raw = lines.get(timeout=0.1)
+                except queue.Empty:
+                    raw = ""
+                if raw is None:
+                    break
+                line = (raw or "").strip()
+                if line:
+                    q.put(("log", line))
+                if getattr(page, cancel_flag, False):
+                    raise ValueError("Calculation cancelled.")
+            code = proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        if code != 0:
+            raise ValueError(f"{name} exited with code {code}")
+
+    def _flowsom_external(self, page, q, X, xdim, ydim, k, seed,
+                          cancel_flag="_cluster_cancel") -> dict:
+        """Run FlowSOM in the extension environment; return its arrays.
+
+        Shared by Cluster (FlowSOM method) and Batch Alignment (CytoNorm
+        training). Smage never imports flowsom itself.
+        """
+        import tempfile
+        from pathlib import Path as _Path
+
+        import numpy as np
+
+        if not self._ext_ready("flowsom"):
+            raise ValueError(
+                "FlowSOM extension is not configured. Open Extension → "
+                "Manage Extensions and set it up first."
+            )
+        python = self._ext_python("flowsom")
+        runner = self._ext_runner_path("flowsom")
+        q.put(("log", f"FlowSOM external run: grid {xdim}×{ydim}, k={k}, "
+                      f"python={python}"))
+        with tempfile.TemporaryDirectory(prefix="smage-flowsom-") as tmp:
+            matrix = _Path(tmp) / "matrix.npy"
+            result = _Path(tmp) / "result.npz"
+            # Keep the caller's dtype: Cluster passes float64 and CytoNorm
+            # float32, exactly as the previous in-process calls did.
+            np.save(matrix, np.ascontiguousarray(X))
+            argv = [
+                python, str(runner), "run",
+                "--input", str(matrix), "--output", str(result),
+                "--xdim", str(int(xdim)), "--ydim", str(int(ydim)),
+                "--k", str(int(k)), "--seed", str(int(seed)),
+            ]
+            self._run_extension_process(
+                page, q, argv, cancel_flag, name="FlowSOM"
+            )
+            if not result.is_file():
+                raise ValueError("FlowSOM did not produce a result file")
+            with np.load(result) as data:
+                return {
+                    "cell_cluster": np.asarray(
+                        data["cell_cluster"], dtype="int64"
+                    ),
+                    "node_cluster": np.asarray(
+                        data["node_cluster"], dtype="int32"
+                    ),
+                    "codes": np.asarray(data["codes"], dtype="float32"),
+                    "n_clusters": int(data["n_clusters"]),
+                }
+
+    def _parc_external(self, page, q, X, knn, resolution, seed,
+                       cancel_flag="_cluster_cancel"):
+        """Run PARC in the extension environment; return 1-based labels."""
+        import tempfile
+        from pathlib import Path as _Path
+
+        import numpy as np
+
+        if not self._ext_ready("parc"):
+            raise ValueError(
+                "PARC extension is not configured. Open Extension → "
+                "Manage Extensions and set it up first."
+            )
+        python = self._ext_python("parc")
+        runner = self._ext_runner_path("parc")
+        q.put(("log", f"PARC external run: knn={knn}, resolution={resolution}, "
+                      f"python={python}"))
+        with tempfile.TemporaryDirectory(prefix="smage-parc-") as tmp:
+            matrix = _Path(tmp) / "matrix.npy"
+            result = _Path(tmp) / "result.npz"
+            np.save(matrix, np.ascontiguousarray(X))
+            argv = [
+                python, str(runner), "run",
+                "--input", str(matrix), "--output", str(result),
+                "--knn", str(int(knn)),
+                "--resolution", str(float(resolution)),
+                "--seed", str(int(seed)),
+            ]
+            self._run_extension_process(
+                page, q, argv, cancel_flag, name="PARC"
+            )
+            if not result.is_file():
+                raise ValueError("PARC did not produce a result file")
+            with np.load(result) as data:
+                labels = np.asarray(data["labels"], dtype="int64")
+        if labels.size != X.shape[0]:
+            raise ValueError(
+                "PARC returned an unexpected number of labels "
+                f"({labels.size} for {X.shape[0]} rows)"
+            )
+        return labels + 1
+
+    def _cluster_fit_parc(self, page, q, cfg, X, seed):
+        return self._parc_external(
+            page, q, X, int(cfg.get("knn", 30)),
+            float(cfg.get("resolution", 1.0)), seed,
+            cancel_flag="_cluster_cancel",
+        )
+
+    def _cluster_fit_flowsom(self, page, q, cfg, X, seed):
+        """Run FlowSOM in the extension's external Python and return labels."""
+        import math
+
+        import numpy as np
+
+        nodes = int(cfg.get("nodes", 100))
+        xdim = int(math.isqrt(nodes)) or 1
+        ydim = max(1, math.ceil(nodes / xdim))
+        result = self._flowsom_external(
+            page, q, X, xdim, ydim, int(cfg.get("k", 20)), seed,
+            cancel_flag="_cluster_cancel",
+        )
+        labels = result["cell_cluster"]
+        if labels.size != X.shape[0]:
+            raise ValueError(
+                "FlowSOM returned an unexpected number of labels "
+                f"({labels.size} for {X.shape[0]} rows)"
+            )
+        return labels + 1
 
     def _cluster_write_file(self, page, path, labels, row_indices=None):
         """Write one file's labels; return (rel, columns, kind)."""
@@ -31418,12 +31671,23 @@ class MainWindow(QMainWindow):
             X = self._cluster_prepare(X, bool(params.get("normalize")))
 
             method = params.get("method", "kmeans")
-            cfg = params.get("kmeans") if method == "kmeans" else params.get("flowsom")
-            detail = ", ".join(f"{k}={v}" for k, v in (cfg or {}).items())
+            # Each method keeps its own parameter group; FlowSOM runs in the
+            # external extension environment instead of this process.
+            cfg = params.get(method) or {}
+            detail = ", ".join(f"{k}={v}" for k, v in cfg.items())
             q.put(("log", f"Clustering {method.upper()} ({detail})…"))
             q.put(("status", "Clustering… (25%)"))
             t0 = time.time()
-            labels = self._cluster_fit(method, cfg, X, self._CLUSTER_SEED)
+            if method == "flowsom":
+                labels = self._cluster_fit_flowsom(
+                    page, q, cfg, X, self._CLUSTER_SEED
+                )
+            elif method == "parc":
+                labels = self._cluster_fit_parc(
+                    page, q, cfg, X, self._CLUSTER_SEED
+                )
+            else:
+                labels = self._cluster_fit(method, cfg, X, self._CLUSTER_SEED)
             fit_seconds = time.time() - t0
             q.put(("log", f"Clustering finished in {fit_seconds:.1f}s"))
 
@@ -31464,6 +31728,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Calculate", message)
             return
         params = page._cluster_params
+        method = params.get("method") or ""
+        if method in ("flowsom", "parc") and not self._ext_ready(method):
+            name = "FlowSOM" if method == "flowsom" else "PARC"
+            QMessageBox.information(
+                self, "Calculate",
+                f"{name} extension is not configured.\n"
+                f"Open Extension → Manage Extensions and install {name} "
+                "in a separate Python environment first.",
+            )
+            return
         files = params.get("files") or []
         existing = [p for p in files if isinstance((params.get("outputs") or {}).get(p), dict)]
         if existing:
@@ -36782,6 +37056,12 @@ class MainWindow(QMainWindow):
             "cytonorm": params.get("cytonorm") or {},
             "combat": params.get("combat") or {},
         }
+        if (params.get("method") or "cytonorm") == "cytonorm":
+            # CytoNorm trains FlowSOM externally; a different FlowSOM version
+            # can produce different clusters, so old models become stale.
+            payload["flowsom_extension"] = (
+                self._ext_entry("flowsom").get("version") or ""
+            )
         return hashlib.sha1(
             json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:16]
@@ -37191,6 +37471,19 @@ class MainWindow(QMainWindow):
         page._ba_param_hint = hint
 
         lay.addWidget(QLabel("<b>Run</b>"))
+        # Shown only for CytoNorm without a configured FlowSOM extension; the
+        # Calculate button is disabled in that state.
+        flowsom_hint = QLabel(
+            "FlowSOM extension is not configured. Install it in "
+            "Extension → Manage Extensions before calculating."
+        )
+        flowsom_hint.setWordWrap(True)
+        flowsom_hint.setStyleSheet(
+            "color: #b58900; font-weight: bold; font-size: 8pt;"
+        )
+        flowsom_hint.setVisible(False)
+        lay.addWidget(flowsom_hint)
+        page._ba_flowsom_status = flowsom_hint
         buttons = QHBoxLayout()
         calc_btn = QPushButton("Calculate")
         calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -37289,6 +37582,20 @@ class MainWindow(QMainWindow):
         page._ba_params["method"] = page._ba_method.currentData() or "cytonorm"
         self._ba_refresh(page)
         self._ba_mark_dirty(page)
+
+    def _ba_update_flowsom_ext(self, page) -> None:
+        """Warn (for CytoNorm) when the external FlowSOM is not configured.
+
+        There is no setup shortcut: the user installs the extension from
+        Extension → Manage Extensions, and Calculate stays disabled until it
+        is ready.
+        """
+        method = page._ba_params.get("method") or "cytonorm"
+        ready = self._ext_ready("flowsom")
+        status = getattr(page, "_ba_flowsom_status", None)
+        if status is not None:
+            status.setVisible(method == "cytonorm" and not ready)
+        self._ba_update_calc_btn(page)
 
     def _ba_on_param(self, page) -> None:
         if getattr(page, "_ba_updating", False):
@@ -37433,11 +37740,24 @@ class MainWindow(QMainWindow):
         ok = bool(files and params.get("columns"))
         if ok:
             ok = all((batches.get(path) or "").strip() for path in files)
+        flowsom_missing = False
         if ok and name == "cytonorm":
             refs = [p for p in params.get("references") or [] if p in files]
             ok = bool(refs)
+            # CytoNorm trains FlowSOM externally; without the extension the
+            # fit cannot run, so Calculate stays disabled.
+            if not self._ext_ready("flowsom"):
+                flowsom_missing = True
+                ok = False
         page._ba_calc_btn.setEnabled(ok and not page._ba_locked
                                      and not page._ba_running)
+        if flowsom_missing:
+            page._ba_calc_btn.setToolTip(
+                "Install the FlowSOM extension first "
+                "(Extension → Manage Extensions)."
+            )
+        else:
+            page._ba_calc_btn.setToolTip("")
         page._ba_report_btn.setEnabled(
             self._ba_model_current(page) and not page._ba_locked
             and not page._ba_reporting
@@ -37454,6 +37774,7 @@ class MainWindow(QMainWindow):
             page._ba_method.blockSignals(False)
             method = params.get("method", "cytonorm")
             page._ba_cytonorm_host.setVisible(method == "cytonorm")
+            self._ba_update_flowsom_ext(page)
             page._ba_combat_host.setVisible(method == "combat")
             page._ba_method_desc.setText(
                 "Aligns every file to the reference samples of its batch: "
@@ -37568,6 +37889,17 @@ class MainWindow(QMainWindow):
         if not ok:
             QMessageBox.warning(self, "Calculate", message)
             return
+        if (page._ba_params.get("method") or "cytonorm") == "cytonorm" and (
+            not self._ext_ready("flowsom")
+        ):
+            QMessageBox.information(
+                self, "Calculate",
+                "FlowSOM extension is not configured.\n"
+                "CytoNorm trains FlowSOM in a separate Python environment. "
+                "Open Extension → Manage Extensions and install FlowSOM "
+                "first.",
+            )
+            return
         if self._ba_model_current(page):
             reply = QMessageBox.question(
                 self, "Calculate",
@@ -37632,11 +37964,12 @@ class MainWindow(QMainWindow):
         return matrix[np.isfinite(matrix).all(axis=1)]
 
     def _ba_fit_cytonorm(self, page, q):
-        """Train FlowSOM on the references, then fit per-cluster splines."""
-        import anndata as ad
+        """Train FlowSOM on the references, then fit per-cluster splines.
+
+        FlowSOM runs in the user's external Python environment (the same
+        extension the Cluster module uses), so Smage never imports it.
+        """
         import numpy as np
-        import pandas as pd
-        from flowsom import FlowSOM
         from scipy.interpolate import PchipInterpolator
 
         params = page._ba_params
@@ -37686,19 +38019,17 @@ class MainWindow(QMainWindow):
         q.put(("status", f"Training FlowSOM ({xdim}×{ydim})…"))
         q.put(("log", f"FlowSOM on {train.shape[0]:,} cells, grid {xdim}×{ydim}, "
                       f"{want_clusters} cluster(s)"))
-        adata = ad.AnnData(X=train, var=pd.DataFrame(index=columns))
-        fsom = FlowSOM(
-            adata, n_clusters=want_clusters, cols_to_use=columns,
-            xdim=xdim, ydim=ydim, seed=seed,
+        result = self._flowsom_external(
+            page, q, train, xdim, ydim, want_clusters, seed,
+            cancel_flag="_ba_cancel",
         )
-        codes = np.asarray(fsom.model.codes, dtype="float32")
-        nodes = np.asarray(fsom.model.cluster_labels).astype(np.int64)
-        metaclusters = np.asarray(fsom.model.metacluster_labels).astype(np.int64)
-        node_cluster = np.zeros(codes.shape[0], dtype=np.int32)
-        node_cluster[nodes] = metaclusters
-        n_clusters = int(node_cluster.max()) + 1
+        codes = result["codes"]
+        node_cluster = result["node_cluster"]
         # Metacluster of every training cell (the unit the splines are fit on).
-        cell_cluster = node_cluster[nodes]
+        cell_cluster = result["cell_cluster"]
+        n_clusters = int(result["n_clusters"])
+        if cell_cluster.size != train.shape[0]:
+            raise ValueError("FlowSOM returned an unexpected number of labels")
 
         q.put(("status", "Fitting per-cluster splines…"))
         probs = np.arange(1, nq + 1) / (nq + 1)

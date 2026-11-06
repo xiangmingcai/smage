@@ -66,5 +66,11 @@
 ## 发布准备
 
 - [ ] 打包为 Windows 可执行程序（PyInstaller 等）并验证 `pythonw` 启动方式；把 `data/icon/*.svg` 复制到 `src/smage/icons/` 一并打包（`_module_icon_dir()` 会优先读包内目录）。
-- [ ] 确定 License，补齐 README（功能列表、截图、安装说明）。
+- [ ] **确定以 GPL-3.0 发布**：
+  - [ ] 根目录添加 `LICENSE`（GPL-3.0 全文），README 写明 "Smage is free software under GPL-3.0"。
+  - [ ] 发布安装包时必须向用户提供完整对应源码（公开 GitHub 仓库，或随包提供源码包/下载链接）。
+  - [ ] 用户协议/EULA 不得附加与 GPL 冲突的限制（禁止再分发、禁止商用等）。
+  - [ ] 决定是否接受外部代码贡献；若接受，先确定 CLA / DCO 策略，以保留将来双许可的可能性。
+  - [ ] 发布前用 `pip-licenses` / ScanCode 审计全部依赖的许可证（重点排查 GPL-2.0-only 等与 GPL-3.0 不兼容的项，以及 Cellpose/StarDist 模型权重的独立条款），生成 `LICENSES/` 目录随安装包分发。
+- [ ] 补齐 README（功能列表、截图、安装说明）。
 - [ ] 统一错误提示与日志格式。

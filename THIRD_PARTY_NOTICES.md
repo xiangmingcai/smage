@@ -21,7 +21,22 @@ This file is a summary — the authoritative text lives in each package's own
 | flowio | 1.4.0 | BSD 3-Clause | Copyright (c) 2019, Scott White. |
 | umap-learn | 0.5.12 | BSD 3-Clause | |
 | scikit-learn | 1.9.1 | BSD 3-Clause | |
-| NodeGraphQt | 0.6.44 | MIT | |
+| scanpy | 1.11.5 | BSD 3-Clause | Used by the Cluster module's PhenoGraph / Leiden methods. |
+| igraph | 0.11.9 | GPL-2.0-or-later | Graph backend required by scanpy's Louvain/Leiden. |
+| leidenalg | 0.12.0 | GPL-3.0 | Leiden community detection for scanpy. |
+
+## Optional extensions (installed by the user, not bundled)
+
+These are installed by the user into a separate Python environment from Smage's
+Extension Manager. They are distributed by their own authors, under their own
+licenses, and are not part of the Smage installer.
+
+| Component | License | Note |
+|---|---|---|
+| FlowSOM (Python package `flowsom`) | GPL-3.0 | Used by the Cluster module as an external process. Smage does not bundle or redistribute it; the user installs it with pip in a separate environment. |
+| scanpy / igraph / leidenalg (FlowSOM's dependencies) | BSD-3 / GPL-2.0-or-later / GPL-3.0 | Also installed by the user when setting up the FlowSOM extension. |
+| PARC (Python package `parc`) | MIT | Used by the Cluster module as an external process. Not bundled; the user installs it in the same kind of separate environment. |
+| hnswlib / pybind11 (PARC's native dependencies) | Apache-2.0 / BSD-3 | Installed with PARC in the user's environment; not part of the Smage installer. |
 
 ## Build-time only (not bundled into the application)
 

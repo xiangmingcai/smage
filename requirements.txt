@@ -16,15 +16,21 @@ flowio
 umap-learn
 scikit-learn
 openTSNE  # optional t-SNE backend (experimental)
-flowsom  # clustering (FlowSOM)
+# FlowSOM is NOT bundled: it is a GPL-3.0 package that the user installs into
+# a separate Python environment (Extension Manager → FlowSOM). The Cluster
+# module calls it as an external process.
+# PhenoGraph / Leiden still use scanpy inside the app, and scanpy alone does
+# not pull the graph backends, so they are listed explicitly.
+scanpy
+igraph
+leidenalg
 louvain  # clustering (PhenoGraph via scanpy)
-parc  # clustering (PARC)
+# PARC is NOT bundled either: it needs native extensions (hnswlib, pybind11)
+# that nothing else uses. The user installs it with pip from the Extension
+# Manager; the Cluster module calls it as an external process.
 peacoqc-rs  # data cleaning (PeacoQC; imported as `peacoqc`)
 polars  # required by peacoqc-rs (event tables)
 matplotlib  # batch-alignment report figures (SVG/PDF/PNG)
-
-# Pipeline editor (used in a later phase)
-NodeGraphQt
 
 # Packaging (used in the release phase)
 PyInstaller
