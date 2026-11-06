@@ -232,6 +232,8 @@ class SessionLog:
                 self._flush()
                 return
             self._write_line_locked(line)
+            # Flush every line: a crash must not lose the last breadcrumb.
+            self._flush()
 
     def _flush(self) -> None:
         fh = self._file

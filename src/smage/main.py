@@ -39,12 +39,14 @@ from PySide6.QtGui import (
     QFontMetrics,
     QIcon,
     QImage,
+    QMouseEvent,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
     QPolygonF,
     QTextCursor,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -773,6 +775,7 @@ TASK_TYPES = {
     "import": ("Data Import", "#9aa0a6"),
     "gating": ("Gating", "#f4b400"),
     "figure": ("Figure", "#34a853"),
+    "heatmap": ("Heatmap", "#00838f"),
     "scale": ("Scale", "#4285f4"),
     "rename": ("Rename", "#8e9aab"),
     "unmix": ("Unmix", "#7b61ff"),
@@ -823,6 +826,7 @@ ADD_MODULE_GROUPS = [
     ]),
     ("Present & export", [
         "figure",
+        "heatmap",
         "export",
     ]),
 ]
@@ -1110,6 +1114,127 @@ def _subsample_allocate(params, sizes) -> dict:
             continue
         out[path] = max(0, min(value, sizes[path]))
     return out
+
+
+# ----- Heatmap module helpers -----------------------------------------
+def _heatmap_sample_counts(sizes: dict, mode: str, method: str, value: int) -> dict:
+    """Rows to keep per file for the Heatmap module.
+
+    ``mode`` is "full" or "sample"; with sampling, ``method`` is "uniform"
+    (``value`` rows per file) or "proportional" (``value`` rows distributed by
+    file size). A file never contributes more rows than it has.
+    """
+    sizes = {str(p): int(n) for p, n in (sizes or {}).items() if int(n) > 0}
+    if not sizes:
+        return {}
+    if mode != "sample":
+        return dict(sizes)
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return dict(sizes)
+    if method == "uniform":
+        return {path: min(rows, value) for path, rows in sizes.items()}
+    total = sum(sizes.values())
+    counts = {
+        path: min(rows, max(0, int(round(value * rows / total))))
+        for path, rows in sizes.items()
+    }
+    # Distribute the rounding remainder to files that still have room.
+    leftover = value - sum(counts.values())
+    for _ in range(8):
+        if leftover <= 0:
+            break
+        room = {
+            path: sizes[path] - counts[path]
+            for path in sizes if sizes[path] > counts[path]
+        }
+        if not room:
+            break
+        room_total = sum(room.values())
+        given = 0
+        for path, capacity in room.items():
+            if leftover <= 0:
+                break
+            share = min(
+                capacity, leftover,
+                max(1, int(round(leftover * capacity / room_total))),
+            )
+            counts[path] += share
+            leftover -= share
+            given += share
+        if given == 0:
+            break
+    return counts
+
+
+def _heatmap_normalize(matrix, mode: str):
+    """Return a float copy normalized by 'raw', 'column' or 'row' z-score."""
+    import warnings
+
+    import numpy as np
+
+    values = np.array(matrix, dtype="float64", copy=True)
+    if values.ndim != 2 or mode not in ("column", "row"):
+        return values
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            axis = 0 if mode == "column" else 1
+            mean = np.nanmean(values, axis=axis, keepdims=True)
+            std = np.nanstd(values, axis=axis, keepdims=True)
+            std = np.where(np.isfinite(std) & (std > 0), std, 1.0)
+            return (values - mean) / std
+
+
+def _heatmap_fill_nan(matrix, axis: int):
+    """Fill NaN cells with the mean of their row (axis=1) or column (axis=0)."""
+    import warnings
+
+    import numpy as np
+
+    values = np.array(matrix, dtype="float64", copy=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        fill = np.nanmean(values, axis=axis, keepdims=True)
+    fill = np.where(np.isfinite(fill), fill, 0.0)
+    return np.where(np.isfinite(values), values, fill)
+
+
+def _heatmap_linkage(matrix, metric: str, method: str):
+    """Dendrogram for a 2-D matrix (linkage + leaf order + draw coordinates)."""
+    import numpy as np
+
+    try:
+        from scipy.cluster.hierarchy import dendrogram, linkage
+    except ImportError:
+        return None
+    values = np.asarray(matrix, dtype="float64")
+    if values.ndim != 2 or values.shape[0] < 2:
+        return None
+    if method not in ("average", "complete", "single", "ward"):
+        method = "average"
+    try:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            warnings.simplefilter("ignore", UserWarning)
+            z = linkage(
+                values, method=method,
+                metric="euclidean" if method == "ward" else metric,
+            )
+            info = dendrogram(z, no_plot=True)
+    except Exception:  # noqa: BLE001
+        return None
+    return {
+        "linkage": [[float(a), float(b), float(c), int(d)] for a, b, c, d in z],
+        "order": [int(i) for i in info["leaves"]],
+        "icoord": [[float(v) for v in item] for item in info["icoord"]],
+        "dcoord": [[float(v) for v in item] for item in info["dcoord"]],
+    }
 
 
 # Extensions: external Python environments managed outside the workflow. Each
@@ -2096,6 +2221,25 @@ def _category_value_label(value) -> str:
             return str(int(value))
         return repr(value)
     return str(value)
+
+
+# Default size (px) of the gating plot card on its canvas.
+_GATING_PLOT_SIZE = (560, 480)
+
+# Smallest span given to a gate preview. pyqtgraph crashes while painting an
+# EllipseROI whose width or height is exactly 0, so a drag that is still
+# perfectly horizontal/vertical must not reach that state.
+_MIN_GATE_SPAN = 1e-6
+
+
+def _gating_plot_size(preview) -> tuple:
+    """The gating plot's fixed card size (width, height) in pixels."""
+    size = (preview or {}).get("size") or _GATING_PLOT_SIZE
+    try:
+        width, height = int(size[0]), int(size[1])
+    except (TypeError, ValueError, IndexError):
+        width, height = _GATING_PLOT_SIZE
+    return (max(200, min(4000, width)), max(200, min(4000, height)))
 
 
 def _default_gating_preview(rec, cols) -> dict:
@@ -3872,6 +4016,31 @@ def _gate_roi_pens(color: str | None = None) -> dict:
     )
 
 
+def _detach_gate_item(item) -> None:
+    """Drop a gate item's signal handlers before it leaves the scene.
+
+    The handlers are lambdas that capture the item itself, so removing the
+    item left a reference cycle; collecting it later (at an arbitrary moment)
+    could delete a Qt object while the scene/event loop still touched it.
+    Disconnecting here makes the deletion happen at a safe, known point.
+    """
+    from shiboken6 import isValid
+
+    if item is None or not isValid(item):
+        return
+    for name in (
+        "sigRegionChangeFinished", "sigRegionChangeStarted", "sigRegionChanged",
+        "sigClicked",
+    ):
+        signal = getattr(item, name, None)
+        if signal is None:
+            continue
+        try:
+            signal.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+
+
 class _NoClickScatter(pg.ScatterPlotItem):
     """Scatter points that never consume mouse clicks.
 
@@ -3916,24 +4085,31 @@ class _GateViewBox(pg.ViewBox):
         self._range_x1 = None
 
     def _cancel_preview(self) -> None:
-        if self._preview is not None:
-            self.removeItem(self._preview)
-            self._preview = None
-        if self._rubber is not None:
-            self.removeItem(self._rubber)
-            self._rubber = None
-        if self._first_highlight is not None:
-            self.removeItem(self._first_highlight)
-            self._first_highlight = None
-        if self._range_anchor is not None:
-            self.removeItem(self._range_anchor)
-            self._range_anchor = None
-        if self._range_band is not None:
-            self.removeItem(self._range_band)
-            self._range_band = None
-        if self._range_arrow is not None:
-            self.removeItem(self._range_arrow)
-            self._range_arrow = None
+        # Items whose C++ object was already destroyed (e.g. by a rebuild) are
+        # skipped: calling removeItem on them would be a use-after-free.
+        from shiboken6 import isValid
+
+        def drop(item):
+            if item is None:
+                return
+            try:
+                if isValid(item):
+                    self.removeItem(item)
+            except (RuntimeError, AttributeError):
+                pass
+
+        drop(self._preview)
+        self._preview = None
+        drop(self._rubber)
+        self._rubber = None
+        drop(self._first_highlight)
+        self._first_highlight = None
+        drop(self._range_anchor)
+        self._range_anchor = None
+        drop(self._range_band)
+        self._range_band = None
+        drop(self._range_arrow)
+        self._range_arrow = None
         self._start = None
         self._polygon_pts = []
         self._range_x1 = None
@@ -4007,7 +4183,9 @@ class _GateViewBox(pg.ViewBox):
             self._start = None
             self._release_view()
         if self._preview is None:
+            runlog.action("gating.drag_start", tool=str(self._tool))
             self._freeze_view()
+            runlog.action("gating.drag_frozen")
             start = self._clamp_to_bounds(
                 self.mapSceneToView(ev.buttonDownScenePos())
             )
@@ -4015,20 +4193,31 @@ class _GateViewBox(pg.ViewBox):
             self._preview = self._make_shape(
                 self._tool, (start.x(), start.y()), (0.0, 0.0)
             )
+            runlog.action("gating.drag_shape")
             self.addItem(self._preview, ignoreBounds=True)
+            runlog.action("gating.drag_added")
         p = self._clamp_to_bounds(self._pt(ev))
         x0, y0 = self._start.x(), self._start.y()
         x1, y1 = p.x(), p.y()
         pos = (min(x0, x1), min(y0, y1))
-        size = (abs(x1 - x0), abs(y1 - y0))
+        raw_w, raw_h = abs(x1 - x0), abs(y1 - y0)
+        size = (max(raw_w, _MIN_GATE_SPAN), max(raw_h, _MIN_GATE_SPAN))
         self._preview.setPos(pos)
         self._preview.setSize(size)
+        self._drag_updates = getattr(self, "_drag_updates", 0) + 1
+        if self._drag_updates <= 3 or self._drag_updates % 25 == 0:
+            runlog.action("gating.drag_update", n=self._drag_updates,
+                          size=(round(size[0], 3), round(size[1], 3)))
         if ev.isFinish():
             roi = self._preview
             self._preview = None
             self._start = None
+            runlog.action(
+                "gating.drag_finish", tool=str(self._tool),
+                size=(size[0], size[1]),
+            )
             try:
-                if roi.size().x() > 0 and roi.size().y() > 0:
+                if raw_w > 0 and raw_h > 0:
                     self._on_gate_created(self._tool, roi)
                 else:
                     self.removeItem(roi)
@@ -4047,6 +4236,15 @@ class _GateViewBox(pg.ViewBox):
             ev.accept()
 
     def _handle_click(self, ev) -> None:
+        if self._tool:
+            # Breadcrumb: click-based tools (polygon/quadrant/split/range) are
+            # otherwise invisible in the log until a gate finishes.
+            try:
+                pos = self._pt(ev)
+                runlog.action("gating.click", tool=str(self._tool),
+                              x=round(pos.x(), 3), y=round(pos.y(), 3))
+            except Exception:
+                runlog.action("gating.click", tool=str(self._tool))
         if self._tool == "polygon" and ev.button() == Qt.MouseButton.RightButton:
             self._finish_polygon()
             ev.accept()
@@ -4505,6 +4703,121 @@ class _DoubleClickFilter(QObject):
         if event.type() == QEvent.Type.MouseButtonDblClick:
             self._callback()
         return False
+
+
+class _GatingCanvasView(QGraphicsView):
+    """Canvas holding the gating plot card.
+
+    The wheel zooms the canvas itself when the cursor is over the empty canvas,
+    while a wheel over the plot keeps zooming the data (it is forwarded to the
+    embedded plot through the scene, exactly as before).
+    """
+
+    MIN_SCALE = 0.35
+    MAX_SCALE = 3.0
+    ZOOM_STEP = 1.15
+
+    def __init__(self, scene, plot_widget, card, parent=None) -> None:
+        super().__init__(scene, parent)
+        self._plot_widget = plot_widget
+        self._plot_viewport = plot_widget.viewport()
+        self._card = card
+        self._zoom = 1.0
+        self._plot_pressed = False
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setBackgroundBrush(QColor("#eef2f7"))
+        self.setRenderHints(QPainter.RenderHint.Antialiasing)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+    def _over_plot(self, view_pos) -> bool:
+        """True when the viewport point falls on the plot inside the card."""
+        proxy = self._card.graphicsProxyWidget()
+        if proxy is None:
+            return False
+        local = proxy.mapFromScene(self.mapToScene(view_pos))
+        top_left = self._plot_widget.mapTo(self._card, QPoint(0, 0))
+        rect = QRectF(
+            float(top_left.x()), float(top_left.y()),
+            float(self._plot_widget.width()), float(self._plot_widget.height()),
+        )
+        return rect.contains(local)
+
+    def _send_mouse(self, event) -> None:
+        """Forward a mouse event to the plot's viewport (translated)."""
+        view_pos = event.position().toPoint()
+        global_pos = self.viewport().mapToGlobal(view_pos)
+        local = self._plot_widget.mapFromGlobal(global_pos)
+        local = self._plot_viewport.mapFrom(self._plot_widget, local)
+        forwarded = QMouseEvent(
+            event.type(), QPointF(local),
+            QPointF(self._plot_viewport.mapToGlobal(local)),
+            event.button(), event.buttons(), event.modifiers(),
+        )
+        QApplication.sendEvent(self._plot_viewport, forwarded)
+
+    def mousePressEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._over_plot(event.position().toPoint())
+        ):
+            self._plot_pressed = True
+            self._send_mouse(event)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._plot_pressed or self._over_plot(event.position().toPoint()):
+            # Forward drags and plain hover moves alike: pyqtgraph needs hover
+            # events to highlight handles and to let gate ROIs be dragged.
+            self._send_mouse(event)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._plot_pressed:
+            self._plot_pressed = False
+            self._send_mouse(event)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self._over_plot(event.position().toPoint()):
+            # Keep forwarding the trailing release too: pyqtgraph delivers the
+            # queued double-click when the release arrives.
+            self._plot_pressed = True
+            self._send_mouse(event)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if not delta:
+            event.ignore()
+            return
+        if self._over_plot(event.position().toPoint()):
+            # The plot zooms its own data (pyqtgraph), anchored at the cursor.
+            super().wheelEvent(event)
+            return
+        factor = self.ZOOM_STEP if delta > 0 else 1.0 / self.ZOOM_STEP
+        new_zoom = self._zoom * factor
+        if new_zoom < self.MIN_SCALE or new_zoom > self.MAX_SCALE:
+            event.accept()
+            return
+        self._zoom = new_zoom
+        self.scale(factor, factor)
+        event.accept()
+
+    def reset_zoom(self) -> None:
+        self.resetTransform()
+        self._zoom = 1.0
 
 
 class _CardProxy(QGraphicsProxyWidget):
@@ -5283,6 +5596,7 @@ MODULE_KINDS = {
     "unmix": "generate",
     "segmentation": "generate",
     "figure": "visualize",
+    "heatmap": "visualize",
     "feature": "generate",
     "gate2col": "generate",
     # Placeholder modules (no implementation yet).
@@ -6221,6 +6535,479 @@ class _UIActionLogger(QObject):
             action.triggered.connect(on_trigger)
 
 
+def _heatmap_export_text(value) -> str:
+    """Number written to the clipboard (more precision than a cell label)."""
+    import math
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(value):
+        return ""
+    return f"{value:.6g}"
+
+
+def _heatmap_cell_text(value, decimals: int = 1) -> str:
+    """Number shown inside a heatmap cell (fixed decimals, default 1)."""
+    import math
+
+    if value is None:
+        return "NA"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    if not math.isfinite(value):
+        return "NA"
+    try:
+        decimals = max(0, min(6, int(decimals)))
+    except (TypeError, ValueError):
+        decimals = 1
+    return f"{value:.{decimals}f}"
+
+
+class _ZoomPixmapLabel(QLabel):
+    """Image label whose wheel zooms the rendered picture."""
+
+    def __init__(self, on_zoom=None, parent=None) -> None:
+        super().__init__(parent)
+        self._on_zoom = on_zoom
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if self._on_zoom is not None and delta:
+            self._on_zoom(
+                1.15 if delta > 0 else 1 / 1.15, event.position().toPoint()
+            )
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+
+class _HeatmapCanvas(QWidget):
+    """Paints the heatmap matrix with optional dendrograms and axis labels."""
+
+    ROW_DENDRO_WIDTH = 90
+    COL_DENDRO_HEIGHT = 70
+    COL_LABEL_HEIGHT = 130
+    LABEL_GAP = 6
+    COLORBAR_WIDTH = 14
+    COLORBAR_GAP = 24
+    COLORBAR_LABEL_WIDTH = 66
+    MARGIN = 10
+    NA_COLOR = "#d9d9d9"
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._rows = []
+        self._cols = []
+        self._values = None
+        self._row_dendro = None
+        self._col_dendro = None
+        self._cfg = {}
+        self._zoom = 1.0
+        self.setMouseTracking(True)
+        self.setMinimumSize(240, 160)
+        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum)
+
+    # -- content -----------------------------------------------------------
+    def set_content(self, rows, cols, values, row_dendro, col_dendro, cfg) -> None:
+        self._rows = list(rows or [])
+        self._cols = list(cols or [])
+        self._values = values
+        self._row_dendro = row_dendro
+        self._col_dendro = col_dendro
+        self._cfg = dict(cfg or {})
+        self.updateGeometry()
+        self.update()
+
+    def clear(self, message: str = "") -> None:
+        self._rows = []
+        self._cols = []
+        self._values = None
+        self._row_dendro = None
+        self._col_dendro = None
+        self._cfg = {"message": message}
+        self.updateGeometry()
+        self.update()
+
+    # -- geometry ----------------------------------------------------------
+    def _layout(self):
+        import numpy as np
+
+        values = self._values
+        if values is None or not self._rows or not self._cols:
+            return None
+        cfg = self._cfg
+        zoom = min(6.0, max(0.2, float(getattr(self, "_zoom", 1.0) or 1.0)))
+        cell_w = max(4, int(round(int(cfg.get("cell_width", 42)) * zoom)))
+        cell_h = max(4, int(round(int(cfg.get("cell_height", 28)) * zoom)))
+        metrics = QFontMetrics(self.font())
+        row_label_w = min(
+            260,
+            max(
+                (metrics.horizontalAdvance(str(r)) for r in self._rows),
+                default=0,
+            ) + 10,
+        )
+        try:
+            row_dendro_size = max(20, int(cfg.get("dendro_width", self.ROW_DENDRO_WIDTH)))
+        except (TypeError, ValueError):
+            row_dendro_size = self.ROW_DENDRO_WIDTH
+        try:
+            col_dendro_size = max(20, int(cfg.get("dendro_height", self.COL_DENDRO_HEIGHT)))
+        except (TypeError, ValueError):
+            col_dendro_size = self.COL_DENDRO_HEIGHT
+        row_dendro_w = row_dendro_size if self._row_dendro else 0
+        col_dendro_h = col_dendro_size if self._col_dendro else 0
+        # Row labels stay left of the grid; the row dendrogram sits right of it.
+        grid_x = self.MARGIN + row_label_w
+        grid_y = self.MARGIN + col_dendro_h
+        grid_w = len(self._cols) * cell_w
+        grid_h = len(self._rows) * cell_h
+        dendro_x = grid_x + grid_w
+        colorbar_x = dendro_x + row_dendro_w + self.COLORBAR_GAP
+        width = (
+            colorbar_x + self.COLORBAR_WIDTH + self.COLORBAR_LABEL_WIDTH
+            + self.MARGIN
+        )
+        height = (
+            grid_y + grid_h + self.COL_LABEL_HEIGHT + self.MARGIN
+        )
+        vmin, vmax = self._range(values)
+        return {
+            "cell_w": cell_w, "cell_h": cell_h,
+            "row_label_w": row_label_w, "row_dendro_w": row_dendro_w,
+            "col_dendro_h": col_dendro_h,
+            "grid_x": grid_x, "grid_y": grid_y,
+            "grid_w": grid_w, "grid_h": grid_h,
+            "dendro_x": dendro_x, "colorbar_x": colorbar_x,
+            "width": width, "height": height,
+            "vmin": vmin, "vmax": vmax,
+        }
+
+    def _range(self, values):
+        import numpy as np
+
+        cfg = self._cfg
+        if not cfg.get("auto_range", True):
+            try:
+                lo = float(cfg.get("vmin"))
+                hi = float(cfg.get("vmax"))
+            except (TypeError, ValueError):
+                lo = hi = None
+            if lo is not None and hi is not None and hi > lo:
+                return lo, hi
+        finite = np.asarray(values, dtype="float64")
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        lo = float(finite.min())
+        hi = float(finite.max())
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+
+    def sizeHint(self):
+        layout = self._layout()
+        if layout is None:
+            return QSize(280, 200)
+        return QSize(layout["width"], layout["height"])
+
+    def minimumSizeHint(self):
+        layout = self._layout()
+        if layout is None:
+            return QSize(240, 160)
+        return QSize(min(layout["width"], 240), min(layout["height"], 160))
+
+    # -- painting ----------------------------------------------------------
+    def paintEvent(self, event) -> None:
+        import numpy as np
+
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+        layout = self._layout()
+        if layout is None:
+            painter.setPen(QColor("#8a94a6"))
+            message = self._cfg.get("message") or (
+                "Press Calculate to build the heatmap."
+            )
+            painter.drawText(
+                self.rect(), Qt.AlignmentFlag.AlignCenter, message
+            )
+            return
+
+        values = np.asarray(self._values, dtype="float64")
+        cfg = self._cfg
+        cell_w = layout["cell_w"]
+        cell_h = layout["cell_h"]
+        grid_x = layout["grid_x"]
+        grid_y = layout["grid_y"]
+        vmin = layout["vmin"]
+        vmax = layout["vmax"]
+        show_numbers = bool(cfg.get("show_numbers", True))
+        auto_color = bool(cfg.get("auto_text_color", True))
+        fixed_color = QColor(cfg.get("text_color") or "#000000")
+        try:
+            decimals = max(0, min(6, int(cfg.get("decimals", 1))))
+        except (TypeError, ValueError):
+            decimals = 1
+
+        cmap = _figure_colormap(cfg.get("colormap") or _default_palette())
+        lut = [
+            tuple(int(c) for c in row[:3])
+            for row in cmap.getLookupTable(0.0, 1.0, 256)
+        ]
+        span = (vmax - vmin) or 1.0
+        metrics = QFontMetrics(self.font())
+        number_font = self.font()
+        number_font.setPointSizeF(max(6.0, min(10.0, cell_h / 3.2)))
+        painter.setFont(number_font)
+        number_metrics = QFontMetrics(number_font)
+
+        for r in range(len(self._rows)):
+            for c in range(len(self._cols)):
+                rect = QRect(
+                    grid_x + c * cell_w, grid_y + r * cell_h, cell_w, cell_h
+                )
+                value = float(values[r, c])
+                if not np.isfinite(value):
+                    color = QColor(self.NA_COLOR)
+                    rgb = (217, 217, 217)
+                else:
+                    pos = (value - vmin) / span
+                    idx = int(round(min(1.0, max(0.0, pos)) * 255))
+                    rgb = lut[idx]
+                    color = QColor(*rgb)
+                painter.fillRect(rect, color)
+                if show_numbers:
+                    if auto_color:
+                        lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+                        painter.setPen(QColor("#ffffff" if lum < 140 else "#000000"))
+                    else:
+                        painter.setPen(fixed_color)
+                    text = _heatmap_cell_text(value, decimals)
+                    if number_metrics.horizontalAdvance(text) <= cell_w - 4:
+                        painter.drawText(
+                            rect, Qt.AlignmentFlag.AlignCenter, text
+                        )
+
+        # Cell grid lines (subtle, keeps large matrices readable).
+        painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        for c in range(1, len(self._cols)):
+            x = grid_x + c * cell_w
+            painter.drawLine(x, grid_y, x, grid_y + layout["grid_h"])
+        for r in range(1, len(self._rows)):
+            y = grid_y + r * cell_h
+            painter.drawLine(grid_x, y, grid_x + layout["grid_w"], y)
+
+        painter.setFont(self.font())
+        self._paint_row_labels(painter, layout, metrics)
+        self._paint_col_labels(painter, layout, metrics)
+        if self._row_dendro:
+            self._paint_dendrogram(painter, self._row_dendro, layout, horizontal=True)
+        if self._col_dendro:
+            self._paint_dendrogram(painter, self._col_dendro, layout, horizontal=False)
+        self._paint_colorbar(painter, layout, lut, vmin, vmax, decimals)
+
+    def _paint_row_labels(self, painter, layout, metrics) -> None:
+        painter.setPen(QColor("#2c3a48"))
+        label_x = layout["grid_x"] - self.LABEL_GAP
+        for r, name in enumerate(self._rows):
+            rect = QRect(
+                0, layout["grid_y"] + r * layout["cell_h"],
+                label_x, layout["cell_h"],
+            )
+            text = metrics.elidedText(
+                str(name), Qt.TextElideMode.ElideRight, max(10, label_x - 4)
+            )
+            painter.drawText(
+                rect,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                text,
+            )
+
+    def _paint_col_labels(self, painter, layout, metrics) -> None:
+        # Rotated labels are pre-rendered into small pixmaps: their box then
+        # starts exactly at the heatmap's lower edge (text reads downwards).
+        top = layout["grid_y"] + layout["grid_h"] + self.LABEL_GAP
+        font = self.font()
+        color = QColor("#2c3a48")
+        cache = getattr(self, "_col_label_cache", None)
+        if cache is None:
+            cache = {}
+            self._col_label_cache = cache
+        base_key = (
+            font.family(), round(font.pointSizeF(), 2), int(font.weight()),
+            color.name(),
+        )
+        dpr = float(self.devicePixelRatioF() or 1.0)
+        for c, name in enumerate(self._cols):
+            center_x = layout["grid_x"] + c * layout["cell_w"] + layout["cell_w"] / 2
+            text = metrics.elidedText(
+                str(name), Qt.TextElideMode.ElideRight,
+                self.COL_LABEL_HEIGHT - 10,
+            )
+            key = (base_key, round(dpr, 2), text)
+            pixmap = cache.get(key)
+            if pixmap is None:
+                width = max(1, metrics.horizontalAdvance(text) + 2)
+                height = metrics.height() + 2
+                # Render at the screen's pixel ratio, otherwise Qt upscales the
+                # bitmap and the rotated names look blurry on scaled displays.
+                source = QPixmap(
+                    max(1, int(round(width * dpr))),
+                    max(1, int(round(height * dpr))),
+                )
+                source.fill(Qt.GlobalColor.transparent)
+                pp = QPainter(source)
+                pp.scale(dpr, dpr)
+                pp.setFont(font)
+                pp.setPen(color)
+                pp.drawText(1, metrics.ascent() + 1, text)
+                pp.end()
+                pixmap = source.transformed(
+                    QTransform().rotate(-90), Qt.TransformationMode.FastTransformation
+                )
+                pixmap.setDevicePixelRatio(dpr)
+                cache[key] = pixmap
+                if len(cache) > 500:
+                    cache.clear()
+            logical_w = pixmap.width() / max(1.0, pixmap.devicePixelRatio())
+            painter.drawPixmap(
+                QPointF(center_x - logical_w / 2.0, float(top)), pixmap
+            )
+
+    def _paint_dendrogram(self, painter, info, layout, horizontal: bool) -> None:
+        dcoords = info.get("dcoord") or []
+        icoords = info.get("icoord") or []
+        if not dcoords or not icoords:
+            return
+        dmax = max((max(item) for item in dcoords), default=0.0) or 1.0
+        painter.setPen(QPen(QColor("#5f6b7a"), 1))
+        if horizontal:
+            x0 = layout["dendro_x"]
+            thickness = layout["row_dendro_w"]
+            y0 = layout["grid_y"]
+            cell = layout["cell_h"]
+        else:
+            x0 = layout["grid_x"]
+            thickness = layout["col_dendro_h"]
+            y0 = layout["grid_y"]
+            cell = layout["cell_w"]
+        for ico, dco in zip(icoords, dcoords):
+            points = []
+            for leaf, dist in zip(ico, dco):
+                pos = (leaf / 10.0) * cell
+                if horizontal:
+                    # Leaves touch the grid; the root sits further right.
+                    points.append(QPointF(x0 + thickness * (dist / dmax),
+                                          y0 + pos))
+                else:
+                    # Leaves touch the grid; the root sits above it.
+                    points.append(QPointF(x0 + pos,
+                                          y0 - thickness * (dist / dmax)))
+            painter.drawPolyline(QPolygonF(points))
+
+    def _paint_colorbar(self, painter, layout, lut, vmin, vmax,
+                        decimals: int = 1) -> None:
+        bar_x = layout["colorbar_x"]
+        bar_y = layout["grid_y"]
+        bar_h = layout["grid_h"]
+        bar_w = self.COLORBAR_WIDTH
+        steps = 64
+        for i in range(steps):
+            pos = 1.0 - i / (steps - 1)
+            idx = int(round(pos * 255))
+            painter.fillRect(
+                QRect(bar_x, bar_y + i * bar_h / steps,
+                      bar_w, max(1, int(bar_h / steps) + 1)),
+                QColor(*lut[idx]),
+            )
+        painter.setPen(QColor(150, 160, 172))
+        painter.drawRect(bar_x, bar_y, bar_w, bar_h)
+        painter.setPen(QColor("#2c3a48"))
+        painter.drawText(
+            QRect(bar_x + bar_w + 4, bar_y - 8, 60, 16),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            _heatmap_cell_text(vmax),
+        )
+        painter.drawText(
+            QRect(bar_x + bar_w + 4, bar_y + bar_h - 8, 60, 16),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            _heatmap_cell_text(vmin),
+        )
+
+    # -- zoom --------------------------------------------------------------
+    MIN_ZOOM = 0.25
+    MAX_ZOOM = 5.0
+
+    def _scroll_area(self):
+        widget = self.parentWidget()
+        while widget is not None:
+            if isinstance(widget, QScrollArea):
+                return widget
+            widget = widget.parentWidget()
+        return None
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if not delta:
+            event.ignore()
+            return
+        factor = 1.15 if delta > 0 else 1 / 1.15
+        old = self._zoom
+        new = min(self.MAX_ZOOM, max(self.MIN_ZOOM, old * factor))
+        if abs(new - old) < 1e-6:
+            event.accept()
+            return
+        scroll = self._scroll_area()
+        h_frac = v_frac = None
+        if scroll is not None:
+            hb = scroll.horizontalScrollBar()
+            vb = scroll.verticalScrollBar()
+            h_frac = hb.value() / max(1, hb.maximum())
+            v_frac = vb.value() / max(1, vb.maximum())
+        self._zoom = new
+        self.updateGeometry()
+        self.adjustSize()
+        self.update()
+        if scroll is not None:
+            def restore() -> None:
+                hb.setValue(int(round(h_frac * hb.maximum())))
+                vb.setValue(int(round(v_frac * vb.maximum())))
+            QTimer.singleShot(0, restore)
+        event.accept()
+
+    # -- tooltips ----------------------------------------------------------
+    def mouseMoveEvent(self, event) -> None:
+        import numpy as np
+
+        layout = self._layout()
+        if layout is None:
+            self.setToolTip("")
+            return
+        pos = event.position().toPoint()
+        dx = pos.x() - layout["grid_x"]
+        dy = pos.y() - layout["grid_y"]
+        if 0 <= dx < layout["grid_w"] and 0 <= dy < layout["grid_h"]:
+            col = int(dx // layout["cell_w"])
+            row = int(dy // layout["cell_h"])
+            value = float(np.asarray(self._values)[row, col])
+            try:
+                dec = max(0, min(6, int(self._cfg.get("decimals", 1))))
+            except (TypeError, ValueError):
+                dec = 1
+            self.setToolTip(
+                f"{self._rows[row]} · {self._cols[col]}"
+                + chr(10)
+                + _heatmap_cell_text(value, dec)
+            )
+        else:
+            self.setToolTip("")
+
+
 class MainWindow(QMainWindow):
     """Main window: File/Help menu bar and a single tabbed workspace."""
 
@@ -6235,6 +7022,9 @@ class MainWindow(QMainWindow):
         self._updating_sample = False
         self._current_entry = None
         self._module_registry = {}
+        # Task ids opened as temporary drafts (locked modules). Their writes
+        # are redirected to Module/<id>/draft/ and discarded on close.
+        self._draft_task_ids = set()
         # Shared sampled-row pools + pooled columns for scatter/histogram
         # rendering (Figure, Gating, Scale preview). See _pool_request.
         self._pool_rows_cache = {}
@@ -6347,6 +7137,7 @@ class MainWindow(QMainWindow):
         # Mask-edge images are temporary: drop this module's cache on exit.
         self._seg_clear_edge_cache()
         self._save_window_geometry()
+        self._discard_draft_folders()
         runlog.info("window.close")
         runlog.stop("window closed")
         event.accept()
@@ -7300,6 +8091,7 @@ class MainWindow(QMainWindow):
         if not ok or not name:
             return
 
+        self._discard_draft_folders()
         try:
             self.project = Project.create(Path(parent_dir), name)
         except OSError as error:
@@ -7326,6 +8118,7 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Open Project")
         if not folder:
             return
+        self._discard_draft_folders()
         try:
             self.project = Project.load(Path(folder))
         except (OSError, ValueError, KeyError) as error:
@@ -7361,6 +8154,7 @@ class MainWindow(QMainWindow):
         if not ok or not name:
             return
 
+        self._discard_draft_folders()
         try:
             new_project = Project.create(Path(parent_dir), name)
             new_project.samples = copy.deepcopy(self.project.samples)
@@ -7483,6 +8277,25 @@ class MainWindow(QMainWindow):
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
         self._refresh_memory_usage()
         self._ram_timer.start()
+
+    def _module_dir(self, task_id) -> Path | None:
+        """Folder holding a module's own files.
+
+        While the module is open as a temporary draft (it is locked), this is
+        ``Module/<id>/draft`` so nothing official is touched.
+        """
+        if self.project is None or not task_id:
+            return None
+        base = self.project.path / "Module" / str(task_id)
+        if str(task_id) in getattr(self, "_draft_task_ids", ()):
+            return base / "draft"
+        return base
+
+    def _module_rel(self, task_id, name: str) -> str:
+        """Relative path of a file inside a module folder (draft-aware)."""
+        if str(task_id) in getattr(self, "_draft_task_ids", ()):
+            return f"Module/{task_id}/draft/{name}"
+        return f"Module/{task_id}/{name}"
 
     def _module_size_path(self, task_id):
         """The folder whose size stands for a module (None without one)."""
@@ -15798,8 +16611,61 @@ class MainWindow(QMainWindow):
             walk(task.get("children", []))
         return [tid for tid in ordered if tid in self._module_registry]
 
+    def _write_draft_params(self, page) -> None:
+        """Keep a draft module's parameters in its temporary folder."""
+        task_id = page.property("task_id")
+        if not task_id or str(task_id) not in self._draft_task_ids:
+            return
+        task_def = getattr(page, "_draft_task_def", None)
+        folder = self._module_dir(task_id)
+        if not isinstance(task_def, dict) or folder is None:
+            return
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "params.json").write_text(
+                json.dumps(task_def.get("params") or {}, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except (OSError, TypeError):
+            pass
+
+    def _discard_draft_folders(self) -> None:
+        """Delete every temporary draft folder (module closed / project left)."""
+        ids = list(getattr(self, "_draft_task_ids", ()))
+        self._draft_task_ids = set()
+        if self.project is None:
+            return
+        for task_id in ids:
+            shutil.rmtree(
+                self.project.path / "Module" / str(task_id) / "draft",
+                ignore_errors=True,
+            )
+
+    def _add_draft_badge(self, page) -> None:
+        """Mark a locked module that was opened for temporary editing."""
+        bar = page.findChild(QFrame, "moduleBar")
+        if bar is None or bar.layout() is None:
+            return
+        lay = bar.layout()
+        label = QLabel("Temporary draft")
+        label.setStyleSheet("color: #b58900; font-weight: bold;")
+        label.setToolTip(
+            "This module is locked by saved downstream data."
+            + chr(10)
+            + "Changes here are temporary: they are written to "
+            "Module/<id>/draft/ and deleted when the module closes."
+        )
+        index = lay.count()
+        for i in range(lay.count()):
+            item = lay.itemAt(i)
+            if item is not None and item.spacerItem() is not None:
+                index = i
+                break
+        lay.insertWidget(index, label)
+
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""
+        self._write_draft_params(page)
         # Any saved change can alter the data flowing downstream.
         self._pool_clear()
         self._channel_range_cache = {}
@@ -16366,7 +17232,7 @@ class MainWindow(QMainWindow):
         if missing:
             raise ValueError("channel(s) not in this file: " + ", ".join(missing))
         stem = Path(str(parquet_path)).stem
-        rel = f"Module/{task_id}/{stem}_unmix.parquet"
+        rel = self._module_rel(task_id, f"{stem}_unmix.parquet")
         out_path = self.project.path / rel
         out_path.parent.mkdir(parents=True, exist_ok=True)
         writer = None
@@ -17455,13 +18321,16 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(False)
         scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         scroll.setStyleSheet("background: #ffffff; border: none;")
-        label = QLabel()
+        label = _ZoomPixmapLabel(
+            on_zoom=lambda f, pos: self._unmix_zoom_matrix(page, f, pos)
+        )
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("background: #ffffff; color: #888888;")
         label.setText("Add a signature to build the matrix.")
         scroll.setWidget(label)
         page._unmix_matrix_label = label
         page._unmix_matrix_image = None
+        page._unmix_matrix_scroll = scroll
         return scroll
 
     def _unmix_curve_tab_page(self, page) -> QWidget:
@@ -17503,13 +18372,16 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(False)
         scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         scroll.setStyleSheet("background: #ffffff; border: none;")
-        label = QLabel()
+        label = _ZoomPixmapLabel(
+            on_zoom=lambda f, pos: self._unmix_zoom_matrix(page, f, pos)
+        )
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("background: #ffffff; color: #888888;")
         label.setText("Add at least two signatures to compare them.")
         scroll.setWidget(label)
         page._unmix_similarity_label = label
         page._unmix_similarity_image = None
+        page._unmix_similarity_scroll = scroll
         return scroll
 
     def _unmix_on_matrix_tab(self, page, index) -> None:
@@ -18466,7 +19338,10 @@ class MainWindow(QMainWindow):
             )
             return
 
-        cfg = self._unmix_matrix_cfg(page, "matrix")
+        cfg = dict(self._unmix_matrix_cfg(page, "matrix"))
+        zoom = float(getattr(page, "_unmix_matrix_zoom", 1.0) or 1.0)
+        cfg["cell_width"] = max(8, int(round(cfg["cell_width"] * zoom)))
+        cfg["cell_height"] = max(8, int(round(cfg["cell_height"] * zoom)))
         finite = [v for _r, values in rows for v in values if np.isfinite(v)]
         lo = min(finite) if finite else 0.0
         hi = max(finite) if finite else 0.0
@@ -18567,7 +19442,10 @@ class MainWindow(QMainWindow):
                 if names else "Add a signature to build the matrix."
             )
             return
-        cfg = self._unmix_matrix_cfg(page, "similarity")
+        cfg = dict(self._unmix_matrix_cfg(page, "similarity"))
+        zoom = float(getattr(page, "_unmix_matrix_zoom", 1.0) or 1.0)
+        cfg["cell_width"] = max(8, int(round(cfg["cell_width"] * zoom)))
+        cfg["cell_height"] = max(8, int(round(cfg["cell_height"] * zoom)))
         image = self._unmix_paint_matrix_image(
             page, list(names), list(names),
             [list(row) for row in matrix],
@@ -18577,6 +19455,34 @@ class MainWindow(QMainWindow):
         label.setText("")
         label.setPixmap(QPixmap.fromImage(image))
         label.resize(image.size())
+
+    def _unmix_zoom_matrix(self, page, factor, pos=None) -> None:
+        """Wheel zoom for the matrix / similarity heatmaps (re-rendered)."""
+        old = float(getattr(page, "_unmix_matrix_zoom", 1.0) or 1.0)
+        new = max(0.35, min(4.0, old * float(factor)))
+        if abs(new - old) < 1e-6:
+            return
+        page._unmix_matrix_zoom = new
+        key = getattr(page, "_unmix_matrix_tab", "matrix")
+        scroll = getattr(
+            page,
+            "_unmix_similarity_scroll" if key == "similarity"
+            else "_unmix_matrix_scroll",
+            None,
+        )
+        h_frac = v_frac = None
+        if scroll is not None:
+            hb = scroll.horizontalScrollBar()
+            vb = scroll.verticalScrollBar()
+            h_frac = hb.value() / max(1, hb.maximum())
+            v_frac = vb.value() / max(1, vb.maximum())
+        self._unmix_render_matrix(page)
+        self._unmix_render_similarity(page)
+        if scroll is not None:
+            def restore() -> None:
+                hb.setValue(int(round(h_frac * hb.maximum())))
+                vb.setValue(int(round(v_frac * vb.maximum())))
+            QTimer.singleShot(0, restore)
 
     def _unmix_refresh_matrix_views(self, page) -> None:
         """Redraw the three matrix sub-pages from the current signatures."""
@@ -22014,7 +22920,7 @@ class MainWindow(QMainWindow):
             height, width = arr.shape
 
         stem = Path(str(parquet_path)).stem
-        rel = f"Module/{task_id}/{stem}_mask.parquet"
+        rel = self._module_rel(task_id, f"{stem}_mask.parquet")
         path = self.project.path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
@@ -23535,8 +24441,8 @@ class MainWindow(QMainWindow):
             if source != parquet_path and isinstance(rec, dict) and rec.get("path")
         }
         if self.project is not None:
-            folder = self.project.path / "Module" / str(page._feat_task_id)
-            if folder.is_dir():
+            folder = self._module_dir(page._feat_task_id)
+            if folder is not None and folder.is_dir():
                 used |= {
                     p.stem for p in folder.glob("*.parquet") if p.stem != old_stem
                 }
@@ -23702,7 +24608,7 @@ class MainWindow(QMainWindow):
         warnings.extend(agg_warnings)
 
         stem = self._feat_output_stem(page, parquet_path)
-        rel = f"Module/{page._feat_task_id}/{stem}.parquet"
+        rel = self._module_rel(page._feat_task_id, f"{stem}.parquet")
         if self.project is None:
             raise RuntimeError("no project")
         path = self.project.path / rel
@@ -24398,7 +25304,7 @@ class MainWindow(QMainWindow):
         ent = self._ensure_image_index(parquet_path)
         is_image = ent is not None and ent.get("manifest") is not None
         stem = Path(str(parquet_path)).stem
-        rel = f"Module/{page._g2c_task_id}/{stem}_gates.parquet"
+        rel = self._module_rel(page._g2c_task_id, f"{stem}_gates.parquet")
         path = self.project.path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -25291,7 +26197,7 @@ class MainWindow(QMainWindow):
         ent = self._ensure_image_index(to_path)
         is_image = ent is not None and ent.get("manifest") is not None
         stem = Path(str(to_path)).stem
-        rel = f"Module/{page._fup_task_id}/{stem}_mapped.parquet"
+        rel = self._module_rel(page._fup_task_id, f"{stem}_mapped.parquet")
         path = self.project.path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -25721,7 +26627,8 @@ class MainWindow(QMainWindow):
         """Folder holding a Subsample module's saved image coverage masks."""
         if self.project is None or not task_id:
             return None
-        return self.project.path / "Module" / str(task_id) / "coverage"
+        folder = self._module_dir(task_id)
+        return folder / "coverage" if folder is not None else None
 
     def _subsample_coverage_paths(self, task, parquet_path):
         """(mask .npy path, metadata .json path) for one module + file."""
@@ -27963,7 +28870,7 @@ class MainWindow(QMainWindow):
         params = page._dimred_params
         names = params.get("names") or ["dim_1", "dim_2"]
         stem = Path(str(path)).stem
-        rel = f"Module/{page._dimred_task_id}/{stem}_dimred.parquet"
+        rel = self._module_rel(page._dimred_task_id, f"{stem}_dimred.parquet")
         out_path = self.project.path / rel
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -29002,7 +29909,7 @@ class MainWindow(QMainWindow):
         params = page._cluster_params
         name = (params.get("name") or "cluster").strip()
         stem = Path(str(path)).stem
-        rel = f"Module/{page._cluster_task_id}/{stem}_cluster.parquet"
+        rel = self._module_rel(page._cluster_task_id, f"{stem}_cluster.parquet")
         out_path = self.project.path / rel
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -29292,6 +30199,1662 @@ class MainWindow(QMainWindow):
     _AREA_LOW_DEFAULT = 100.0
     _AREA_HIGH_DEFAULT = 10000.0
     _AREA_DENSITY_DEFAULT = 10.0
+
+    # ----- Heatmap module ------------------------------------------------
+    _HEATMAP_STORE_NAME = "heatmap.json"
+
+    def _heatmap_store_path(self, task_id) -> Path | None:
+        folder = self._module_dir(task_id)
+        if folder is None:
+            return None
+        return folder / self._HEATMAP_STORE_NAME
+
+    def _heatmap_store_load(self, task_id) -> dict | None:
+        path = self._heatmap_store_path(task_id)
+        if path is None or not path.is_file():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _heatmap_store_save(self, task_id, payload: dict) -> None:
+        path = self._heatmap_store_path(task_id)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+        except OSError:
+            pass
+
+    def _heatmap_signature(self, page) -> str:
+        """Hash of everything a recalculation depends on."""
+        params = page._heatmap_params
+        task_id = page._heatmap_task_id
+        files = []
+        for path in params.get("files") or []:
+            try:
+                st = Path(path).stat()
+                entry = [str(path), int(st.st_size), int(st.st_mtime_ns)]
+            except OSError:
+                entry = [str(path), 0, 0]
+            sig = self._subsample_sig(task_id, path)
+            if sig:
+                entry.append(sig)
+            files.append(entry)
+        try:
+            stages = [
+                [kind, stage]
+                for kind, stage in self._map_stages(task_id)
+            ]
+            stages_text = json.dumps(stages, sort_keys=True, default=str)
+        except Exception:  # noqa: BLE001
+            stages_text = ""
+        payload = {
+            "task": task_id,
+            "files": files,
+            "sampling": params.get("sampling") or {},
+            "gates": [
+                (g.get("task"), g.get("id"))
+                for g in params.get("gates") or []
+            ],
+            "variables": list(params.get("variables") or []),
+            "stages": hashlib.sha1(stages_text.encode("utf-8")).hexdigest(),
+        }
+        text = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def _heatmap_gate_options(self, page) -> list:
+        """Gates (from upstream Gating modules) present for every selected file."""
+        files = list(page._heatmap_params.get("files") or [])
+        if not files:
+            return []
+        task_id = page._heatmap_task_id
+        gating_tasks = [
+            task for task in self._task_chain(task_id)
+            if task.get("id") != task_id and task.get("type") == "gating"
+        ]
+        multi = len(gating_tasks) > 1
+        options = []
+        used_labels = set()
+        for task in gating_tasks:
+            per_file = [
+                {g["id"]: g for g in self._gating_gates_for(task, path)}
+                for path in files
+            ]
+            if not per_file or any(not ids for ids in per_file):
+                continue
+            common = set(per_file[0])
+            for ids in per_file[1:]:
+                common &= set(ids)
+            if not common:
+                continue
+            gates = self._gating_gates_for(task)
+            for gate in gates:
+                if gate["id"] not in common:
+                    continue
+                label = str(gate.get("name", gate["id"]))
+                if multi:
+                    # Only distinguish the same gate name across modules.
+                    label += f" ({task.get('name', '')})"
+                if label in used_labels:
+                    label = f"{label} [{gate['id']}]"
+                used_labels.add(label)
+                options.append({
+                    "task": task["id"],
+                    "id": gate["id"],
+                    "label": label,
+                    "name": gate.get("name", gate["id"]),
+                })
+        return options
+
+    def _heatmap_common_columns(self, page) -> list:
+        files = list(page._heatmap_params.get("files") or [])
+        if not files:
+            return []
+        lists = [
+            self._columns_for(path, page._heatmap_task_id) for path in files
+        ]
+        if not lists:
+            return []
+        common = set(lists[0])
+        for columns in lists[1:]:
+            common &= set(columns)
+        return [name for name in lists[0] if name in common]
+
+    def _heatmap_file_sizes(self, page) -> dict:
+        sizes = {}
+        for path in page._heatmap_params.get("files") or []:
+            try:
+                index = self._subsample_row_index(page._heatmap_task_id, path)
+                sizes[path] = (
+                    int(len(index)) if index is not None
+                    else int(self._data_row_count(path) or 0)
+                )
+            except Exception:  # noqa: BLE001
+                sizes[path] = 0
+        return sizes
+
+    def _heatmap_sampled_counts(self, page) -> dict:
+        params = page._heatmap_params
+        sampling = params.get("sampling") or {}
+        method = sampling.get("method") or "uniform"
+        try:
+            value = int(sampling.get(method) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return _heatmap_sample_counts(
+            self._heatmap_file_sizes(page),
+            sampling.get("mode") or "full", method, value,
+        )
+
+    # -- page construction -------------------------------------------------
+    def _build_heatmap_page(self, name: str, task_def: dict,
+                            locked: bool) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName("moduleBar")
+        tl = QHBoxLayout(bar)
+        tl.setContentsMargins(12, 6, 12, 6)
+        tl.setSpacing(4)
+        tl.addWidget(QLabel(
+            f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"
+        ))
+        if locked:
+            draft = QLabel("Draft (locked)")
+            draft.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(draft)
+        tl.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setEnabled(not locked)
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(lambda _=False: self._heatmap_close(page))
+        tl.addWidget(save_btn)
+        tl.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        params = task_def.setdefault("params", {})
+        params.setdefault("files", [])
+        params.setdefault("sampling", {
+            "mode": "full", "method": "uniform",
+            "uniform": 10000, "total": 100000,
+        })
+        params.setdefault("gates", [])
+        params.setdefault("variables", [])
+        params.setdefault("log", [])
+        plot_cfg = params.setdefault("plot", {})
+        plot_cfg.setdefault("cell_width", 42)
+        plot_cfg.setdefault("cell_height", 28)
+        plot_cfg.setdefault("colormap", _default_palette())
+        plot_cfg.setdefault("show_numbers", True)
+        plot_cfg.setdefault("auto_text_color", True)
+        plot_cfg.setdefault("text_color", "#000000")
+        plot_cfg.setdefault("decimals", 1)
+        plot_cfg.setdefault("normalize", "raw")
+        plot_cfg.setdefault("cluster_rows", False)
+        plot_cfg.setdefault("cluster_cols", False)
+        plot_cfg.setdefault("dendro_width", 90)
+        plot_cfg.setdefault("dendro_height", 70)
+        plot_cfg.setdefault("metric", "euclidean")
+        plot_cfg.setdefault("linkage", "average")
+        plot_cfg.setdefault("auto_range", True)
+        plot_cfg.setdefault("vmin", None)
+        plot_cfg.setdefault("vmax", None)
+
+        if not params["files"]:
+            params["files"] = [
+                rec.get("parquet")
+                for rec in self._available_files(task_def.get("id"))
+            ]
+
+        page._heatmap_task_def = task_def
+        page._heatmap_task_id = task_def.get("id")
+        page._heatmap_params = params
+        page._heatmap_locked = locked
+        page._heatmap_save_btn = save_btn
+        page._heatmap_dirty = False
+        page._heatmap_snapshot = copy.deepcopy(params)
+        page._heatmap_log_lines = list(params.get("log") or [])
+        page._heatmap_running = False
+        page._heatmap_cancel = False
+        page._heatmap_queue = None
+        page._heatmap_timer = None
+        page._heatmap_thread = None
+        page._heatmap_result = self._heatmap_store_load(task_def.get("id"))
+        page._heatmap_dendro_cache = {}
+        page._heatmap_syncing = False
+        save_btn.clicked.connect(lambda _=False: self._heatmap_save_now(page))
+
+        content = QWidget()
+        content.setStyleSheet("background: #f5f8fb;")
+        outer = QHBoxLayout(content)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._heatmap_left_panel(page))
+        splitter.addWidget(self._heatmap_middle_panel(page))
+        splitter.addWidget(self._heatmap_right_panel(page))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 3)
+        splitter.setSizes([260, 260, 900])
+        page._heatmap_splitter = splitter
+        outer.addWidget(splitter, 1)
+        layout.addWidget(content, 1)
+        # Apply the requested proportions once the page has a real size.
+        QTimer.singleShot(0, lambda sp=splitter: sp.setSizes([280, 280, 840]))
+
+        self._heatmap_refresh(page)
+        self._heatmap_refresh_plot(page)
+        self._heatmap_update_save_btn(page)
+        return page
+
+    def _heatmap_left_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        # Data files and Sampling share the column height 1:1.
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._heatmap_files_section(page))
+        split.addWidget(self._heatmap_sampling_section(page))
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+
+        def equalize():
+            total = max(2, split.height())
+            split.setSizes([total // 2, total - total // 2])
+
+        QTimer.singleShot(0, equalize)
+        lay.addWidget(split, 1)
+        page._heatmap_left_splitter = split
+        return panel
+
+    def _heatmap_files_section(self, page) -> QWidget:
+        section = QWidget()
+        lay = QVBoxLayout(section)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("<b>Data files</b>"))
+        files_btn = QPushButton("Select files…")
+        files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        files_btn.setEnabled(not page._heatmap_locked)
+        files_btn.clicked.connect(lambda _=False: self._heatmap_select_files(page))
+        lay.addWidget(files_btn)
+        files_box = QListWidget()
+        files_box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(files_box, 1)
+        files_count = QLabel("")
+        files_count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(files_count)
+        page._heatmap_files_box = files_box
+        page._heatmap_files_count = files_count
+        page._heatmap_files_btn = files_btn
+        return section
+
+    def _heatmap_sampling_section(self, page) -> QWidget:
+        section = QWidget()
+        lay = QVBoxLayout(section)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("<b>Sampling</b>"))
+        sampling = _NoWheelComboBox()
+        sampling.addItem("Full data", "full")
+        sampling.addItem("Sample", "sample")
+        sampling.setEnabled(not page._heatmap_locked)
+        lay.addWidget(sampling)
+        page._heatmap_sampling = sampling
+
+        method = _NoWheelComboBox()
+        method.addItem("Uniform per file", "uniform")
+        method.addItem("Proportional", "proportional")
+        method.setEnabled(not page._heatmap_locked)
+        lay.addWidget(method)
+        page._heatmap_sampling_method = method
+
+        value_row = QWidget()
+        value_lay = QHBoxLayout(value_row)
+        value_lay.setContentsMargins(0, 0, 0, 0)
+        value_lay.setSpacing(6)
+        value_label = QLabel("Rows per file")
+        value_lay.addWidget(value_label)
+        value_spin = _NoWheelSpinBox()
+        value_spin.setRange(1, 2_000_000_000)
+        value_spin.setGroupSeparatorShown(True)
+        value_spin.setSingleStep(1000)
+        value_spin.setEnabled(not page._heatmap_locked)
+        value_lay.addWidget(value_spin, 1)
+        lay.addWidget(value_row)
+        page._heatmap_sampling_value_label = value_label
+        page._heatmap_sampling_value = value_spin
+
+        hint = QLabel(
+            "Files with fewer rows are used entirely; rows are never "
+            "duplicated. Sampling happens before gating."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        lay.addWidget(hint)
+        lay.addStretch(1)
+
+        summary = QLabel("")
+        summary.setWordWrap(True)
+        summary.setStyleSheet("color: #6b7785; font-size: 8pt;")
+        lay.addWidget(summary)
+        page._heatmap_sampling_summary = summary
+
+        sampling.currentIndexChanged.connect(
+            lambda _=0: self._heatmap_on_sampling(page)
+        )
+        method.currentIndexChanged.connect(
+            lambda _=0: self._heatmap_on_sampling(page)
+        )
+        value_spin.valueChanged.connect(
+            lambda _v: self._heatmap_on_sampling_value(page)
+        )
+        return section
+
+    def _heatmap_gates_panel(self, page) -> QWidget:
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Gates (rows)</b>"))
+        hint = QLabel(
+            "Gates shared by every selected file, from all upstream Gating "
+            "modules. Drag rows to change their order."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        lay.addWidget(hint)
+        gates_btn = QPushButton("Select gates…")
+        gates_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        gates_btn.setEnabled(not page._heatmap_locked)
+        gates_btn.clicked.connect(lambda _=False: self._heatmap_select_gates(page))
+        lay.addWidget(gates_btn)
+        box = QListWidget()
+        box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        box.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        box.setDefaultDropAction(Qt.DropAction.MoveAction)
+        box.setDragEnabled(not page._heatmap_locked)
+        box.setToolTip("Drag rows to change their order")
+        box.model().rowsMoved.connect(
+            lambda *a: self._heatmap_on_order(page, "gates", box)
+        )
+        lay.addWidget(box, 1)
+        count = QLabel("")
+        count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(count)
+        page._heatmap_gates_box = box
+        page._heatmap_gates_count = count
+        page._heatmap_gates_btn = gates_btn
+        return panel
+
+    def _heatmap_variables_panel(self, page) -> QWidget:
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Variables (columns)</b>"))
+        hint = QLabel(
+            "Columns shared by every selected file. Drag columns to change "
+            "their order."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        lay.addWidget(hint)
+        vars_btn = QPushButton("Select variables…")
+        vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vars_btn.setEnabled(not page._heatmap_locked)
+        vars_btn.clicked.connect(
+            lambda _=False: self._heatmap_select_variables(page)
+        )
+        lay.addWidget(vars_btn)
+        box = QListWidget()
+        box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        box.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        box.setDefaultDropAction(Qt.DropAction.MoveAction)
+        box.setDragEnabled(not page._heatmap_locked)
+        box.setToolTip("Drag columns to change their order")
+        box.model().rowsMoved.connect(
+            lambda *a: self._heatmap_on_order(page, "variables", box)
+        )
+        lay.addWidget(box, 1)
+        count = QLabel("")
+        count.setStyleSheet("color: #6b7785;")
+        lay.addWidget(count)
+        page._heatmap_vars_box = box
+        page._heatmap_vars_count = count
+        page._heatmap_vars_btn = vars_btn
+        return panel
+
+    def _heatmap_middle_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._heatmap_gates_panel(page))
+        split.addWidget(self._heatmap_variables_panel(page))
+        split.setSizes([280, 280])
+        lay.addWidget(split, 1)
+
+        row = QHBoxLayout()
+        calc_btn = QPushButton("Calculate")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.clicked.connect(lambda _=False: self._heatmap_calculate(page))
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setVisible(False)
+        cancel_btn.clicked.connect(lambda _=False: self._heatmap_cancel(page))
+        row.addWidget(calc_btn, 1)
+        row.addWidget(cancel_btn)
+        lay.addLayout(row)
+        page._heatmap_calc_btn = calc_btn
+        page._heatmap_cancel_btn = cancel_btn
+
+        progress = QProgressBar()
+        progress.setTextVisible(False)
+        progress.setFixedHeight(8)
+        progress.setVisible(False)
+        lay.addWidget(progress)
+        page._heatmap_progress = progress
+
+        status = QLabel("")
+        status.setWordWrap(True)
+        status.setStyleSheet("color: #6b7785;")
+        lay.addWidget(status)
+        page._heatmap_status = status
+        return panel
+
+    def _heatmap_right_panel(self, page) -> QWidget:
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._heatmap_plot_panel(page))
+        bottom = QSplitter(Qt.Orientation.Horizontal)
+        bottom.setChildrenCollapsible(False)
+        bottom.addWidget(self._heatmap_log_panel(page))
+        bottom.addWidget(self._heatmap_params_panel(page))
+        # Log : plot settings = 2 : 3.
+        bottom.setStretchFactor(0, 2)
+        bottom.setStretchFactor(1, 3)
+        bottom.setSizes([320, 480])
+        split.addWidget(bottom)
+        # Heatmap : (log + settings) = 3 : 2.
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([600, 400])
+        page._heatmap_bottom_splitter = bottom
+
+        def apply_bottom_ratio():
+            total = bottom.width()
+            if total <= 0:
+                QTimer.singleShot(30, apply_bottom_ratio)
+                return
+            first = total * 2 // 5
+            bottom.setSizes([first, total - first])
+
+        def apply_right_ratio():
+            total = split.height()
+            if total <= 0:
+                QTimer.singleShot(30, apply_right_ratio)
+                return
+            first = total * 3 // 5
+            split.setSizes([first, total - first])
+
+        QTimer.singleShot(0, apply_bottom_ratio)
+        QTimer.singleShot(0, apply_right_ratio)
+        return split
+
+    def _heatmap_plot_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Heatmap</b>"))
+        header.addStretch()
+        stale = QLabel("")
+        stale.setStyleSheet("color: #b58900;")
+        header.addWidget(stale)
+        lay.addLayout(header)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll.setStyleSheet("background: #ffffff; border: none;")
+        canvas = _HeatmapCanvas()
+        scroll.setWidget(canvas)
+        lay.addWidget(scroll, 1)
+        page._heatmap_canvas = canvas
+        page._heatmap_canvas_scroll = scroll
+        page._heatmap_stale_label = stale
+        return panel
+
+    def _heatmap_log_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Log</b>"))
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlaceholderText("Calculation output appears here…")
+        log.setStyleSheet(
+            "background: #1e1e1e; color: #d4d4d4; "
+            "font-family: Consolas, monospace; font-size: 9pt;"
+        )
+        for line in page._heatmap_log_lines:
+            log.appendPlainText(line)
+        lay.addWidget(log, 1)
+        page._heatmap_log_box = log
+        return panel
+
+    def _heatmap_params_panel(self, page) -> QWidget:
+        panel = self._build_panel_frame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(QLabel("<b>Plot settings</b>"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
+        host = QWidget()
+        host.setStyleSheet("background: transparent;")
+        form = QVBoxLayout(host)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(6)
+        scroll.setWidget(host)
+        lay.addWidget(scroll, 1)
+        page._heatmap_params_form = form
+        self._heatmap_fill_params(page, form)
+        return panel
+
+    def _heatmap_fill_params(self, page, form) -> None:
+        self._clear_settings_layout(form)
+        cfg = page._heatmap_params.setdefault("plot", {})
+        editable = not page._heatmap_locked
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        grid.addWidget(QLabel("Cell width"), 0, 0)
+        width_spin = _NoWheelSpinBox()
+        width_spin.setRange(12, 400)
+        width_spin.setValue(int(cfg.get("cell_width", 42)))
+        width_spin.setEnabled(editable)
+        grid.addWidget(width_spin, 0, 1)
+        grid.addWidget(QLabel("Cell height"), 0, 2)
+        height_spin = _NoWheelSpinBox()
+        height_spin.setRange(12, 200)
+        height_spin.setValue(int(cfg.get("cell_height", 28)))
+        height_spin.setEnabled(editable)
+        grid.addWidget(height_spin, 0, 3)
+
+        grid.addWidget(QLabel("Colormap"), 1, 0)
+        cmap_combo = _NoWheelComboBox()
+        self._populate_palette_combo(
+            cmap_combo, cfg.get("colormap") or _default_palette()
+        )
+        cmap_combo.setEnabled(editable)
+        grid.addWidget(cmap_combo, 1, 1, 1, 3)
+
+        grid.addWidget(QLabel("Normalize"), 2, 0)
+        norm_combo = _NoWheelComboBox()
+        norm_combo.addItem("Raw values", "raw")
+        norm_combo.addItem("Column z-score", "column")
+        norm_combo.addItem("Row z-score", "row")
+        idx = norm_combo.findData(cfg.get("normalize", "raw"))
+        norm_combo.setCurrentIndex(max(0, idx))
+        norm_combo.setEnabled(editable)
+        grid.addWidget(norm_combo, 2, 1, 1, 3)
+
+        show_numbers = QCheckBox("Show numbers")
+        show_numbers.setChecked(bool(cfg.get("show_numbers", True)))
+        show_numbers.setEnabled(editable)
+        auto_color = QCheckBox("Auto number color")
+        auto_color.setChecked(bool(cfg.get("auto_text_color", True)))
+        auto_color.setEnabled(editable)
+        grid.addWidget(show_numbers, 3, 0, 1, 2)
+        grid.addWidget(auto_color, 3, 2, 1, 2)
+
+        grid.addWidget(QLabel("Number color"), 4, 0)
+        color_btn = QPushButton()
+        color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        color_btn.setFixedHeight(24)
+        color_btn.setEnabled(editable and not auto_color.isChecked())
+        grid.addWidget(color_btn, 4, 1)
+
+        grid.addWidget(QLabel("Decimals"), 4, 2)
+        decimals_spin = _NoWheelSpinBox()
+        decimals_spin.setRange(0, 6)
+        decimals_spin.setValue(int(cfg.get("decimals", 1)))
+        decimals_spin.setEnabled(editable)
+        decimals_spin.setToolTip("Number of decimals shown in the cells")
+        grid.addWidget(decimals_spin, 4, 3)
+
+        auto_range = QCheckBox("Auto value range")
+        auto_range.setChecked(bool(cfg.get("auto_range", True)))
+        auto_range.setEnabled(editable)
+        grid.addWidget(auto_range, 5, 0, 1, 2)
+        vmin_spin = QDoubleSpinBox()
+        vmax_spin = QDoubleSpinBox()
+        for spin, key in ((vmin_spin, "vmin"), (vmax_spin, "vmax")):
+            spin.setRange(-1e12, 1e12)
+            spin.setDecimals(4)
+            spin.setEnabled(editable and not auto_range.isChecked())
+            value = cfg.get(key)
+            if isinstance(value, (int, float)):
+                spin.setValue(float(value))
+        grid.addWidget(QLabel("Min"), 6, 0)
+        grid.addWidget(vmin_spin, 6, 1)
+        grid.addWidget(QLabel("Max"), 6, 2)
+        grid.addWidget(vmax_spin, 6, 3)
+
+        cluster_rows = QCheckBox("Cluster rows")
+        cluster_rows.setChecked(bool(cfg.get("cluster_rows")))
+        cluster_rows.setEnabled(editable)
+        cluster_cols = QCheckBox("Cluster columns")
+        cluster_cols.setChecked(bool(cfg.get("cluster_cols")))
+        cluster_cols.setEnabled(editable)
+        grid.addWidget(cluster_rows, 7, 0, 1, 2)
+        grid.addWidget(cluster_cols, 7, 2, 1, 2)
+
+        grid.addWidget(QLabel("Dendro width"), 8, 0)
+        dendro_width = _NoWheelSpinBox()
+        dendro_width.setRange(20, 300)
+        dendro_width.setValue(int(cfg.get("dendro_width", 90)))
+        dendro_width.setEnabled(editable)
+        dendro_width.setToolTip("Width of the row dendrogram (right side)")
+        grid.addWidget(dendro_width, 8, 1)
+        grid.addWidget(QLabel("Dendro height"), 8, 2)
+        dendro_height = _NoWheelSpinBox()
+        dendro_height.setRange(20, 300)
+        dendro_height.setValue(int(cfg.get("dendro_height", 70)))
+        dendro_height.setEnabled(editable)
+        dendro_height.setToolTip("Height of the column dendrogram (top)")
+        grid.addWidget(dendro_height, 8, 3)
+
+        grid.addWidget(QLabel("Distance"), 9, 0)
+        metric_combo = _NoWheelComboBox()
+        metric_combo.addItem("Euclidean", "euclidean")
+        metric_combo.addItem("Correlation", "correlation")
+        metric_combo.setCurrentIndex(
+            max(0, metric_combo.findData(cfg.get("metric", "euclidean")))
+        )
+        metric_combo.setEnabled(editable)
+        grid.addWidget(metric_combo, 9, 1)
+        grid.addWidget(QLabel("Linkage"), 9, 2)
+        linkage_combo = _NoWheelComboBox()
+        linkage_combo.addItem("Average", "average")
+        linkage_combo.addItem("Complete", "complete")
+        linkage_combo.addItem("Single", "single")
+        linkage_combo.addItem("Ward", "ward")
+        linkage_combo.setCurrentIndex(
+            max(0, linkage_combo.findData(cfg.get("linkage", "average")))
+        )
+        linkage_combo.setEnabled(editable)
+        grid.addWidget(linkage_combo, 9, 3)
+
+        copy_btn = QPushButton("Copy matrix")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.setToolTip("Copy the displayed matrix to the clipboard (TSV)")
+        copy_btn.clicked.connect(lambda _=False: self._heatmap_copy_matrix(page))
+        grid.addWidget(copy_btn, 10, 0, 1, 4)
+        form.addLayout(grid)
+
+        def update_color_button():
+            color = QColor(cfg.get("text_color") or "#000000")
+            text_color = "#ffffff" if color.lightness() < 128 else "#000000"
+            color_btn.setText(color.name())
+            color_btn.setStyleSheet(
+                f"QPushButton {{ background-color: {color.name()}; "
+                f"color: {text_color}; border: 1px solid #999; }}"
+            )
+
+        def changed():
+            self._heatmap_mark_dirty(page)
+            self._heatmap_refresh_plot(page)
+
+        def on_width(value):
+            cfg["cell_width"] = int(value)
+            changed()
+
+        def on_height(value):
+            cfg["cell_height"] = int(value)
+            changed()
+
+        def on_colormap():
+            cfg["colormap"] = cmap_combo.currentData()
+            changed()
+
+        def on_normalize():
+            cfg["normalize"] = norm_combo.currentData() or "raw"
+            changed()
+
+        def on_show_numbers(checked):
+            cfg["show_numbers"] = bool(checked)
+            changed()
+
+        def on_decimals(value):
+            cfg["decimals"] = int(value)
+            changed()
+
+        def on_auto_color(checked):
+            cfg["auto_text_color"] = bool(checked)
+            color_btn.setEnabled(editable and not checked)
+            changed()
+
+        def on_auto_range(checked):
+            cfg["auto_range"] = bool(checked)
+            vmin_spin.setEnabled(editable and not checked)
+            vmax_spin.setEnabled(editable and not checked)
+            changed()
+
+        def on_range():
+            cfg["vmin"] = float(vmin_spin.value())
+            cfg["vmax"] = float(vmax_spin.value())
+            changed()
+
+        def on_cluster_rows(checked):
+            cfg["cluster_rows"] = bool(checked)
+            changed()
+
+        def on_dendro_width(value):
+            cfg["dendro_width"] = int(value)
+            changed()
+
+        def on_dendro_height(value):
+            cfg["dendro_height"] = int(value)
+            changed()
+
+        def on_cluster_cols(checked):
+            cfg["cluster_cols"] = bool(checked)
+            changed()
+
+        def on_metric():
+            cfg["metric"] = metric_combo.currentData() or "euclidean"
+            changed()
+
+        def on_linkage():
+            cfg["linkage"] = linkage_combo.currentData() or "average"
+            changed()
+
+        def pick_color():
+            color = QColorDialog.getColor(
+                QColor(cfg.get("text_color") or "#000000"),
+                self, "Number color",
+            )
+            if color.isValid():
+                cfg["text_color"] = color.name()
+                update_color_button()
+                changed()
+
+        width_spin.valueChanged.connect(on_width)
+        height_spin.valueChanged.connect(on_height)
+        cmap_combo.currentIndexChanged.connect(lambda _=0: on_colormap())
+        norm_combo.currentIndexChanged.connect(lambda _=0: on_normalize())
+        show_numbers.toggled.connect(on_show_numbers)
+        decimals_spin.valueChanged.connect(on_decimals)
+        auto_color.toggled.connect(on_auto_color)
+        auto_range.toggled.connect(on_auto_range)
+        vmin_spin.valueChanged.connect(lambda _v: on_range())
+        vmax_spin.valueChanged.connect(lambda _v: on_range())
+        cluster_rows.toggled.connect(on_cluster_rows)
+        cluster_cols.toggled.connect(on_cluster_cols)
+        dendro_width.valueChanged.connect(on_dendro_width)
+        dendro_height.valueChanged.connect(on_dendro_height)
+        metric_combo.currentIndexChanged.connect(lambda _=0: on_metric())
+        linkage_combo.currentIndexChanged.connect(lambda _=0: on_linkage())
+        color_btn.clicked.connect(lambda _=False: pick_color())
+        update_color_button()
+
+    # -- refresh -----------------------------------------------------------
+    def _heatmap_select_files(self, page) -> None:
+        records = self._available_files(page._heatmap_task_id)
+        names = [rec.get("name", "") for rec in records]
+        by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+        current = [
+            self._comp_file_name(path, page._heatmap_task_id)
+            for path in page._heatmap_params.get("files") or []
+        ]
+        chosen = self._pick_items_dialog(
+            "Select data files", names, current, "Filter files...",
+            reorder=True,
+        )
+        if chosen is None:
+            return
+        page._heatmap_params["files"] = [
+            by_name[name] for name in chosen if name in by_name
+        ]
+        self._heatmap_mark_dirty(page)
+        self._heatmap_refresh(page)
+
+    def _heatmap_select_gates(self, page) -> None:
+        options = self._heatmap_gate_options(page)
+        if not options:
+            QMessageBox.information(
+                self, "Select gates",
+                "Select data files that share gates first.",
+            )
+            return
+        labels = [opt["label"] for opt in options]
+        by_label = {opt["label"]: opt for opt in options}
+        current = [
+            gate.get("label")
+            for gate in page._heatmap_params.get("gates") or []
+            if gate.get("label") in by_label
+        ]
+        chosen = self._pick_items_dialog(
+            "Select gates", labels, current, "Filter gates...", reorder=True,
+        )
+        if chosen is None:
+            return
+        selected = []
+        for label in chosen:
+            opt = by_label.get(label)
+            if opt is None:
+                continue
+            selected.append({
+                "task": opt["task"], "id": opt["id"], "label": label,
+            })
+        page._heatmap_params["gates"] = selected
+        self._heatmap_mark_dirty(page)
+        self._heatmap_refresh(page)
+
+    def _heatmap_select_variables(self, page) -> None:
+        columns = self._heatmap_common_columns(page)
+        if not columns:
+            QMessageBox.information(
+                self, "Select variables",
+                "Select data files with common columns first.",
+            )
+            return
+        chosen = self._pick_items_dialog(
+            "Select variables", columns,
+            page._heatmap_params.get("variables") or [],
+            "Filter variables...", reorder=True,
+        )
+        if chosen is None:
+            return
+        page._heatmap_params["variables"] = list(chosen)
+        self._heatmap_mark_dirty(page)
+        self._heatmap_refresh(page)
+
+    def _heatmap_on_order(self, page, key, box) -> None:
+        if page._heatmap_syncing:
+            return
+        values = [
+            box.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(box.count())
+        ]
+        if key == "gates":
+            by_key = {
+                f"{g.get('task')}|{g.get('id')}": g
+                for g in page._heatmap_params.get("gates") or []
+            }
+            page._heatmap_params["gates"] = [
+                by_key[value] for value in values if value in by_key
+            ]
+        else:
+            page._heatmap_params["variables"] = [
+                value for value in values if value
+            ]
+        self._heatmap_mark_dirty(page)
+        self._heatmap_update_buttons(page)
+        self._heatmap_refresh_stale(page)
+
+    def _heatmap_fill_list(self, box, entries) -> None:
+        box.blockSignals(True)
+        box.clear()
+        for value, label in entries:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, value)
+            flags = item.flags()
+            item.setFlags(
+                flags | Qt.ItemFlag.ItemIsDragEnabled
+                | Qt.ItemFlag.ItemIsDropEnabled
+            )
+            box.addItem(item)
+        box.blockSignals(False)
+
+    def _heatmap_refresh(self, page) -> None:
+        params = page._heatmap_params
+        records = self._available_files(page._heatmap_task_id)
+        by_path = {rec.get("parquet"): rec for rec in records}
+        params["files"] = [
+            path for path in params.get("files") or [] if path in by_path
+        ]
+        page._heatmap_files_box.blockSignals(True)
+        page._heatmap_files_box.clear()
+        for path in params["files"]:
+            page._heatmap_files_box.addItem(
+                self._comp_file_name(path, page._heatmap_task_id)
+            )
+        page._heatmap_files_box.blockSignals(False)
+        page._heatmap_files_count.setText(
+            f"{len(params['files'])} file(s)"
+        )
+
+        # Keep only gates/variables that still exist for the selection.
+        options = self._heatmap_gate_options(page)
+        by_gate = {
+            f"{opt['task']}|{opt['id']}": opt for opt in options
+        }
+        gates = []
+        for gate in params.get("gates") or []:
+            key = f"{gate.get('task')}|{gate.get('id')}"
+            opt = by_gate.get(key)
+            if opt is None:
+                continue
+            gates.append({
+                "task": opt["task"], "id": opt["id"],
+                "label": opt["label"],
+            })
+        if gates != (params.get("gates") or []):
+            params["gates"] = gates
+            self._heatmap_mark_dirty(page)
+        common = set(self._heatmap_common_columns(page))
+        variables = [
+            name for name in params.get("variables") or [] if name in common
+        ]
+        if variables != (params.get("variables") or []):
+            params["variables"] = variables
+            self._heatmap_mark_dirty(page)
+
+        page._heatmap_syncing = True
+        try:
+            self._heatmap_fill_list(
+                page._heatmap_gates_box,
+                [
+                    (f"{g['task']}|{g['id']}", g["label"])
+                    for g in params["gates"]
+                ],
+            )
+            self._heatmap_fill_list(
+                page._heatmap_vars_box,
+                [(name, name) for name in params["variables"]],
+            )
+        finally:
+            page._heatmap_syncing = False
+        page._heatmap_gates_count.setText(
+            f"{len(params['gates'])} gate(s)"
+        )
+        page._heatmap_vars_count.setText(
+            f"{len(params['variables'])} variable(s)"
+        )
+
+        self._heatmap_sync_sampling_controls(page)
+        self._heatmap_refresh_sampling(page)
+        self._heatmap_update_buttons(page)
+        self._heatmap_refresh_stale(page)
+
+    def _heatmap_sync_sampling_controls(self, page) -> None:
+        sampling = page._heatmap_params.setdefault("sampling", {})
+        mode = sampling.get("mode") or "full"
+        method = sampling.get("method") or "uniform"
+        sampled = mode == "sample"
+        page._heatmap_sampling.blockSignals(True)
+        idx = page._heatmap_sampling.findData(mode)
+        page._heatmap_sampling.setCurrentIndex(max(0, idx))
+        page._heatmap_sampling.blockSignals(False)
+        page._heatmap_sampling_method.blockSignals(True)
+        idx = page._heatmap_sampling_method.findData(method)
+        page._heatmap_sampling_method.setCurrentIndex(max(0, idx))
+        page._heatmap_sampling_method.blockSignals(False)
+        page._heatmap_sampling_method.setVisible(sampled)
+        page._heatmap_sampling_value_label.setText(
+            "Total rows" if method == "proportional" else "Rows per file"
+        )
+        page._heatmap_sampling_value_label.setVisible(sampled)
+        page._heatmap_sampling_value.setVisible(sampled)
+        page._heatmap_sampling_value.blockSignals(True)
+        try:
+            value = int(sampling.get(method) or 1)
+        except (TypeError, ValueError):
+            value = 1
+        page._heatmap_sampling_value.setValue(max(1, value))
+        page._heatmap_sampling_value.blockSignals(False)
+        page._heatmap_sampling.setEnabled(not page._heatmap_locked)
+
+    def _heatmap_on_sampling(self, page) -> None:
+        sampling = page._heatmap_params.setdefault("sampling", {})
+        sampling["mode"] = page._heatmap_sampling.currentData() or "full"
+        sampling["method"] = (
+            page._heatmap_sampling_method.currentData() or "uniform"
+        )
+        method = sampling["method"]
+        sampling[method] = int(page._heatmap_sampling_value.value())
+        self._heatmap_sync_sampling_controls(page)
+        self._heatmap_refresh_sampling(page)
+        self._heatmap_mark_dirty(page)
+        self._heatmap_update_buttons(page)
+        self._heatmap_refresh_stale(page)
+
+    def _heatmap_on_sampling_value(self, page) -> None:
+        sampling = page._heatmap_params.setdefault("sampling", {})
+        method = sampling.get("method") or "uniform"
+        sampling[method] = int(page._heatmap_sampling_value.value())
+        self._heatmap_refresh_sampling(page)
+        self._heatmap_mark_dirty(page)
+        self._heatmap_refresh_stale(page)
+
+    def _heatmap_refresh_sampling(self, page) -> None:
+        params = page._heatmap_params
+        files = params.get("files") or []
+        if not files:
+            page._heatmap_sampling_summary.setText("Select data files first.")
+            return
+        sizes = self._heatmap_file_sizes(page)
+        sampling = params.get("sampling") or {}
+        method = sampling.get("method") or "uniform"
+        try:
+            value = int(sampling.get(method) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        counts = _heatmap_sample_counts(
+            sizes, sampling.get("mode") or "full", method, value
+        )
+        lines = []
+        for path in files:
+            name = self._comp_file_name(path, page._heatmap_task_id)
+            used = counts.get(path, sizes.get(path, 0))
+            lines.append(f"{name}: {sizes.get(path, 0):,} → {used:,}")
+        page._heatmap_sampling_summary.setText("\n".join(lines))
+
+    def _heatmap_update_buttons(self, page) -> None:
+        params = page._heatmap_params
+        running = page._heatmap_running
+        ready = bool(
+            params.get("files") and params.get("gates")
+            and params.get("variables")
+        )
+        page._heatmap_calc_btn.setEnabled(
+            ready and not running and not page._heatmap_locked
+        )
+        page._heatmap_cancel_btn.setVisible(running)
+        page._heatmap_progress.setVisible(running)
+        editable = not page._heatmap_locked and not running
+        for widget in (
+            page._heatmap_files_btn, page._heatmap_gates_btn,
+            page._heatmap_vars_btn, page._heatmap_sampling,
+        ):
+            widget.setEnabled(editable)
+        page._heatmap_sampling_method.setEnabled(editable)
+        page._heatmap_sampling_value.setEnabled(editable)
+        page._heatmap_gates_box.setDragEnabled(editable)
+        page._heatmap_vars_box.setDragEnabled(editable)
+
+    def _heatmap_refresh_stale(self, page) -> None:
+        result = page._heatmap_result
+        if not result:
+            page._heatmap_stale_label.setText("")
+            return
+        stale = result.get("signature") != self._heatmap_signature(page)
+        page._heatmap_stale_label.setText(
+            "Outdated — press Calculate" if stale else ""
+        )
+
+    def _heatmap_update_save_btn(self, page) -> None:
+        page._heatmap_save_btn.setEnabled(
+            page._heatmap_dirty and not page._heatmap_locked
+        )
+
+    def _heatmap_mark_dirty(self, page) -> None:
+        page._heatmap_dirty = True
+        self._heatmap_update_save_btn(page)
+        self._module_set_state(page, MODULE_STATE_MODIFIED)
+
+    def _heatmap_log(self, page, text) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = page._heatmap_log_lines
+        for line in str(text).splitlines():
+            if line.strip():
+                lines.append(f"[{ts}] {line}")
+        if len(lines) > _FEATURE_LOG_LIMIT:
+            del lines[:-_FEATURE_LOG_LIMIT]
+        page._heatmap_params["log"] = list(lines)
+        box = getattr(page, "_heatmap_log_box", None)
+        if box is not None:
+            for line in str(text).splitlines():
+                if line.strip():
+                    box.appendPlainText(f"[{ts}] {line}")
+
+    # -- calculation -------------------------------------------------------
+    def _heatmap_calculate(self, page) -> None:
+        if page._heatmap_running:
+            return
+        params = page._heatmap_params
+        if not params.get("files"):
+            QMessageBox.warning(self, "Calculate", "Select data files first.")
+            return
+        if not params.get("gates"):
+            QMessageBox.warning(self, "Calculate", "Select at least one gate.")
+            return
+        if not params.get("variables"):
+            QMessageBox.warning(
+                self, "Calculate", "Select at least one variable."
+            )
+            return
+        sampling = params.get("sampling") or {}
+        if sampling.get("mode") == "sample":
+            method = sampling.get("method") or "uniform"
+            try:
+                value = int(sampling.get(method) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value <= 0:
+                QMessageBox.warning(
+                    self, "Calculate", "Enter a sampling row count."
+                )
+                return
+
+        page._heatmap_running = True
+        page._heatmap_cancel = False
+        page._heatmap_status.setText("Calculating…")
+        page._heatmap_progress.setRange(0, max(1, len(params["files"])))
+        page._heatmap_progress.setValue(0)
+        self._heatmap_update_buttons(page)
+
+        runlog.action(
+            "heatmap.calculate", module=str(page._heatmap_task_id),
+            files=len(params["files"]), gates=len(params["gates"]),
+            variables=len(params["variables"]),
+            sampling=str((params.get("sampling") or {}).get("mode", "full")),
+        )
+        q = queue.Queue()
+        page._heatmap_queue = q
+        page._heatmap_thread = threading.Thread(
+            target=self._heatmap_run, args=(page, q), daemon=True
+        )
+        page._heatmap_thread.start()
+        timer = QTimer(self)
+        timer.setInterval(100)
+        timer.timeout.connect(lambda: self._heatmap_poll(page))
+        timer.start()
+        page._heatmap_timer = timer
+
+    def _heatmap_cancel(self, page) -> None:
+        page._heatmap_cancel = True
+        page._heatmap_status.setText("Cancelling…")
+
+    def _heatmap_run(self, page, q) -> None:
+        import time
+        import warnings
+
+        import numpy as np
+
+        params = copy.deepcopy(page._heatmap_params)
+        task_id = page._heatmap_task_id
+        files = list(params.get("files") or [])
+        gate_refs = list(params.get("gates") or [])
+        variables = list(params.get("variables") or [])
+        sampling = dict(params.get("sampling") or {})
+        plot_cfg = dict(params.get("plot") or {})
+        total = len(files)
+        started = time.perf_counter()
+        try:
+            q.put(("log", "— Starting heatmap calculation —"))
+            sizes = {}
+            for path in files:
+                index = self._subsample_row_index(task_id, path)
+                sizes[path] = (
+                    int(len(index)) if index is not None
+                    else int(self._data_row_count(path) or 0)
+                )
+            method = sampling.get("method") or "uniform"
+            try:
+                sample_value = int(sampling.get(method) or 0)
+            except (TypeError, ValueError):
+                sample_value = 0
+            used_rows = _heatmap_sample_counts(
+                sizes, sampling.get("mode") or "full", method, sample_value
+            )
+            if sampling.get("mode") == "sample":
+                q.put(("log", f"Sampling: {sampling.get('method', 'uniform')}"
+                              f" ({sum(used_rows.values()):,} rows used)"))
+            else:
+                q.put(("log", "Sampling: full data"))
+
+            numerators = {}
+            denominators = {}
+            gate_counts = {}
+            gate_labels = {
+                f"{ref.get('task')}|{ref.get('id')}":
+                    str(ref.get("label") or ref.get("id"))
+                for ref in gate_refs
+            }
+            empty_pairs = []       # (gate label, file name, reason)
+            na_terms = {}          # (gate key, variable) -> [file names]
+            for i, path in enumerate(files):
+                if page._heatmap_cancel:
+                    q.put(("cancelled",))
+                    return
+                name = self._comp_file_name(path, task_id)
+                q.put(("status", f"Reading {i + 1}/{total}"))
+                q.put(("log", f"Reading {i + 1}/{total}: {name} "
+                              f"({sizes.get(path, 0):,} rows)"))
+
+                gates_cache = {}
+                needed = set(variables)
+                for ref in gate_refs:
+                    task = self._find_task_by_id(ref.get("task"))
+                    if task is None:
+                        continue
+                    gates = gates_cache.get(ref["task"])
+                    if gates is None:
+                        gates = self._gating_gates_for(task, path)
+                        gates_cache[ref["task"]] = gates
+                    by_id = {g["id"]: g for g in gates}
+                    for gate in _gate_chain(gates, ref.get("id")):
+                        needed |= _gate_needed_columns(gate, by_id)
+                names = sorted(needed)
+                arrays = self._column_data(
+                    task_id, path, names, row_filter=False
+                )
+                missing = [name_ for name_ in variables if name_ not in arrays]
+                if missing:
+                    raise ValueError(
+                        f"{name} is missing: {', '.join(missing)}"
+                    )
+                index = self._subsample_row_index(task_id, path)
+                if index is not None:
+                    arrays = {key: value[index] for key, value in arrays.items()}
+                if not arrays:
+                    continue
+                visible = len(next(iter(arrays.values())))
+                keep_rows = used_rows.get(path, visible)
+                if 0 < keep_rows < visible:
+                    selection = _stable_sample_selection(
+                        np.ones(visible, dtype=bool), int(keep_rows)
+                    )
+                    picked = np.flatnonzero(selection)
+                    arrays = {
+                        key: value[picked] for key, value in arrays.items()
+                    }
+                q.put(("log", f"  using "
+                              f"{len(next(iter(arrays.values()))):,} rows"))
+
+                existing = set(arrays)
+                for ref in gate_refs:
+                    key = f"{ref.get('task')}|{ref.get('id')}"
+                    gate_counts.setdefault(key, {})
+                    gates = gates_cache.get(ref.get("task"))
+                    if not gates or not any(
+                        g["id"] == ref.get("id") for g in gates
+                    ):
+                        empty_pairs.append((
+                            gate_labels.get(key, key), name,
+                            "gate does not apply to this file",
+                        ))
+                        continue
+                    try:
+                        mask = _compute_gate_filter_mask(
+                            gates, ref.get("id"), path, {},
+                            existing=existing, extra=arrays,
+                        )
+                    except Exception:  # noqa: BLE001
+                        mask = None
+                    if mask is None:
+                        gate_counts[key][path] = None
+                        empty_pairs.append((
+                            gate_labels.get(key, key), name,
+                            "gate could not be evaluated",
+                        ))
+                        continue
+                    mask = np.asarray(mask, dtype=bool)
+                    count = int(np.count_nonzero(mask))
+                    gate_counts[key][path] = count
+                    if count == 0:
+                        empty_pairs.append((
+                            gate_labels.get(key, key), name, "no data points",
+                        ))
+                        continue
+                    for var in variables:
+                        values = np.asarray(
+                            arrays[var], dtype="float64"
+                        )[mask]
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", RuntimeWarning)
+                            with np.errstate(all="ignore"):
+                                mean = (
+                                    float(np.nanmean(values))
+                                    if values.size else float("nan")
+                                )
+                        if not np.isfinite(mean):
+                            # Only files with a real value take part in the
+                            # weighted average; the skip is reported below.
+                            na_terms.setdefault((key, var), []).append(name)
+                            continue
+                        slot = (key, var)
+                        numerators[slot] = (
+                            numerators.get(slot, 0.0) + count * mean
+                        )
+                        denominators[slot] = (
+                            denominators.get(slot, 0.0) + count
+                        )
+                q.put(("progress", i + 1, total))
+
+            if empty_pairs:
+                q.put(("log",
+                       f"! {len(empty_pairs)} gate/file pair(s) have no data:"
+                       " the cell becomes NA and the file is skipped"))
+                for gate_label, file_name, reason in empty_pairs[:20]:
+                    q.put(("log",
+                           f"  {gate_label} · {file_name} ({reason})"))
+                if len(empty_pairs) > 20:
+                    q.put(("log", f"  … and {len(empty_pairs) - 20} more"))
+            if na_terms:
+                total_terms = sum(len(names) for names in na_terms.values())
+                q.put(("log",
+                       f"! {total_terms} weighted term(s) were NA: "
+                       "skipped, calculation continued"))
+                for (key, var), names_ in list(na_terms.items())[:40]:
+                    label = gate_labels.get(key, key)
+                    shown = ", ".join(names_[:6])
+                    if len(names_) > 6:
+                        shown += f", … (+{len(names_) - 6})"
+                    q.put(("log", f"  {label} × {var}: {shown}"))
+
+            values = []
+            for ref in gate_refs:
+                key = f"{ref.get('task')}|{ref.get('id')}"
+                row = []
+                for var in variables:
+                    total_weight = denominators.get((key, var), 0.0)
+                    if total_weight > 0:
+                        row.append(
+                            numerators.get((key, var), 0.0) / total_weight
+                        )
+                    else:
+                        row.append(None)
+                values.append(row)
+
+            na_cells = sum(
+                1 for row in values for value in row if value is None
+            )
+            if na_cells:
+                q.put(("log",
+                       f"! {na_cells} cell(s) have no data (shown as NA)."))
+            q.put(("log", "Building dendrograms…"))
+            clustering = {}
+            for normalize in ("raw", "column", "row"):
+                matrix = _heatmap_normalize(values, normalize)
+                row_matrix = _heatmap_fill_nan(matrix, 1)
+                col_matrix = _heatmap_fill_nan(matrix, 0)
+                metric = plot_cfg.get("metric") or "euclidean"
+                linkage_method = plot_cfg.get("linkage") or "average"
+                clustering[f"{normalize}|{metric}|{linkage_method}"] = {
+                    "row": _heatmap_linkage(row_matrix, metric, linkage_method),
+                    "col": _heatmap_linkage(
+                        col_matrix.T, metric, linkage_method
+                    ),
+                }
+
+            payload = {
+                "version": 1,
+                "signature": self._heatmap_signature(page),
+                "computed_at": datetime.now().isoformat(timespec="seconds"),
+                "files": files,
+                "file_names": {
+                    path: self._comp_file_name(path, task_id)
+                    for path in files
+                },
+                "gates": gate_refs,
+                "variables": variables,
+                "values": values,
+                "counts": gate_counts,
+                "clustering": clustering,
+                "sampling": sampling,
+                "row_counts": {path: sizes.get(path, 0) for path in files},
+                "used_rows": used_rows,
+                "seconds": round(time.perf_counter() - started, 3),
+            }
+            q.put(("done", payload))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("error", str(exc)))
+
+    def _heatmap_poll(self, page) -> None:
+        q = getattr(page, "_heatmap_queue", None)
+        if q is None:
+            return
+        finished = False
+        error = None
+        cancelled = False
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            if kind == "log":
+                self._heatmap_log(page, msg[1])
+            elif kind == "status":
+                page._heatmap_status.setText(msg[1])
+            elif kind == "progress":
+                page._heatmap_progress.setRange(0, max(1, msg[2]))
+                page._heatmap_progress.setValue(msg[1])
+            elif kind == "cancelled":
+                cancelled = True
+                finished = True
+            elif kind == "done":
+                payload = msg[1]
+                self._heatmap_apply_result(page, payload)
+                finished = True
+            elif kind == "error":
+                error = msg[1]
+                finished = True
+        if not finished:
+            return
+        page._heatmap_running = False
+        timer = getattr(page, "_heatmap_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._heatmap_timer = None
+        page._heatmap_queue = None
+        self._heatmap_update_buttons(page)
+        if cancelled:
+            self._heatmap_log(page, "Cancelled.")
+            page._heatmap_status.setText("Cancelled")
+            return
+        if error:
+            self._heatmap_log(page, f"✗ {error}")
+            page._heatmap_status.setText("Failed — see the log")
+            QMessageBox.warning(self, "Calculate", error)
+            return
+        page._heatmap_status.setText("Done")
+        page._heatmap_progress.setValue(page._heatmap_progress.maximum())
+
+    def _heatmap_apply_result(self, page, payload) -> None:
+        page._heatmap_result = payload
+        page._heatmap_dendro_cache = {}
+        self._heatmap_store_save(page._heatmap_task_id, payload)
+        self._heatmap_refresh_plot(page)
+        self._heatmap_refresh_stale(page)
+        if self.project is not None:
+            self.project.save()
+        page._heatmap_snapshot = copy.deepcopy(page._heatmap_params)
+        page._heatmap_dirty = False
+        self._heatmap_update_save_btn(page)
+        gates = len(payload.get("gates") or [])
+        variables = len(payload.get("variables") or [])
+        files = len(payload.get("files") or [])
+        self._heatmap_log(
+            page,
+            f"✓ {gates} gates × {variables} variables "
+            f"({files} files, {payload.get('seconds', 0):.2f} s)",
+        )
+        self._heatmap_log(page, "Matrix saved to the module folder.")
+        self.statusBar().showMessage("Heatmap calculated")
+        self._module_saved(page)
+        runlog.action(
+            "heatmap.done", module=str(page._heatmap_task_id),
+            gates=gates, variables=variables, files=files,
+        )
+
+    # -- rendering ---------------------------------------------------------
+    def _heatmap_display(self, page):
+        """(row labels, column labels, matrix, row dendro, col dendro) to draw."""
+        import numpy as np
+
+        result = page._heatmap_result
+        if not result:
+            return None
+        values = result.get("values") or []
+        gates = result.get("gates") or []
+        variables = result.get("variables") or []
+        if not values or not gates or not variables:
+            return None
+        cfg = page._heatmap_params.get("plot") or {}
+        matrix = _heatmap_normalize(values, cfg.get("normalize") or "raw")
+        row_labels = [gate.get("label") or gate.get("id") for gate in gates]
+        col_labels = [str(name) for name in variables]
+        row_order = list(range(len(row_labels)))
+        col_order = list(range(len(col_labels)))
+        row_dendro = col_dendro = None
+        if cfg.get("cluster_rows"):
+            info = self._heatmap_dendro(page, "row")
+            if info and len(info.get("order") or []) == len(row_labels):
+                row_order = list(info["order"])
+                row_dendro = info
+        if cfg.get("cluster_cols"):
+            info = self._heatmap_dendro(page, "col")
+            if info and len(info.get("order") or []) == len(col_labels):
+                col_order = list(info["order"])
+                col_dendro = info
+        matrix = matrix[np.ix_(row_order, col_order)]
+        return (
+            [row_labels[i] for i in row_order],
+            [col_labels[i] for i in col_order],
+            matrix, row_dendro, col_dendro,
+        )
+
+    def _heatmap_dendro(self, page, axis: str):
+        result = page._heatmap_result or {}
+        cfg = page._heatmap_params.get("plot") or {}
+        normalize = cfg.get("normalize") or "raw"
+        metric = cfg.get("metric") or "euclidean"
+        linkage_method = cfg.get("linkage") or "average"
+        key = f"{normalize}|{metric}|{linkage_method}"
+        cache = page._heatmap_dendro_cache
+        if key not in cache:
+            cluster = (result.get("clustering") or {}).get(key)
+            if cluster is None:
+                matrix = _heatmap_normalize(
+                    result.get("values") or [], normalize
+                )
+                if getattr(matrix, "ndim", 0) == 2 and matrix.size:
+                    row_matrix = _heatmap_fill_nan(matrix, 1)
+                    col_matrix = _heatmap_fill_nan(matrix, 0)
+                    cluster = {
+                        "row": _heatmap_linkage(
+                            row_matrix, metric, linkage_method
+                        ),
+                        "col": _heatmap_linkage(
+                            col_matrix.T, metric, linkage_method
+                        ),
+                    }
+                else:
+                    cluster = {}
+            cache[key] = cluster
+        return (cache[key] or {}).get(axis)
+
+    def _heatmap_refresh_plot(self, page) -> None:
+        display = self._heatmap_display(page)
+        canvas = getattr(page, "_heatmap_canvas", None)
+        if canvas is None:
+            return
+        if display is None:
+            if page._heatmap_result:
+                canvas.clear("No data in the selected gates.")
+            else:
+                canvas.clear("Press Calculate to build the heatmap.")
+            return
+        rows, cols, matrix, row_dendro, col_dendro = display
+        cfg = dict(page._heatmap_params.get("plot") or {})
+        cfg["normalize"] = cfg.get("normalize") or "raw"
+        canvas.set_content(rows, cols, matrix, row_dendro, col_dendro, cfg)
+        try:
+            canvas.adjustSize()
+        except RuntimeError:
+            pass
+
+    def _heatmap_copy_matrix(self, page) -> None:
+        display = self._heatmap_display(page)
+        if display is None:
+            return
+        rows, cols, matrix, _row, _col = display
+        lines = ["\t".join([""] + cols)]
+        for index, label in enumerate(rows):
+            cells = [_heatmap_export_text(value) for value in matrix[index]]
+            lines.append("\t".join([str(label)] + cells))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Heatmap matrix copied", 3000)
+
+    # -- save / close ------------------------------------------------------
+    def _heatmap_save_now(self, page) -> None:
+        if page._heatmap_result is not None:
+            merged = dict(page._heatmap_result.get("clustering") or {})
+            merged.update(page._heatmap_dendro_cache)
+            if merged:
+                page._heatmap_result["clustering"] = merged
+            self._heatmap_store_save(
+                page._heatmap_task_id, page._heatmap_result
+            )
+        if self.project is not None:
+            self.project.save()
+        page._heatmap_snapshot = copy.deepcopy(page._heatmap_params)
+        page._heatmap_dirty = False
+        self._heatmap_update_save_btn(page)
+        self.statusBar().showMessage("Heatmap saved")
+        self._module_saved(page)
+
+    def _heatmap_close(self, page) -> None:
+        if page._heatmap_dirty:
+            reply = QMessageBox.question(
+                self, "Close Heatmap",
+                "There are unsaved changes.\n"
+                "Close without saving? Unsaved changes will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            page._heatmap_task_def["params"] = copy.deepcopy(
+                page._heatmap_snapshot
+            )
+        self._heatmap_cleanup(page)
+        self._close_module_page(page)
+
+    def _heatmap_cleanup(self, page) -> None:
+        page._heatmap_cancel = True
+        timer = getattr(page, "_heatmap_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._heatmap_timer = None
 
     def _build_area_page(self, name: str, task_def: dict, locked: bool) -> QWidget:
         """Build the Area page: files/batch (1) | per-file table (2) | plot (1)."""
@@ -31423,7 +33986,7 @@ class MainWindow(QMainWindow):
         params = page._dc_params
         name = (params.get("name") or "PeacoQC_pass").strip()
         stem = Path(str(path)).stem
-        rel = f"Module/{page._dc_task_id}/{stem}_dataclean.parquet"
+        rel = self._module_rel(page._dc_task_id, f"{stem}_dataclean.parquet")
         out_path = self.project.path / rel
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -32813,14 +35376,14 @@ class MainWindow(QMainWindow):
         """Save the fitted arrays into the module folder and describe them."""
         import numpy as np
 
-        folder = self.project.path / "Module" / str(page._ba_task_id)
+        folder = self._module_dir(page._ba_task_id)
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / "alignment.npz"
         np.savez_compressed(path, **arrays)
         stat = path.stat()
         model_id = f"{int(stat.st_mtime_ns)}-{int(stat.st_size)}"
         model = {
-            "npz": f"Module/{page._ba_task_id}/alignment.npz",
+            "npz": self._module_rel(page._ba_task_id, "alignment.npz"),
             "model_id": model_id,
             "config_sig": self._ba_config_sig(page._ba_params),
             "method": meta.get("method"),
@@ -33157,7 +35720,7 @@ class MainWindow(QMainWindow):
         from matplotlib.backends.backend_pdf import PdfPages
         from matplotlib.figure import Figure
 
-        folder = self.project.path / "Module" / str(page._ba_task_id) / "report"
+        folder = self._module_dir(page._ba_task_id) / "report"
         folder.mkdir(parents=True, exist_ok=True)
         columns = payload["columns"]
         batches = payload["batches"]
@@ -33463,7 +36026,8 @@ class MainWindow(QMainWindow):
         """Where a Gating task's gate tree lives (its own module folder)."""
         if self.project is None or not task_def.get("id"):
             return None
-        return self.project.path / "Module" / str(task_def.get("id")) / "gates.json"
+        folder = self._module_dir(task_def.get("id"))
+        return folder / "gates.json" if folder is not None else None
 
     def _gating_store_load(self, task_def) -> dict:
         """Load ``{files, gates, per_file}`` for a Gating task (cached).
@@ -33621,6 +36185,9 @@ class MainWindow(QMainWindow):
             preview.setdefault("last_x", preview.get("x"))
             preview.setdefault("last_y", preview.get("y"))
             preview.setdefault("type", "scatter")
+        # The gating plot sits on a bordered canvas card whose size is saved
+        # with the module (Plot settings: W / H / resolution / square).
+        preview.setdefault("size", list(_GATING_PLOT_SIZE))
         page._gating_preview = preview
         page._gating_task_def = task_def
         page._gating_task_id = task_def.get("id")
@@ -33861,7 +36428,7 @@ class MainWindow(QMainWindow):
         )
         tools_lay.addWidget(col2gate_btn)
         page._gating_col2gate_btn = col2gate_btn
-        mid_lay.addWidget(tools, 1)
+        mid_lay.addWidget(tools)
 
         plot_widget, viewbox = self._gating_make_plot(page)
         # Overlay shown when the current file lacks the scatter's x/y parameter.
@@ -33890,9 +36457,41 @@ class MainWindow(QMainWindow):
         ov.addStretch()
         overlay.hide()
         host_grid.addWidget(overlay, 0, 0)
-        mid_lay.addWidget(plot_host, 5)
+
+        # The plot is a bordered card at a fixed size on a light canvas, like
+        # the Figure module (size is set in Plot settings).
+        plot_card = QFrame()
+        plot_card.setObjectName("gatingPlotCard")
+        plot_card.setStyleSheet(
+            "#gatingPlotCard { background: #ffffff;"
+            " border: 1px solid #c9d5e2; border-radius: 6px; }"
+        )
+        card_lay = QVBoxLayout(plot_card)
+        card_lay.setContentsMargins(6, 6, 6, 6)
+        card_lay.setSpacing(0)
+        card_lay.addWidget(plot_host, 1)
+        card_w, card_h = _gating_plot_size(page._gating_preview)
+        plot_card.setFixedSize(card_w, card_h)
+
+        # Canvas (like the Figure module): the card lives in a graphics scene,
+        # the wheel zooms the canvas around the empty area.
+        plot_scene = QGraphicsScene()
+        plot_proxy = QGraphicsProxyWidget()
+        plot_proxy.setWidget(plot_card)
+        plot_scene.addItem(plot_proxy)
+        plot_proxy.setPos(0, 0)
+        plot_scene.setSceneRect(
+            QRectF(0, 0, card_w, card_h).adjusted(-24, -24, 24, 24)
+        )
+        canvas = _GatingCanvasView(plot_scene, plot_widget, plot_card)
+
+        mid_lay.addWidget(canvas, 5)
         page._gating_plot_widget = plot_widget
         page._gating_viewbox = viewbox
+        page._gating_plot_card = plot_card
+        page._gating_plot_canvas = canvas
+        page._gating_plot_scene = plot_scene
+        page._gating_plot_proxy = plot_proxy
         page._gating_overlay = overlay
         page._gating_overlay_box = overlay_box
         page._gating_tool = None
@@ -33928,9 +36527,18 @@ class MainWindow(QMainWindow):
         settings_lay.addWidget(settings_scroll, 1)
         page._gating_settings_layout = settings_layout
 
-        cl.addWidget(tree_panel, 1)
-        cl.addWidget(mid_panel, 2)
-        cl.addWidget(settings_panel, 1)
+        # Tree | plot canvas | plot settings, resizable by dragging the edges.
+        gating_split = QSplitter(Qt.Orientation.Horizontal)
+        gating_split.setChildrenCollapsible(False)
+        gating_split.addWidget(tree_panel)
+        gating_split.addWidget(mid_panel)
+        gating_split.addWidget(settings_panel)
+        gating_split.setStretchFactor(0, 1)
+        gating_split.setStretchFactor(1, 2)
+        gating_split.setStretchFactor(2, 1)
+        gating_split.setSizes([300, 700, 320])
+        cl.addWidget(gating_split, 1)
+        page._gating_splitter = gating_split
 
         tree.itemClicked.connect(lambda item, col=0: self._gating_on_tree_selection(page, item, col))
         tree.itemDoubleClicked.connect(lambda item, col=0: self._gating_on_tree_double_clicked(page, item, col))
@@ -34656,10 +37264,14 @@ class MainWindow(QMainWindow):
             "xmin": xr[0], "xmax": xr[1],
             "ymin": yr[0], "ymax": yr[1],
         }
+        runlog.action("gating.create", module=str(page._gating_task_id),
+                      tool=str(tool), id=str(gate["id"]))
         geometry = self._gating_sync_gate(gate, arg)
         for key, value in geometry.items():
             gate[key] = copy.deepcopy(value)
+        runlog.action("gating.create.geometry", id=str(gate["id"]))
         self._gating_style_handles(arg)
+        runlog.action("gating.create.handles", id=str(gate["id"]))
         arg.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         arg.setAcceptHoverEvents(True)
         arg.setCursor(Qt.CursorShape.CrossCursor)
@@ -34673,10 +37285,13 @@ class MainWindow(QMainWindow):
         page._gating_rois.append([arg])
         self._gating_set_items_handles_visible([arg], False)
         page._gating_context_gate_id = gate["id"]
+        runlog.action("gating.create.visibility", id=str(gate["id"]))
         self._gating_update_roi_visibility(page)
+        runlog.action("gating.create.tree", id=str(gate["id"]))
         self._gating_rebuild_tree(page)
         self._gating_set_tool(page, None)
         self._gating_mark_dirty(page)
+        runlog.action("gating.create.done", id=str(gate["id"]))
 
     def _gating_style_handles(self, roi) -> None:
         """Make a gate ROI's handles round and a bit larger."""
@@ -34921,6 +37536,9 @@ class MainWindow(QMainWindow):
         """Reconcile and refresh the per-gate name labels on the scatter."""
         labels = page._gating_labels
         gates = page._gating_gates
+        if len(labels) != len(gates):
+            runlog.action("gating.labels_reconcile",
+                          labels=len(labels), gates=len(gates))
         while len(labels) < len(gates):
             labels.append(self._gating_new_label(page))
         while len(labels) > len(gates):
@@ -34981,7 +37599,10 @@ class MainWindow(QMainWindow):
                 if t == "rect":
                     roi = pg.RectROI(
                         (rgate["pos"][0], rgate["pos"][1]),
-                        (rgate["size"][0], rgate["size"][1]),
+                        (
+                            max(float(rgate["size"][0]), _MIN_GATE_SPAN),
+                            max(float(rgate["size"][1]), _MIN_GATE_SPAN),
+                        ),
                         **_gate_roi_pens(gate_color),
                     )
                     self._gating_style_handles(roi)
@@ -34998,7 +37619,10 @@ class MainWindow(QMainWindow):
                 elif t == "ellipse":
                     roi = pg.EllipseROI(
                         (rgate["pos"][0], rgate["pos"][1]),
-                        (rgate["size"][0], rgate["size"][1]),
+                        (
+                            max(float(rgate["size"][0]), _MIN_GATE_SPAN),
+                            max(float(rgate["size"][1]), _MIN_GATE_SPAN),
+                        ),
                         **_gate_roi_pens(gate_color),
                     )
                     self._gating_style_handles(roi)
@@ -35125,30 +37749,34 @@ class MainWindow(QMainWindow):
             page._gating_rois.append(items)
 
     def _gating_remove_rois(self, page) -> None:
-        """Remove every gate ROI/line from the ViewBox (labels are kept)."""
+        """Remove every gate ROI/line from the ViewBox (labels are kept).
+
+        Items are validated first: a rebuild may leave a wrapper whose C++
+        object is already gone, and removing it would crash the scene.
+        """
+        from shiboken6 import isValid
+
+        def drop(item) -> None:
+            if item is None:
+                return
+            try:
+                if isValid(item):
+                    _detach_gate_item(item)
+                    page._gating_viewbox.removeItem(item)
+            except (RuntimeError, AttributeError):
+                pass
+
         for items in page._gating_rois:
             for item in items:
-                try:
-                    page._gating_viewbox.removeItem(item)
-                except Exception:
-                    pass
+                drop(item)
         for entry in page._gating_crosshairs.values():
             for line in entry["lines"]:
-                try:
-                    page._gating_viewbox.removeItem(line)
-                except Exception:
-                    pass
+                drop(line)
         for entry in page._gating_split_lines.values():
             for line in entry["lines"]:
-                try:
-                    page._gating_viewbox.removeItem(line)
-                except Exception:
-                    pass
+                drop(line)
         for entry in page._gating_skewed_lines.values():
-            try:
-                page._gating_viewbox.removeItem(entry["roi"])
-            except Exception:
-                pass
+            drop(entry["roi"])
         page._gating_rois = []
         page._gating_crosshairs = {}
         page._gating_split_lines = {}
@@ -35215,6 +37843,7 @@ class MainWindow(QMainWindow):
         indices = [i for i, g in enumerate(page._gating_gates) if g["id"] in to_delete]
         for i in reversed(indices):
             for item in page._gating_rois[i]:
+                _detach_gate_item(item)
                 page._gating_viewbox.removeItem(item)
             if i < len(page._gating_labels):
                 label = page._gating_labels.pop(i)
@@ -35830,7 +38459,10 @@ class MainWindow(QMainWindow):
             return
         for generation, stats in worker.poll():
             if generation == page._gating_stat_generation:
+                runlog.action("gating.stats_apply",
+                              gates=len(page._gating_gates))
                 self._gating_apply_stats(page, stats)
+                runlog.action("gating.stats_applied")
 
     @staticmethod
     def _gating_gate_display_name(gate, idx, stats) -> str:
@@ -35910,6 +38542,8 @@ class MainWindow(QMainWindow):
         plot_widget = page._gating_plot_widget
         viewbox = page._gating_viewbox
         plot_type = preview.get("type", "scatter")
+        runlog.action("gating.render", type=str(plot_type),
+                      items=len(plot_widget.getPlotItem().items))
 
         # Undo image-view locks (aspect / auto-range) when leaving image mode.
         if plot_type != "image":
@@ -36106,6 +38740,97 @@ class MainWindow(QMainWindow):
                 ),
             ))
 
+        # ----- plot size on the canvas (same controls as the Figure module) --
+        layout.addWidget(QLabel("Size (px)"))
+        size_row = QWidget()
+        sh = QHBoxLayout(size_row)
+        sh.setContentsMargins(0, 0, 0, 0)
+        sh.setSpacing(4)
+        size = _gating_plot_size(preview)
+
+        def apply_size(width, height):
+            width = max(200, min(4000, int(width)))
+            height = max(200, min(4000, int(height)))
+            preview["size"] = [width, height]
+            card = getattr(page, "_gating_plot_card", None)
+            if card is not None:
+                card.setFixedSize(width, height)
+            scene = getattr(page, "_gating_plot_scene", None)
+            if scene is not None:
+                scene.setSceneRect(
+                    QRectF(0, 0, width, height).adjusted(-24, -24, 24, 24)
+                )
+            self._gating_mark_dirty(page)
+
+        def on_width():
+            width = width_field.value()
+            if width is None:
+                return
+            height = height_field.value() or width
+            resolution_field.set_value(max(20, min(400, round(width / 10.0))))
+            apply_size(width, height)
+
+        def on_height():
+            width = width_field.value()
+            height = height_field.value()
+            if width is None or height is None:
+                return
+            apply_size(width, height)
+
+        def on_resolution():
+            res = resolution_field.value()
+            if res is None:
+                return
+            width = int(res) * 10
+            old_w = width_field.value() or 0
+            old_h = height_field.value() or 0
+            height = (
+                int(round(old_h * width / old_w)) if old_w
+                else int(round(width * 0.86))
+            )
+            width_field.set_value(width)
+            height_field.set_value(height)
+            apply_size(width, height)
+
+        def on_square():
+            height = height_field.value() or width_field.value()
+            if height is None:
+                return
+            width_field.set_value(height)
+            resolution_field.set_value(max(20, min(400, round(height / 10.0))))
+            apply_size(height, height)
+
+        width_field = _SizeField(size[0], lambda _v=None: on_width())
+        height_field = _SizeField(size[1], lambda _v=None: on_height())
+        width_field.set_enabled(enabled)
+        height_field.set_enabled(enabled)
+        sh.addWidget(QLabel("W"))
+        sh.addWidget(width_field)
+        sh.addWidget(QLabel("H"))
+        sh.addWidget(height_field)
+        sh.addStretch()
+        layout.addWidget(size_row)
+
+        layout.addWidget(QLabel("Resolution"))
+        res_row = QWidget()
+        rh = QHBoxLayout(res_row)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.setSpacing(4)
+        resolution_field = _SizeField(
+            max(20, min(400, int(round(size[0] / 10.0)))),
+            lambda _v=None: on_resolution(), minimum=20, maximum=400,
+        )
+        resolution_field.set_enabled(enabled)
+        rh.addWidget(resolution_field)
+        square_btn = QPushButton("Square")
+        square_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        square_btn.setEnabled(enabled)
+        square_btn.setToolTip("Make width equal to height")
+        square_btn.clicked.connect(lambda _=False: on_square())
+        rh.addWidget(square_btn)
+        rh.addStretch()
+        layout.addWidget(res_row)
+
         self._figure_display_toggles(
             layout, preview, enabled,
             on_change=lambda: (
@@ -36260,6 +38985,10 @@ class MainWindow(QMainWindow):
         handle_hover_pen = pg.mkPen(hover, width=2)
 
         def repen(item) -> None:
+            from shiboken6 import isValid
+
+            if not isValid(item):
+                return
             if isinstance(item, pg.InfiniteLine):
                 item.setPen(pen)
                 item.setHoverPen(hover_pen)
@@ -36505,11 +39234,39 @@ class MainWindow(QMainWindow):
         task_def = self._find_task_by_id(task_id)
         locked = task_def is not None and _task_is_locked(task_def)
         kind = _task_kind(task_type or "")
+        # A locked module is still editable: it is opened on a deep copy of
+        # its definition and everything it writes goes to Module/<id>/draft/,
+        # which is removed when the module closes.
+        draft = bool(locked and task_type != "import" and task_def is not None)
+        if draft:
+            task_def = copy.deepcopy(task_def)
+            self._draft_task_ids.add(str(task_id))
+            locked = False
+            # Start from a clean draft folder, seeded with the module's small
+            # state files so the page shows the saved state it had before.
+            if self.project is not None:
+                official = self.project.path / "Module" / str(task_id)
+                pending = official / "draft"
+                shutil.rmtree(pending, ignore_errors=True)
+                try:
+                    pending.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pending = None
+                if pending is not None:
+                    for name in ("gates.json", "heatmap.json"):
+                        source = official / name
+                        if source.is_file():
+                            try:
+                                shutil.copy2(source, pending / name)
+                            except OSError:
+                                pass
 
         if task_type == "import":
             page = self._build_data_import_page()
         elif task_type == "figure":
             page = self._build_figure_page(name, task_def, locked)
+        elif task_type == "heatmap":
+            page = self._build_heatmap_page(name, task_def, locked)
         elif task_type == "scale":
             page = self._build_scaling_page(name, task_def, locked)
         elif task_type == "gating":
@@ -36549,6 +39306,9 @@ class MainWindow(QMainWindow):
         else:
             page = self._build_module_page(name, locked=locked, task_id=task_id)
         page.setProperty("task_id", task_id)
+        if draft:
+            page._draft_task_def = task_def
+            self._add_draft_badge(page)
         index = self.tabs.addTab(page, name)
         if task_type:
             self.tabs.setTabIcon(
@@ -36573,6 +39333,13 @@ class MainWindow(QMainWindow):
         )
         if task_id:
             self._module_registry.pop(task_id, None)
+        if task_id and str(task_id) in self._draft_task_ids:
+            self._draft_task_ids.discard(str(task_id))
+            if self.project is not None:
+                shutil.rmtree(
+                    self.project.path / "Module" / str(task_id) / "draft",
+                    ignore_errors=True,
+                )
         index = self.tabs.indexOf(page)
         if index > 0:
             self.tabs.removeTab(index)
