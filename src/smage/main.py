@@ -2028,8 +2028,40 @@ def _resolve_gates_for_file(gates, per_file, file_key):
     return resolved
 
 
-def _gate_needed_columns(gate, by_id):
-    """Return the x/y column names needed to compute a gate's own mask."""
+def _json_stable(value) -> str:
+    """Deterministic JSON text for cache keys (sets become sorted lists).
+
+    Plain ``json.dumps(default=str)`` renders a set in hash order, which
+    changes between runs, so a disk cache keyed that way would never hit.
+    """
+    def norm(item):
+        if isinstance(item, dict):
+            return {
+                str(key): norm(val)
+                for key, val in sorted(item.items(), key=lambda kv: str(kv[0]))
+            }
+        if isinstance(item, (list, tuple)):
+            return [norm(entry) for entry in item]
+        if isinstance(item, (set, frozenset)):
+            return sorted(str(entry) for entry in item)
+        return item
+
+    return json.dumps(norm(value), sort_keys=True, default=str)
+
+
+def _gate_needed_columns(gate, by_id, _seen=None):
+    """Return the x/y column names needed to compute a gate's own mask.
+
+    Boolean sources are followed recursively, so ``NOT (A OR B)`` also pulls
+    in the columns of A and B.
+    """
+    if _seen is None:
+        _seen = set()
+    gid = gate.get("id")
+    if gid is not None:
+        if gid in _seen:
+            return set()
+        _seen.add(gid)
     cols = set()
     for key in ("x", "y"):
         v = gate.get(key)
@@ -2038,46 +2070,68 @@ def _gate_needed_columns(gate, by_id):
     for sid in _gate_source_ids(gate):
         src = by_id.get(sid)
         if src is not None:
-            for key in ("x", "y"):
-                v = src.get(key)
-                if v:
-                    cols.add(v)
+            cols |= _gate_needed_columns(src, by_id, _seen)
     return cols
 
 
-def _gate_own_mask(gate, by_id, get_col, transforms, existing):
+def _gate_own_mask(gate, by_id, get_col, transforms, existing, _visiting=None):
     """Return a gate's own boolean mask (transformed data), handling boolean
-    gates (NOT / AND / OR)."""
-    if gate.get("type") == "not":
-        src = by_id.get(gate.get("source"))
-        if src is None:
+    gates (NOT / AND / OR). Boolean gates may reference other boolean gates,
+    for example ``NOT (A OR B)``."""
+    kind = gate.get("type")
+    if kind not in ("not", "and", "or"):
+        x_name, y_name = gate.get("x"), gate.get("y")
+        if not x_name or x_name not in existing or (
+            y_name and y_name not in existing
+        ):
             return None
-        sx, sy = src.get("x"), src.get("y")
+        x = _apply_scale_transforms(get_col(x_name), transforms.get(x_name))
+        y = (
+            _apply_scale_transforms(get_col(y_name), transforms.get(y_name))
+            if y_name else None
+        )
+        return _gate_mask(x, y, gate)
+
+    if _visiting is None:
+        _visiting = set()
+    gid = gate.get("id")
+    if gid in _visiting:
+        return None
+    visiting = _visiting | {gid} if gid is not None else _visiting
+
+    def source_mask(source):
+        if source is None:
+            return None
+        if source.get("type") in ("not", "and", "or"):
+            return _gate_own_mask(
+                source, by_id, get_col, transforms, existing, visiting
+            )
+        sx, sy = source.get("x"), source.get("y")
         if not sx or sx not in existing or (sy and sy not in existing):
             return None
         x = _apply_scale_transforms(get_col(sx), transforms.get(sx))
-        y = _apply_scale_transforms(get_col(sy), transforms.get(sy)) if sy else None
-        return ~_gate_mask(x, y, src)
-    if gate.get("type") in ("and", "or"):
-        combine_and = gate.get("type") == "and"
-        result = None
-        for sid in gate.get("sources", []):
-            src = by_id.get(sid)
-            if src is None:
-                continue
-            sx, sy = src.get("x"), src.get("y")
-            if not sx or sx not in existing or (sy and sy not in existing):
-                continue
-            x = _apply_scale_transforms(get_col(sx), transforms.get(sx))
-            y = _apply_scale_transforms(get_col(sy), transforms.get(sy)) if sy else None
-            sm = _gate_mask(x, y, src)
-            if result is None:
-                result = sm
-            elif combine_and:
-                result = result & sm
-            else:
-                result = result | sm
-        return result
+        y = (
+            _apply_scale_transforms(get_col(sy), transforms.get(sy))
+            if sy else None
+        )
+        return _gate_mask(x, y, source)
+
+    if kind == "not":
+        mask = source_mask(by_id.get(gate.get("source")))
+        return None if mask is None else ~mask
+    combine_and = kind == "and"
+    result = None
+    for sid in gate.get("sources", []):
+        sm = source_mask(by_id.get(sid))
+        if sm is None:
+            continue
+        if result is None:
+            result = sm
+        elif combine_and:
+            result = result & sm
+        else:
+            result = result | sm
+    return result
     x_name, y_name = gate.get("x"), gate.get("y")
     if not x_name or x_name not in existing or (y_name and y_name not in existing):
         return None
@@ -6569,6 +6623,32 @@ def _heatmap_cell_text(value, decimals: int = 1) -> str:
     return f"{value:.{decimals}f}"
 
 
+class _DraftSaveGuard(QObject):
+    """Keeps a draft module's Save button disabled.
+
+    Module pages re-enable Save when their settings become dirty. A temporary
+    draft has nothing to save, so the button must stay greyed out even then.
+    """
+
+    def __init__(self, button) -> None:
+        super().__init__(button)
+        self._blocked = False
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() == QEvent.Type.EnabledChange
+            and not self._blocked
+            and hasattr(watched, "isEnabled")
+            and watched.isEnabled()
+        ):
+            self._blocked = True
+            try:
+                watched.setEnabled(False)
+            finally:
+                self._blocked = False
+        return False
+
+
 class _ZoomPixmapLabel(QLabel):
     """Image label whose wheel zooms the rendered picture."""
 
@@ -10331,6 +10411,12 @@ class MainWindow(QMainWindow):
             "source": str(parquet_path),
             "stat": stat,
         }
+        # Ignored feature values change the aggregated rows. Projects saved
+        # before this setting existed keep their old signature until the
+        # default is materialized (None = legacy, same as before).
+        ignore = params.get("ignore_values")
+        if ignore is not None:
+            payload["ignore"] = sorted(float(v) for v in ignore)
         # Only fold in sampling when it actually applies, so projects without a
         # Subsample module keep matching their previously saved outputs.
         sample = self._subsample_sig(task_id, parquet_path)
@@ -16732,6 +16818,26 @@ class MainWindow(QMainWindow):
                 index = i
                 break
         lay.insertWidget(index, label)
+
+    def _guard_draft_save(self, page) -> None:
+        """Grey out Save on a temporary draft and keep it disabled.
+
+        Module pages enable Save again as soon as their settings become dirty;
+        a draft has nothing that can be saved, so the button stays off.
+        """
+        guards = []
+        for button in page.findChildren(QPushButton):
+            if button.text().strip() != "Save":
+                continue
+            button.setEnabled(False)
+            button.setToolTip(
+                "Save is disabled: this locked module is open as a temporary "
+                "draft, so its changes cannot be saved."
+            )
+            guard = _DraftSaveGuard(button)
+            button.installEventFilter(guard)
+            guards.append(guard)
+        page._draft_save_guards = guards
 
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""
@@ -23907,6 +24013,9 @@ class MainWindow(QMainWindow):
         params.setdefault("rules", [])
         params.setdefault("outputs", {})
         params.setdefault("log", [])
+        # Feature values left out before aggregation (None = not chosen yet;
+        # the most frequent value is suggested once the values are known).
+        params.setdefault("ignore_values", None)
         # The first rule is always Count; it cannot be deleted.
         rules = params.get("rules") or []
         if not rules or (rules[0].get("method") != "count"):
@@ -24033,6 +24142,22 @@ class MainWindow(QMainWindow):
         lay.addWidget(combo)
         page._feat_column_combo = combo
 
+        page._feat_ignore_table = None
+        page._feat_ignore_status = None
+        page._feat_ignore_counts = None
+        page._feat_ignore_default = None
+        page._feat_ignore_token = 0
+        page._feat_ignore_syncing = False
+        page._feat_ignore_pending = set()
+        page._feat_ignore_batch_total = 0
+        page._feat_ignore_active = None
+        page._feat_ignore_requests = None
+        page._feat_ignore_results = None
+        page._feat_ignore_thread = None
+        page._feat_ignore_timer = None
+        page._feat_ignore_cache = self._feat_ignore_cache_load(page)
+        lay.addWidget(self._feat_ignore_section(page))
+
         lay.addWidget(QLabel("Data files"))
         select_btn = QPushButton("Select files…")
         select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -24069,6 +24194,541 @@ class MainWindow(QMainWindow):
         combo.currentIndexChanged.connect(on_column_changed)
         select_btn.clicked.connect(lambda _=False: self._feat_select_files(page))
         return panel
+
+    def _feat_ignore_section(self, page) -> QWidget:
+        """Background ignore: the most frequent feature values, checkable."""
+        section = QWidget()
+        lay = QVBoxLayout(section)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+        header.addWidget(QLabel("<b>Background ignore</b>"))
+        header.addStretch()
+        status = QLabel("Select a feature variable and files")
+        status.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        header.addWidget(status)
+        lay.addLayout(header)
+
+        hint = QLabel(
+            "Checked values are left out before aggregation, so background "
+            "(for example a mask label 0) is not treated as a cell."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        lay.addWidget(hint)
+
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["Value", "Count", "Ignore"])
+        head = table.horizontalHeader()
+        head.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        head.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        head.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(24)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        # Header plus the five most frequent values without scrolling.
+        table.setFixedHeight(30 + 5 * 24)
+        table.setEnabled(not page._feat_locked)
+        table.itemChanged.connect(
+            lambda item: self._feat_ignore_toggled(page, item)
+        )
+        lay.addWidget(table)
+
+        note = QLabel(
+            "Ignored values will be missing from the matching data in "
+            "Feature Up. That is expected, not an error."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        lay.addWidget(note)
+
+        page._feat_ignore_table = table
+        page._feat_ignore_status = status
+        return section
+
+    @staticmethod
+    def _feat_value_text(value) -> str:
+        """Compact display of a feature value (mask labels stay integral)."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if math.isfinite(number) and number == int(number):
+            return str(int(number))
+        return f"{number:.6g}"
+
+    @staticmethod
+    def _feat_value_json(value):
+        """JSON-safe form of a feature value (ints stay ints in the project)."""
+        number = float(value)
+        if math.isfinite(number) and number == int(number):
+            return int(number)
+        return number
+
+    _FEAT_IGNORE_CACHE_NAME = "feature_values.json"
+    _FEAT_IGNORE_CACHE_LIMIT = 256
+    _FEAT_IGNORE_LEADERS = 64
+
+    def _feat_ignore_cache_path(self, page):
+        # Deliberately not draft-aware: the cache is derived data (each entry
+        # is keyed by the exact file, feature and upstream settings it was
+        # computed from), so keeping it in the official module folder lets a
+        # locked module reuse it across drafts. Draft cleanup leaves it alone.
+        if self.project is None or not page._feat_task_id:
+            return None
+        folder = self.project.path / "Module" / str(page._feat_task_id)
+        return folder / self._FEAT_IGNORE_CACHE_NAME
+
+    def _feat_ignore_cache_load(self, page) -> dict:
+        """Per-file value counts saved with the module (key -> [[v, n]])."""
+        path = self._feat_ignore_cache_path(page)
+        if path is None or not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+        cache = {}
+        for key, entry in entries.items():
+            counts = entry.get("counts") if isinstance(entry, dict) else None
+            if not isinstance(counts, list):
+                continue
+            try:
+                cache[str(key)] = [
+                    [float(value), int(count)] for value, count in counts
+                ]
+            except (TypeError, ValueError):
+                continue
+        return cache
+
+    def _feat_ignore_cache_save(self, page) -> None:
+        path = self._feat_ignore_cache_path(page)
+        if path is None:
+            return
+        cache = page._feat_ignore_cache
+        while len(cache) > self._FEAT_IGNORE_CACHE_LIMIT:
+            cache.pop(next(iter(cache)), None)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({
+                    "version": 1,
+                    "entries": {
+                        key: {"counts": counts}
+                        for key, counts in cache.items()
+                    },
+                }),
+                encoding="utf-8",
+            )
+        except (OSError, TypeError):
+            pass
+
+    def _feat_file_stat(self, path) -> str:
+        """size + nanosecond mtime of a file (relative paths use the project)."""
+        if not path:
+            return ""
+        candidate = Path(str(path))
+        if not candidate.is_absolute() and self.project is not None:
+            candidate = self.project.path / candidate
+        try:
+            st = candidate.stat()
+        except OSError:
+            return ""
+        return f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+
+    def _feat_feature_source_sig(self, task_id, path, feature) -> str:
+        """Change signature of columns the feature value may come from."""
+        parts = []
+        try:
+            mask_path = self._seg_applied_columns(task_id, path).get(feature)
+        except Exception:  # noqa: BLE001
+            mask_path = None
+        if mask_path:
+            parts.append(["seg", self._feat_file_stat(mask_path)])
+        for kind, getter in (
+            ("gate2col", self._gate2col_applied_columns),
+            ("feature_up", self._feature_up_applied_columns),
+            ("dimred", self._dimred_applied_columns),
+            ("cluster", self._cluster_applied_columns),
+            ("dc", self._dc_applied_columns),
+        ):
+            try:
+                rec = getter(task_id, path).get(feature)
+            except Exception:  # noqa: BLE001
+                rec = None
+            if not rec:
+                continue
+            rec_path = rec.get("parquet") or rec.get("path") or ""
+            parts.append([
+                kind, str(rec_path), self._feat_file_stat(rec_path),
+                str(rec.get("signature") or ""),
+            ])
+        return hashlib.sha1(
+            _json_stable(parts).encode("utf-8")
+        ).hexdigest()
+
+    def _feat_ignore_cache_key(self, page, feature, path) -> str:
+        """Identifies one file's worth of counts (invalidated when inputs change)."""
+        try:
+            stages = _json_stable(self._map_stages(page._feat_task_id))
+        except Exception:  # noqa: BLE001
+            stages = ""
+        payload = [
+            str(path), self._feat_file_stat(path), str(feature),
+            hashlib.sha1(stages.encode("utf-8")).hexdigest(),
+            self._subsample_sig(page._feat_task_id, path) or "",
+            self._feat_feature_source_sig(
+                page._feat_task_id, path, feature
+            ),
+        ]
+        return hashlib.sha1(
+            json.dumps(payload).encode("utf-8")
+        ).hexdigest()
+
+    def _feat_ignore_file_counts(self, page, feature, path) -> list:
+        """[[value, count]] of the feature variable in one file."""
+        import numpy as np
+
+        values = self._column_data(page._feat_task_id, path, [feature])
+        array = values.get(feature)
+        if array is None:
+            return []
+        array = np.asarray(array, dtype="float64")
+        array = array[np.isfinite(array)]
+        if array.size == 0:
+            return []
+        unique, counts = np.unique(array, return_counts=True)
+        # A value that leads the global ranking leads its own file too, so
+        # keeping each file's leaders is enough for the global top five.
+        if unique.size > self._FEAT_IGNORE_LEADERS:
+            pick = np.argpartition(
+                -counts, self._FEAT_IGNORE_LEADERS - 1
+            )[:self._FEAT_IGNORE_LEADERS]
+            unique, counts = unique[pick], counts[pick]
+        return [[float(value), int(count)] for value, count in zip(unique, counts)]
+
+    def _feat_ignore_combine(self, page, only_cached: bool = False):
+        """Aggregate the selected files' cached counts (None when incomplete)."""
+        params = page._feat_params
+        feature = params.get("feature")
+        files = list(params.get("files") or [])
+        if not feature or not files:
+            return None
+        totals = {}
+        found = False
+        for path in files:
+            key = self._feat_ignore_cache_key(page, feature, path)
+            counts = page._feat_ignore_cache.get(key)
+            if counts is None:
+                if only_cached:
+                    continue
+                return None
+            found = True
+            for value, count in counts:
+                value = float(value)
+                totals[value] = totals.get(value, 0) + int(count)
+        if not found:
+            return None
+        return sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+
+    def _feat_ignore_apply(self, page, counts) -> None:
+        page._feat_ignore_counts = counts
+        # Default: the most frequent value (background in a mask image). It
+        # stays implicit until the user toggles a box or calculates, so simply
+        # opening and saving the module does not invalidate saved outputs.
+        page._feat_ignore_default = float(counts[0][0]) if counts else None
+        self._feat_ignore_fill(page, counts)
+
+    def _feat_ignore_start_worker(self, page) -> None:
+        if getattr(page, "_feat_ignore_requests", None) is not None:
+            return
+        page._feat_ignore_requests = queue.Queue()
+        page._feat_ignore_results = queue.Queue()
+        page._feat_ignore_thread = threading.Thread(
+            target=self._feat_ignore_worker, args=(page,), daemon=True
+        )
+        page._feat_ignore_thread.start()
+
+    def _feat_ignore_start_timer(self, page) -> None:
+        if getattr(page, "_feat_ignore_timer", None) is not None:
+            return
+        timer = QTimer(self)
+        timer.setInterval(100)
+        timer.timeout.connect(lambda: self._feat_ignore_poll(page))
+        timer.start()
+        page._feat_ignore_timer = timer
+
+    def _feat_ignore_worker(self, page) -> None:
+        """Count one file at a time; superseded jobs stop at a file boundary."""
+        while True:
+            requests = getattr(page, "_feat_ignore_requests", None)
+            if requests is None:
+                return
+            job = requests.get()
+            if job is None:
+                return
+            token, feature, items = job
+            for path, key in items:
+                if getattr(page, "_feat_ignore_requests", None) is not requests:
+                    return
+                if int(getattr(page, "_feat_ignore_token", 0)) != token:
+                    break
+                try:
+                    counts = self._feat_ignore_file_counts(page, feature, path)
+                except Exception:  # noqa: BLE001
+                    counts = []
+                results = getattr(page, "_feat_ignore_results", None)
+                if results is None:
+                    return
+                results.put(("file", token, feature, key, path, counts))
+            results = getattr(page, "_feat_ignore_results", None)
+            if results is not None:
+                results.put(("done", token, feature))
+
+    def _feat_ignore_poll(self, page) -> None:
+        results = getattr(page, "_feat_ignore_results", None)
+        if results is None:
+            return
+        cache_changed = False
+        while True:
+            try:
+                message = results.get_nowait()
+            except queue.Empty:
+                break
+            if message[0] == "file":
+                _tag, token, feature, key, _path, counts = message
+                if counts:
+                    page._feat_ignore_cache[key] = counts
+                    cache_changed = True
+                if token != page._feat_ignore_token:
+                    continue
+                pending = page._feat_ignore_pending
+                pending.discard(key)
+                status = getattr(page, "_feat_ignore_status", None)
+                total = page._feat_ignore_batch_total
+                if status is not None and total:
+                    status.setText(
+                        f"Counting values… {total - len(pending)}/{total}"
+                    )
+            elif message[0] == "done":
+                _tag, token, _feature = message
+                if token != page._feat_ignore_token:
+                    continue
+                page._feat_ignore_pending = set()
+                page._feat_ignore_active = None
+                combined = self._feat_ignore_combine(page)
+                if combined is not None:
+                    self._feat_ignore_apply(page, combined)
+                timer = getattr(page, "_feat_ignore_timer", None)
+                if timer is not None:
+                    timer.stop()
+                    page._feat_ignore_timer = None
+        if cache_changed:
+            self._feat_ignore_cache_save(page)
+
+    def _feat_ignore_cleanup(self, page) -> None:
+        page._feat_ignore_token = int(
+            getattr(page, "_feat_ignore_token", 0)
+        ) + 1
+        page._feat_ignore_active = None
+        page._feat_ignore_pending = set()
+        timer = getattr(page, "_feat_ignore_timer", None)
+        if timer is not None:
+            timer.stop()
+            page._feat_ignore_timer = None
+        requests = getattr(page, "_feat_ignore_requests", None)
+        page._feat_ignore_requests = None
+        page._feat_ignore_results = None
+        if requests is not None:
+            try:
+                requests.put_nowait(None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _feat_ignore_refresh(self, page) -> None:
+        """Rebuild the background-ignore table for the current files."""
+        table = getattr(page, "_feat_ignore_table", None)
+        if table is None:
+            return
+        params = page._feat_params
+        feature = params.get("feature")
+        files = list(params.get("files") or [])
+        status = getattr(page, "_feat_ignore_status", None)
+        if not feature or not files:
+            page._feat_ignore_token = int(
+                getattr(page, "_feat_ignore_token", 0)
+            ) + 1
+            page._feat_ignore_active = None
+            page._feat_ignore_pending = set()
+            page._feat_ignore_batch_total = 0
+            page._feat_ignore_counts = None
+            page._feat_ignore_default = None
+            self._feat_ignore_fill(page, [])
+            if status is not None:
+                status.setText("Select a feature variable and files")
+            return
+        self._feat_ignore_start_worker(page)
+        pending = []
+        for path in files:
+            key = self._feat_ignore_cache_key(page, feature, path)
+            if key not in page._feat_ignore_cache:
+                pending.append((path, key))
+        if not pending:
+            page._feat_ignore_token = int(
+                getattr(page, "_feat_ignore_token", 0)
+            ) + 1
+            page._feat_ignore_active = None
+            page._feat_ignore_pending = set()
+            page._feat_ignore_batch_total = 0
+            combined = self._feat_ignore_combine(page)
+            if combined is not None:
+                self._feat_ignore_apply(page, combined)
+            if status is not None:
+                status.setText("Most frequent values")
+            return
+        batch_key = (feature, tuple(key for _path, key in pending))
+        if batch_key == getattr(page, "_feat_ignore_active", None):
+            # These exact files are already being counted; keep that job.
+            return
+        page._feat_ignore_token = int(
+            getattr(page, "_feat_ignore_token", 0)
+        ) + 1
+        page._feat_ignore_active = batch_key
+        page._feat_ignore_pending = {key for _path, key in pending}
+        page._feat_ignore_batch_total = len(pending)
+        # Show what is already cached; the rest arrives from the worker.
+        cached = self._feat_ignore_combine(page, only_cached=True)
+        self._feat_ignore_fill(page, cached or [])
+        if status is not None:
+            status.setText(f"Counting values… 0/{len(pending)}")
+        self._feat_ignore_start_timer(page)
+        page._feat_ignore_requests.put(
+            (page._feat_ignore_token, feature, pending)
+        )
+
+    def _feat_ignore_fill(self, page, counts) -> None:
+        """Draw the top five values (plus any ignored value outside them)."""
+        table = getattr(page, "_feat_ignore_table", None)
+        if table is None:
+            return
+        params = page._feat_params
+        explicit = params.get("ignore_values")
+        if explicit is None:
+            default = getattr(page, "_feat_ignore_default", None)
+            ignored = [default] if default is not None else []
+        else:
+            ignored = [float(v) for v in explicit]
+        rows = []
+        seen = set()
+        for value, count in counts[:5]:
+            value = float(value)
+            rows.append((value, int(count)))
+            seen.add(value)
+        count_map = {float(v): int(c) for v, c in counts}
+        for value in ignored:
+            if value not in seen:
+                rows.append((value, count_map.get(value, 0)))
+                seen.add(value)
+
+        page._feat_ignore_syncing = True
+        try:
+            table.blockSignals(True)
+            table.setRowCount(len(rows))
+            for row, (value, count) in enumerate(rows):
+                vitem = QTableWidgetItem(self._feat_value_text(value))
+                vitem.setData(Qt.ItemDataRole.UserRole, float(value))
+                vitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                vitem.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+                table.setItem(row, 0, vitem)
+                citem = QTableWidgetItem(f"{count:,}")
+                citem.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                citem.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+                table.setItem(row, 1, citem)
+                iitem = QTableWidgetItem("")
+                iitem.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                iitem.setCheckState(
+                    Qt.CheckState.Checked if value in ignored
+                    else Qt.CheckState.Unchecked
+                )
+                table.setItem(row, 2, iitem)
+        finally:
+            table.blockSignals(False)
+            page._feat_ignore_syncing = False
+
+        status = getattr(page, "_feat_ignore_status", None)
+        if status is not None:
+            status.setText(
+                "Most frequent values" if rows else "No values to show"
+            )
+
+    def _feat_ignore_toggled(self, page, item) -> None:
+        if getattr(page, "_feat_ignore_syncing", False):
+            return
+        table = getattr(page, "_feat_ignore_table", None)
+        if table is None or item is None or item.column() != 2:
+            return
+        values = []
+        for row in range(table.rowCount()):
+            cell = table.item(row, 2)
+            name = table.item(row, 0)
+            if cell is None or name is None:
+                continue
+            if cell.checkState() == Qt.CheckState.Checked:
+                value = name.data(Qt.ItemDataRole.UserRole)
+                if value is not None:
+                    values.append(self._feat_value_json(value))
+        values = sorted(set(values))
+        params = page._feat_params
+        if params.get("ignore_values") != values:
+            params["ignore_values"] = values
+            self._feat_mark_dirty(page)
+
+    def _feat_ignore_prepare(self, page) -> None:
+        """Make sure a default is chosen before a calculation starts."""
+        params = page._feat_params
+        if params.get("ignore_values") is not None:
+            return
+        feature = params.get("feature")
+        files = list(params.get("files") or [])
+        if not feature or not files:
+            return
+        changed = False
+        for path in files:
+            key = self._feat_ignore_cache_key(page, feature, path)
+            if key in page._feat_ignore_cache:
+                continue
+            try:
+                counts = self._feat_ignore_file_counts(page, feature, path)
+            except Exception:  # noqa: BLE001
+                counts = []
+            page._feat_ignore_cache[key] = counts
+            changed = True
+        if changed:
+            self._feat_ignore_cache_save(page)
+        combined = self._feat_ignore_combine(page)
+        if combined:
+            page._feat_ignore_default = float(combined[0][0])
+            params["ignore_values"] = [
+                self._feat_value_json(combined[0][0])
+            ]
+            self._feat_ignore_fill(page, combined)
 
     def _feat_select_files(self, page) -> None:
         """Pick the data files this module aggregates."""
@@ -24135,6 +24795,7 @@ class MainWindow(QMainWindow):
                 table.setItem(i, 1, sitem)
             table.blockSignals(False)
         self._feat_rebuild_rules(page)
+        self._feat_ignore_refresh(page)
 
     def _feat_rules_panel(self, page) -> QWidget:
         """Right panel: the 4-column aggregation rules table."""
@@ -24536,6 +25197,9 @@ class MainWindow(QMainWindow):
         if not ok:
             QMessageBox.warning(self, "Calculate", message)
             return
+        # A default ignore value is suggested by the Background ignore widget;
+        # make sure it is set even if the user calculated immediately.
+        self._feat_ignore_prepare(page)
         params = page._feat_params
         outputs = params.get("outputs") or {}
         selected = params.get("files") or []
@@ -24659,17 +25323,25 @@ class MainWindow(QMainWindow):
                 f"{self._comp_file_name(parquet_path, page._feat_task_id)}: skipped {dropped} row(s) "
                 f"with an empty '{feature}' value"
             )
-        # A Segmentation mask labels objects 1..N and leaves the background 0.
-        # Aggregating label 0 would create a huge "background object" that then
-        # takes part in gating and gets painted over every background pixel
-        # downstream, so it is skipped.
-        if feature in self._seg_applied_columns(page._feat_task_id, parquet_path):
-            background = int((df[feature] == 0).sum())
-            if background:
-                df = df[df[feature] != 0]
+        # Values the user marked "ignore" in Background ignore are left out
+        # before aggregation. By default that is the most frequent value of
+        # the feature variable, which is the background of a segmentation
+        # mask (label 0). This no longer depends on where the column came from.
+        ignored = [float(v) for v in (params.get("ignore_values") or [])]
+        if ignored:
+            drop = df[feature].isin(ignored)
+            skipped = int(drop.sum())
+            if skipped:
+                df = df[~drop]
+                labels = ", ".join(
+                    self._feat_value_text(v) for v in ignored[:6]
+                )
+                if len(ignored) > 6:
+                    labels += " …"
                 warnings.append(
                     f"{self._comp_file_name(parquet_path, page._feat_task_id)}: "
-                    f"skipped {background} background pixel(s) (mask label 0)"
+                    f"skipped {skipped} row(s) with ignored value(s) "
+                    f"{labels}"
                 )
         if df.empty:
             raise ValueError("no rows with a valid feature value")
@@ -39040,6 +39712,46 @@ class MainWindow(QMainWindow):
                 "gate before deleting it.",
             )
             return
+        # Ask before anything is removed: a branch can take many gates with it.
+        name = gate.get("name") or "Unnamed gate"
+        count = len(to_delete)
+        victims = [
+            str(g.get("name") or "Unnamed gate")
+            for g in page._gating_gates if g["id"] in to_delete
+        ]
+        preview = ", ".join(victims[:6])
+        if count > 6:
+            preview += f" … (+{count - 6} more)"
+        if cascade:
+            question = f"Delete gate '{name}'"
+            if count > 1:
+                question += f" and its {count - 1} descendant gate(s)"
+            question += f"?\n\n{preview}\n\nThis cannot be undone."
+        else:
+            if count > 1:
+                question = (
+                    f"Delete gate '{name}' and the {count - 1} other gate(s) "
+                    f"that share its boundaries?\n\n{preview}"
+                )
+            else:
+                question = f"Delete gate '{name}'?"
+            children = sum(
+                1 for g in page._gating_gates
+                if g.get("parent") in to_delete and g["id"] not in to_delete
+            )
+            if children:
+                question += (
+                    f"\n\n{children} child gate(s) will be kept and moved up "
+                    "one level."
+                )
+            question += "\n\nThis cannot be undone."
+        reply = QMessageBox.question(
+            self, "Delete gate", question,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         if not cascade:
             # Keep children; re-parent them to this gate's parent.
             for g in page._gating_gates:
@@ -39617,9 +40329,34 @@ class MainWindow(QMainWindow):
             page._gating_gates, page._gating_per_file, str(parquet_path)
         )
         stages = self._map_stages(page._gating_task_id)
-        base_columns = set(
-            self._column_index.get(self._rel_data_key(parquet_path), [])
-        )
+        # A Feature output is not in the import column index and already holds
+        # the transforms applied above its Feature module; only the stages
+        # below it still apply (renames remain a name change). Without this a
+        # gating module on aggregated data had no columns to evaluate, so no
+        # gate ever received a count/percent.
+        feature = self._feature_output(parquet_path)
+        if feature is not None:
+            post = self._map_stages(
+                page._gating_task_id, after=feature.get("feature_task")
+            )
+            renames = [
+                (kind, stage) for kind, stage in stages
+                if kind == "rename" and (kind, stage) not in post
+            ]
+            stages = renames + post
+            base_columns = set(feature.get("columns") or [])
+        else:
+            base_columns = set(
+                self._column_index.get(self._rel_data_key(parquet_path), [])
+            )
+        if not base_columns:
+            try:
+                import pyarrow.parquet as pq
+                base_columns = set(
+                    pq.ParquetFile(parquet_path).schema.names
+                )
+            except Exception:  # noqa: BLE001
+                base_columns = set()
         page._gating_stat_generation += 1
         # Mask columns exposed by an upstream Segmentation module are not in
         # the data file; resolve them here and hand them to the worker.
@@ -40462,11 +41199,12 @@ class MainWindow(QMainWindow):
                 except OSError:
                     pending = None
                 if pending is not None:
-                    for name in ("gates.json", "heatmap.json"):
-                        source = official / name
+                    # Do not reuse `name` here: it is the module title.
+                    for state_name in ("gates.json", "heatmap.json"):
+                        source = official / state_name
                         if source.is_file():
                             try:
-                                shutil.copy2(source, pending / name)
+                                shutil.copy2(source, pending / state_name)
                             except OSError:
                                 pass
 
@@ -40519,6 +41257,7 @@ class MainWindow(QMainWindow):
         page.setProperty("task_id", task_id)
         if draft:
             page._draft_task_def = task_def
+            self._guard_draft_save(page)
             self._add_draft_badge(page)
         index = self.tabs.addTab(page, name)
         if task_type:
@@ -40551,6 +41290,10 @@ class MainWindow(QMainWindow):
                     self.project.path / "Module" / str(task_id) / "draft",
                     ignore_errors=True,
                 )
+        # Feature Down counts feature values in a background thread; stop it
+        # when the page goes away.
+        if hasattr(page, "_feat_ignore_requests"):
+            self._feat_ignore_cleanup(page)
         index = self.tabs.indexOf(page)
         if index > 0:
             self.tabs.removeTab(index)
