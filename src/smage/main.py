@@ -885,6 +885,23 @@ IMAGE_LAYER_COLORS = [
     (128, 0, 255),    # violet
 ]
 
+# Colours auto-assigned to overlay-scatter layers (top layer first).
+OVERLAY_LAYER_COLORS = [
+    (31, 119, 180),   # blue
+    (214, 39, 40),    # red
+    (44, 160, 44),    # green
+    (255, 127, 14),   # orange
+    (148, 103, 189),  # purple
+    (23, 190, 207),   # cyan
+    (227, 119, 194),  # pink
+    (188, 189, 34),   # olive
+    (140, 86, 75),    # brown
+    (127, 127, 127),  # grey
+]
+
+# Colour of overlay-scatter points that are not inside any visible layer.
+OVERLAY_OTHER_COLOR = (200, 200, 200)
+
 # Distinct line colours for the Unmix "Spectral curve" tab (one per signature).
 UNMIX_CURVE_COLORS = [
     "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
@@ -2927,7 +2944,7 @@ def _figure_default_size(ptype: str | None) -> list:
 
     All three share the same height (400), so a row of new plots lines up.
     """
-    if ptype in ("scatter", "histogram"):
+    if ptype in ("scatter", "histogram", "overlay"):
         return [400, 400]
     return [440, 400]
 
@@ -3031,7 +3048,7 @@ def _figure_image_layers(plot_dict: dict) -> list:
 
 def _is_scatter_plot(ptype: str) -> bool:
     """Whether a Figure plot type is scatter-like (plots x/y data points)."""
-    return ptype in ("scatter", "image")
+    return ptype in ("scatter", "image", "overlay")
 
 
 # --- Image plot: level-of-detail sample index (disk-cached) ----------------
@@ -5206,7 +5223,7 @@ class _FigurePermuteDialog(QDialog):
         specs = [
             (self.FILE, "File", bool(self._files)),
             (self.X_AXIS, "X axis", plot_type != "image" and bool(self._columns)),
-            (self.Y_AXIS, "Y axis", plot_type == "scatter" and bool(self._columns)),
+            (self.Y_AXIS, "Y axis", _is_scatter_plot(plot_type) and bool(self._columns)),
             (self.FILTER, "Filter", bool(self._filters)),
         ]
         for i, (key, label, enabled) in enumerate(specs):
@@ -6647,6 +6664,69 @@ class _DraftSaveGuard(QObject):
             finally:
                 self._blocked = False
         return False
+
+
+class _OverlayLayerTable(QTableWidget):
+    """Overlay-scatter layer table whose rows can be dragged into order.
+
+    Qt's built-in internal move rebuilds the cells and drops their widgets, so
+    the drag is handled here with plain mouse events: pressing a row and
+    dragging it onto another row emits ``rowMoved(source, target)`` and the
+    owner rebuilds the table from its own model.
+    """
+
+    rowMoved = Signal(int, int)
+
+    def __init__(self, rows: int = 0, columns: int = 3, parent=None) -> None:
+        super().__init__(rows, columns, parent)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._drag_row = None
+        self._drag_start = None
+        self._dragging = False
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self.indexAt(event.position().toPoint())
+            self._drag_row = index.row() if index.isValid() else None
+            self._drag_start = event.position().toPoint()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self._drag_row is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            moved = (
+                event.position().toPoint() - self._drag_start
+            ).manhattanLength()
+            if self._dragging or moved >= QApplication.startDragDistance():
+                self._dragging = True
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._dragging and self._drag_row is not None:
+            source = self._drag_row
+            self.unsetCursor()
+            self._drag_row = None
+            self._dragging = False
+            target = self.indexAt(event.position().toPoint()).row()
+            if target < 0:
+                target = self.rowCount()
+            if target > source:
+                target -= 1
+            if 0 <= target != source:
+                self.rowMoved.emit(source, target)
+            event.accept()
+            return
+        self._drag_row = None
+        self._dragging = False
+        super().mouseReleaseEvent(event)
 
 
 class _ZoomPixmapLabel(QLabel):
@@ -11385,13 +11465,17 @@ class MainWindow(QMainWindow):
         header.addWidget(QLabel("<b>Figures</b>"))
         header.addStretch()
         add_scatter = QPushButton("Add Scatter")
+        add_overlay = QPushButton("Add Overlay")
+        add_overlay.setToolTip(
+            "Scatter colored by gates, painted layer over layer"
+        )
         add_hist = QPushButton("Add Histogram")
         add_image = QPushButton("Add Image")
         add_nxn = QPushButton("Add N×N Plot")
         add_nxn.setToolTip(
             "Scatter matrix: one plot per variable pair below the diagonal"
         )
-        for button in (add_scatter, add_hist, add_image, add_nxn):
+        for button in (add_scatter, add_overlay, add_hist, add_image, add_nxn):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             header.addWidget(button)
         fl.addLayout(header)
@@ -11474,12 +11558,14 @@ class MainWindow(QMainWindow):
             self._figure_new_card(page, plot_dict)
 
         add_scatter.clicked.connect(lambda _=False: self._figure_add_plot(page, "scatter"))
+        add_overlay.clicked.connect(lambda _=False: self._figure_add_plot(page, "overlay"))
         add_hist.clicked.connect(lambda _=False: self._figure_add_plot(page, "histogram"))
         add_image.clicked.connect(lambda _=False: self._figure_add_plot(page, "image"))
         add_nxn.clicked.connect(lambda _=False: self._figure_add_nxn(page))
 
         if locked:
             add_scatter.setEnabled(False)
+            add_overlay.setEnabled(False)
             add_hist.setEnabled(False)
             add_image.setEnabled(False)
             add_nxn.setEnabled(False)
@@ -11959,6 +12045,10 @@ class MainWindow(QMainWindow):
             # Image plots default to coloring by the first non-coordinate channel.
             color_mode = "parameter"
             color_param = next((c for c in columns if c not in ("x", "y")), None)
+        elif ptype == "overlay":
+            # Overlay scatter colors by layer; no parameter coloring.
+            color_mode = "overlay"
+            color_param = None
         else:
             color_mode = "density"
             color_param = x
@@ -11975,7 +12065,8 @@ class MainWindow(QMainWindow):
             "last_color_param": color_param,
             "palette": _default_palette(),
             "layers": (
-                [{"parameter": color_param, "color": (255, 255, 255), "name": str(color_param), "visible": True}]
+                [{"parameter": color_param, "color": (255, 255, 255),
+                  "name": str(color_param), "visible": True}]
                 if ptype == "image" and color_param else []
             ),
             "xmin": None,
@@ -13166,9 +13257,13 @@ class MainWindow(QMainWindow):
 
         transforms = column_transforms or {}
 
+        overlay = plot_dict.get("type") == "overlay"
         columns = [x_name, y_name]
-        mode = plot_dict.get("color_mode", "density")
-        color_param = plot_dict.get("color_param") if mode == "parameter" else None
+        mode = "overlay" if overlay else plot_dict.get("color_mode", "density")
+        color_param = (
+            plot_dict.get("color_param")
+            if mode == "parameter" and not overlay else None
+        )
         if color_param and color_param not in columns:
             columns.append(color_param)
 
@@ -13285,7 +13380,10 @@ class MainWindow(QMainWindow):
             mode == "parameter" and color_param
         )
         hist_xe_ye = None
-        if mode == "solid":
+        if overlay:
+            # Overlay scatter colours points by layer after sampling (below).
+            density_mode = False
+        elif mode == "solid":
             # Solid: every point shares one user-chosen color.
             solid = plot_dict.get("solid_color", (0, 0, 200))
         else:
@@ -13317,6 +13415,7 @@ class MainWindow(QMainWindow):
 
         # Sample the rows to draw. Pool rows are already in priority order, so
         # the first `max_points` kept rows are exactly the stable sample.
+        picked = None
         if pooled_mode:
             if x.size > max_points:
                 x = x[:max_points]
@@ -13336,9 +13435,19 @@ class MainWindow(QMainWindow):
                 if values is not None:
                     values = values[picked]
 
+        point_colors = None
+        if overlay:
+            point_colors = self._figure_overlay_point_colors(
+                plot_dict, task_id, rec.get("parquet"), int(x.size),
+                keep=keep,
+                indices=indices if pooled_mode else None,
+                pooled=pooled_mode, picked=picked,
+                max_points=max_points,
+            )
+
         self._figure_draw_colored_scatter(
             plot_widget, x, y, values, cmap, size=size, px_mode=px_mode,
-            solid_color=solid,
+            solid_color=solid, point_colors=point_colors,
         )
         self._figure_apply_ranges(plot_dict, plot_widget)
         self._figure_apply_display_options(plot_dict, plot_widget)
@@ -13367,15 +13476,22 @@ class MainWindow(QMainWindow):
 
     def _figure_draw_colored_scatter(self, plot_widget, x, y, values, cmap,
                                      size: float = 4, px_mode: bool = True,
-                                     solid_color=None) -> None:
+                                     solid_color=None, point_colors=None) -> None:
         """Draw points colored by `values`, normalized through the colormap.
 
-        When `solid_color` is given, every point uses that single color instead.
+        When `point_colors` is given, each point uses its own RGB colour
+        (overlay scatter). When `solid_color` is given, every point uses that
+        single color instead.
         """
         import numpy as np
         import pyqtgraph as pg
 
-        if solid_color is not None:
+        if point_colors is not None:
+            brushes = [
+                _scatter_brush(int(c[0]), int(c[1]), int(c[2]))
+                for c in point_colors
+            ]
+        elif solid_color is not None:
             brushes = _scatter_brush(
                 int(solid_color[0]), int(solid_color[1]), int(solid_color[2])
             )
@@ -14102,15 +14218,24 @@ class MainWindow(QMainWindow):
                 y_combo = self._figure_param_combo(columns, plot_dict.get("y"), enabled)
                 layout.addWidget(y_combo)
 
-            self._figure_scatter_color_settings(
-                layout, plot_dict, plot_widget, columns, enabled,
-                on_change=lambda: self._figure_apply_change(page, index, plot_dict),
-                on_rebuild=lambda: (
-                    self._figure_rebuild_settings(page),
-                    self._figure_apply_change(page, index, plot_dict),
-                ),
-                task_id=page._fig_task_id,
-            )
+            if plot_dict.get("type") == "overlay":
+                self._figure_overlay_settings(
+                    layout, plot_dict, plot_widget, enabled,
+                    on_change=lambda: self._figure_apply_change(
+                        page, index, plot_dict
+                    ),
+                    page=page, index=index,
+                )
+            else:
+                self._figure_scatter_color_settings(
+                    layout, plot_dict, plot_widget, columns, enabled,
+                    on_change=lambda: self._figure_apply_change(page, index, plot_dict),
+                    on_rebuild=lambda: (
+                        self._figure_rebuild_settings(page),
+                        self._figure_apply_change(page, index, plot_dict),
+                    ),
+                    task_id=page._fig_task_id,
+                )
 
         if plot_dict.get("type") == "histogram":
             # Number of bins for the histogram.
@@ -14173,14 +14298,14 @@ class MainWindow(QMainWindow):
             self._figure_axis_scale_configs(
                 page._fig_task_id, file_path, plot_dict.get("x"),
                 page._fig_column_transforms,
-            ) if ptype in ("scatter", "histogram") else []
+            ) if ptype in ("scatter", "histogram", "overlay") else []
         )
         # Histograms show counts and images show pixel coordinates.
         y_configs = (
             self._figure_axis_scale_configs(
                 page._fig_task_id, file_path, plot_dict.get("y"),
                 page._fig_column_transforms,
-            ) if ptype == "scatter" else []
+            ) if ptype in ("scatter", "overlay") else []
         )
 
         # X range.
@@ -15027,38 +15152,9 @@ class MainWindow(QMainWindow):
         # Point size (scatter only; an Image renders as a raster, so this row
         # is hidden for image plots).
         if plot_dict.get("type") != "image":
-            def on_point_size(v):
-                plot_dict["point_size"] = float(v)
-                on_change()
-
-            layout.addWidget(QLabel("Point size"))
-            ps_row = QWidget()
-            ph = QHBoxLayout(ps_row)
-            ph.setContentsMargins(0, 0, 0, 0)
-            ph.setSpacing(4)
-            point_fixed = QCheckBox("Fixed")
-            point_fixed.setChecked(plot_dict.get("fixed_point_size", False))
-            point_fixed.setEnabled(enabled)
-            point_spin = _LogStepSpinBox(plot_dict.get("point_size", 4), on_point_size)
-            point_spin.set_enabled(enabled and point_fixed.isChecked())
-            ph.addWidget(point_fixed)
-            ph.addWidget(point_spin)
-            ph.addStretch()
-            layout.addWidget(ps_row)
-
-            def on_point_fixed(toggled):
-                plot_dict["fixed_point_size"] = toggled
-                point_spin.set_enabled(enabled and toggled)
-                if toggled:
-                    # Seed a sensible data-unit size from the current x-range.
-                    xmin = getattr(plot_widget, "_data_xmin", None)
-                    xmax = getattr(plot_widget, "_data_xmax", None)
-                    if xmin is not None and xmax is not None and xmax > xmin:
-                        auto_size = 0.01 * (xmax - xmin)
-                        point_spin.set_value(auto_size)
-                        plot_dict["point_size"] = auto_size
-                on_change()
-            point_fixed.toggled.connect(on_point_fixed)
+            self._figure_point_size_settings(
+                layout, plot_dict, plot_widget, enabled, on_change
+            )
 
         def on_mode_changed(_=0):
             plot_dict["color_mode"] = mode_combo.currentData()
@@ -15077,6 +15173,391 @@ class MainWindow(QMainWindow):
                 plot_dict["palette"] = palette_combo.currentText()
                 on_change()
             palette_combo.currentIndexChanged.connect(on_palette)
+
+    def _figure_point_size_settings(self, layout, plot_dict, plot_widget,
+                                    enabled, on_change) -> None:
+        """Point-size row shared by scatter and overlay-scatter settings."""
+        def on_point_size(v):
+            plot_dict["point_size"] = float(v)
+            on_change()
+
+        layout.addWidget(QLabel("Point size"))
+        ps_row = QWidget()
+        ph = QHBoxLayout(ps_row)
+        ph.setContentsMargins(0, 0, 0, 0)
+        ph.setSpacing(4)
+        point_fixed = QCheckBox("Fixed")
+        point_fixed.setChecked(plot_dict.get("fixed_point_size", False))
+        point_fixed.setEnabled(enabled)
+        point_spin = _LogStepSpinBox(
+            plot_dict.get("point_size", 4), on_point_size
+        )
+        point_spin.set_enabled(enabled and point_fixed.isChecked())
+        ph.addWidget(point_fixed)
+        ph.addWidget(point_spin)
+        ph.addStretch()
+        layout.addWidget(ps_row)
+
+        def on_point_fixed(toggled):
+            plot_dict["fixed_point_size"] = toggled
+            point_spin.set_enabled(enabled and toggled)
+            if toggled:
+                # Seed a sensible data-unit size from the current x-range.
+                xmin = getattr(plot_widget, "_data_xmin", None)
+                xmax = getattr(plot_widget, "_data_xmax", None)
+                if xmin is not None and xmax is not None and xmax > xmin:
+                    auto_size = 0.01 * (xmax - xmin)
+                    point_spin.set_value(auto_size)
+                    plot_dict["point_size"] = auto_size
+            on_change()
+
+        point_fixed.toggled.connect(on_point_fixed)
+
+    # -- overlay scatter ---------------------------------------------------
+    def _figure_overlay_gate_options(self, page, plot_dict) -> list:
+        """Gates of the plot's file, one entry per upstream gate."""
+        path = plot_dict.get("file")
+        if not path:
+            return []
+        options = []
+        for task in self._task_chain(page._fig_task_id):
+            if task.get("id") == page._fig_task_id:
+                continue
+            if task.get("type") != "gating":
+                continue
+            for gate in self._gating_gates_for(task, path):
+                options.append({
+                    "task_id": task.get("id"),
+                    "gate_id": gate.get("id"),
+                    "name": str(gate.get("name") or gate.get("id")),
+                    "module": str(task.get("name") or "Gating"),
+                })
+        counts = Counter(opt["name"] for opt in options)
+        for opt in options:
+            label = opt["name"]
+            if counts[opt["name"]] > 1:
+                # Same gate name in several gating modules: disambiguate in
+                # the picker only; the layer table keeps the plain name.
+                label = f"{label} ({opt['module']})"
+            opt["label"] = label
+        return options
+
+    def _figure_overlay_pick(self, page, index, plot_dict, on_change) -> None:
+        """Choose the layers of an overlay scatter (gates, in order)."""
+        options = self._figure_overlay_gate_options(page, plot_dict)
+        if not options:
+            QMessageBox.information(
+                self, "Select gates",
+                "This data file has no gates from an upstream Gating module.",
+            )
+            return
+        layers = plot_dict.setdefault("layers", [])
+        existing = {
+            (layer.get("task_id"), layer.get("gate_id")): layer
+            for layer in layers
+        }
+        current = [
+            opt["label"] for opt in options
+            if (opt["task_id"], opt["gate_id"]) in existing
+        ]
+        # The picker only chooses which gates are layers (its list keeps the
+        # gating order); the layer order is controlled by dragging the table.
+        chosen = self._pick_items_dialog(
+            "Select gates", [opt["label"] for opt in options], current,
+            "Filter gates...",
+        )
+        if chosen is None:
+            return
+        chosen_set = set(chosen)
+        by_key = {(opt["task_id"], opt["gate_id"]): opt for opt in options}
+        # Keep the current table order for layers that stay selected.
+        new_layers = []
+        for layer in layers:
+            key = (layer.get("task_id"), layer.get("gate_id"))
+            opt = by_key.get(key)
+            if opt is None or opt["label"] not in chosen_set:
+                continue
+            kept = dict(layer)
+            kept["name"] = opt["name"]
+            new_layers.append(kept)
+        # Append newly selected gates in the picker's fixed order.
+        for opt in options:
+            key = (opt["task_id"], opt["gate_id"])
+            if key in existing or opt["label"] not in chosen_set:
+                continue
+            new_layers.append({
+                "task_id": opt["task_id"],
+                "gate_id": opt["gate_id"],
+                "name": opt["name"],
+                "color": OVERLAY_LAYER_COLORS[
+                    len(new_layers) % len(OVERLAY_LAYER_COLORS)
+                ],
+                "visible": True,
+            })
+        plot_dict["layers"] = new_layers
+        if page is not None:
+            self._figure_rebuild_settings(page)
+        on_change()
+
+    def _figure_overlay_settings(self, layout, plot_dict, plot_widget,
+                                 enabled, on_change, page=None,
+                                 index=None) -> None:
+        """Layers table (gate, visibility, colour) and point size."""
+        hint = QLabel(
+            "Each layer is a gate. Points are painted layer over layer: when "
+            "several gates contain a point, the topmost layer's colour wins. "
+            "Gates may overlap."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        layout.addWidget(hint)
+
+        layout.addWidget(QLabel("Layers"))
+        pick_btn = QPushButton("Select gates…")
+        pick_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        pick_btn.setEnabled(enabled)
+        pick_btn.clicked.connect(
+            lambda _=False: self._figure_overlay_pick(
+                page, index, plot_dict, on_change
+            )
+        )
+        layout.addWidget(pick_btn)
+
+        layers = plot_dict.setdefault("layers", [])
+        table = _OverlayLayerTable(len(layers), 3)
+        table.setHorizontalHeaderLabels(["Show", "Layer", "Color"])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(26)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #d0d7e2; "
+            "color: #2c3a48; }"
+            "QTableWidget::item:selected { background: #e1ecf9; "
+            "color: #1a4a76; }"
+            "QTableWidget::item:hover { background: #f0f7fe; }"
+            "QHeaderView::section { background: #f5f8fb; color: #2c3a48; "
+            "border: none; padding: 2px 4px; }"
+            "QToolTip { background-color: #ffffff; color: #2c3a48; "
+            "border: 1px solid #c9d3df; }"
+        )
+        table.setMinimumHeight(110)
+        table.setMaximumHeight(220)
+        table.setEnabled(enabled)
+        layout.addWidget(table)
+
+        hint_row = QLabel("Drag a row to change the layer order")
+        hint_row.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        layout.addWidget(hint_row)
+
+        # Current gate names (a gate may have been renamed upstream).
+        names = {}
+        if page is not None:
+            for opt in self._figure_overlay_gate_options(page, plot_dict):
+                names[(opt["task_id"], opt["gate_id"])] = opt["name"]
+
+        syncing = {"value": False}
+
+        def on_check(item):
+            if syncing["value"] or page is None:
+                return
+            row = item.row()
+            if item.column() != 0 or not (0 <= row < len(layers)):
+                return
+            layers[row]["visible"] = (
+                item.checkState() == Qt.CheckState.Checked
+            )
+            on_change()
+
+        for row, layer in enumerate(layers):
+            key = (layer.get("task_id"), layer.get("gate_id"))
+            show_item = QTableWidgetItem("")
+            show_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled
+            )
+            show_item.setCheckState(
+                Qt.CheckState.Checked if layer.get("visible", True)
+                else Qt.CheckState.Unchecked
+            )
+            table.setItem(row, 0, show_item)
+            name_item = QTableWidgetItem(
+                names.get(key) or str(layer.get("name") or layer.get("gate_id"))
+            )
+            name_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDragEnabled
+                | Qt.ItemFlag.ItemIsDropEnabled
+            )
+            table.setItem(row, 1, name_item)
+            color = layer.get("color") or OVERLAY_LAYER_COLORS[
+                row % len(OVERLAY_LAYER_COLORS)
+            ]
+            color_btn = QPushButton()
+            color_btn.setFixedSize(32, 20)
+            color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            color_btn.setEnabled(enabled)
+            color_btn.setStyleSheet(
+                f"background-color: rgb({color[0]},{color[1]},{color[2]}); "
+                "border: 1px solid #555;"
+            )
+
+            def on_color(_=False, r=row, btn=color_btn):
+                if not (0 <= r < len(layers)):
+                    return
+                current = layers[r].get("color") or OVERLAY_LAYER_COLORS[
+                    r % len(OVERLAY_LAYER_COLORS)
+                ]
+                chosen = QColorDialog.getColor(
+                    QColor(current[0], current[1], current[2]),
+                    self, "Choose layer color",
+                )
+                if not chosen.isValid():
+                    return
+                layers[r]["color"] = (
+                    chosen.red(), chosen.green(), chosen.blue()
+                )
+                btn.setStyleSheet(
+                    f"background-color: rgb({chosen.red()},"
+                    f"{chosen.green()},{chosen.blue()}); "
+                    "border: 1px solid #555;"
+                )
+                on_change()
+
+            color_btn.clicked.connect(on_color)
+            table.setCellWidget(row, 2, color_btn)
+
+        table.itemChanged.connect(on_check)
+
+        def on_move(source, target):
+            if not (0 <= source < len(layers)):
+                return
+            layer = layers.pop(source)
+            target = max(0, min(int(target), len(layers)))
+            layers.insert(target, layer)
+            if page is not None:
+                QTimer.singleShot(
+                    0, lambda: self._figure_rebuild_settings(page)
+                )
+            on_change()
+
+        table.rowMoved.connect(on_move)
+
+        if not layers:
+            empty = QLabel("No layers yet — use Select gates… to add some.")
+            empty.setStyleSheet("color: #8a94a6;")
+            layout.addWidget(empty)
+
+        self._figure_point_size_settings(
+            layout, plot_dict, plot_widget, enabled, on_change
+        )
+
+    def _figure_overlay_masks(self, plot_dict, task_id, parquet_path) -> dict:
+        """{'task|gate': full-row bool mask} for every visible layer."""
+        import numpy as np
+
+        layers = [
+            layer for layer in plot_dict.get("layers") or []
+            if layer.get("visible", True) and layer.get("task_id")
+            and layer.get("gate_id")
+        ]
+        masks = {}
+        if not layers or not parquet_path:
+            return masks
+        groups = {}
+        for layer in layers:
+            groups.setdefault(layer["task_id"], []).append(layer)
+        full_rows = int(self._data_row_count(parquet_path) or 0)
+        for gate_task_id, group in groups.items():
+            gating_task = self._find_task_by_id(gate_task_id)
+            if gating_task is None:
+                continue
+            gates = self._gating_gates_for(gating_task, parquet_path)
+            if not gates:
+                continue
+            by_id = {g["id"]: g for g in gates}
+            needed = set()
+            gate_ids = []
+            for layer in group:
+                gate_id = layer.get("gate_id")
+                if gate_id not in by_id:
+                    continue
+                for gate in _gate_chain(gates, gate_id):
+                    needed |= _gate_needed_columns(gate, by_id)
+                gate_ids.append(gate_id)
+            if not needed:
+                continue
+            try:
+                values = self._column_data(
+                    gate_task_id, parquet_path, list(needed)
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if not values:
+                continue
+            index = self._subsample_row_index(task_id, parquet_path)
+            for gate_id in gate_ids:
+                try:
+                    mask = _compute_gate_filter_mask(
+                        gates, gate_id, parquet_path, {},
+                        existing=set(values), extra=values,
+                    )
+                except Exception:  # noqa: BLE001
+                    mask = None
+                if mask is None:
+                    continue
+                mask = np.asarray(mask, dtype=bool)
+                if index is not None and len(mask) == full_rows:
+                    mask = mask[index]
+                masks[(gate_task_id, gate_id)] = mask
+        return masks
+
+    def _figure_overlay_point_colors(self, plot_dict, task_id, parquet_path,
+                                     n_points, keep, indices, pooled,
+                                     picked, max_points):
+        """Per-point RGB colours; later (lower) layers are painted first."""
+        import numpy as np
+
+        colors = np.empty((n_points, 3), dtype=np.uint8)
+        colors[:, :] = OVERLAY_OTHER_COLOR
+        masks = self._figure_overlay_masks(plot_dict, task_id, parquet_path)
+        keep = np.asarray(keep, dtype=bool)
+        layers = [
+            layer for layer in plot_dict.get("layers") or []
+            if layer.get("visible", True)
+        ]
+        # Bottom row first so the topmost layer's colour overwrites it.
+        for layer in reversed(layers):
+            mask = masks.get((layer.get("task_id"), layer.get("gate_id")))
+            if mask is None:
+                continue
+            if pooled:
+                if indices is None or indices.size == 0:
+                    continue
+                if int(indices.max()) >= mask.size:
+                    continue
+                mask = mask[indices]
+                if mask.size != keep.size:
+                    continue
+                mask = mask[keep]
+                if mask.size > max_points:
+                    mask = mask[:max_points]
+            else:
+                if mask.size != keep.size:
+                    continue
+                mask = mask[keep]
+                if picked is not None:
+                    mask = mask[picked]
+            if mask.size != n_points:
+                continue
+            color = layer.get("color") or (0, 0, 200)
+            colors[mask] = (
+                int(color[0]), int(color[1]), int(color[2])
+            )
+        return colors
 
     def _figure_channel_values(self, task_id, parquet_path, channel,
                                max_points: int | None = 200000,
