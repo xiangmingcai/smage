@@ -5718,13 +5718,16 @@ MODULE_STATE_SAVED = "saved"
 
 
 def _task_is_locked(task: dict) -> bool:
-    """True if a descendant generate module has saved data.
+    """True if the task is locked, manually or by saved downstream data.
 
-    Saved generated output (for example segmentation masks) locks every module
-    *above* it: those modules can still be opened and explored, but their
-    changes cannot be saved. The generate module itself is never locked, and
-    neither is anything below it.
+    A manual lock (``task["locked"]``) is persisted with the project and has
+    no permanent unlock: it can only be lifted for one session from the module
+    toolbar. Saving generated output (for example segmentation masks) locks
+    every module *above* it the same way; the generate module itself is never
+    locked by that rule, and neither is anything below it.
     """
+    if task.get("locked"):
+        return True
 
     def walk(node) -> bool:
         for child in node.get("children", []):
@@ -7255,6 +7258,9 @@ class MainWindow(QMainWindow):
         # Task ids opened as temporary drafts (locked modules). Their writes
         # are redirected to Module/<id>/draft/ and discarded on close.
         self._draft_task_ids = set()
+        # Task ids unlocked for the current session (Unlock button). The lock
+        # itself stays saved; closing the module removes the id again.
+        self._session_unlocked = set()
         # Shared sampled-row pools + pooled columns for scatter/histogram
         # rendering (Figure, Gating, Scale preview). See _pool_request.
         self._pool_rows_cache = {}
@@ -8428,10 +8434,19 @@ class MainWindow(QMainWindow):
                 return task
         return None
 
+    def _task_locked(self, task_def) -> bool:
+        """Effective lock: manual/automatic, unless unlocked for this session."""
+        if not task_def:
+            return False
+        task_id = str(task_def.get("id") or "")
+        if task_id and task_id in getattr(self, "_session_unlocked", ()):
+            return False
+        return _task_is_locked(task_def)
+
     def _import_locked(self) -> bool:
-        """True if the Data Import task is locked (a downstream generate saved data)."""
+        """True if Data Import is currently locked (session unlocks apply)."""
         task = self._import_task()
-        return task is not None and _task_is_locked(task)
+        return task is not None and self._task_locked(task)
 
     def _find_task_by_id(self, task_id: str | None):
         """Return the workflow task dict with the given id, or None."""
@@ -8842,6 +8857,17 @@ class MainWindow(QMainWindow):
         rename_action.triggered.connect(lambda: self._rename_task(task_def))
         menu.addAction(rename_action)
 
+        # Manual lock: a locked module opens as a temporary draft and can only
+        # be unlocked for one session from its toolbar.
+        lock_action = QAction("Lock", self)
+        lock_action.setEnabled(not _task_is_locked(task_def))
+        lock_action.setToolTip(
+            "Lock this module: it opens as a temporary draft until unlocked "
+            "for a session"
+        )
+        lock_action.triggered.connect(lambda: self._lock_task(task_def))
+        menu.addAction(lock_action)
+
         delete_action = QAction("Delete", self)
         delete_action.triggered.connect(
             lambda: self._delete_task(task_def, parent_task_def, False)
@@ -8924,6 +8950,9 @@ class MainWindow(QMainWindow):
             params = node.get("params")
             if isinstance(params, dict):
                 params.pop("log", None)
+            # A copy of a locked module is a fresh configuration; it starts
+            # unlocked so it can actually be saved.
+            node.pop("locked", None)
             if _task_kind(node.get("type", "")) != "generate":
                 continue
             node["output"] = {"saved": False}
@@ -9233,7 +9262,7 @@ class MainWindow(QMainWindow):
             on_actions=lambda checked=False, t=task_def, p=parent_task_def: self._show_actions_menu(t, p),
             task_type=task_type,
             task_id=task_def.get("id", ""),
-            locked=_task_is_locked(task_def),
+            locked=self._task_locked(task_def),
         )
         task_id = task_def.get("id", "")
         if live is not None and task_id:
@@ -9304,9 +9333,59 @@ class MainWindow(QMainWindow):
         if dialog is not None:
             dialog.accept()
 
+    def _lock_task(self, task_def: dict) -> None:
+        """Persistently lock a task (manual lock from the + map)."""
+        if not isinstance(task_def, dict) or task_def.get("locked"):
+            return
+        name = task_def.get("name") or "Module"
+        reply = QMessageBox.question(
+            self, "Lock Module",
+            f"Lock '{name}'?\n\n"
+            "A locked module opens as a temporary draft: changes are kept in "
+            "a temporary folder and are not saved until you unlock the module "
+            "for a session from its toolbar.\n\n"
+            "Lock this module?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        task_id = str(task_def.get("id") or "")
+        # An open page must be closed first; its own Close path runs the
+        # unsaved-changes prompt, and cancelling there cancels the lock.
+        for index in range(1, self.tabs.count()):
+            page = self.tabs.widget(index)
+            if str(page.property("task_id")) != task_id:
+                continue
+            self.tabs.setCurrentIndex(index)
+            close_btn = next(
+                (b for b in page.findChildren(QPushButton)
+                 if b.text() == "Close"),
+                None,
+            )
+            if close_btn is not None:
+                close_btn.click()
+            else:
+                self._close_module_page(page)
+            QApplication.processEvents()
+            if self.tabs.indexOf(page) >= 0:
+                return  # the page stayed open (user cancelled)
+            break
+        task_def["locked"] = True
+        if self.project is not None:
+            self.project.save()
+        runlog.action(
+            "module.lock", id=task_id,
+            type=str(task_def.get("type") or ""),
+        )
+        self._refresh_workflow_tree()
+
     # ----- module tabs ----------------------------------------------
     def _build_module_toolbar(self, name: str, page: QWidget, include_save: bool = True,
-                              locked: bool = False, task_id: str | None = None) -> QFrame:
+                              locked: bool = False, task_id: str | None = None,
+                              include_settings: bool = True,
+                              extra_buttons=None,
+                              lock_text: str = "Draft (locked)") -> QFrame:
         """Build the module toolbar (title + Save/Settings/Close, plus a lock badge)."""
         bar = QFrame()
         bar.setObjectName("moduleBar")
@@ -9320,10 +9399,15 @@ class MainWindow(QMainWindow):
             lock.setFixedSize(14, 14)
             lock.setToolTip("Locked — a downstream generate module has saved data")
             tl.addWidget(lock)
-            draft = QLabel("Draft (locked)")
-            draft.setStyleSheet("color: #b58900; font-weight: bold;")
-            tl.addWidget(draft)
+            bar._lock_icon = lock
+            badge = QLabel(lock_text)
+            badge.setStyleSheet("color: #b58900; font-weight: bold;")
+            tl.addWidget(badge)
+            bar._lock_label = badge
         tl.addStretch()
+        for button in extra_buttons or ():
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            tl.addWidget(button)
         if include_save:
             save_btn = QPushButton("Save")
             save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -9334,7 +9418,8 @@ class MainWindow(QMainWindow):
         for b in (settings_btn, close_btn):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(lambda _=False, p=page: self._close_module_page(p))
-        tl.addWidget(settings_btn)
+        if include_settings:
+            tl.addWidget(settings_btn)
         tl.addWidget(close_btn)
         return bar
 
@@ -9451,7 +9536,10 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
         locked = self._import_locked()
         page._import_locked_state = locked
-        layout.addWidget(self._build_module_toolbar("Data Import", page, include_save=False, locked=locked))
+        layout.addWidget(self._build_module_toolbar(
+            "Data Import", page, include_save=False, locked=locked,
+            include_settings=False, lock_text="Locked",
+        ))
 
         content = QWidget()
         content.setStyleSheet("background: #f5f8fb;")
@@ -17270,6 +17358,8 @@ class MainWindow(QMainWindow):
         """Delete every temporary draft folder (module closed / project left)."""
         ids = list(getattr(self, "_draft_task_ids", ()))
         self._draft_task_ids = set()
+        # Session unlocks never outlive the project session.
+        self._session_unlocked = set()
         if self.project is None:
             return
         for task_id in ids:
@@ -17319,6 +17409,94 @@ class MainWindow(QMainWindow):
             button.installEventFilter(guard)
             guards.append(guard)
         page._draft_save_guards = guards
+
+    def _install_unlock_button(self, page) -> None:
+        """Add the session Unlock button left of Save (or Close)."""
+        bar = page.findChild(QFrame, "moduleBar")
+        if bar is None or bar.layout() is None:
+            return
+        lay = bar.layout()
+        for i in range(lay.count()):
+            widget = lay.itemAt(i).widget()
+            if isinstance(widget, QPushButton) and widget.text() == "Unlock":
+                return
+        btn = QPushButton("Unlock")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(
+            "Discard temporary changes and save normally until this module "
+            "is closed"
+        )
+        btn.clicked.connect(lambda _=False: self._module_unlock(page))
+        index = None
+        for i in range(lay.count()):
+            widget = lay.itemAt(i).widget()
+            if not isinstance(widget, QPushButton):
+                continue
+            if widget.text() == "Save":
+                index = i
+                break
+            if widget.text() == "Close" and index is None:
+                index = i
+        if index is None:
+            index = lay.count()
+        lay.insertWidget(index, btn)
+        page._unlock_btn = btn
+
+    def _add_session_badge(self, page) -> None:
+        """Mark a module that was unlocked for the current session."""
+        bar = page.findChild(QFrame, "moduleBar")
+        if bar is None or bar.layout() is None:
+            return
+        lay = bar.layout()
+        label = QLabel("Unlocked (this session)")
+        label.setStyleSheet("color: #b58900; font-weight: bold;")
+        label.setToolTip(
+            "Changes save normally until this module is closed; it locks "
+            "again afterwards."
+        )
+        index = lay.count()
+        for i in range(lay.count()):
+            item = lay.itemAt(i)
+            if item is not None and item.spacerItem() is not None:
+                index = i
+                break
+        lay.insertWidget(index, label)
+
+    def _module_unlock(self, page) -> None:
+        """Unlock a locked module for this session (discard temporary work)."""
+        task_id = page.property("task_id")
+        task = self._find_task_by_id(task_id)
+        if task is None:
+            return
+        name = task.get("name") or "Module"
+        reply = QMessageBox.warning(
+            self, "Unlock Module",
+            f"Unlock '{name}'?\n\n"
+            "• Unlocking lets you change and save this module again. "
+            "Changes may affect downstream modules — please proceed with "
+            "caution.\n"
+            "• The module is restored to its last saved state: any temporary "
+            "changes made while it was locked will be discarded.\n\n"
+            "Unlock anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        task_type = task.get("type")
+        index = self.tabs.indexOf(page)
+        title = self.tabs.tabText(index) if index > 0 else name
+        # Closing the draft discards Module/<id>/draft and stops its workers.
+        self._close_module_page(page)
+        self._session_unlocked.add(str(task_id))
+        self._open_module(task_id, task_type, title)
+        new_index = self.tabs.count() - 1
+        if index > 0 and new_index != index:
+            self.tabs.tabBar().moveTab(new_index, index)
+        runlog.action(
+            "module.unlock", id=str(task_id or ""),
+            type=str(task_type or ""),
+        )
 
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""
@@ -41659,7 +41837,8 @@ class MainWindow(QMainWindow):
                 return
 
         task_def = self._find_task_by_id(task_id)
-        locked = task_def is not None and _task_is_locked(task_def)
+        locked = task_def is not None and self._task_locked(task_def)
+        was_locked = bool(locked)
         kind = _task_kind(task_type or "")
         # A locked module is still editable: it is opened on a deep copy of
         # its definition and everything it writes goes to Module/<id>/draft/,
@@ -41740,6 +41919,12 @@ class MainWindow(QMainWindow):
             page._draft_task_def = task_def
             self._guard_draft_save(page)
             self._add_draft_badge(page)
+        # Unlock is offered only while the module is locked (as a draft, or a
+        # locked page that is not drafted, such as Data Import).
+        if draft or was_locked:
+            self._install_unlock_button(page)
+        if task_id and str(task_id) in self._session_unlocked:
+            self._add_session_badge(page)
         index = self.tabs.addTab(page, name)
         if task_type:
             self.tabs.setTabIcon(
@@ -41771,13 +41956,50 @@ class MainWindow(QMainWindow):
                     self.project.path / "Module" / str(task_id) / "draft",
                     ignore_errors=True,
                 )
-        # Feature Down counts feature values in a background thread; stop it
-        # when the page goes away.
-        if hasattr(page, "_feat_ignore_requests"):
-            self._feat_ignore_cleanup(page)
+        self._cleanup_module_page(page, (task or {}).get("type"))
+        # Closing a session-unlocked module puts it back under its lock.
+        session_dropped = False
+        if task_id and str(task_id) in getattr(self, "_session_unlocked", ()):
+            self._session_unlocked.discard(str(task_id))
+            session_dropped = True
         index = self.tabs.indexOf(page)
         if index > 0:
             self.tabs.removeTab(index)
+        if session_dropped:
+            self._refresh_workflow_tree()
+
+    def _cleanup_module_page(self, page, task_type) -> None:
+        """Stop page-owned timers and workers before its tab is removed.
+
+        The module Close buttons call the same cleanups; doing it here as well
+        makes the Unlock reload safe (it closes the page without prompts).
+        Every cleanup is idempotent.
+        """
+        try:
+            if task_type == "gating":
+                self._gating_cleanup(page)
+            elif task_type == "heatmap":
+                self._heatmap_cleanup(page)
+            elif task_type == "export":
+                self._export_cleanup(page)
+            elif task_type == "figure":
+                self._figure_cancel_rendering(page)
+        except Exception:  # noqa: BLE001 - teardown must never raise
+            pass
+        # Feature Down counts values in a background thread regardless of how
+        # the page was opened.
+        if hasattr(page, "_feat_ignore_requests"):
+            try:
+                self._feat_ignore_cleanup(page)
+            except Exception:  # noqa: BLE001
+                pass
+        timer = getattr(page, "_fig_filter_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            page._fig_filter_timer = None
 
 
 def main() -> int:
