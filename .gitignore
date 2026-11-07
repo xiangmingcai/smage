@@ -25,4 +25,8 @@ Thumbs.db
 
 # --- Data ---
 # Sample datasets are kept out of the repository (they can be large).
-data/
+# Anchored: the source package lives at src/smage/data/.
+/data/
+
+# --- Claude Code local settings ---
+.claude/

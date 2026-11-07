@@ -1,0 +1,3293 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|<dynamic>|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 412
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Browse…|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "button",
+      "label": "Browse…",
+      "line": 371
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Create venv…|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "button",
+      "label": "Create venv…",
+      "line": 390
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Detect installed Python…|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "button",
+      "label": "Detect installed Python…",
+      "line": 356
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Detect library|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "button",
+      "label": "Detect library",
+      "line": 398
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Download model|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "button",
+      "label": "Download model",
+      "line": 460
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Install Python…|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "button",
+      "label": "Install Python…",
+      "line": 388
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Install dependencies|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "button",
+      "label": "Install dependencies",
+      "line": 448
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|combo|<dynamic>|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "combo",
+      "label": "<dynamic>",
+      "line": 364
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|combo|<dynamic>|1",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "combo",
+      "label": "<dynamic>",
+      "line": 431
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|text|<dynamic>|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._ext_detail_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 473
+    },
+    {
+      "key": "src/smage/app/extensions.py|ExtensionsMixin._open_extension_manager|list|<dynamic>|0",
+      "file": "src/smage/app/extensions.py",
+      "function": "ExtensionsMixin._open_extension_manager",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 264
+    },
+    {
+      "key": "src/smage/app/module_host.py|ModuleHostMixin._build_generate_page|button|Close|0",
+      "file": "src/smage/app/module_host.py",
+      "function": "ModuleHostMixin._build_generate_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 180
+    },
+    {
+      "key": "src/smage/app/module_host.py|ModuleHostMixin._build_generate_page|button|Run|0",
+      "file": "src/smage/app/module_host.py",
+      "function": "ModuleHostMixin._build_generate_page",
+      "kind": "button",
+      "label": "Run",
+      "line": 179
+    },
+    {
+      "key": "src/smage/app/module_host.py|ModuleHostMixin._build_generate_page|button|Save|0",
+      "file": "src/smage/app/module_host.py",
+      "function": "ModuleHostMixin._build_generate_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 178
+    },
+    {
+      "key": "src/smage/app/module_host.py|ModuleHostMixin._build_module_toolbar|button|Close|0",
+      "file": "src/smage/app/module_host.py",
+      "function": "ModuleHostMixin._build_module_toolbar",
+      "kind": "button",
+      "label": "Close",
+      "line": 123
+    },
+    {
+      "key": "src/smage/app/module_host.py|ModuleHostMixin._build_module_toolbar|button|Save|0",
+      "file": "src/smage/app/module_host.py",
+      "function": "ModuleHostMixin._build_module_toolbar",
+      "kind": "button",
+      "label": "Save",
+      "line": 118
+    },
+    {
+      "key": "src/smage/app/module_host.py|ModuleHostMixin._build_module_toolbar|button|Settings|0",
+      "file": "src/smage/app/module_host.py",
+      "function": "ModuleHostMixin._build_module_toolbar",
+      "kind": "button",
+      "label": "Settings",
+      "line": 122
+    },
+    {
+      "key": "src/smage/app/module_host.py|ModuleHostMixin._install_unlock_button|button|Unlock|0",
+      "file": "src/smage/app/module_host.py",
+      "function": "ModuleHostMixin._install_unlock_button",
+      "kind": "button",
+      "label": "Unlock",
+      "line": 318
+    },
+    {
+      "key": "src/smage/app/module_host.py|ModuleHostMixin._open_module|tab|<dynamic>|0",
+      "file": "src/smage/app/module_host.py",
+      "function": "ModuleHostMixin._open_module",
+      "kind": "tab",
+      "label": "<dynamic>",
+      "line": 580
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_main_area|tabs|<dynamic>|0",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_main_area",
+      "kind": "tabs",
+      "label": "<dynamic>",
+      "line": 264
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|0",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 109
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|1",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 113
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|2",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 117
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|3",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 122
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|4",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 127
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|5",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 130
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|menu|&Extension|0",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "menu",
+      "label": "&Extension",
+      "line": 119
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|menu|&File|0",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "menu",
+      "label": "&File",
+      "line": 105
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|menu|&Help|0",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "menu",
+      "label": "&Help",
+      "line": 129
+    },
+    {
+      "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|menu|&Settings|0",
+      "file": "src/smage/app/project_io.py",
+      "function": "ProjectIOMixin._build_menu_bar",
+      "kind": "menu",
+      "label": "&Settings",
+      "line": 124
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|0",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_actions_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 645
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|1",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_actions_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 649
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|2",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_actions_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 655
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|3",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_actions_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 659
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|4",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_actions_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 665
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|5",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_actions_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 676
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|6",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_actions_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 682
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|7",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_actions_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 688
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_workflow_tab|tab|Workflow|0",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_workflow_tab",
+      "kind": "tab",
+      "label": "Workflow",
+      "line": 540
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_workflow_tab|tree|<dynamic>|0",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._build_workflow_tab",
+      "kind": "tree",
+      "label": "<dynamic>",
+      "line": 527
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._task_item_widget|button|+|0",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._task_item_widget",
+      "kind": "button",
+      "label": "+",
+      "line": 594
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._task_item_widget|button|Actions ▾|0",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._task_item_widget",
+      "kind": "button",
+      "label": "Actions ▾",
+      "line": 588
+    },
+    {
+      "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._task_item_widget|button|Open|0",
+      "file": "src/smage/app/workflow_tree.py",
+      "function": "WorkflowTreeMixin._task_item_widget",
+      "kind": "button",
+      "label": "Open",
+      "line": 581
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_area_center_panel|button|Copy|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_area_center_panel",
+      "kind": "button",
+      "label": "Copy",
+      "line": 286
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_area_center_panel|spin|<dynamic>|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_area_center_panel",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 240
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_area_center_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_area_center_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 259
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_area_left_panel|button|Apply to checked files|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_area_left_panel",
+      "kind": "button",
+      "label": "Apply to checked files",
+      "line": 221
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_area_left_panel|button|Select files…|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_area_left_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 159
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_area_left_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_area_left_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 164
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_build_area_page|button|Close|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_build_area_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 90
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_build_area_page|button|Save|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_build_area_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 87
+    },
+    {
+      "key": "src/smage/modules/area/page.py|_build_area_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/area/page.py",
+      "function": "_build_area_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 136
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_center_panel|button|Select variables…|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_center_panel",
+      "kind": "button",
+      "label": "Select variables…",
+      "line": 356
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_center_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_center_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 360
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_left_panel|button|Copy|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_left_panel",
+      "kind": "button",
+      "label": "Copy",
+      "line": 327
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_left_panel|button|Paste|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_left_panel",
+      "kind": "button",
+      "label": "Paste",
+      "line": 329
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_left_panel|button|Select files…|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_left_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 294
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_left_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_left_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 304
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_log_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_log_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 243
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_right_panel|button|Calculate|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_right_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 505
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_right_panel|button|Report|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_right_panel",
+      "kind": "button",
+      "label": "Report",
+      "line": 507
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_right_panel|checkbox|Adjust variance as well as location|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_right_panel",
+      "kind": "checkbox",
+      "label": "Adjust variance as well as location",
+      "line": 472
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_ba_right_panel|checkbox|Empirical Bayes shrinkage|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_ba_right_panel",
+      "kind": "checkbox",
+      "label": "Empirical Bayes shrinkage",
+      "line": 465
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_build_ba_page|button|Close|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_build_ba_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 178
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_build_ba_page|button|Save|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_build_ba_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 175
+    },
+    {
+      "key": "src/smage/modules/batch_align/page.py|_build_ba_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/batch_align/page.py",
+      "function": "_build_ba_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 219
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_build_cluster_page|button|Close|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_build_cluster_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 129
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_build_cluster_page|button|Save|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_build_cluster_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 126
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_build_cluster_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_build_cluster_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 171
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_cluster_center_panel|button|Select variables…|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_cluster_center_panel",
+      "kind": "button",
+      "label": "Select variables…",
+      "line": 288
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_cluster_center_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_cluster_center_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 292
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_cluster_left_panel|button|Select files…|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_cluster_left_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 255
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_cluster_left_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_cluster_left_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 259
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_cluster_log_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_cluster_log_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 195
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_cluster_right_panel|button|Calculate|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_cluster_right_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 490
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_cluster_right_panel|checkbox|Normalize (z-score)|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_cluster_right_panel",
+      "kind": "checkbox",
+      "label": "Normalize (z-score)",
+      "line": 455
+    },
+    {
+      "key": "src/smage/modules/cluster/page.py|_cluster_right_panel|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/cluster/page.py",
+      "function": "_cluster_right_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 469
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_build_compensation_page|button|Close|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_build_compensation_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 59
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_build_compensation_page|button|Save|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_build_compensation_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 56
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_build_compensation_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_build_compensation_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 94
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_comp_files_panel|button|Set Files|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_comp_files_panel",
+      "kind": "button",
+      "label": "Set Files",
+      "line": 115
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_comp_files_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_comp_files_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 120
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_comp_matrix_panel|button|Copy Matrix|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_comp_matrix_panel",
+      "kind": "button",
+      "label": "Copy Matrix",
+      "line": 143
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_comp_matrix_panel|button|Paste Matrix|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_comp_matrix_panel",
+      "kind": "button",
+      "label": "Paste Matrix",
+      "line": 144
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_comp_matrix_panel|button|Set Compensation Matrix|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_comp_matrix_panel",
+      "kind": "button",
+      "label": "Set Compensation Matrix",
+      "line": 137
+    },
+    {
+      "key": "src/smage/modules/compensation/page.py|_comp_matrix_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/compensation/page.py",
+      "function": "_comp_matrix_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 153
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_build_dc_page|button|Close|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_build_dc_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 119
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_build_dc_page|button|Save|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_build_dc_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 116
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_build_dc_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_build_dc_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 160
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_dc_center_panel|button|Select variables…|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_dc_center_panel",
+      "kind": "button",
+      "label": "Select variables…",
+      "line": 292
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_dc_center_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_dc_center_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 296
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_dc_left_panel|button|Select files…|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_dc_left_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 236
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_dc_left_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_dc_left_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 240
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_dc_log_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_dc_log_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 184
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_dc_right_panel|button|Calculate|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_dc_right_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 415
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_dc_right_panel|checkbox|Remove zeros before peak detection|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_dc_right_panel",
+      "kind": "checkbox",
+      "label": "Remove zeros before peak detection",
+      "line": 391
+    },
+    {
+      "key": "src/smage/modules/data_clean/page.py|_dc_right_panel|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/data_clean/page.py",
+      "function": "_dc_right_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 405
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_build_dimred_page|button|Close|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_build_dimred_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 164
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_build_dimred_page|button|Save|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_build_dimred_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 161
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_build_dimred_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_build_dimred_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 204
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_center_panel|button|Select variables…|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_center_panel",
+      "kind": "button",
+      "label": "Select variables…",
+      "line": 359
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_center_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_center_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 363
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_left_panel|button|Select files…|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_left_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 326
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_left_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_left_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 330
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_log_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_log_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 277
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|button|Calculate|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_right_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 539
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|checkbox|Allow parallel (non-reproducible)|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_right_panel",
+      "kind": "checkbox",
+      "label": "Allow parallel (non-reproducible)",
+      "line": 499
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|checkbox|Normalize (z-score)|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_right_panel",
+      "kind": "checkbox",
+      "label": "Normalize (z-score)",
+      "line": 480
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|checkbox|PCA pre-reduction (faster)|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_right_panel",
+      "kind": "checkbox",
+      "label": "PCA pre-reduction (faster)",
+      "line": 489
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_right_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 514
+    },
+    {
+      "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|lineedit|<dynamic>|1",
+      "file": "src/smage/modules/dimred/page.py",
+      "function": "_dimred_right_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 521
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_build_export_page|button|Close|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_build_export_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 74
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_build_export_page|button|Save|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_build_export_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 71
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_build_export_page|tabs|<dynamic>|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_build_export_page",
+      "kind": "tabs",
+      "label": "<dynamic>",
+      "line": 102
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_build_export_page|tab|Image Export|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_build_export_page",
+      "kind": "tab",
+      "label": "Image Export",
+      "line": 104
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_build_export_page|tab|Table Export|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_build_export_page",
+      "kind": "tab",
+      "label": "Table Export",
+      "line": 103
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_columns_panel|button|<dynamic>|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_columns_panel",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 212
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_columns_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_columns_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 219
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_files_panel|button|Select files…|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_files_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 167
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_files_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_files_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 172
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_settings_panel|button|Browse…|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_settings_panel",
+      "kind": "button",
+      "label": "Browse…",
+      "line": 266
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_settings_panel|button|Cancel|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_settings_panel",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 290
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_settings_panel|button|Export|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_settings_panel",
+      "kind": "button",
+      "label": "Export",
+      "line": 287
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_settings_panel|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_settings_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 261
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_settings_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_settings_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 309
+    },
+    {
+      "key": "src/smage/modules/export/page.py|_export_subpage|splitter|<dynamic>|0",
+      "file": "src/smage/modules/export/page.py",
+      "function": "_export_subpage",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 127
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_build_feature_page|button|Close|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_build_feature_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 85
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_build_feature_page|button|Save|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_build_feature_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 82
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_build_feature_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_build_feature_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 127
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_files_panel|button|Select files…|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_files_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 250
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_files_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_files_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 255
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_ignore_section|table|<dynamic>|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_ignore_section",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 312
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_log_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_log_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 151
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_rebuild_rules|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_rebuild_rules",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 1126
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_rules_panel|button|Add|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_rules_panel",
+      "kind": "button",
+      "label": "Add",
+      "line": 936
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_rules_panel|button|Calculate|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_rules_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 947
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_rules_panel|button|Delete|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_rules_panel",
+      "kind": "button",
+      "label": "Delete",
+      "line": 939
+    },
+    {
+      "key": "src/smage/modules/feature/page.py|_feat_rules_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/feature/page.py",
+      "function": "_feat_rules_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 911
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_build_feature_up_page|button|Close|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_build_feature_up_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 71
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_build_feature_up_page|button|Save|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_build_feature_up_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 68
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_build_feature_up_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_build_feature_up_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 105
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|button|Calculate|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_features_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 305
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|button|Delete|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_features_panel",
+      "kind": "button",
+      "label": "Delete",
+      "line": 298
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|button|Select features…|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_features_panel",
+      "kind": "button",
+      "label": "Select features…",
+      "line": 278
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_features_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 283
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|button|Match|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_files_panel",
+      "kind": "button",
+      "label": "Match",
+      "line": 224
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|button|Select From files…|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_files_panel",
+      "kind": "button",
+      "label": "Select From files…",
+      "line": 176
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|button|Select To files…|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_files_panel",
+      "kind": "button",
+      "label": "Select To files…",
+      "line": 193
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_files_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 180
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|list|<dynamic>|1",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_files_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 197
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_log_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_log_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 130
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_match_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_match_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 246
+    },
+    {
+      "key": "src/smage/modules/feature_up/page.py|_fup_rebuild_features|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/feature_up/page.py",
+      "function": "_fup_rebuild_features",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 457
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|button|Cancel|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 390
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|button|Clear|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "button",
+      "label": "Clear",
+      "line": 367
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|button|Permute|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "button",
+      "label": "Permute",
+      "line": 392
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|button|Select all|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "button",
+      "label": "Select all",
+      "line": 365
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 351
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|list|<dynamic>|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 357
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|radio|<dynamic>|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "radio",
+      "label": "<dynamic>",
+      "line": 342
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|radio|New row|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "radio",
+      "label": "New row",
+      "line": 376
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|radio|Same row|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_FigurePermuteDialog.__init__",
+      "kind": "radio",
+      "label": "Same row",
+      "line": 375
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add Histogram|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "button",
+      "label": "Add Histogram",
+      "line": 601
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add Image|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "button",
+      "label": "Add Image",
+      "line": 602
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add N×N Plot|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "button",
+      "label": "Add N×N Plot",
+      "line": 603
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add Overlay|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "button",
+      "label": "Add Overlay",
+      "line": 597
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add Scatter|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "button",
+      "label": "Add Scatter",
+      "line": 596
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Cancel|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 565
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Close|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 575
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Save|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 573
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_build_figure_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_build_figure_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 635
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_card_context_menu|action|Delete|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_card_context_menu",
+      "kind": "action",
+      "label": "Delete",
+      "line": 971
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_card_context_menu|action|Duplicate|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_card_context_menu",
+      "kind": "action",
+      "label": "Duplicate",
+      "line": 970
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_card_context_menu|action|Permute…|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_card_context_menu",
+      "kind": "action",
+      "label": "Permute…",
+      "line": 973
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_overlay_settings|button|<dynamic>|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_overlay_settings",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 3148
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_overlay_settings|button|Select gates…|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_overlay_settings",
+      "kind": "button",
+      "label": "Select gates…",
+      "line": 3065
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_point_size_settings|checkbox|Fixed|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_point_size_settings",
+      "kind": "checkbox",
+      "label": "Fixed",
+      "line": 2938
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_multi.make_color_button|button|<dynamic>|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_rebuild_settings_multi.make_color_button",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 2479
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_multi.make_range_row|checkbox|Auto|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_rebuild_settings_multi.make_range_row",
+      "kind": "checkbox",
+      "label": "Auto",
+      "line": 2516
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_multi|checkbox|<dynamic>|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_rebuild_settings_multi",
+      "kind": "checkbox",
+      "label": "<dynamic>",
+      "line": 2875
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_multi|checkbox|Fixed|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_rebuild_settings_multi",
+      "kind": "checkbox",
+      "label": "Fixed",
+      "line": 2761
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_single.make_color_button|button|<dynamic>|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_rebuild_settings_single.make_color_button",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 2156
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_single|button|Origin|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_rebuild_settings_single",
+      "kind": "button",
+      "label": "Origin",
+      "line": 2249
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_single|button|Square|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_rebuild_settings_single",
+      "kind": "button",
+      "label": "Square",
+      "line": 2255
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_build_gate2col_page|button|Close|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_build_gate2col_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 69
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_build_gate2col_page|button|Save|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_build_gate2col_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 66
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_build_gate2col_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_build_gate2col_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 99
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_g2c_files_panel|button|Select files…|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_g2c_files_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 220
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_g2c_files_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_g2c_files_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 229
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_g2c_log_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_g2c_log_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 122
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_g2c_rebuild_rules|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_g2c_rebuild_rules",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 485
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_g2c_rules_panel|button|Add|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_g2c_rules_panel",
+      "kind": "button",
+      "label": "Add",
+      "line": 362
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_g2c_rules_panel|button|Convert|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_g2c_rules_panel",
+      "kind": "button",
+      "label": "Convert",
+      "line": 373
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_g2c_rules_panel|button|Delete|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_g2c_rules_panel",
+      "kind": "button",
+      "label": "Delete",
+      "line": 365
+    },
+    {
+      "key": "src/smage/modules/gate2col/page.py|_g2c_rules_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/gate2col/page.py",
+      "function": "_g2c_rules_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 349
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_build_gating_page|button|Close|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_build_gating_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 245
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_build_gating_page|button|Save|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_build_gating_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 242
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_add_boolean_gate|button|Cancel|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_add_boolean_gate",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 2253
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_add_boolean_gate|button|OK|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_add_boolean_gate",
+      "kind": "button",
+      "label": "OK",
+      "line": 2252
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_add_boolean_gate|checkbox|<dynamic>|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_add_boolean_gate",
+      "kind": "checkbox",
+      "label": "<dynamic>",
+      "line": 2247
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_open_col2gate|button|Check|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_open_col2gate",
+      "kind": "button",
+      "label": "Check",
+      "line": 729
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_open_col2gate|button|Set as gates|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_open_col2gate",
+      "kind": "button",
+      "label": "Set as gates",
+      "line": 750
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_open_col2gate|lineedit|cate_|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_open_col2gate",
+      "kind": "lineedit",
+      "label": "cate_",
+      "line": 748
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_open_col2gate|table|<dynamic>|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_open_col2gate",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 736
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1847
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|1",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1852
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|10",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1931
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|11",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1935
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|2",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1858
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|3",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1864
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|4",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1872
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|5",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1891
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|6",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1900
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|7",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1911
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|8",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1916
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|9",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1921
+    },
+    {
+      "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|menu|<dynamic>|0",
+      "file": "src/smage/modules/gating/page.py",
+      "function": "_gating_tree_context_menu",
+      "kind": "menu",
+      "label": "<dynamic>",
+      "line": 1922
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_build_heatmap_page|button|Close|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_build_heatmap_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 682
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_build_heatmap_page|button|Save|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_build_heatmap_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 679
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_build_heatmap_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_build_heatmap_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 747
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_files_section|button|Select files…|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_files_section",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 799
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_files_section|list|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_files_section",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 804
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|button|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 1160
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|button|Copy matrix|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "button",
+      "label": "Copy matrix",
+      "line": 1237
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Auto number color|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "checkbox",
+      "label": "Auto number color",
+      "line": 1153
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Auto value range|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "checkbox",
+      "label": "Auto value range",
+      "line": 1174
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Cluster columns|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "checkbox",
+      "label": "Cluster columns",
+      "line": 1195
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Cluster rows|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "checkbox",
+      "label": "Cluster rows",
+      "line": 1192
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Show numbers|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "checkbox",
+      "label": "Show numbers",
+      "line": 1150
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|spin|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1178
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|spin|<dynamic>|1",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_fill_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1179
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_gates_panel|button|Select gates…|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_gates_panel",
+      "kind": "button",
+      "label": "Select gates…",
+      "line": 895
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_gates_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_gates_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 900
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_left_panel|splitter|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_left_panel",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 775
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_log_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_log_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 1075
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_middle_panel|button|Calculate|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_middle_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 976
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_middle_panel|button|Cancel|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_middle_panel",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 979
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_middle_panel|splitter|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_middle_panel",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 968
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_right_panel|splitter|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_right_panel",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 1005
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_right_panel|splitter|<dynamic>|1",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_right_panel",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 1008
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_variables_panel|button|Select variables…|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_variables_panel",
+      "kind": "button",
+      "label": "Select variables…",
+      "line": 934
+    },
+    {
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_variables_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/heatmap/page.py",
+      "function": "_heatmap_variables_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 941
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_build_illumination_page|button|Close|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_build_illumination_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 76
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_build_illumination_page|button|Save|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_build_illumination_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 73
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_build_illumination_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_build_illumination_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 116
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_channel_panel|button|Set Files|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_channel_panel",
+      "kind": "button",
+      "label": "Set Files",
+      "line": 469
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_channel_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_channel_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 477
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_list_menu|action|<dynamic>|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_list_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 282
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_list_menu|action|<dynamic>|1",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_list_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 286
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_list_menu|action|<dynamic>|2",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_list_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 291
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_list_panel|button|Add Submodule|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_list_panel",
+      "kind": "button",
+      "label": "Add Submodule",
+      "line": 146
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_list_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_list_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 151
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_params_panel|button|Calculate Illumination|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_params_panel",
+      "kind": "button",
+      "label": "Calculate Illumination",
+      "line": 673
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_params_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_params_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 651
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_plot_settings|checkbox|Show tile grid|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_plot_settings",
+      "kind": "checkbox",
+      "label": "Show tile grid",
+      "line": 1007
+    },
+    {
+      "key": "src/smage/modules/illumination/page.py|_illum_rebuild_right|splitter|<dynamic>|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_rebuild_right",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 403
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_input_panel|button|Delete|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_input_panel",
+      "kind": "button",
+      "label": "Delete",
+      "line": 228
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_input_panel|button|Import|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_input_panel",
+      "kind": "button",
+      "label": "Import",
+      "line": 223
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_input_panel|button|Peek|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_input_panel",
+      "kind": "button",
+      "label": "Peek",
+      "line": 218
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_input_panel|button|Select Files…|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_input_panel",
+      "kind": "button",
+      "label": "Select Files…",
+      "line": 202
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_input_panel|checkbox|Select all|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_input_panel",
+      "kind": "checkbox",
+      "label": "Select all",
+      "line": 208
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_input_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_input_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 212
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_parameter_panel|button|Apply to|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_parameter_panel",
+      "kind": "button",
+      "label": "Apply to",
+      "line": 609
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_parameter_panel|button|Copy|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_parameter_panel",
+      "kind": "button",
+      "label": "Copy",
+      "line": 607
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_parameter_panel|button|Paste|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_parameter_panel",
+      "kind": "button",
+      "label": "Paste",
+      "line": 608
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_processed_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_processed_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 164
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_sample_panel|button|Apply to|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_sample_panel",
+      "kind": "button",
+      "label": "Apply to",
+      "line": 145
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_show_apply_dialog|button|Cancel|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_show_apply_dialog",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 1027
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_show_apply_dialog|button|Confirm|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_show_apply_dialog",
+      "kind": "button",
+      "label": "Confirm",
+      "line": 1026
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_show_apply_dialog|list|<dynamic>|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_show_apply_dialog",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 1014
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_show_file_parameters|checkbox|<dynamic>|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_show_file_parameters",
+      "kind": "checkbox",
+      "label": "<dynamic>",
+      "line": 825
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_show_file_parameters|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_show_file_parameters",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 831
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_build_rename_page|button|Close|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_build_rename_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 68
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_build_rename_page|button|Save|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_build_rename_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 65
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_column_panel|button|Select files…|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_column_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 160
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_column_panel|button|Select variables…|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_column_panel",
+      "kind": "button",
+      "label": "Select variables…",
+      "line": 182
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_column_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_column_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 164
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_column_panel|list|<dynamic>|1",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_column_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 186
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_column_panel|splitter|<dynamic>|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_column_panel",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 145
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_copy_paste|button|Copy|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_copy_paste",
+      "kind": "button",
+      "label": "Copy",
+      "line": 229
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_copy_paste|button|Paste|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_copy_paste",
+      "kind": "button",
+      "label": "Paste",
+      "line": 231
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_file_panel|button|Select files…|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_file_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 122
+    },
+    {
+      "key": "src/smage/modules/rename/page.py|_rename_table|table|<dynamic>|0",
+      "file": "src/smage/modules/rename/page.py",
+      "function": "_rename_table",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 208
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_build_scaling_page|button|Close|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_build_scaling_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 372
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_build_scaling_page|button|Save|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_build_scaling_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 369
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_build_scaling_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_build_scaling_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 396
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_build_scaling_page|splitter|<dynamic>|1",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_build_scaling_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 517
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_build_scaling_page|table|<dynamic>|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_build_scaling_page",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 410
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|button|Apply|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_apply_panel",
+      "kind": "button",
+      "label": "Apply",
+      "line": 247
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|button|Select variables…|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_apply_panel",
+      "kind": "button",
+      "label": "Select variables…",
+      "line": 188
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_apply_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 218
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|lineedit|<dynamic>|1",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_apply_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 226
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|lineedit|<dynamic>|2",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_apply_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 231
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_apply_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 197
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_files_panel|button|Select files…|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_files_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 120
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_files_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_files_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 127
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_populate_table|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_populate_table",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 571
+    },
+    {
+      "key": "src/smage/modules/scale/page.py|_scaling_populate_table|lineedit|<dynamic>|1",
+      "file": "src/smage/modules/scale/page.py",
+      "function": "_scaling_populate_table",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 582
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_build_segmentation_page|button|Close|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_build_segmentation_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 229
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_build_segmentation_page|button|Save|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_build_segmentation_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 226
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_build_segmentation_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_build_segmentation_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 269
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_external_method_panel|button|Calculate|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_external_method_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 909
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_external_method_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_external_method_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 806
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_external_method_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_external_method_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 917
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|button|Set Files|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_files_panel",
+      "kind": "button",
+      "label": "Set Files",
+      "line": 383
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_files_panel",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 410
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|splitter|<dynamic>|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_files_panel",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 425
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_files_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 390
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_mask_input_panel|button|Import|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_mask_input_panel",
+      "kind": "button",
+      "label": "Import",
+      "line": 983
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_mask_input_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_mask_input_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 967
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_method_params_panel|button|Calculate|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_method_params_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 702
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_refresh_input_table|button|<dynamic>|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_refresh_input_table",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 1029
+    },
+    {
+      "key": "src/smage/modules/subsample/page.py|_build_subsample_page|button|Close|0",
+      "file": "src/smage/modules/subsample/page.py",
+      "function": "_build_subsample_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 188
+    },
+    {
+      "key": "src/smage/modules/subsample/page.py|_build_subsample_page|button|Save|0",
+      "file": "src/smage/modules/subsample/page.py",
+      "function": "_build_subsample_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 185
+    },
+    {
+      "key": "src/smage/modules/subsample/page.py|_build_subsample_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/subsample/page.py",
+      "function": "_build_subsample_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 219
+    },
+    {
+      "key": "src/smage/modules/subsample/page.py|_subs_settings_panel|button|Select files…|0",
+      "file": "src/smage/modules/subsample/page.py",
+      "function": "_subs_settings_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 248
+    },
+    {
+      "key": "src/smage/modules/subsample/page.py|_subs_settings_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/subsample/page.py",
+      "function": "_subs_settings_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 252
+    },
+    {
+      "key": "src/smage/modules/subsample/page.py|_subs_table_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/subsample/page.py",
+      "function": "_subs_table_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 324
+    },
+    {
+      "key": "src/smage/modules/subset/page.py|_build_subset_page|button|Close|0",
+      "file": "src/smage/modules/subset/page.py",
+      "function": "_build_subset_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 40
+    },
+    {
+      "key": "src/smage/modules/subset/page.py|_build_subset_page|button|Save|0",
+      "file": "src/smage/modules/subset/page.py",
+      "function": "_build_subset_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 37
+    },
+    {
+      "key": "src/smage/modules/subset/page.py|_build_subset_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/subset/page.py",
+      "function": "_build_subset_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 73
+    },
+    {
+      "key": "src/smage/modules/subset/page.py|_subset_columns_panel|button|Select columns…|0",
+      "file": "src/smage/modules/subset/page.py",
+      "function": "_subset_columns_panel",
+      "kind": "button",
+      "label": "Select columns…",
+      "line": 128
+    },
+    {
+      "key": "src/smage/modules/subset/page.py|_subset_columns_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/subset/page.py",
+      "function": "_subset_columns_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 132
+    },
+    {
+      "key": "src/smage/modules/subset/page.py|_subset_files_panel|button|Select files…|0",
+      "file": "src/smage/modules/subset/page.py",
+      "function": "_subset_files_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 100
+    },
+    {
+      "key": "src/smage/modules/subset/page.py|_subset_files_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/subset/page.py",
+      "function": "_subset_files_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 104
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_build_unmix_page|button|Close|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_build_unmix_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 217
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_build_unmix_page|button|Save|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_build_unmix_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 214
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_build_unmix_page|tabs|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_build_unmix_page",
+      "kind": "tabs",
+      "label": "<dynamic>",
+      "line": 270
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_build_unmix_page|tab|Matrix & Unmixing|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_build_unmix_page",
+      "kind": "tab",
+      "label": "Matrix & Unmixing",
+      "line": 272
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_build_unmix_page|tab|Spectrum Extraction|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_build_unmix_page",
+      "kind": "tab",
+      "label": "Spectrum Extraction",
+      "line": 271
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_curve_settings_content|button|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_curve_settings_content",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 1889
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_curve_settings_content|button|Reset colours to defaults|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_curve_settings_content",
+      "kind": "button",
+      "label": "Reset colours to defaults",
+      "line": 1913
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_curve_settings_content|checkbox|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_curve_settings_content",
+      "kind": "checkbox",
+      "label": "<dynamic>",
+      "line": 1866
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_extraction_subpage|splitter|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_extraction_subpage",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 296
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_grid_settings_content|button|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_grid_settings_content",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 1758
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_grid_settings_content|button|<dynamic>|1",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_grid_settings_content",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 1764
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_grid_settings_content|checkbox|Auto number color|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_grid_settings_content",
+      "kind": "checkbox",
+      "label": "Auto number color",
+      "line": 1752
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_grid_settings_content|checkbox|Show numbers|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_grid_settings_content",
+      "kind": "checkbox",
+      "label": "Show numbers",
+      "line": 1747
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_image_panel|button|Unmix for image|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_image_panel",
+      "kind": "button",
+      "label": "Unmix for image",
+      "line": 2193
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_image_panel|text|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_image_panel",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 2204
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tabs|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_panel",
+      "kind": "tabs",
+      "label": "<dynamic>",
+      "line": 1565
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tab|Similarity matrix|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_panel",
+      "kind": "tab",
+      "label": "Similarity matrix",
+      "line": 1569
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tab|Spectral curve|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_panel",
+      "kind": "tab",
+      "label": "Spectral curve",
+      "line": 1568
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tab|Spectral matrix|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_panel",
+      "kind": "tab",
+      "label": "Spectral matrix",
+      "line": 1567
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_subpage|splitter|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_subpage",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 1524
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_subpage|splitter|<dynamic>|1",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_subpage",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 1532
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_subpage|splitter|<dynamic>|2",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_subpage",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 1535
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_subpage|splitter|<dynamic>|3",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_subpage",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 1547
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_signature_table|checkbox|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_rebuild_signature_table",
+      "kind": "checkbox",
+      "label": "<dynamic>",
+      "line": 2241
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_signature_table|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_rebuild_signature_table",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 2251
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_spectrum_settings|button|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_rebuild_spectrum_settings",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 1443
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_spectrum_settings|button|Set|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_rebuild_spectrum_settings",
+      "kind": "button",
+      "label": "Set",
+      "line": 1387
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_spectrum_settings|combo|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_rebuild_spectrum_settings",
+      "kind": "combo",
+      "label": "<dynamic>",
+      "line": 1363
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_spectrum_settings|list|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_rebuild_spectrum_settings",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 1406
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_reset_spectrum_source|button|Cancel|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_reset_spectrum_source",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 1050
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_reset_spectrum_source|button|OK|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_reset_spectrum_source",
+      "kind": "button",
+      "label": "OK",
+      "line": 1049
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_reset_spectrum_source|combo|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_reset_spectrum_source",
+      "kind": "combo",
+      "label": "<dynamic>",
+      "line": 1043
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|button|All|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_sample_panel",
+      "kind": "button",
+      "label": "All",
+      "line": 2143
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|button|None|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_sample_panel",
+      "kind": "button",
+      "label": "None",
+      "line": 2144
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_sample_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 2157
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_signature_header_menu|action|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_signature_header_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 2335
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_signature_menu|action|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_signature_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 2319
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_signature_panel|button|Add signature|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_signature_panel",
+      "kind": "button",
+      "label": "Add signature",
+      "line": 2085
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_signature_panel|table|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_signature_panel",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 2094
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_signature_widget_menu|action|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_signature_widget_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 2361
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_area|button|New gate tree|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_spectrum_area",
+      "kind": "button",
+      "label": "New gate tree",
+      "line": 373
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_area|list|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_spectrum_area",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 342
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_context_menu|action|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_spectrum_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 957
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_context_menu|action|<dynamic>|1",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_spectrum_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 961
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_context_menu|action|<dynamic>|2",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_spectrum_context_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 966
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_menu|action|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_spectrum_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1082
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_menu|action|<dynamic>|1",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_spectrum_menu",
+      "kind": "action",
+      "label": "<dynamic>",
+      "line": 1089
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_ColormapPicker.__init__|button|Delete custom|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_ColormapPicker.__init__",
+      "kind": "button",
+      "label": "Delete custom",
+      "line": 418
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_ColormapPicker.__init__|button|New custom…|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_ColormapPicker.__init__",
+      "kind": "button",
+      "label": "New custom…",
+      "line": 416
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_ColormapPicker.__init__|lineedit|<dynamic>|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_ColormapPicker.__init__",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 391
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_ColormapPicker.__init__|list|<dynamic>|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_ColormapPicker.__init__",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 397
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_CustomColormapDialog.__init__|button|Add stop|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_CustomColormapDialog.__init__",
+      "kind": "button",
+      "label": "Add stop",
+      "line": 221
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_CustomColormapDialog.__init__|button|Cancel|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_CustomColormapDialog.__init__",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 232
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_CustomColormapDialog.__init__|button|OK|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_CustomColormapDialog.__init__",
+      "kind": "button",
+      "label": "OK",
+      "line": 234
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_CustomColormapDialog.__init__|lineedit|<dynamic>|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_CustomColormapDialog.__init__",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 190
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_CustomColormapDialog.__init__|table|<dynamic>|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_CustomColormapDialog.__init__",
+      "kind": "table",
+      "label": "<dynamic>",
+      "line": 207
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_CustomColormapDialog._rebuild_table|button|<dynamic>|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_CustomColormapDialog._rebuild_table",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 297
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_CustomColormapDialog._rebuild_table|button|Remove|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_CustomColormapDialog._rebuild_table",
+      "kind": "button",
+      "label": "Remove",
+      "line": 303
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_pick_colormap|button|Cancel|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_pick_colormap",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 582
+    },
+    {
+      "key": "src/smage/widgets/colormap.py|_pick_colormap|button|OK|0",
+      "file": "src/smage/widgets/colormap.py",
+      "function": "_pick_colormap",
+      "kind": "button",
+      "label": "OK",
+      "line": 584
+    },
+    {
+      "key": "src/smage/widgets/controls.py|_LogStepSpinBox.__init__|button|<dynamic>|0",
+      "file": "src/smage/widgets/controls.py",
+      "function": "_LogStepSpinBox.__init__",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 151
+    },
+    {
+      "key": "src/smage/widgets/controls.py|_LogStepSpinBox.__init__|button|<dynamic>|1",
+      "file": "src/smage/widgets/controls.py",
+      "function": "_LogStepSpinBox.__init__",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 157
+    },
+    {
+      "key": "src/smage/widgets/controls.py|_LogStepSpinBox.__init__|lineedit|<dynamic>|0",
+      "file": "src/smage/widgets/controls.py",
+      "function": "_LogStepSpinBox.__init__",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 141
+    },
+    {
+      "key": "src/smage/widgets/controls.py|_SizeField.__init__|button|<dynamic>|0",
+      "file": "src/smage/widgets/controls.py",
+      "function": "_SizeField.__init__",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 67
+    },
+    {
+      "key": "src/smage/widgets/controls.py|_SizeField.__init__|button|<dynamic>|1",
+      "file": "src/smage/widgets/controls.py",
+      "function": "_SizeField.__init__",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 72
+    },
+    {
+      "key": "src/smage/widgets/controls.py|_SizeField.__init__|lineedit|<dynamic>|0",
+      "file": "src/smage/widgets/controls.py",
+      "function": "_SizeField.__init__",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 54
+    },
+    {
+      "key": "src/smage/widgets/image_level.py|_image_level_controls|button|Auto set|0",
+      "file": "src/smage/widgets/image_level.py",
+      "function": "_image_level_controls",
+      "kind": "button",
+      "label": "Auto set",
+      "line": 79
+    },
+    {
+      "key": "src/smage/widgets/image_level.py|_image_level_controls|button|Reset|0",
+      "file": "src/smage/widgets/image_level.py",
+      "function": "_image_level_controls",
+      "kind": "button",
+      "label": "Reset",
+      "line": 87
+    },
+    {
+      "key": "src/smage/widgets/image_level.py|_image_level_controls|lineedit|<dynamic>|0",
+      "file": "src/smage/widgets/image_level.py",
+      "function": "_image_level_controls",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 38
+    },
+    {
+      "key": "src/smage/widgets/image_level.py|_image_level_controls|lineedit|<dynamic>|1",
+      "file": "src/smage/widgets/image_level.py",
+      "function": "_image_level_controls",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 51
+    },
+    {
+      "key": "src/smage/widgets/panels.py|_file_nav_row|button|<dynamic>|0",
+      "file": "src/smage/widgets/panels.py",
+      "function": "_file_nav_row",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 103
+    },
+    {
+      "key": "src/smage/widgets/panels.py|_file_nav_row|button|<dynamic>|1",
+      "file": "src/smage/widgets/panels.py",
+      "function": "_file_nav_row",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 105
+    },
+    {
+      "key": "src/smage/widgets/picker.py|_pick_items_dialog|button|Cancel|0",
+      "file": "src/smage/widgets/picker.py",
+      "function": "_pick_items_dialog",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 83
+    },
+    {
+      "key": "src/smage/widgets/picker.py|_pick_items_dialog|button|OK|0",
+      "file": "src/smage/widgets/picker.py",
+      "function": "_pick_items_dialog",
+      "kind": "button",
+      "label": "OK",
+      "line": 84
+    },
+    {
+      "key": "src/smage/widgets/picker.py|_pick_items_dialog|checkbox|Select all|0",
+      "file": "src/smage/widgets/picker.py",
+      "function": "_pick_items_dialog",
+      "kind": "checkbox",
+      "label": "Select all",
+      "line": 50
+    },
+    {
+      "key": "src/smage/widgets/picker.py|_pick_items_dialog|lineedit|<dynamic>|0",
+      "file": "src/smage/widgets/picker.py",
+      "function": "_pick_items_dialog",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 46
+    },
+    {
+      "key": "src/smage/widgets/picker.py|_pick_items_dialog|list|<dynamic>|0",
+      "file": "src/smage/widgets/picker.py",
+      "function": "_pick_items_dialog",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 54
+    },
+    {
+      "key": "src/smage/widgets/settings.py|_GlobalSettingsDialog.__init__|button|Cancel|0",
+      "file": "src/smage/widgets/settings.py",
+      "function": "_GlobalSettingsDialog.__init__",
+      "kind": "button",
+      "label": "Cancel",
+      "line": 68
+    },
+    {
+      "key": "src/smage/widgets/settings.py|_GlobalSettingsDialog.__init__|button|OK|0",
+      "file": "src/smage/widgets/settings.py",
+      "function": "_GlobalSettingsDialog.__init__",
+      "kind": "button",
+      "label": "OK",
+      "line": 70
+    },
+    {
+      "key": "src/smage/widgets/settings.py|_GlobalSettingsDialog.__init__|button|Restore Defaults|0",
+      "file": "src/smage/widgets/settings.py",
+      "function": "_GlobalSettingsDialog.__init__",
+      "kind": "button",
+      "label": "Restore Defaults",
+      "line": 64
+    },
+    {
+      "key": "src/smage/widgets/settings.py|_GlobalSettingsDialog.__init__|list|<dynamic>|0",
+      "file": "src/smage/widgets/settings.py",
+      "function": "_GlobalSettingsDialog.__init__",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 41
+    },
+    {
+      "key": "src/smage/widgets/settings.py|_GlobalSettingsDialog._appearance_page|checkbox|Remember window size and position|0",
+      "file": "src/smage/widgets/settings.py",
+      "function": "_GlobalSettingsDialog._appearance_page",
+      "kind": "checkbox",
+      "label": "Remember window size and position",
+      "line": 135
+    },
+    {
+      "key": "src/smage/widgets/settings.py|_GlobalSettingsDialog._appearance_page|spin|<dynamic>|0",
+      "file": "src/smage/widgets/settings.py",
+      "function": "_GlobalSettingsDialog._appearance_page",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 99
+    },
+    {
+      "key": "src/smage/widgets/settings.py|_GlobalSettingsDialog._gating_page|spin|<dynamic>|0",
+      "file": "src/smage/widgets/settings.py",
+      "function": "_GlobalSettingsDialog._gating_page",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 212
+    },
+    {
+      "key": "src/smage/widgets/settings.py|_GlobalSettingsDialog._parameters_page.add_spin|spin|<dynamic>|0",
+      "file": "src/smage/widgets/settings.py",
+      "function": "_GlobalSettingsDialog._parameters_page.add_spin",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 155
+    }
+  ]
+}

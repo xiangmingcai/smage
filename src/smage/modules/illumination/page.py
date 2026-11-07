@@ -1,0 +1,1330 @@
+"""Illumination Correction module: per-tile flat-field correction."""
+from __future__ import annotations
+
+from smage.widgets.panels import _FlowArrowBand
+
+from PySide6.QtCore import (
+    QRectF,
+    QTimer,
+    Qt,
+)
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QFrame,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+from smage.core.constants import MODULE_STATE_MODIFIED
+from smage.core.settings import (
+    _default_palette,
+    _plot_background,
+)
+from smage.data.columns import _illumination_stage_item
+from smage.data.image_index import _image_geometry
+from smage.data.workers import _IlluminationWorker
+from smage.widgets.colormap import _figure_colormap
+from smage.widgets.controls import (
+    _NoWheelComboBox,
+    _NoWheelSpinBox,
+)
+from smage.widgets.plot_axes import _make_sci_axis
+from smage.widgets.resources import _lock_pixmap
+from uuid import uuid4
+import copy
+import pyqtgraph as pg
+
+
+def _build_illumination_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
+    """Build the Illumination Correction page."""
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+
+    bar = QFrame()
+    bar.setObjectName("moduleBar")
+    tl = QHBoxLayout(bar)
+    tl.setContentsMargins(12, 6, 12, 6)
+    tl.setSpacing(4)
+    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    if locked:
+        lock_icon = QLabel()
+        lock_icon.setPixmap(_lock_pixmap())
+        lock_icon.setFixedSize(14, 14)
+        lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+        tl.addWidget(lock_icon)
+        draft = QLabel("Draft (locked)")
+        draft.setStyleSheet("color: #b58900; font-weight: bold;")
+        tl.addWidget(draft)
+    tl.addStretch()
+    save_btn = QPushButton("Save")
+    save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    save_btn.setEnabled(not locked)
+    close_btn = QPushButton("Close")
+    close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    close_btn.clicked.connect(lambda _=False: ctx._illum_close(page))
+    tl.addWidget(save_btn)
+    tl.addWidget(close_btn)
+    layout.addWidget(bar)
+
+    params = task_def.setdefault("params", {})
+    params.setdefault("submodules", [])
+    page._illum_task_def = task_def
+    page._illum_task_id = task_def.get("id")
+    page._illum_params = params
+    page._illum_submodules = params["submodules"]
+    page._illum_selected = None
+    page._illum_plot = None
+    page._illum_locked = locked
+    page._illum_save_btn = save_btn
+    page._illum_dirty = False
+    page._illum_snapshot = copy.deepcopy(params)
+    page._illum_worker = _IlluminationWorker()
+    page._illum_request_key = None
+    page._illum_poll_timer = QTimer(ctx.host)
+    page._illum_poll_timer.setInterval(120)
+    page._illum_poll_timer.timeout.connect(
+        lambda: ctx._illum_on_poll(page)
+    )
+    page._illum_poll_timer.start()
+    page._illum_order_timer = QTimer(ctx.host)
+    page._illum_order_timer.setSingleShot(True)
+    page._illum_order_timer.setInterval(200)
+    page._illum_order_timer.timeout.connect(
+        lambda: ctx._illum_reordered(page)
+    )
+    save_btn.clicked.connect(lambda _=False: ctx._illum_save_now(page))
+
+    content = QWidget()
+    content.setStyleSheet("background: #f5f8fb;")
+    row = QHBoxLayout(content)
+    row.setContentsMargins(12, 12, 12, 12)
+    row.setSpacing(12)
+    splitter = QSplitter(Qt.Orientation.Horizontal)
+    splitter.setChildrenCollapsible(False)
+    splitter.addWidget(ctx._illum_list_panel(page))
+    right_host = QWidget()
+    right_lay = QVBoxLayout(right_host)
+    right_lay.setContentsMargins(0, 0, 0, 0)
+    right_lay.setSpacing(0)
+    splitter.addWidget(right_host)
+    splitter.setStretchFactor(0, 1)
+    splitter.setStretchFactor(1, 5)
+    splitter.setSizes([220, 1100])
+    row.addWidget(splitter, 1)
+    layout.addWidget(content, 1)
+    page._illum_right_host = right_host
+
+    ctx._illum_refresh_list(page)
+    ctx._illum_rebuild_right(page)
+    ctx._illum_update_save_btn(page)
+    return page
+
+
+def _illum_list_panel(ctx, page) -> QWidget:
+    panel = ctx._build_panel_frame()
+    outer = QHBoxLayout(panel)
+    outer.setContentsMargins(6, 10, 10, 10)
+    outer.setSpacing(4)
+    outer.addWidget(_FlowArrowBand())
+    inner = QVBoxLayout()
+    inner.setContentsMargins(0, 0, 0, 0)
+    inner.setSpacing(6)
+    add_btn = QPushButton("Add Submodule")
+    add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    add_btn.setEnabled(not page._illum_locked)
+    add_btn.clicked.connect(lambda _=False: ctx._illum_add_submodule(page))
+    inner.addWidget(add_btn)
+    sub_list = QListWidget()
+    sub_list.setStyleSheet(
+        "QListWidget { background: #ffffff; border: none; }"
+        "QListWidget::item:selected { background: #dbeafa; }"
+    )
+    sub_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+    sub_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+    sub_list.itemDoubleClicked.connect(
+        lambda item: ctx._illum_select_submodule(
+            page, item.data(Qt.ItemDataRole.UserRole)
+        )
+    )
+    sub_list.itemClicked.connect(
+        lambda item: ctx._illum_select_submodule(
+            page, item.data(Qt.ItemDataRole.UserRole)
+        )
+    )
+    sub_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    sub_list.customContextMenuRequested.connect(
+        lambda pos: ctx._illum_list_menu(page, pos)
+    )
+    sub_list.model().rowsMoved.connect(
+        lambda *_: page._illum_order_timer.start()
+    )
+    inner.addWidget(sub_list, 1)
+    note = QLabel(
+        "Data passes through the submodules above, top to bottom, "
+        "and leaves the module after the last one."
+    )
+    note.setWordWrap(True)
+    note.setStyleSheet("color: #6b7785;")
+    inner.addWidget(note)
+    outer.addLayout(inner, 1)
+    page._illum_list = sub_list
+    page._illum_add_btn = add_btn
+    return panel
+
+
+def _illum_refresh_list(ctx, page) -> None:
+    sub_list = page._illum_list
+    sub_list.blockSignals(True)
+    sub_list.clear()
+    for sub in page._illum_submodules:
+        item = QListWidgetItem(sub.get("name", ""))
+        item.setData(Qt.ItemDataRole.UserRole, sub.get("id"))
+        if sub.get("mask") is None:
+            item.setToolTip("Mask not calculated yet")
+        sub_list.addItem(item)
+    sub_list.blockSignals(False)
+    if page._illum_selected:
+        for i in range(sub_list.count()):
+            if sub_list.item(i).data(Qt.ItemDataRole.UserRole) == page._illum_selected:
+                sub_list.setCurrentItem(sub_list.item(i))
+                break
+
+
+def _illum_selected_sub(ctx, page):
+    for sub in page._illum_submodules:
+        if sub.get("id") == page._illum_selected:
+            return sub
+    return None
+
+
+def _illum_next_name(ctx, page) -> str:
+    taken = {sub.get("name") for sub in page._illum_submodules}
+    n = 1
+    while f"Channel{n}" in taken:
+        n += 1
+    return f"Channel{n}"
+
+
+def _illum_unique_name(ctx, page, base: str) -> str:
+    taken = {sub.get("name") for sub in page._illum_submodules}
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base} {n}" in taken:
+        n += 1
+    return f"{base} {n}"
+
+
+def _illum_default_axes(ctx, task_id=None):
+    columns = []
+    for rec in ctx._available_files(task_id):
+        for name in ctx._columns_for(rec.get("parquet"), task_id):
+            if name not in columns:
+                columns.append(name)
+    return (
+        "x" if "x" in columns else None,
+        "y" if "y" in columns else None,
+    )
+
+
+def _illum_add_submodule(ctx, page) -> None:
+    x_default, y_default = ctx._illum_default_axes(page._illum_task_id)
+    sub = {
+        "id": uuid4().hex[:8],
+        "name": ctx._illum_next_name(page),
+        "files": [],
+        "channel": None,
+        "x": x_default,
+        "y": y_default,
+        "tile_w": 256,
+        "tile_h": 256,
+        "bin": 5,
+        "resolution": 10,
+        "method": "median",
+        "calc_files": [],
+        "mask": None,
+        "mask_source": None,
+    }
+    page._illum_submodules.append(sub)
+    page._illum_selected = sub["id"]
+    ctx._illum_refresh_list(page)
+    ctx._illum_rebuild_right(page)
+    ctx._illum_mark_dirty(page)
+
+
+def _illum_list_menu(ctx, page, pos) -> None:
+    sub_list = page._illum_list
+    item = sub_list.itemAt(pos)
+    if item is None:
+        return
+    sub_id = item.data(Qt.ItemDataRole.UserRole)
+    sub = next((s for s in page._illum_submodules if s["id"] == sub_id), None)
+    if sub is None:
+        return
+    menu = QMenu(sub_list)
+    ren = QAction("Rename", menu)
+    ren.setEnabled(not page._illum_locked)
+    ren.triggered.connect(lambda: ctx._illum_rename_submodule(page, sub))
+    menu.addAction(ren)
+    dup = QAction("Duplicate", menu)
+    dup.setEnabled(not page._illum_locked)
+    dup.triggered.connect(lambda: ctx._illum_duplicate_submodule(page, sub))
+    menu.addAction(dup)
+    menu.addSeparator()
+    delete = QAction("Delete", menu)
+    delete.setEnabled(not page._illum_locked)
+    delete.triggered.connect(lambda: ctx._illum_delete_submodule(page, sub))
+    menu.addAction(delete)
+    menu.exec(sub_list.viewport().mapToGlobal(pos))
+
+
+def _illum_rename_submodule(ctx, page, sub) -> None:
+    text, ok = QInputDialog.getText(
+        ctx.host, "Rename submodule", "Name:", QLineEdit.EchoMode.Normal,
+        sub.get("name", ""),
+    )
+    if not ok:
+        return
+    name = text.strip()
+    if not name:
+        return
+    if any(
+        other is not sub and other.get("name") == name
+        for other in page._illum_submodules
+    ):
+        QMessageBox.information(
+            ctx.host, "Rename submodule", "A submodule with this name already exists."
+        )
+        return
+    sub["name"] = name
+    ctx._illum_refresh_list(page)
+    ctx._illum_mark_dirty(page)
+
+
+def _illum_duplicate_submodule(ctx, page, sub) -> None:
+    name = sub.get("name", "Channel") + " copy"
+    while any(s.get("name") == name for s in page._illum_submodules):
+        name += " copy"
+    new_sub = copy.deepcopy(sub)
+    new_sub["id"] = uuid4().hex[:8]
+    new_sub["name"] = name
+    new_sub["mask"] = None
+    new_sub["mask_source"] = None
+    page._illum_submodules.append(new_sub)
+    page._illum_selected = new_sub["id"]
+    ctx._illum_refresh_list(page)
+    ctx._illum_rebuild_right(page)
+    ctx._illum_mark_dirty(page)
+
+
+def _illum_drop_mask_file(ctx, task_id, sub) -> None:
+    """Delete a submodule's illumination mask file, if any."""
+    if ctx.project is None:
+        return
+    try:
+        ctx.project._mask_path(str(task_id), str(sub["id"])).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _illum_delete_submodule(ctx, page, sub) -> None:
+    reply = QMessageBox.question(
+        ctx.host,
+        "Delete submodule",
+        f'Delete "{sub.get("name", "")}"?',
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+        return
+    page._illum_submodules.remove(sub)
+    ctx._illum_drop_mask_file(page._illum_task_id, sub)
+    if page._illum_selected == sub["id"]:
+        page._illum_selected = (
+            page._illum_submodules[0]["id"]
+            if page._illum_submodules else None
+        )
+    ctx._illum_refresh_list(page)
+    ctx._illum_rebuild_right(page)
+    ctx._illum_mark_dirty(page)
+
+
+def _illum_select_submodule(ctx, page, sub_id) -> None:
+    if page._illum_selected == sub_id:
+        return
+    page._illum_selected = sub_id
+    ctx._illum_rebuild_right(page)
+
+
+def _illum_reordered(ctx, page) -> None:
+    sub_list = page._illum_list
+    order = [
+        sub_list.item(i).data(Qt.ItemDataRole.UserRole)
+        for i in range(sub_list.count())
+    ]
+    by_id = {sub["id"]: sub for sub in page._illum_submodules}
+    reordered = [by_id[sid] for sid in order if sid in by_id]
+    if len(reordered) != len(page._illum_submodules):
+        return
+    if [s["id"] for s in reordered] == [s["id"] for s in page._illum_submodules]:
+        return
+    page._illum_submodules[:] = reordered
+    ctx._illum_refresh_list(page)
+    ctx._illum_render_preview(page)
+    ctx._illum_mark_dirty(page)
+
+
+def _illum_rebuild_right(ctx, page) -> None:
+    host = page._illum_right_host
+    ctx._clear_settings_layout(host.layout())
+    sub = ctx._illum_selected_sub(page)
+    page._illum_plot = None
+    if sub is None:
+        hint = QLabel(
+            "Add a submodule on the left, then double-click it to edit."
+        )
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setStyleSheet("color: #888888;")
+        host.layout().addWidget(hint)
+        return
+    splitter = QSplitter(Qt.Orientation.Vertical)
+    splitter.setChildrenCollapsible(False)
+    top = QWidget()
+    top_lay = QHBoxLayout(top)
+    top_lay.setContentsMargins(0, 0, 0, 0)
+    top_lay.setSpacing(12)
+    top_lay.addWidget(ctx._illum_channel_panel(page, sub), 1)
+    top_lay.addWidget(ctx._illum_params_panel(page, sub), 2)
+    top_lay.addWidget(ctx._illum_mask_panel(page, sub), 2)
+    bottom = QWidget()
+    bottom_lay = QHBoxLayout(bottom)
+    bottom_lay.setContentsMargins(0, 0, 0, 0)
+    bottom_lay.setSpacing(12)
+    bottom_lay.addWidget(ctx._illum_plot_panel(page, sub, "Before"), 2)
+    bottom_lay.addWidget(ctx._illum_plot_panel(page, sub, "After"), 2)
+    bottom_lay.addWidget(ctx._illum_plot_settings(page, sub), 1)
+    splitter.addWidget(top)
+    splitter.addWidget(bottom)
+    splitter.setSizes([320, 520])
+    host.layout().addWidget(splitter, 1)
+    ctx._illum_render_preview(page)
+    ctx._illum_render_mask(page, sub)
+
+
+def _illum_channel_panel(ctx, page, sub) -> QWidget:
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    editable = not page._illum_locked
+    columns = ctx._illum_all_columns(page._illum_task_id)
+
+    top = QWidget()
+    top_lay = QVBoxLayout(top)
+    top_lay.setContentsMargins(0, 0, 0, 0)
+    top_lay.setSpacing(4)
+    top_lay.addWidget(QLabel("<b>Channel &amp; axes</b>"))
+    channel_combo = _NoWheelComboBox()
+    channel_combo.addItem("", None)
+    for name in columns:
+        channel_combo.addItem(name, name)
+    index = channel_combo.findData(sub.get("channel"))
+    channel_combo.setCurrentIndex(index if index >= 0 else 0)
+    channel_combo.setEnabled(editable)
+    top_lay.addWidget(QLabel("Channel"))
+    top_lay.addWidget(channel_combo)
+    axes_row = QHBoxLayout()
+    x_combo = _NoWheelComboBox()
+    y_combo = _NoWheelComboBox()
+    for combo, value in ((x_combo, sub.get("x")), (y_combo, sub.get("y"))):
+        combo.addItem("", None)
+        for name in columns:
+            combo.addItem(name, name)
+        idx = combo.findData(value)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.setEnabled(editable)
+    axes_row.addWidget(QLabel("X"))
+    axes_row.addWidget(x_combo, 1)
+    axes_row.addWidget(QLabel("Y"))
+    axes_row.addWidget(y_combo, 1)
+    top_lay.addLayout(axes_row)
+
+    files_host = QWidget()
+    files_lay = QVBoxLayout(files_host)
+    files_lay.setContentsMargins(0, 0, 0, 0)
+    files_lay.setSpacing(4)
+    set_btn = QPushButton("Set Files")
+    set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    set_btn.setEnabled(editable and bool(sub.get("channel")))
+    set_btn.setToolTip(
+        "" if sub.get("channel") else "Select the channel first"
+    )
+    set_btn.clicked.connect(lambda _=False: ctx._illum_set_files(page, sub))
+    files_lay.addWidget(set_btn)
+    files_list = QListWidget()
+    files_list.setStyleSheet(
+        "QListWidget { background: #ffffff; border: none; }"
+    )
+    for path in sub.get("files") or []:
+        files_list.addItem(QListWidgetItem(ctx._comp_file_name(path, page._illum_task_id)))
+    page._illum_files_list = files_list
+    files_lay.addWidget(files_list, 1)
+
+    lay.addWidget(top, 1)
+    lay.addWidget(files_host, 3)
+
+    def on_channel():
+        new_channel = channel_combo.currentData()
+        if new_channel == sub.get("channel"):
+            return
+        files = sub.get("files") or []
+        missing = [
+            ctx._comp_file_name(path, page._illum_task_id) for path in files
+            if new_channel and new_channel not in set(
+                ctx._columns_for(path, page._illum_task_id)
+            )
+        ]
+        if missing:
+            ctx._comp_show_missing(
+                [(name, [new_channel]) for name in missing]
+            )
+            channel_combo.blockSignals(True)
+            idx = channel_combo.findData(sub.get("channel"))
+            channel_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            channel_combo.blockSignals(False)
+            return
+        sub["channel"] = new_channel
+        set_btn.setEnabled(editable and bool(new_channel))
+        set_btn.setToolTip("" if new_channel else "Select the channel first")
+        ctx._illum_reset_plot_defaults(page, sub)
+        rebuild_levels = getattr(page, "_illum_rebuild_levels", None)
+        if rebuild_levels is not None:
+            rebuild_levels()
+        ctx._illum_render_preview(page)
+        ctx._illum_mark_dirty(page)
+
+    def on_axis(key, combo):
+        def handler():
+            sub[key] = combo.currentData()
+            ctx._illum_reset_plot_defaults(page, sub)
+            rebuild_levels = getattr(page, "_illum_rebuild_levels", None)
+            if rebuild_levels is not None:
+                rebuild_levels()
+            ctx._illum_render_preview(page)
+            ctx._illum_mark_dirty(page)
+        return handler
+
+    channel_combo.currentIndexChanged.connect(lambda _=0: on_channel())
+    x_combo.currentIndexChanged.connect(lambda _=0: on_axis("x", x_combo)())
+    y_combo.currentIndexChanged.connect(lambda _=0: on_axis("y", y_combo)())
+    return panel
+
+
+def _illum_all_columns(ctx, task_id=None) -> list:
+    columns = []
+    for rec in ctx._available_files(task_id):
+        for name in ctx._columns_for(rec.get("parquet"), task_id):
+            if name not in columns:
+                columns.append(name)
+    return columns
+
+
+def _illum_set_files(ctx, page, sub) -> None:
+    channel = sub.get("channel")
+    if not channel:
+        QMessageBox.information(
+            ctx.host, "Set Files", "Select the channel first."
+        )
+        return
+    records = ctx._available_files(page._illum_task_id)
+    names = [rec.get("name", "") for rec in records]
+    current = [
+        ctx._comp_file_name(path, page._illum_task_id) for path in (sub.get("files") or [])
+    ]
+    chosen = ctx._pick_items_dialog(
+        "Select files", names, current, "Filter files..."
+    )
+    if chosen is None:
+        return
+    chosen_set = set(chosen)
+    paths = [
+        rec.get("parquet") for rec in records
+        if rec.get("name", "") in chosen_set
+    ]
+    problems = []
+    for path in paths:
+        columns = set(ctx._columns_for(path, page._illum_task_id))
+        if channel not in columns:
+            problems.append((ctx._comp_file_name(path, page._illum_task_id), [channel]))
+    if problems:
+        ctx._comp_show_missing(problems)
+        return
+    sub["files"] = paths
+    sub["calc_files"] = [
+        path for path in (sub.get("calc_files") or []) if path in paths
+    ]
+    ctx._illum_rebuild_right(page)
+    ctx._illum_mark_dirty(page)
+
+
+def _illum_params_panel(ctx, page, sub) -> QWidget:
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    lay.addWidget(QLabel("<b>Correction parameters</b>"))
+    editable = not page._illum_locked
+
+    sizes = QHBoxLayout()
+    sizes.addWidget(QLabel("Tile W"))
+    tile_w = _NoWheelSpinBox()
+    tile_w.setRange(1, 1_000_000)
+    tile_w.setValue(int(sub.get("tile_w", 256)))
+    tile_w.setEnabled(editable)
+    sizes.addWidget(tile_w)
+    sizes.addWidget(QLabel("Tile H"))
+    tile_h = _NoWheelSpinBox()
+    tile_h.setRange(1, 1_000_000)
+    tile_h.setValue(int(sub.get("tile_h", 256)))
+    tile_h.setEnabled(editable)
+    sizes.addWidget(tile_h)
+    sizes.addStretch()
+    lay.addLayout(sizes)
+    lay.addWidget(ctx._param_hint(
+        "Tile size the correction is estimated on. Tiles that would run "
+        "past the right or bottom edge are excluded from the calculation."
+    ))
+
+    hint = QLabel(ctx._illum_divisibility_hint(sub))
+    hint.setWordWrap(True)
+    hint.setStyleSheet("color: #b58900;")
+    lay.addWidget(hint)
+
+    bins_row = QHBoxLayout()
+    bins_row.addWidget(QLabel("Bin"))
+    bin_spin = _NoWheelSpinBox()
+    bin_spin.setRange(3, 10)
+    bin_spin.setValue(int(sub.get("bin", 5)))
+    bin_spin.setEnabled(editable)
+    bins_row.addWidget(bin_spin)
+    bins_row.addWidget(QLabel("Resolution"))
+    res_spin = _NoWheelSpinBox()
+    res_spin.setRange(max(3, int(sub.get("bin", 5))), 20)
+    res_spin.setValue(max(int(sub.get("bin", 5)), int(sub.get("resolution", 10))))
+    res_spin.setEnabled(editable)
+    bins_row.addWidget(res_spin)
+    bins_row.addStretch()
+    lay.addLayout(bins_row)
+    lay.addWidget(ctx._param_hint(
+        "Bin = tile size of the coarse grid; Resolution = number of bins "
+        "across the image. The mask is fitted on that grid."
+    ))
+
+    lay.addWidget(QLabel("Correction method"))
+    method_combo = _NoWheelComboBox()
+    method_combo.addItem("Down (darkest unchanged)", "down")
+    method_combo.addItem("Up (brightest unchanged)", "up")
+    method_combo.addItem("Median (default)", "median")
+    idx = method_combo.findData(sub.get("method", "median"))
+    method_combo.setCurrentIndex(idx if idx >= 0 else 2)
+    method_combo.setEnabled(editable)
+    lay.addWidget(method_combo)
+    lay.addWidget(ctx._param_hint(
+        "Down keeps the darkest tile, Up the brightest; Median keeps the "
+        "median level and is the safe default."
+    ))
+
+    lay.addWidget(QLabel("Files for the calculation"))
+    calc_list = QListWidget()
+    calc_list.setStyleSheet(
+        "QListWidget { background: #ffffff; border: none; }"
+    )
+    calc_list.setEnabled(editable)
+    selected = set(sub.get("calc_files") or [])
+    files = sub.get("files") or []
+    calc_list.blockSignals(True)
+    for path in files:
+        item = QListWidgetItem(ctx._comp_file_name(path, page._illum_task_id))
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(
+            Qt.CheckState.Checked if path in selected
+            else Qt.CheckState.Unchecked
+        )
+        calc_list.addItem(item)
+    calc_list.blockSignals(False)
+    lay.addWidget(calc_list, 1)
+    page._illum_calc_list = calc_list
+
+    calc_row = QHBoxLayout()
+    calc_btn = QPushButton("Calculate Illumination")
+    calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    calc_btn.setEnabled(editable and bool(sub.get("channel")))
+    calc_btn.clicked.connect(
+        lambda _=False: ctx._illum_calculate(page, sub, calc_btn)
+    )
+    calc_row.addWidget(calc_btn)
+    status = QLabel("")
+    status.setStyleSheet("color: #6b7785;")
+    calc_row.addWidget(status, 1)
+    lay.addLayout(calc_row)
+    page._illum_calc_btn = calc_btn
+    page._illum_calc_status = status
+
+    def on_sizes():
+        sub["tile_w"] = int(tile_w.value())
+        sub["tile_h"] = int(tile_h.value())
+        hint.setText(ctx._illum_divisibility_hint(sub))
+        cleared = False
+        if sub.get("mask"):
+            sub["mask"] = None
+            sub["mask_source"] = None
+            ctx._illum_drop_mask_file(page._illum_task_id, sub)
+            status.setText("Parameters changed — recalculate the mask.")
+            cleared = True
+        ctx._illum_mark_dirty(page)
+        if cleared:
+            # The correction is gone now; redraw the mask panel and both
+            # previews (which also redraws the tile grid).
+            ctx._illum_render_mask(page, sub)
+            ctx._illum_render_preview(page)
+        else:
+            # Only the overlay changes: skip re-running the correction.
+            ctx._illum_update_tile_grid(page)
+
+    def on_bin(value):
+        sub["bin"] = int(value)
+        res_spin.setMinimum(int(value))
+        if res_spin.value() < int(value):
+            res_spin.setValue(int(value))
+        sub["resolution"] = int(res_spin.value())
+        if sub.get("mask"):
+            sub["mask"] = None
+            sub["mask_source"] = None
+            ctx._illum_drop_mask_file(page._illum_task_id, sub)
+            status.setText("Parameters changed — recalculate the mask.")
+        ctx._illum_mark_dirty(page)
+
+    def on_resolution(value):
+        sub["resolution"] = int(value)
+        if sub.get("mask"):
+            sub["mask"] = None
+            sub["mask_source"] = None
+            ctx._illum_drop_mask_file(page._illum_task_id, sub)
+            status.setText("Parameters changed — recalculate the mask.")
+        ctx._illum_mark_dirty(page)
+
+    def on_method():
+        sub["method"] = method_combo.currentData()
+        ctx._illum_mark_dirty(page)
+        ctx._illum_render_mask(page, sub)
+        ctx._illum_render_preview(page)
+
+    def on_calc_files(_item=None):
+        sub["calc_files"] = [
+            calc_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(calc_list.count())
+            if calc_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        ctx._illum_mark_dirty(page)
+
+    tile_w.valueChanged.connect(lambda _=0: on_sizes())
+    tile_h.valueChanged.connect(lambda _=0: on_sizes())
+    bin_spin.valueChanged.connect(on_bin)
+    res_spin.valueChanged.connect(on_resolution)
+    method_combo.currentIndexChanged.connect(lambda _=0: on_method())
+    calc_list.itemChanged.connect(on_calc_files)
+    return panel
+
+
+def _illum_divisibility_hint(ctx, sub) -> str:
+    files = sub.get("files") or []
+    tile_w = int(sub.get("tile_w", 256))
+    tile_h = int(sub.get("tile_h", 256))
+    if not files or tile_w <= 0 or tile_h <= 0:
+        return ""
+    try:
+        geom = _image_geometry(files[0])
+    except Exception:  # noqa: BLE001
+        return ""
+    width = int(round(geom[1] - geom[0] + 1))
+    height = int(round(geom[3] - geom[2] + 1))
+    messages = []
+    if width % tile_w:
+        messages.append(
+            f"Width {width} is not divisible by tile width {tile_w}: "
+            "the edge strip is excluded from the mask calculation."
+        )
+    if height % tile_h:
+        messages.append(
+            f"Height {height} is not divisible by tile height {tile_h}: "
+            "the edge strip is excluded from the mask calculation."
+        )
+    return "\n".join(messages)
+
+
+def _illum_mask_panel(ctx, page, sub) -> QWidget:
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    lay.addWidget(QLabel("<b>Illumination mask</b>"))
+    plot = pg.PlotWidget(background=_plot_background())
+    plot.getPlotItem().hideAxis("bottom")
+    plot.getPlotItem().hideAxis("left")
+    plot.getPlotItem().getViewBox().setAspectLocked(True)
+    image_item = pg.ImageItem(axisOrder="row-major")
+    plot.addItem(image_item)
+    lay.addWidget(plot, 1)
+    source = QLabel("")
+    source.setWordWrap(True)
+    source.setStyleSheet("color: #6b7785;")
+    lay.addWidget(source)
+    page._illum_mask_plot = plot
+    page._illum_mask_image = image_item
+    page._illum_mask_source = source
+    return panel
+
+
+def _illum_render_mask(ctx, page, sub) -> None:
+    import numpy as np
+
+    image_item = getattr(page, "_illum_mask_image", None)
+    if image_item is None:
+        return
+    source = getattr(page, "_illum_mask_source", None)
+    mask_data = sub.get("mask")
+    if not mask_data:
+        image_item.clear()
+        if source is not None:
+            source.setText("No mask yet. Click Calculate Illumination.")
+        return
+    mask = np.asarray(mask_data, dtype="float64")
+    finite = mask[np.isfinite(mask)]
+    if finite.size == 0:
+        image_item.clear()
+        return
+    lo = float(finite.min())
+    hi = float(finite.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    lut = _figure_colormap("viridis").getLookupTable(0.0, 1.0, 256)
+    image_item.setImage(mask, autoLevels=False, levels=(lo, hi), lut=lut)
+    image_item.setRect(QRectF(0, 0, mask.shape[1], mask.shape[0]))
+    source_params = sub.get("mask_source") or {}
+    if source is not None:
+        source.setText(
+            f"tile {source_params.get('tile_w', sub.get('tile_w'))}"
+            f" × {source_params.get('tile_h', sub.get('tile_h'))}"
+            f" · bin {source_params.get('bin', sub.get('bin'))}"
+            f" · resolution {source_params.get('resolution', sub.get('resolution'))}\n"
+            f"channel {sub.get('channel')} · method {sub.get('method')}\n"
+            f"mask range {lo:.4g} – {hi:.4g}"
+        )
+
+
+def _illum_plot_panel(ctx, page, sub, title: str) -> QWidget:
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    lay.addWidget(QLabel(f"<b>{title}</b>"))
+    plot = pg.PlotWidget(background=_plot_background())
+    plot.showGrid(x=True, y=True, alpha=0.2)
+    plot.getPlotItem().setAxisItems({
+        "bottom": _make_sci_axis("bottom"),
+        "left": _make_sci_axis("left"),
+    })
+    lay.addWidget(plot, 1)
+    if title == "Before":
+        page._illum_before_plot = plot
+    else:
+        page._illum_after_plot = plot
+    return panel
+
+
+def _illum_plot_settings(ctx, page, sub) -> QWidget:
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    lay.addWidget(QLabel("<b>Plot settings</b>"))
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setStyleSheet("background: transparent;")
+    host = QWidget()
+    host.setStyleSheet("background: transparent;")
+    settings = QVBoxLayout(host)
+    settings.setContentsMargins(0, 0, 0, 0)
+    settings.setSpacing(6)
+    scroll.setWidget(host)
+    lay.addWidget(scroll, 1)
+    page._illum_settings_layout = settings
+
+    plot_dict = {
+        "type": sub.get("plot_type") or "scatter",
+        "file": (sub.get("files") or [None])[0],
+        "file_name": None,
+        "x": sub.get("x"),
+        "y": sub.get("y"),
+        "color_mode": "parameter",
+        "color_param": sub.get("channel"),
+        "palette": _default_palette(),
+        "show_axes": True,
+        "show_axis_names": True,
+        "show_indices": True,
+        "show_sample_name": True,
+        "show_tile_grid": True,
+        # Image display levels, shared by the Before and After plots.
+        "image_min": sub.get("plot_image_min"),
+        "image_max": sub.get("plot_image_max"),
+    }
+    page._illum_plot = plot_dict
+    page._illum_plot_settings_built = True
+
+    records = ctx._available_files(page._illum_task_id)
+    enabled = not page._illum_locked
+
+    def refresh():
+        ctx._illum_render_preview(page)
+        ctx._illum_mark_dirty(page)
+
+    settings.addWidget(QLabel("Plot type"))
+    type_combo = _NoWheelComboBox()
+    type_combo.addItem("Scatter", "scatter")
+    type_combo.addItem("Image", "image")
+    idx = type_combo.findData(plot_dict.get("type"))
+    type_combo.setCurrentIndex(idx if idx >= 0 else 0)
+    type_combo.setEnabled(enabled)
+    settings.addWidget(type_combo)
+
+    settings.addWidget(QLabel("File"))
+    file_combo = _NoWheelComboBox()
+    files = sub.get("files") or []
+    for path in files:
+        file_combo.addItem(ctx._comp_file_name(path, page._illum_task_id), path)
+    idx = file_combo.findData(plot_dict.get("file"))
+    file_combo.setCurrentIndex(idx if idx >= 0 else 0)
+    file_combo.setEnabled(enabled)
+    settings.addWidget(file_combo)
+    plot_dict["file_name"] = file_combo.currentText()
+
+    # Image display levels (Min/Max, signal histogram, Auto set). The same
+    # bounds drive the Before and After plots, which share `plot_dict`.
+    levels_host = QWidget()
+    levels_host.setStyleSheet("background: transparent;")
+    levels_lay = QVBoxLayout(levels_host)
+    levels_lay.setContentsMargins(0, 0, 0, 0)
+    levels_lay.setSpacing(6)
+    settings.addWidget(levels_host)
+
+    def clear_levels() -> None:
+        while levels_lay.count():
+            entry = levels_lay.takeAt(0)
+            widget = entry.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def on_levels(lo, hi) -> None:
+        sub["plot_image_min"] = lo
+        sub["plot_image_max"] = hi
+        plot_dict["image_min"] = lo
+        plot_dict["image_max"] = hi
+        ctx._illum_mark_dirty(page)
+        ctx._illum_render_preview(page)
+
+    def rebuild_levels() -> None:
+        import numpy as np  # noqa: F401
+
+        clear_levels()
+        is_image = plot_dict.get("type") == "image"
+        levels_host.setVisible(is_image)
+        if not is_image:
+            return
+        rec = ctx._figure_record(plot_dict.get("file"))
+        path = rec.get("parquet") if rec else None
+        try:
+            index = page._illum_submodules.index(sub)
+        except ValueError:
+            index = len(page._illum_submodules)
+        stages = ctx._illum_preview_stages(
+            page, page._illum_submodules[: index + 1]
+        )
+        ctx._image_level_controls(
+            levels_lay,
+            plot_dict.get("color_param"),
+            sub.get("plot_image_min"),
+            sub.get("plot_image_max"),
+            enabled,
+            on_levels,
+            page._illum_task_id,
+            path,
+            extra_stages=stages,
+        )
+
+    page._illum_rebuild_levels = rebuild_levels
+
+    columns = []
+    rec = ctx._figure_record(plot_dict.get("file"))
+    if rec is not None:
+        columns = ctx._columns_for(rec.get("parquet"), page._illum_task_id)
+
+    settings.addWidget(QLabel("X parameter"))
+    x_combo = ctx._gating_param_combo(columns, plot_dict.get("x"), enabled)
+    settings.addWidget(x_combo)
+    settings.addWidget(QLabel("Y parameter"))
+    y_combo = ctx._gating_param_combo(columns, plot_dict.get("y"), enabled)
+    settings.addWidget(y_combo)
+
+    settings.addWidget(QLabel("Color parameter (corrected channel)"))
+    color_label = QLabel(str(plot_dict.get("color_param") or "—"))
+    color_label.setStyleSheet("color: #37474f; font-weight: bold;")
+    settings.addWidget(color_label)
+    page._illum_color_label = color_label
+
+    settings.addWidget(QLabel("Palette"))
+    palette_combo = _NoWheelComboBox()
+    ctx._populate_palette_combo(
+        palette_combo, plot_dict.get("palette") or _default_palette()
+    )
+    palette_combo.setEnabled(enabled)
+    settings.addWidget(palette_combo)
+
+    grid_box = QCheckBox("Show tile grid")
+    grid_box.setChecked(bool(plot_dict.get("show_tile_grid")))
+    grid_box.setEnabled(enabled)
+    settings.addWidget(grid_box)
+    settings.addStretch()
+
+    def on_type():
+        plot_dict["type"] = type_combo.currentData()
+        sub["plot_type"] = plot_dict["type"]
+        rebuild_levels()
+        refresh()
+
+    def on_file():
+        plot_dict["file"] = file_combo.currentData()
+        plot_dict["file_name"] = file_combo.currentText()
+        rebuild_levels()
+        refresh()
+
+    def on_param(key, combo):
+        def handler(value):
+            plot_dict[key] = value or None
+            refresh()
+        return handler
+
+    def on_palette():
+        plot_dict["palette"] = palette_combo.currentData()
+        refresh()
+
+    def on_grid(checked):
+        plot_dict["show_tile_grid"] = bool(checked)
+        # Only toggle the overlay; re-rendering the data would re-run the
+        # whole correction pipeline and make the checkbox feel sluggish.
+        ctx._illum_update_tile_grid(page)
+        ctx._illum_mark_dirty(page)
+
+    type_combo.currentIndexChanged.connect(lambda _=0: on_type())
+    file_combo.currentIndexChanged.connect(lambda _=0: on_file())
+    x_combo.currentTextChanged.connect(on_param("x", x_combo))
+    y_combo.currentTextChanged.connect(on_param("y", y_combo))
+    palette_combo.currentIndexChanged.connect(lambda _=0: on_palette())
+    grid_box.toggled.connect(on_grid)
+    rebuild_levels()
+    return panel
+
+
+def _illum_sub_stage(ctx, sub):
+    return _illumination_stage_item(sub)
+
+
+def _illum_preview_stages(ctx, page, subs):
+    items = [
+        item for item in (ctx._illum_sub_stage(s) for s in subs)
+        if item is not None
+    ]
+    if not items:
+        return None
+    return [("illumination", {
+        "task_id": page._illum_task_id,
+        "submodules": items,
+    })]
+
+
+def _illum_render_preview(ctx, page) -> None:
+    sub = ctx._illum_selected_sub(page)
+    plot_dict = getattr(page, "_illum_plot", None)
+    before = getattr(page, "_illum_before_plot", None)
+    after = getattr(page, "_illum_after_plot", None)
+    if sub is None or plot_dict is None or before is None or after is None:
+        return
+    try:
+        index = page._illum_submodules.index(sub)
+    except ValueError:
+        return
+    earlier = page._illum_submodules[:index]
+    before_stages = ctx._illum_preview_stages(page, earlier)
+    after_stages = ctx._illum_preview_stages(page, earlier + [sub])
+    for plot_widget in (before, after):
+        ctx._illum_clear_tile_grid(plot_widget)
+    ctx._figure_render(
+        plot_dict, before, task_id=page._illum_task_id,
+        extra_stages=before_stages,
+    )
+    ctx._figure_render(
+        plot_dict, after, task_id=page._illum_task_id,
+        extra_stages=after_stages,
+    )
+    if plot_dict.get("show_tile_grid"):
+        before._illum_grid_item = ctx._illum_draw_tile_grid(
+            before, plot_dict, sub
+        )
+        after._illum_grid_item = ctx._illum_draw_tile_grid(
+            after, plot_dict, sub
+        )
+
+
+def _illum_clear_tile_grid(ctx, plot_widget) -> None:
+    item = getattr(plot_widget, "_illum_grid_item", None)
+    if item is None:
+        return
+    try:
+        plot_widget.removeItem(item)
+    except Exception:  # noqa: BLE001
+        pass
+    plot_widget._illum_grid_item = None
+
+
+def _illum_draw_tile_grid(ctx, plot_widget, plot_dict, sub):
+    import numpy as np
+
+    tile_w = int(sub.get("tile_w", 0) or 0)
+    tile_h = int(sub.get("tile_h", 0) or 0)
+    if tile_w <= 0 or tile_h <= 0:
+        return None
+    if plot_dict.get("type") == "image":
+        extent = getattr(plot_widget, "_img_extent", None)
+        if not extent:
+            return None
+        xmin, xmax, ymin, ymax = extent
+    else:
+        xmin = getattr(plot_widget, "_data_xmin", None)
+        xmax = getattr(plot_widget, "_data_xmax", None)
+        ymin = getattr(plot_widget, "_data_ymin", None)
+        ymax = getattr(plot_widget, "_data_ymax", None)
+        if None in (xmin, xmax, ymin, ymax):
+            return None
+    xs = []
+    ys = []
+    x = xmin
+    while x <= xmax:
+        xs.extend([x, x, np.nan])
+        ys.extend([ymin, ymax, np.nan])
+        x += tile_w
+        if len(xs) > 20000:
+            break
+    y = ymin
+    while y <= ymax:
+        xs.extend([xmin, xmax, np.nan])
+        ys.extend([y, y, np.nan])
+        y += tile_h
+        if len(xs) > 20000:
+            break
+    if not xs:
+        return None
+    item = pg.PlotDataItem(
+        np.asarray(xs), np.asarray(ys),
+        pen=pg.mkPen((120, 140, 170, 140), width=1),
+        connect="finite",
+    )
+    plot_widget.addItem(item)
+    return item
+
+
+def _illum_update_tile_grid(ctx, page) -> None:
+    """Add/remove the tile-grid overlay without re-rendering the data."""
+    sub = ctx._illum_selected_sub(page)
+    plot_dict = getattr(page, "_illum_plot", None)
+    before = getattr(page, "_illum_before_plot", None)
+    after = getattr(page, "_illum_after_plot", None)
+    if sub is None or plot_dict is None or before is None or after is None:
+        return
+    for plot_widget in (before, after):
+        ctx._illum_clear_tile_grid(plot_widget)
+    if plot_dict.get("show_tile_grid"):
+        before._illum_grid_item = ctx._illum_draw_tile_grid(
+            before, plot_dict, sub
+        )
+        after._illum_grid_item = ctx._illum_draw_tile_grid(
+            after, plot_dict, sub
+        )
+
+
+def _illum_reset_plot_defaults(ctx, page, sub) -> None:
+    plot_dict = getattr(page, "_illum_plot", None)
+    if plot_dict is None:
+        return
+    plot_dict["x"] = sub.get("x")
+    plot_dict["y"] = sub.get("y")
+    plot_dict["color_param"] = sub.get("channel")
+    label = getattr(page, "_illum_color_label", None)
+    if label is not None:
+        label.setText(str(sub.get("channel") or "—"))
+
+
+def _illum_calculate(ctx, page, sub, button) -> None:
+    channel = sub.get("channel")
+    x_name = sub.get("x")
+    y_name = sub.get("y")
+    if not channel or not x_name or not y_name:
+        QMessageBox.information(
+            ctx.host,
+            "Calculate Illumination",
+            "Select the channel and the X/Y parameters first.",
+        )
+        return
+    files = list(sub.get("calc_files") or [])
+    if not files:
+        QMessageBox.information(
+            ctx.host,
+            "Calculate Illumination",
+            "Select at least one file to calculate the mask from.",
+        )
+        return
+    if int(sub.get("resolution", 10)) < int(sub.get("bin", 5)):
+        QMessageBox.information(
+            ctx.host,
+            "Calculate Illumination",
+            "Resolution must be greater than or equal to bin.",
+        )
+        return
+    try:
+        index = page._illum_submodules.index(sub)
+    except ValueError:
+        return
+    earlier = page._illum_submodules[:index]
+    stages = ctx._map_stages(page._illum_task_id) or []
+    stages = list(stages)
+    earlier_items = [
+        item for item in (ctx._illum_sub_stage(s) for s in earlier)
+        if item is not None
+    ]
+    if earlier_items:
+        stages.append(("illumination", {
+            "task_id": page._illum_task_id,
+            "submodules": earlier_items,
+        }))
+    base_columns = {}
+    for path in files:
+        base_columns[path] = set(
+            ctx._column_index.get(ctx._rel_data_key(path), [])
+        )
+    page._illum_request_key = sub["id"]
+    button.setEnabled(False)
+    status = getattr(page, "_illum_calc_status", None)
+    if status is not None:
+        status.setText("Calculating…")
+    page._illum_worker.request(
+        sub["id"], stages, base_columns, files, channel, x_name, y_name,
+        int(sub.get("tile_w", 256)), int(sub.get("tile_h", 256)),
+        int(sub.get("bin", 5)), int(sub.get("resolution", 10)),
+    )
+
+
+def _illum_on_poll(ctx, page) -> None:
+    worker = getattr(page, "_illum_worker", None)
+    if worker is None:
+        return
+    for key, result, error in worker.poll():
+        if key != page._illum_request_key:
+            continue
+        page._illum_request_key = None
+        button = getattr(page, "_illum_calc_btn", None)
+        if button is not None:
+            button.setEnabled(not page._illum_locked)
+        status = getattr(page, "_illum_calc_status", None)
+        if error:
+            if status is not None:
+                status.setText(error)
+            QMessageBox.warning(ctx.host, "Calculate Illumination", error)
+            continue
+        sub = next(
+            (s for s in page._illum_submodules if s["id"] == key), None
+        )
+        if sub is None:
+            continue
+        sub["mask"] = result["mask"]
+        sub["mask_source"] = {
+            "tile_w": result["tile_w"],
+            "tile_h": result["tile_h"],
+            "bin": result["bin"],
+            "resolution": result["resolution"],
+            "files": result["files"],
+            "channel": sub.get("channel"),
+            "x": sub.get("x"),
+            "y": sub.get("y"),
+        }
+        if status is not None:
+            status.setText("Mask calculated.")
+        ctx._illum_render_mask(page, sub)
+        if sub.get("id") == page._illum_selected:
+            ctx._illum_render_preview(page)
+        ctx._illum_refresh_list(page)
+        ctx._illum_mark_dirty(page)
+
+
+def _illum_mark_dirty(ctx, page) -> None:
+    page._illum_dirty = True
+    ctx._illum_update_save_btn(page)
+    ctx._module_set_state(page, MODULE_STATE_MODIFIED)
+
+
+def _illum_save_now(ctx, page) -> None:
+    page._illum_task_def["params"] = page._illum_params
+    if ctx.project is not None:
+        ctx.project.save()
+    page._illum_snapshot = copy.deepcopy(page._illum_params)
+    page._illum_dirty = False
+    ctx._illum_update_save_btn(page)
+    ctx.statusBar().showMessage("Illumination correction saved")
+    ctx._module_saved(page)
+
+
+def _illum_update_save_btn(ctx, page) -> None:
+    page._illum_save_btn.setEnabled(page._illum_dirty and not page._illum_locked)
+
+
+def _illum_close(ctx, page) -> None:
+    if page._illum_dirty:
+        reply = QMessageBox.question(
+            ctx.host,
+            "Close Illumination Correction",
+            "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        page._illum_task_def["params"] = page._illum_snapshot
+    for name in ("_illum_poll_timer", "_illum_order_timer"):
+        timer = getattr(page, name, None)
+        if timer is not None:
+            timer.stop()
+    worker = getattr(page, "_illum_worker", None)
+    if worker is not None:
+        worker.stop()
+    ctx._close_module_page(page)

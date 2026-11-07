@@ -1,0 +1,2891 @@
+"""Unmix module: spectral unmixing and unmix-for-image pyramids."""
+from __future__ import annotations
+
+import queue
+
+from smage.widgets.controls import _ZoomPixmapLabel
+
+from PySide6.QtCore import (
+    QRect,
+    QRectF,
+    QTimer,
+    Qt,
+)
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+)
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+    QStackedWidget,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+from pathlib import Path
+from smage.core.constants import MODULE_STATE_MODIFIED
+from smage.core.gates import (
+    _compute_gate_filter_mask,
+    _gate_needed_columns,
+)
+from smage.core.settings import (
+    _default_palette,
+    _plot_background,
+)
+from smage.data.image_index import _build_image_index_files
+from smage.widgets.colormap import _figure_colormap
+from smage.widgets.controls import (
+    _NoWheelComboBox,
+    _NoWheelSpinBox,
+)
+from smage.widgets.gate_editor.canvas import _GatingState
+from smage.widgets.plot_axes import (
+    _make_fixed_axis,
+    _make_rotated_axis,
+    _make_sci_axis,
+)
+from smage.widgets.resources import (
+    _drag_handle_pixmap,
+    _lock_pixmap,
+)
+from uuid import uuid4
+import copy
+import hashlib
+import json
+import pyqtgraph as pg
+import threading
+
+
+def _unmix_output_names(ctx, task_id, parquet_path) -> list:
+    """Names of the parameters an upstream Unmix module adds to this file."""
+    names = []
+    for config in ctx._upstream_unmix_configs(task_id, parquet_path):
+        for name in config["names"]:
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _unmix_flow_config(ctx, task_def) -> dict | None:
+    """Build (and cache) the unmixing matrix of a saved Unmix task.
+
+    Returns ``{"task_id", "names", "columns", "matrix", "method"}`` with the
+    matrix at full precision, or None when there is nothing to apply.
+    """
+    import numpy as np
+
+    task_id = task_def.get("id")
+    cached = ctx._unmix_flow_cache.get(task_id)
+    if cached is not None:
+        return cached or None
+    # Downstream modules only see the saved configuration: when the module
+    # is open, use its last-saved snapshot rather than live edits.
+    reg = ctx._module_registry.get(task_id)
+    if reg is not None and reg.get("task_type") == "unmix":
+        params = getattr(reg["page"], "_unmix_snapshot", None)
+        if not isinstance(params, dict):
+            params = task_def.get("params") or {}
+    else:
+        params = task_def.get("params") or {}
+    settings = params.get("spectrum_settings") or {}
+    enabled = set(settings.get("enabled") or [])
+    columns = [p for p in settings.get("params", []) if p in enabled]
+    stat = settings.get("stat", "median")
+    spectra = {s["id"]: s for s in params.get("spectra", [])}
+    names = []
+    rows = []
+    for row in params.get("matrix", []):
+        positive = spectra.get(row.get("positive"))
+        if positive is None:
+            continue
+        pos = ctx._unmix_params_vector(task_id, params, positive, columns, stat)
+        if pos is None:
+            continue
+        values = []
+        negative = spectra.get(row.get("negative"))
+        neg = {}
+        if negative is not None:
+            neg = ctx._unmix_params_vector(
+                task_id, params, negative, columns, stat
+            ) or {}
+        for column in columns:
+            p = pos.get(column, float("nan"))
+            n = neg.get(column, 0.0) if negative is not None else 0.0
+            values.append(p - n if np.isfinite(p) else float("nan"))
+        if row.get("normalize", True):
+            finite = [v for v in values if np.isfinite(v)]
+            peak = max(finite) if finite else None
+            if peak is not None and peak > 0:
+                values = [
+                    (v / peak) if np.isfinite(v) else v for v in values
+                ]
+        if not all(np.isfinite(v) for v in values):
+            continue  # a signature with missing data cannot unmix
+        names.append(row.get("name", f"Signature {len(names) + 1}"))
+        rows.append(values)
+    if not rows or not columns:
+        ctx._unmix_flow_cache[task_id] = False
+        return None
+    config = {
+        "task_id": task_id,
+        "names": names,
+        "columns": columns,
+        "matrix": np.asarray(rows, dtype="float64"),
+        "method": params.get("method", "ols"),
+        "samples": set(params.get("samples") or []),
+    }
+    ctx._unmix_flow_cache[task_id] = config
+    return config
+
+
+def _unmix_params_vector(ctx, task_id, params, spectrum, columns, stat):
+    """Statistic per parameter for a spectrum stored in task params."""
+    import numpy as np
+
+    names, arrays, error = ctx._unmix_spectrum_arrays_for(
+        task_id, params, spectrum, columns
+    )
+    if error:
+        return None
+    values = {}
+    for name, arr in zip(names, arrays):
+        if arr.size == 0:
+            values[name] = float("nan")
+        elif stat == "mean":
+            values[name] = float(arr.mean())
+        else:
+            values[name] = float(np.median(arr))
+    return values
+
+
+def _build_unmix_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
+    """Build the Unmix page: two fixed sub-pages (extraction / matrix)."""
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+
+    # Toolbar with Save/Close.
+    bar = QFrame()
+    bar.setObjectName("moduleBar")
+    tl = QHBoxLayout(bar)
+    tl.setContentsMargins(12, 6, 12, 6)
+    tl.setSpacing(4)
+    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    if locked:
+        lock_icon = QLabel()
+        lock_icon.setPixmap(_lock_pixmap())
+        lock_icon.setFixedSize(14, 14)
+        lock_icon.setToolTip("Locked — a downstream generate module has saved data")
+        tl.addWidget(lock_icon)
+        draft = QLabel("Draft (locked)")
+        draft.setStyleSheet("color: #b58900; font-weight: bold;")
+        tl.addWidget(draft)
+    tl.addStretch()
+    save_btn = QPushButton("Save")
+    save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    save_btn.setEnabled(not locked)
+    close_btn = QPushButton("Close")
+    close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    close_btn.clicked.connect(lambda _=False: ctx._unmix_close(page))
+    tl.addWidget(save_btn)
+    tl.addWidget(close_btn)
+    layout.addWidget(bar)
+
+    page._unmix_task_def = task_def
+    page._unmix_task_id = task_def.get("id")
+    page._unmix_params = task_def.setdefault("params", {})
+    page._unmix_params.setdefault("spectra", [])
+    page._unmix_params.setdefault("matrix", [])
+    page._unmix_params.setdefault("method", "ols")
+    page._unmix_params.setdefault("trees", [])
+    page._unmix_params.setdefault("next_spectrum_no", 1)
+    spectrum_cfg = page._unmix_params.setdefault("spectrum_settings", {})
+    spectrum_cfg.setdefault("params", [])
+    spectrum_cfg.setdefault("enabled", None)
+    spectrum_cfg.setdefault("stat", "median")
+    spectrum_cfg.setdefault("colormap", "viridis")
+    spectrum_cfg.setdefault("line_color", "#2b6cb0")
+    spectrum_cfg.setdefault("decimals", 2)
+    page._unmix_spectrum_cfg = spectrum_cfg
+    page._unmix_snapshot = copy.deepcopy(page._unmix_params)
+    page._unmix_locked = locked
+    page._unmix_save_btn = save_btn
+    page._unmix_dirty = False
+    page._unmix_spectra = page._unmix_params["spectra"]
+    page._unmix_active_spectrum = None
+    # One embedded gate tree per spectrum (each is a full Gating pane).
+    page._unmix_trees = []
+    page._unmix_active_tree = None
+    # Debounced recompute of the displayed spectrum after gate edits.
+    page._unmix_spectrum_timer = QTimer(ctx.host)
+    page._unmix_spectrum_timer.setSingleShot(True)
+    page._unmix_spectrum_timer.timeout.connect(
+        lambda: ctx._unmix_refresh_outputs(page)
+    )
+    # Debounced apply of a signature-table row drag.
+    page._unmix_sig_order_timer = QTimer(ctx.host)
+    page._unmix_sig_order_timer.setSingleShot(True)
+    page._unmix_sig_order_timer.setInterval(200)
+    page._unmix_sig_order_timer.timeout.connect(
+        lambda: ctx._unmix_signature_reordered(page)
+    )
+    page._unmix_matrix = page._unmix_params["matrix"]
+    if "samples" not in page._unmix_params:
+        page._unmix_params["samples"] = [
+            r.get("parquet") for r in ctx._available_files(page._unmix_task_id) if r.get("parquet")
+        ]
+    # Per-spectrum value cache, cleared whenever anything changes.
+    page._unmix_spectrum_cache = {}
+
+    tabs = QTabWidget()
+    tabs.addTab(ctx._unmix_extraction_subpage(page), "Spectrum Extraction")
+    tabs.addTab(ctx._unmix_matrix_subpage(page), "Matrix & Unmixing")
+    layout.addWidget(tabs, 1)
+
+    save_btn.clicked.connect(lambda _=False: ctx._unmix_save_now(page))
+    ctx._unmix_restore_trees(page)
+    ctx._unmix_rebuild_spectrum_list(page)
+    ctx._unmix_rebuild_spectrum_settings(page)
+    ctx._unmix_rebuild_signature_table(page)
+    ctx._unmix_rebuild_sample_list(page)
+    ctx._unmix_refresh_matrix_views(page)
+    active_spectrum = page._unmix_params.get("active_spectrum")
+    if any(s["id"] == active_spectrum for s in page._unmix_spectra):
+        ctx._unmix_select_spectrum(page, active_spectrum)
+    ctx._unmix_update_save_btn(page)
+    return page
+
+
+def _unmix_extraction_subpage(ctx, page) -> QWidget:
+    """Sub-page 1: spectrum area (1) above the embedded gate tree (2)."""
+    w = QWidget()
+    outer = QVBoxLayout(w)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+
+    split = QSplitter(Qt.Orientation.Vertical)
+    split.setChildrenCollapsible(False)
+    split.addWidget(ctx._unmix_spectrum_area(page))
+    page._unmix_tree_stack = QStackedWidget()
+    page._unmix_tree_stack.addWidget(ctx._unmix_tree_placeholder())
+    split.addWidget(page._unmix_tree_stack)
+    split.setStretchFactor(0, 1)
+    split.setStretchFactor(1, 1)
+    split.setSizes([380, 380])
+    outer.addWidget(split, 1)
+    return w
+
+
+def _unmix_spectrum_area(ctx, page) -> QWidget:
+    """Spectrum settings (left) | spectra list (middle) | plot (right)."""
+    content = QWidget()
+    content.setStyleSheet("background: #f5f8fb;")
+    row = QHBoxLayout(content)
+    row.setContentsMargins(12, 12, 12, 12)
+    row.setSpacing(12)
+
+    # Left: settings shared by every spectrum in this module.
+    settings_panel = ctx._build_panel_frame()
+    settings_lay = QVBoxLayout(settings_panel)
+    settings_lay.setContentsMargins(10, 10, 10, 10)
+    settings_lay.setSpacing(6)
+    settings_lay.addWidget(QLabel("<b>Spectrum settings</b>"))
+    settings_scroll = QScrollArea()
+    settings_scroll.setWidgetResizable(True)
+    settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    settings_scroll.setStyleSheet("background: transparent;")
+    settings_host = QWidget()
+    settings_host.setStyleSheet("background: transparent;")
+    settings_layout = QVBoxLayout(settings_host)
+    settings_layout.setContentsMargins(0, 0, 0, 0)
+    settings_layout.setSpacing(6)
+    settings_scroll.setWidget(settings_host)
+    settings_lay.addWidget(settings_scroll, 1)
+    page._unmix_spectrum_settings_layout = settings_layout
+
+    # Middle: extracted spectra + the "New gate tree" entry point.
+    list_panel = ctx._build_panel_frame()
+    list_lay = QVBoxLayout(list_panel)
+    list_lay.setContentsMargins(10, 10, 10, 10)
+    list_lay.setSpacing(6)
+    list_lay.addWidget(QLabel("<b>Spectra</b>"))
+    spectra_list = QListWidget()
+    spectra_list.setStyleSheet(
+        "QListWidget { background: #ffffff; border: none; }"
+        "QListWidget::item:selected { background: #dbeafa; }"
+    )
+    # Drag rows to change the order the spectra are quantified in.
+    spectra_list.setDragDropMode(
+        QAbstractItemView.DragDropMode.InternalMove
+    )
+    spectra_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+    spectra_list.setDragEnabled(not page._unmix_locked)
+    spectra_list.model().rowsMoved.connect(
+        lambda *_: ctx._unmix_reorder_spectra(page)
+    )
+    list_lay.addWidget(spectra_list, 1)
+    spectra_list.itemClicked.connect(
+        lambda item: ctx._unmix_select_spectrum(
+            page, item.data(Qt.ItemDataRole.UserRole)
+        )
+    )
+    spectra_list.itemDoubleClicked.connect(
+        lambda item: ctx._unmix_select_spectrum(
+            page, item.data(Qt.ItemDataRole.UserRole), open_tree=True
+        )
+    )
+    spectra_list.setContextMenuPolicy(
+        Qt.ContextMenuPolicy.CustomContextMenu
+    )
+    spectra_list.customContextMenuRequested.connect(
+        lambda pos: ctx._unmix_spectrum_context_menu(page, pos)
+    )
+    new_tree_btn = QPushButton("New gate tree")
+    new_tree_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    new_tree_btn.setEnabled(not page._unmix_locked)
+    new_tree_btn.clicked.connect(lambda _=False: ctx._unmix_new_gate_tree(page))
+    list_lay.addWidget(new_tree_btn)
+    page._unmix_spectra_list = spectra_list
+    page._unmix_new_tree_btn = new_tree_btn
+
+    # Middle: spectrum curve (empty until a spectrum is extracted).
+    plot_panel = ctx._build_panel_frame()
+    plot_lay = QVBoxLayout(plot_panel)
+    plot_lay.setContentsMargins(10, 10, 10, 10)
+    plot_lay.setSpacing(6)
+    plot_lay.addWidget(QLabel("<b>Spectrum</b>"))
+    spectrum_plot = pg.PlotWidget()
+    spectrum_plot.setBackground(_plot_background())
+    spectrum_plot.showGrid(x=True, y=True, alpha=0.2)
+    spectrum_plot.getPlotItem().setAxisItems({
+        "bottom": _make_rotated_axis("bottom"),
+        "left": _make_sci_axis("left"),
+    })
+    plot_lay.addWidget(spectrum_plot, 1)
+    page._unmix_spectrum_plot = spectrum_plot
+
+    row.addWidget(settings_panel, 1)
+    row.addWidget(list_panel, 1)
+    row.addWidget(plot_panel, 2)
+    return content
+
+
+def _unmix_tree_placeholder(ctx) -> QWidget:
+    """Shown in the gate-tree area until the first tree is created."""
+    w = QWidget()
+    l = QVBoxLayout(w)
+    hint = QLabel('Click "New gate tree" to start drawing gates.')
+    hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    hint.setStyleSheet("color: #888888;")
+    l.addStretch()
+    l.addWidget(hint)
+    l.addStretch()
+    return w
+
+
+def _unmix_make_tree(ctx, page, store: dict, spectrum_id=None) -> dict:
+    """Register one gate tree; its widgets are built lazily when opened."""
+    tree = {
+        "id": store["id"],
+        "store": store,
+        "holder": None,
+        "content": None,
+        "spectrum_id": spectrum_id,
+    }
+    page._unmix_trees.append(tree)
+    return tree
+
+
+def _unmix_build_tree_widgets(ctx, page, tree: dict) -> None:
+    """Create the embedded Gating pane for a tree (once)."""
+    if tree.get("holder") is not None:
+        return
+    holder = _GatingState()
+    holder._module_page = page
+    holder._gating_on_dirty = lambda: ctx._unmix_on_gating_dirty(page, holder)
+    holder._gating_spectrum_menu = (
+        lambda menu, h, idx: ctx._unmix_spectrum_menu(page, h, idx, menu)
+    )
+    ctx._gating_state_init(holder, tree["store"], page._unmix_locked)
+    holder._gating_task_id = page._unmix_task_id
+    holder._gating_save_btn = None
+    spectrum = ctx._unmix_spectrum_for_tree(page, tree)
+    holder._gating_protected_gate_id = spectrum["gate_id"] if spectrum else None
+    content = ctx._gating_build_content(holder, page._unmix_locked)
+    tree["holder"] = holder
+    tree["content"] = content
+    page._unmix_tree_stack.addWidget(content)
+
+
+def _unmix_activate_tree(ctx, page, tree: dict) -> None:
+    """Show a gate tree and refresh its scatter (it may have been hidden)."""
+    ctx._unmix_build_tree_widgets(page, tree)
+    page._unmix_active_tree = tree
+    page._unmix_tree_stack.setCurrentWidget(tree["content"])
+    ctx._gating_render(tree["holder"])
+    ctx._gating_rebuild_settings(tree["holder"])
+
+
+def _unmix_destroy_tree(ctx, page, tree: dict) -> None:
+    """Tear down a gate tree (worker, timer and plot items)."""
+    if tree.get("holder") is not None:
+        ctx._gating_cleanup(tree["holder"])
+    if tree.get("content") is not None:
+        page._unmix_tree_stack.removeWidget(tree["content"])
+        tree["content"].deleteLater()
+    if tree in page._unmix_trees:
+        page._unmix_trees.remove(tree)
+    if page._unmix_active_tree is tree:
+        page._unmix_active_tree = None
+    if not page._unmix_trees:
+        page._unmix_tree_stack.setCurrentIndex(0)
+
+
+def _unmix_new_gate_tree(ctx, page) -> None:
+    """Start a fresh gate tree (discarding an unused scratch tree)."""
+    active = page._unmix_active_tree
+    if active is not None and active["spectrum_id"] is None:
+        gates = active["store"].get("params", {}).get("gates", [])
+        if gates:
+            reply = QMessageBox.question(
+                ctx.host,
+                "New gate tree",
+                "The current gate tree is not used by any spectrum.\n"
+                "Discard it and start a new one?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        ctx._unmix_destroy_tree(page, active)
+    tree = ctx._unmix_make_tree(page, {"id": uuid4().hex[:8], "params": {}})
+    ctx._unmix_activate_tree(page, tree)
+    ctx._unmix_clear_spectrum_selection(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_restore_trees(ctx, page) -> None:
+    """Recreate the gate trees stored in the project file."""
+    for rec in page._unmix_params.get("trees", []):
+        store = {
+            "id": rec.get("id") or uuid4().hex[:8],
+            "params": rec.get("params") or {},
+        }
+        ctx._unmix_make_tree(page, store, rec.get("spectrum_id"))
+    active_id = page._unmix_params.get("active_tree")
+    tree = next((t for t in page._unmix_trees if t["id"] == active_id), None)
+    if tree is None and page._unmix_trees:
+        tree = page._unmix_trees[0]
+    if tree is not None:
+        ctx._unmix_activate_tree(page, tree)
+
+
+def _unmix_on_gating_dirty(ctx, page, holder) -> None:
+    """A gate tree changed: mark the module dirty and refresh its spectrum."""
+    if page._unmix_locked:
+        return
+    ctx._unmix_mark_dirty(page)
+    # If the displayed spectrum comes from this tree, recompute it soon.
+    spectrum = page._unmix_active_spectrum
+    if spectrum is None:
+        return
+    tree = ctx._unmix_tree_for_holder(page, holder)
+    if tree is not None and tree["id"] == spectrum.get("tree_id"):
+        page._unmix_spectrum_timer.start(250)
+
+
+def _unmix_cleanup(ctx, page) -> None:
+    """Stop every embedded gate tree (workers and timers)."""
+    for name in ("_unmix_spectrum_timer", "_unmix_sig_order_timer"):
+        timer = getattr(page, name, None)
+        if timer is not None:
+            timer.stop()
+    for tree in list(page._unmix_trees):
+        if tree.get("holder") is not None:
+            ctx._gating_cleanup(tree["holder"])
+    page._unmix_trees = []
+    page._unmix_active_tree = None
+
+
+def _unmix_tree_by_id(ctx, page, tree_id):
+    return next((t for t in page._unmix_trees if t["id"] == tree_id), None)
+
+
+def _unmix_tree_for_holder(ctx, page, holder):
+    return next((t for t in page._unmix_trees if t.get("holder") is holder), None)
+
+
+def _unmix_spectrum_for_tree(ctx, page, tree):
+    if tree is None or not tree.get("spectrum_id"):
+        return None
+    return next(
+        (s for s in page._unmix_spectra if s["id"] == tree["spectrum_id"]),
+        None,
+    )
+
+
+def _unmix_spectrum_parameters(ctx, page) -> list:
+    """Every parameter available in the module (union of imported files).
+
+    The settings are set up before any spectrum exists, so they cannot be
+    tied to one gate tree's file.
+    """
+    columns = []
+    for rec in ctx._available_files(page._unmix_task_id):
+        for name in ctx._columns_for(rec.get("parquet"), page._unmix_task_id):
+            if name not in columns:
+                columns.append(name)
+    return columns
+
+
+def _unmix_selected_parameters(ctx, page) -> list:
+    """The parameters a spectrum contains, in left-to-right plot order."""
+    cfg = page._unmix_spectrum_cfg
+    enabled = set(cfg.get("enabled") or [])
+    return [p for p in cfg.get("params", []) if p in enabled]
+
+
+def _unmix_apply_parameter_order(ctx, page, new_order) -> None:
+    """Apply a drag-reordered selection without moving unselected items."""
+    cfg = page._unmix_spectrum_cfg
+    current = list(cfg.get("params") or [])
+    chosen = set(new_order)
+    slots = [i for i, name in enumerate(current) if name in chosen]
+    if len(slots) != len(new_order):
+        return
+    for slot, name in zip(slots, new_order):
+        current[slot] = name
+    cfg["params"] = current
+    ctx._unmix_render_spectrum_plot(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_sync_spectrum_params(ctx, page) -> list:
+    """Keep the module-wide parameter order and selection in sync."""
+    cfg = page._unmix_spectrum_cfg
+    columns = ctx._unmix_spectrum_parameters(page)
+    stored = [p for p in cfg.get("params", []) if p in columns]
+    for col in columns:
+        if col not in stored:
+            stored.append(col)
+    cfg["params"] = stored
+    enabled = cfg.get("enabled")
+    if not isinstance(enabled, list):
+        # Unset: default to every parameter except the image coordinates.
+        enabled = [c for c in columns if c not in ("x", "y")]
+    cfg["enabled"] = [c for c in enabled if c in stored]
+    return stored
+
+
+def _unmix_next_spectrum_name(ctx, page) -> str:
+    """Spectrum N — numbering keeps increasing and never reuses gaps."""
+    while True:
+        n = int(page._unmix_params.get("next_spectrum_no", 1))
+        page._unmix_params["next_spectrum_no"] = n + 1
+        name = f"Spectrum {n}"
+        if not any(s["name"] == name for s in page._unmix_spectra):
+            return name
+
+
+def _unmix_rebuild_spectrum_list(ctx, page) -> None:
+    lst = page._unmix_spectra_list
+    active = page._unmix_active_spectrum
+    lst.blockSignals(True)
+    lst.clear()
+    for spectrum in page._unmix_spectra:
+        item = QListWidgetItem(spectrum["name"])
+        item.setData(Qt.ItemDataRole.UserRole, spectrum["id"])
+        lst.addItem(item)
+    lst.blockSignals(False)
+    if active is not None:
+        ctx._unmix_highlight_spectrum(page, active["id"])
+
+
+def _unmix_reorder_spectra(ctx, page) -> None:
+    """Adopt the order the spectra list was dragged into."""
+    lst = page._unmix_spectra_list
+    order = [
+        lst.item(i).data(Qt.ItemDataRole.UserRole)
+        for i in range(lst.count())
+    ]
+    by_id = {s["id"]: s for s in page._unmix_spectra}
+    reordered = [by_id[sid] for sid in order if sid in by_id]
+    if len(reordered) != len(page._unmix_spectra):
+        return  # a partial view: keep the stored order
+    page._unmix_spectra[:] = reordered
+    active = page._unmix_active_spectrum
+    if active is not None:
+        ctx._unmix_highlight_spectrum(page, active["id"])
+    # The signature editor's dropdowns list the spectra in this order.
+    if getattr(page, "_unmix_signature_table", None) is not None:
+        ctx._unmix_rebuild_signature_table(page)
+    ctx._unmix_mark_dirty(page, data=False)
+
+
+def _unmix_log(ctx, page, text: str) -> None:
+    """Append a line to the Unmix-for-image log (saved with the module)."""
+    log = getattr(page, "_unmix_image_log", None)
+    if log is not None:
+        log.appendPlainText(text)
+    lines = page._unmix_params.setdefault("image_log", [])
+    lines.append(str(text))
+    del lines[:-500]
+
+
+def _unmix_output_signature(ctx, task_id, parquet_path, config) -> str:
+    """Fingerprint of the unmixing config an image output was made from."""
+    import numpy as np
+
+    payload = {
+        "task": task_id,
+        "file": str(parquet_path),
+        "columns": list(config.get("columns") or []),
+        "names": list(config.get("names") or []),
+        "matrix": np.round(
+            np.asarray(config.get("matrix"), dtype="float64"), 6
+        ).tolist(),
+        "method": config.get("method"),
+    }
+    return hashlib.md5(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _unmix_write_image_output(ctx, task_id, parquet_path, config) -> dict:
+    """Write one file's unmixed channels + their image pyramid."""
+    import numpy as np
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    names = list(config.get("names") or [])
+    columns = list(config.get("columns") or [])
+    matrix = np.asarray(config.get("matrix"), dtype="float64")
+    if not names or not columns:
+        raise ValueError("no unmixing signatures")
+    pf = pq.ParquetFile(parquet_path)
+    available = set(pf.schema_arrow.names)
+    missing = [c for c in columns if c not in available]
+    if missing:
+        raise ValueError("channel(s) not in this file: " + ", ".join(missing))
+    stem = Path(str(parquet_path)).stem
+    rel = ctx._module_rel(task_id, f"{stem}_unmix.parquet")
+    out_path = ctx.project.path / rel
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = None
+    try:
+        for batch in pf.iter_batches(
+            batch_size=500_000, columns=["x", "y"] + columns
+        ):
+            df = batch.to_pandas()
+            values = np.column_stack([
+                np.nan_to_num(
+                    pd.to_numeric(df[c], errors="coerce").to_numpy(
+                        dtype="float64"
+                    ),
+                    nan=0.0, posinf=0.0, neginf=0.0,
+                )
+                for c in columns
+            ])
+            unmixed = values @ matrix.T
+            data = {
+                "x": df["x"].to_numpy(dtype="float64"),
+                "y": df["y"].to_numpy(dtype="float64"),
+            }
+            for j, name in enumerate(names):
+                data[name] = unmixed[:, j]
+            table = pa.Table.from_pandas(
+                pd.DataFrame(data), preserve_index=False
+            )
+            if writer is None:
+                writer = pq.ParquetWriter(str(out_path), table.schema)
+            writer.write_table(table)
+    finally:
+        if writer is not None:
+            writer.close()
+    _build_image_index_files(str(out_path))
+    return {
+        "path": rel,
+        "columns": names,
+        "kind": "image",
+        "signature": ctx._unmix_output_signature(
+            task_id, parquet_path, config
+        ),
+    }
+
+
+def _unmix_start_image(ctx, page) -> None:
+    """Save, then generate the unmixed image channels of every sample."""
+    import queue as queue_module
+
+    if getattr(page, "_unmix_running", False):
+        return
+    params = page._unmix_params
+    samples = [p for p in (params.get("samples") or []) if p]
+    if not samples:
+        QMessageBox.information(
+            ctx.host, "Unmix for image",
+            "Select at least one sample under “Samples to be unmixed”.",
+        )
+        return
+    # The matrix that gets applied is the saved one.
+    ctx._unmix_save_now(page)
+    config = ctx._unmix_flow_config(page._unmix_task_def)
+    if config is None:
+        QMessageBox.information(
+            ctx.host, "Unmix for image",
+            "Add at least one complete signature to the matrix first.",
+        )
+        return
+    page._unmix_running = True
+    page._unmix_cancel = False
+    if getattr(page, "_unmix_image_btn", None) is not None:
+        page._unmix_image_btn.setEnabled(False)
+    ctx._unmix_log(
+        page, f"— Unmix for image: {len(samples)} file(s) selected —"
+    )
+    # Resolve the user-facing names here (the worker runs off the UI thread).
+    labels = {
+        path: ctx._comp_file_name(path, page._unmix_task_id)
+        for path in samples
+    }
+    q = queue_module.Queue()
+    page._unmix_queue = q
+    page._unmix_thread = threading.Thread(
+        target=ctx._unmix_image_worker,
+        args=(page, q, config, samples, labels),
+        daemon=True,
+    )
+    page._unmix_thread.start()
+    timer = QTimer(ctx.host)
+    timer.setInterval(100)
+    timer.timeout.connect(lambda: ctx._unmix_image_poll(page))
+    timer.start()
+    page._unmix_timer = timer
+
+
+def _unmix_output_is_current(ctx, task_id, parquet_path, config, rec) -> bool:
+    """Whether a saved unmix output still matches the current matrix."""
+    if not isinstance(rec, dict) or not rec.get("path"):
+        return False
+    if rec.get("signature") != ctx._unmix_output_signature(
+        task_id, parquet_path, config
+    ):
+        return False
+    path = ctx.project.path / rec["path"]
+    if not path.is_file():
+        return False
+    return ctx._image_load_manifest(str(path)) is not None
+
+
+def _unmix_image_worker(ctx, page, q, config, files, labels=None) -> None:
+    """Background: generate one image pyramid per selected image file."""
+    task_id = page._unmix_task_id
+    labels = labels or {}
+    outputs = dict(page._unmix_params.get("outputs") or {})
+    done = failed = skipped = unchanged = 0
+    try:
+        for i, path in enumerate(files):
+            if getattr(page, "_unmix_cancel", False):
+                q.put(("log", "Cancelled."))
+                break
+            label = labels.get(path) or Path(str(path)).name
+            if ctx._image_load_manifest(path) is None:
+                q.put(("log", f"• skipped (not an image): {label}"))
+                skipped += 1
+                continue
+            if ctx._unmix_output_is_current(
+                task_id, path, config, outputs.get(path)
+            ):
+                # Nothing about the matrix changed: keep the saved output.
+                q.put(("log", f"• already up to date, skipped: {label}"))
+                unchanged += 1
+                continue
+            try:
+                outputs[path] = ctx._unmix_write_image_output(
+                    task_id, path, config
+                )
+                done += 1
+                q.put(("log", f"✓ {label}  ({i + 1}/{len(files)})"))
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                q.put(("log", f"✗ {label}: {exc}"))
+        q.put(("done", outputs, done, failed, skipped, unchanged))
+    except Exception as exc:  # noqa: BLE001
+        q.put(("error", str(exc)))
+
+
+def _unmix_image_poll(ctx, page) -> None:
+    q = getattr(page, "_unmix_queue", None)
+    if q is None:
+        return
+    finished = False
+    error = None
+    counts = (0, 0, 0, 0)
+    outputs = None
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+        kind = msg[0]
+        if kind == "log":
+            ctx._unmix_log(page, msg[1])
+        elif kind == "done":
+            outputs = msg[1]
+            counts = (msg[2], msg[3], msg[4], msg[5])
+            finished = True
+        elif kind == "error":
+            error = msg[1]
+            finished = True
+    if not finished:
+        return
+    page._unmix_running = False
+    timer = getattr(page, "_unmix_timer", None)
+    if timer is not None:
+        timer.stop()
+        page._unmix_timer = None
+    if getattr(page, "_unmix_image_btn", None) is not None:
+        page._unmix_image_btn.setEnabled(not page._unmix_locked)
+    if outputs is not None:
+        page._unmix_params["outputs"] = outputs
+        page._unmix_task_def["params"] = page._unmix_params
+        if counts[0] or counts[3]:
+            # Generated data exists: lock the upstream modules.
+            page._unmix_task_def["output"] = {"saved": True}
+        if ctx.project is not None:
+            ctx.project.save()
+        page._unmix_snapshot = copy.deepcopy(page._unmix_params)
+        page._unmix_dirty = False
+        ctx._unmix_update_save_btn(page)
+        ctx._refresh_workflow_tree()
+        ctx._module_saved(page)
+    if error:
+        ctx._unmix_log(page, f"✗ {error}")
+        QMessageBox.warning(ctx.host, "Unmix for image", error)
+    else:
+        done, failed, skipped, unchanged = counts
+        ctx._unmix_log(
+            page,
+            f"— Done: {done} generated, {unchanged} already up to date, "
+            f"{failed} failed, {skipped} skipped (not images) —",
+        )
+
+
+def _unmix_highlight_spectrum(ctx, page, spectrum_id) -> None:
+    lst = page._unmix_spectra_list
+    lst.blockSignals(True)
+    lst.clearSelection()
+    for i in range(lst.count()):
+        item = lst.item(i)
+        if item.data(Qt.ItemDataRole.UserRole) == spectrum_id:
+            lst.setCurrentItem(item)
+            break
+    lst.blockSignals(False)
+
+
+def _unmix_select_spectrum(ctx, page, spectrum_id, open_tree=False) -> None:
+    spectrum = next(
+        (s for s in page._unmix_spectra if s["id"] == spectrum_id), None
+    )
+    page._unmix_active_spectrum = spectrum
+    if spectrum is None:
+        lst = page._unmix_spectra_list
+        lst.blockSignals(True)
+        lst.clearSelection()
+        lst.setCurrentItem(None)
+        lst.blockSignals(False)
+    else:
+        ctx._unmix_highlight_spectrum(page, spectrum["id"])
+    ctx._unmix_render_spectrum_plot(page)
+    if open_tree and spectrum is not None:
+        tree = ctx._unmix_tree_by_id(page, spectrum.get("tree_id"))
+        if tree is not None:
+            ctx._unmix_activate_tree(page, tree)
+
+
+def _unmix_clear_spectrum_selection(ctx, page) -> None:
+    ctx._unmix_select_spectrum(page, None, open_tree=False)
+
+
+def _unmix_spectrum_context_menu(ctx, page, pos) -> None:
+    lst = page._unmix_spectra_list
+    item = lst.itemAt(pos)
+    if item is None:
+        return
+    spectrum = next(
+        (s for s in page._unmix_spectra
+         if s["id"] == item.data(Qt.ItemDataRole.UserRole)),
+        None,
+    )
+    if spectrum is None:
+        return
+    enabled = not page._unmix_locked
+    menu = QMenu(lst)
+    ren_act = QAction("Rename", menu)
+    ren_act.setEnabled(enabled)
+    ren_act.triggered.connect(lambda: ctx._unmix_rename_spectrum(page, spectrum))
+    menu.addAction(ren_act)
+    copy_act = QAction("Duplicate", menu)
+    copy_act.setEnabled(enabled)
+    copy_act.triggered.connect(lambda: ctx._unmix_copy_spectrum(page, spectrum))
+    menu.addAction(copy_act)
+    menu.addSeparator()
+    del_act = QAction("Delete", menu)
+    del_act.setEnabled(enabled)
+    del_act.triggered.connect(lambda: ctx._unmix_delete_spectrum(page, spectrum))
+    menu.addAction(del_act)
+    menu.exec(lst.viewport().mapToGlobal(pos))
+
+
+def _unmix_set_spectrum(ctx, page, tree, gate_id) -> None:
+    """Bind a gate tree to a new spectrum (a tree can only be set once)."""
+    if tree.get("spectrum_id"):
+        return
+    cfg = page._unmix_spectrum_cfg
+    enabled = list(cfg.get("enabled") or [])
+    if not enabled:
+        QMessageBox.information(
+            ctx.host,
+            "Set as spectrum",
+            "No spectrum parameters are selected.\n"
+            'Choose them with "Set" in Spectrum settings first.',
+        )
+        return
+    preview = tree["store"].get("params", {}).get("preview") or {}
+    if not preview.get("file"):
+        QMessageBox.warning(
+            ctx.host,
+            "Set as spectrum",
+            "This gate tree has no data file selected.",
+        )
+        return
+    columns = set(ctx._columns_for(preview.get("file"), page._unmix_task_id))
+    missing = [p for p in enabled if p not in columns]
+    if missing:
+        shown = ", ".join(str(m) for m in missing[:12])
+        if len(missing) > 12:
+            shown += ", ..."
+        QMessageBox.warning(
+            ctx.host,
+            "Set as spectrum",
+            f"The data file of this gate tree is missing "
+            f"{len(missing)} selected spectrum parameter(s):\n\n{shown}"
+            "\n\nChoose a data file that contains these parameters.",
+        )
+        return
+    spectrum = {
+        "id": uuid4().hex[:8],
+        "name": ctx._unmix_next_spectrum_name(page),
+        "tree_id": tree["id"],
+        "gate_id": gate_id,
+    }
+    page._unmix_spectra.append(spectrum)
+    tree["spectrum_id"] = spectrum["id"]
+    if tree.get("holder") is not None:
+        tree["holder"]._gating_protected_gate_id = gate_id
+    ctx._unmix_rebuild_spectrum_list(page)
+    ctx._unmix_select_spectrum(page, spectrum["id"], open_tree=False)
+    ctx._unmix_rebuild_signature_table(page)
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_reset_spectrum_source(ctx, page, tree) -> None:
+    """Move a spectrum's source to another gate of its bound tree."""
+    holder = tree.get("holder")
+    spectrum = ctx._unmix_spectrum_for_tree(page, tree)
+    if holder is None or spectrum is None:
+        return
+    others = [
+        g for g in holder._gating_gates if g["id"] != spectrum.get("gate_id")
+    ]
+    if not others:
+        QMessageBox.information(
+            ctx.host,
+            "Re-set spectrum source",
+            "This gate tree has no other gates.",
+        )
+        return
+    dialog = QDialog(ctx.host)
+    dialog.setWindowTitle("Re-set spectrum source")
+    dlg = QVBoxLayout(dialog)
+    dlg.addWidget(QLabel("Use another gate as the source of this spectrum:"))
+    combo = QComboBox()
+    for gate in others:
+        combo.addItem(gate.get("name", gate["id"]), gate["id"])
+    dlg.addWidget(combo)
+    row = QHBoxLayout()
+    row.addStretch()
+    ok_btn = QPushButton("OK")
+    cancel_btn = QPushButton("Cancel")
+    row.addWidget(ok_btn)
+    row.addWidget(cancel_btn)
+    dlg.addLayout(row)
+    ok_btn.clicked.connect(dialog.accept)
+    cancel_btn.clicked.connect(dialog.reject)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return
+    gate_id = combo.currentData()
+    if not gate_id:
+        return
+    spectrum["gate_id"] = gate_id
+    holder._gating_protected_gate_id = gate_id
+    ctx._unmix_select_spectrum(page, spectrum["id"], open_tree=False)
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_spectrum_menu(ctx, page, holder, idx, menu) -> None:
+    """Add Unmix actions to a gate tree's context menu."""
+    if idx is None or idx < 0 or idx >= len(holder._gating_gates):
+        return
+    tree = ctx._unmix_tree_for_holder(page, holder)
+    if tree is None:
+        return
+    gate_id = holder._gating_gates[idx]["id"]
+    spectrum = ctx._unmix_spectrum_for_tree(page, tree)
+    if spectrum is None and not page._unmix_locked:
+        act = QAction("Set as spectrum", menu)
+        act.triggered.connect(
+            lambda _=False: ctx._unmix_set_spectrum(page, tree, gate_id)
+        )
+        menu.addAction(act)
+    elif spectrum is not None and spectrum.get("gate_id") == gate_id:
+        act = QAction("Re-set as spectrum...", menu)
+        act.setEnabled(not page._unmix_locked)
+        act.triggered.connect(
+            lambda _=False: ctx._unmix_reset_spectrum_source(page, tree)
+        )
+        menu.addAction(act)
+
+
+def _unmix_rename_spectrum(ctx, page, spectrum) -> None:
+    text, ok = QInputDialog.getText(
+        ctx.host, "Rename spectrum", "Name:", QLineEdit.EchoMode.Normal,
+        spectrum.get("name", ""),
+    )
+    if not ok:
+        return
+    name = text.strip()
+    if not name:
+        return
+    if any(s is not spectrum and s["name"] == name for s in page._unmix_spectra):
+        QMessageBox.information(
+            ctx.host, "Rename spectrum", "A spectrum with this name already exists."
+        )
+        return
+    spectrum["name"] = name
+    ctx._unmix_rebuild_spectrum_list(page)
+    ctx._unmix_render_spectrum_plot(page)
+    ctx._unmix_rebuild_signature_table(page)
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page, data=False)
+
+
+def _unmix_copy_spectrum(ctx, page, spectrum) -> None:
+    """Duplicate a spectrum, including an independent copy of its gate tree."""
+    name = spectrum["name"] + " copy"
+    while any(s["name"] == name for s in page._unmix_spectra):
+        name += " copy"
+    new_spectrum = copy.deepcopy(spectrum)
+    new_spectrum["id"] = uuid4().hex[:8]
+    new_spectrum["name"] = name
+    source_tree = ctx._unmix_tree_by_id(page, spectrum.get("tree_id"))
+    if source_tree is not None:
+        store = {
+            "id": uuid4().hex[:8],
+            "params": copy.deepcopy(source_tree["store"].get("params") or {}),
+        }
+        new_tree = ctx._unmix_make_tree(page, store, new_spectrum["id"])
+        new_spectrum["tree_id"] = new_tree["id"]
+    page._unmix_spectra.append(new_spectrum)
+    ctx._unmix_rebuild_spectrum_list(page)
+    ctx._unmix_select_spectrum(page, new_spectrum["id"], open_tree=False)
+    ctx._unmix_rebuild_signature_table(page)
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_delete_spectrum(ctx, page, spectrum) -> None:
+    reply = QMessageBox.question(
+        ctx.host,
+        "Delete spectrum",
+        f'Delete "{spectrum["name"]}"?\n'
+        "Its bound gate tree will be destroyed.",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+        return
+    tree = ctx._unmix_tree_by_id(page, spectrum.get("tree_id"))
+    if tree is not None:
+        ctx._unmix_destroy_tree(page, tree)
+    if spectrum in page._unmix_spectra:
+        page._unmix_spectra.remove(spectrum)
+    if page._unmix_active_spectrum is spectrum:
+        page._unmix_active_spectrum = None
+    ctx._unmix_rebuild_spectrum_list(page)
+    ctx._unmix_select_spectrum(
+        page,
+        page._unmix_active_spectrum["id"] if page._unmix_active_spectrum else None,
+        open_tree=False,
+    )
+    ctx._unmix_rebuild_signature_table(page)
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_spectrum_arrays(ctx, page, spectrum):
+    """Return (names, arrays, error) for a spectrum's gated subset."""
+    cfg = page._unmix_spectrum_cfg
+    ordered = ctx._unmix_sync_spectrum_params(page)
+    enabled = set(cfg.get("enabled") or [])
+    columns = [p for p in ordered if p in enabled]
+    live_trees = [
+        {"id": t["id"], "params": t["store"].get("params", {})}
+        for t in page._unmix_trees
+    ]
+    return ctx._unmix_spectrum_arrays_for(
+        page._unmix_task_id, page._unmix_params, spectrum, columns,
+        trees=live_trees,
+    )
+
+
+def _unmix_spectrum_arrays_for(ctx, task_id, params, spectrum, columns, trees=None):
+    """Return (names, arrays, error) for a spectrum from task parameters.
+
+    Each array holds the transformed, finite values of one parameter inside
+    the source gate, in `columns` order (parameters missing from the gate
+    tree's file are skipped). `trees` overrides the saved tree list when
+    the module is open and has unsaved edits.
+    """
+    import numpy as np
+
+    if trees is None:
+        trees = params.get("trees") or []
+    tree = next((t for t in trees if t.get("id") == spectrum.get("tree_id")), None)
+    if tree is None:
+        return None, None, "The gate tree for this spectrum no longer exists."
+    tree_params = tree.get("params") or {}
+    gates = tree_params.get("gates") or []
+    preview = tree_params.get("preview") or {}
+    gate = next((g for g in gates if g.get("id") == spectrum.get("gate_id")), None)
+    if gate is None:
+        return None, None, "The source gate no longer exists."
+    parquet = preview.get("file")
+    if not parquet:
+        return None, None, "The gate tree has no data file."
+    # Gate columns and spectrum columns are evaluated through the same
+    # ordered pipeline, so upstream Scale/Compensation modules apply.
+    by_id = {g["id"]: g for g in gates}
+    needed = set()
+    for g in gates:
+        needed |= _gate_needed_columns(g, by_id)
+    gate_values = ctx._column_data(task_id, parquet, list(needed))
+    try:
+        mask = _compute_gate_filter_mask(
+            gates, gate["id"], parquet, {},
+            existing=set(gate_values), extra=gate_values,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, None, f"Could not compute the gate: {exc}"
+    if mask is None:
+        return None, None, "Could not compute the gate (missing parameters)."
+
+    data = ctx._column_data(task_id, parquet, columns)
+    names = [p for p in columns if p in data]
+    if not names:
+        return None, None, "No parameters selected."
+    mask = np.asarray(mask, dtype=bool)
+    arrays = []
+    for name in names:
+        arr = np.asarray(data[name], dtype="float64")
+        if arr.size != mask.size:
+            return None, None, "Gate mask size mismatch."
+        arr = arr[mask]
+        arr = arr[np.isfinite(arr)]
+        arrays.append(arr)
+    return names, arrays, None
+
+
+def _unmix_spectrum_values(ctx, page, spectrum):
+    """Compute a spectrum from its source gate.
+
+    Returns ``(names, values, hist, y_range, error)`` where `values` is the
+    median/mean per parameter, `hist` is a (bins, parameters) density
+    heatmap of the gated subset and `y_range` is the raw value range the
+    heatmap spans.
+    """
+    import numpy as np
+
+    names, arrays, error = ctx._unmix_spectrum_arrays(page, spectrum)
+    if error:
+        return None, None, None, None, error
+    stat = page._unmix_spectrum_cfg.get("stat", "median")
+    values = []
+    for arr in arrays:
+        if arr.size == 0:
+            values.append(float("nan"))
+        elif stat == "mean":
+            values.append(float(arr.mean()))
+        else:
+            values.append(float(np.median(arr)))
+
+    # Distribution heatmap: one column per parameter, shared raw value axis.
+    bins = 128
+    pooled = (
+        np.concatenate([a for a in arrays if a.size])
+        if any(a.size for a in arrays) else np.array([])
+    )
+    if pooled.size:
+        lo, hi = np.percentile(pooled, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = float(pooled.min()), float(pooled.max())
+        if hi <= lo:
+            hi = lo + 1.0
+    else:
+        lo, hi = 0.0, 1.0
+    hist = np.zeros((bins, len(names)), dtype="float32")
+    for i, arr in enumerate(arrays):
+        if arr.size == 0:
+            continue
+        counts, _ = np.histogram(
+            np.clip(arr, lo, hi), bins=bins, range=(lo, hi)
+        )
+        peak = counts.max()
+        if peak > 0:
+            hist[:, i] = (counts / float(peak)).astype("float32")
+    return names, values, hist, (lo, hi), None
+
+
+def _unmix_render_spectrum_plot(ctx, page) -> None:
+    import numpy as np
+
+    plot_widget = page._unmix_spectrum_plot
+    plot_item = plot_widget.getPlotItem()
+    plot_item.clear()
+    axis = plot_item.getAxis("bottom")
+    spectrum = page._unmix_active_spectrum
+    if spectrum is None:
+        axis.setTicks(None)
+        axis.setHeight(None)
+        plot_item.setTitle("")
+        return
+    names, values, hist, y_range, error = ctx._unmix_spectrum_values(
+        page, spectrum
+    )
+    if error:
+        axis.setTicks(None)
+        axis.setHeight(None)
+        plot_item.setTitle(f"<span style='color:#b00000'>{error}</span>")
+        return
+    cfg = page._unmix_spectrum_cfg
+    plot_item.setTitle(spectrum.get("name", ""))
+    xs = list(range(len(names)))
+
+    lo, hi = y_range
+    finite = [v for v in values if np.isfinite(v)]
+    y0 = min([lo] + finite)
+    y1 = max([hi] + finite)
+    if y1 <= y0:
+        y1 = y0 + 1.0
+
+    # Distribution heatmap drawn behind the spectrum line. Empty bins stay
+    # transparent so the plot background shows through.
+    cmap = _figure_colormap(cfg.get("colormap", "viridis"))
+    rgb = np.array(cmap.getLookupTable(0.0, 1.0, 256), dtype="ubyte")
+    lut = np.zeros((256, 4), dtype="ubyte")
+    lut[:, :3] = rgb[:, :3]
+    ramp = np.linspace(0.0, 1.0, 256) ** 0.45
+    lut[:, 3] = np.clip(ramp * 255.0, 0, 255).astype("ubyte")
+    lut[0, 3] = 0
+    img = pg.ImageItem(axisOrder="row-major")
+    img.setImage(hist, autoLevels=False, levels=(0.0, 1.0), lut=lut)
+    img.setRect(QRectF(-0.5, lo, max(1, len(names)), hi - lo))
+    img.setZValue(-10)
+    plot_item.addItem(img)
+
+    line_color = cfg.get("line_color", "#2b6cb0")
+    plot_item.plot(
+        xs, values,
+        pen=pg.mkPen(line_color, width=2),
+        symbol="o", symbolSize=6,
+        symbolBrush=line_color, symbolPen=None,
+    )
+    axis.setTicks([[(i, name) for i, name in enumerate(names)]])
+    # Rotated labels need as much height as the widest parameter name.
+    font = axis.style.get("tickFont") or axis.font()
+    metrics = QFontMetrics(font)
+    widest = max((metrics.horizontalAdvance(str(n)) for n in names), default=0)
+    axis.setHeight(int(widest) + 26)
+    plot_item.setXRange(-0.5, max(0.5, len(names) - 0.5), padding=0)
+    plot_item.setYRange(y0, y1, padding=0.02)
+
+
+def _unmix_rebuild_spectrum_settings(ctx, page) -> None:
+    """Build the module-wide spectrum settings (one set for all spectra)."""
+    layout = page._unmix_spectrum_settings_layout
+    ctx._clear_settings_layout(layout)
+    enabled = not page._unmix_locked
+    cfg = page._unmix_spectrum_cfg
+    ctx._unmix_sync_spectrum_params(page)
+
+    layout.addWidget(QLabel("Statistic"))
+    stat_combo = QComboBox()
+    stat_combo.addItem("Median", "median")
+    stat_combo.addItem("Mean", "mean")
+    stat_index = stat_combo.findData(cfg.get("stat", "median"))
+    stat_combo.setCurrentIndex(stat_index if stat_index >= 0 else 0)
+    stat_combo.setEnabled(enabled)
+    layout.addWidget(stat_combo)
+
+    layout.addWidget(QLabel("Distribution colormap"))
+    cmap_combo = _NoWheelComboBox()
+    ctx._populate_palette_combo(
+        cmap_combo, cfg.get("colormap") or _default_palette()
+    )
+    cmap_combo.setEnabled(enabled)
+    layout.addWidget(cmap_combo)
+
+    params_row = QHBoxLayout()
+    params_row.addWidget(QLabel("Parameters"))
+    params_row.addStretch()
+    selected_count = len(ctx._unmix_selected_parameters(page))
+    count_label = QLabel(f"{selected_count} selected")
+    count_label.setStyleSheet("color: #5b6b82;")
+    params_row.addWidget(count_label)
+    layout.addLayout(params_row)
+    params_btn = QPushButton("Set")
+    params_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    params_btn.setEnabled(enabled)
+    layout.addWidget(params_btn)
+
+    def update_params_button():
+        params_btn.setToolTip(
+            f"{len(cfg.get('enabled') or [])}/{len(cfg.get('params') or [])}"
+        )
+
+    update_params_button()
+    page._unmix_params_btn = params_btn
+    params_btn.clicked.connect(
+        lambda _=False: ctx._unmix_edit_spectrum_parameters(page)
+    )
+
+    # The selected parameters, in plotting order; drag a row to reorder.
+    selected_names = ctx._unmix_selected_parameters(page)
+    if selected_names:
+        order_list = QListWidget()
+        order_list.setDragDropMode(
+            QAbstractItemView.DragDropMode.InternalMove
+        )
+        order_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        order_list.setDropIndicatorShown(True)
+        order_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        order_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        handle_icon = QIcon(_drag_handle_pixmap())
+        for name in selected_names:
+            item = QListWidgetItem(handle_icon, name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setToolTip("Drag to reorder")
+            order_list.addItem(item)
+        order_list.setEnabled(enabled)
+
+        def on_rows_moved(*_args):
+            order = [
+                order_list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(order_list.count())
+            ]
+            ctx._unmix_apply_parameter_order(page, order)
+
+        order_list.model().rowsMoved.connect(on_rows_moved)
+        layout.addWidget(order_list, 1)
+    else:
+        hint = QLabel("No parameters selected. Click Set to choose.")
+        hint.setStyleSheet("color: gray;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addStretch(1)
+
+    layout.addWidget(QLabel("Spectrum line color"))
+    color_btn = QPushButton()
+    color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    color_btn.setEnabled(enabled)
+    color_btn.setFixedHeight(26)
+    layout.addWidget(color_btn)
+
+    layout.addWidget(QLabel("Matrix decimal places"))
+    decimals_spin = _NoWheelSpinBox()
+    decimals_spin.setRange(0, 6)
+    decimals_spin.setValue(int(cfg.get("decimals", 2)))
+    decimals_spin.setEnabled(enabled)
+    layout.addWidget(decimals_spin)
+
+    def refresh():
+        ctx._unmix_refresh_outputs(page)
+        ctx._unmix_mark_dirty(page)
+
+    def update_color_button():
+        color = QColor(cfg.get("line_color", "#2b6cb0"))
+        text_color = "#ffffff" if color.lightness() < 128 else "#000000"
+        color_btn.setText(color.name())
+        color_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {color.name()}; "
+            f"color: {text_color}; border: 1px solid #999; }}"
+        )
+
+    def pick_line_color():
+        color = QColorDialog.getColor(
+            QColor(cfg.get("line_color", "#2b6cb0")), ctx.host,
+            "Spectrum line color",
+        )
+        if color.isValid():
+            cfg["line_color"] = color.name()
+            update_color_button()
+            refresh()
+
+    def on_stat_changed():
+        cfg["stat"] = stat_combo.currentData()
+        refresh()
+
+    def on_colormap_changed():
+        cfg["colormap"] = cmap_combo.currentData()
+        refresh()
+
+    def on_decimals_changed(value):
+        cfg["decimals"] = int(value)
+        ctx._unmix_refresh_matrix_views(page)
+        ctx._unmix_mark_dirty(page)
+
+    update_color_button()
+    stat_combo.currentIndexChanged.connect(lambda _=0: on_stat_changed())
+    cmap_combo.currentIndexChanged.connect(lambda _=0: on_colormap_changed())
+    color_btn.clicked.connect(lambda _=False: pick_line_color())
+    decimals_spin.valueChanged.connect(on_decimals_changed)
+
+
+def _unmix_edit_spectrum_parameters(ctx, page) -> None:
+    """Pick which parameters a spectrum contains (shared picker dialog)."""
+    cfg = page._unmix_spectrum_cfg
+    ordered = ctx._unmix_sync_spectrum_params(page)
+    chosen = ctx._pick_items_dialog(
+        "Spectrum parameters", ordered, set(cfg.get("enabled") or []),
+        "Filter parameters...",
+    )
+    if chosen is None:
+        return
+    chosen_set = set(chosen)
+    cfg["enabled"] = [p for p in cfg.get("params", []) if p in chosen_set]
+    ctx._unmix_rebuild_spectrum_settings(page)
+    ctx._unmix_render_spectrum_plot(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_matrix_subpage(ctx, page) -> QWidget:
+    """Sub-page 2: signatures + samples (left) | matrix image + settings (right)."""
+    w = QWidget()
+    w.setStyleSheet("background: #f5f8fb;")
+    row = QHBoxLayout(w)
+    row.setContentsMargins(12, 12, 12, 12)
+    row.setSpacing(12)
+
+    left = QSplitter(Qt.Orientation.Vertical)
+    left.setChildrenCollapsible(False)
+    left.addWidget(ctx._unmix_signature_panel(page))
+    left.addWidget(ctx._unmix_sample_panel(page))
+    left.setStretchFactor(0, 3)
+    left.setStretchFactor(1, 2)
+    left.setSizes([420, 240])
+
+    right = QSplitter(Qt.Orientation.Vertical)
+    right.setChildrenCollapsible(False)
+    right.addWidget(ctx._unmix_matrix_panel(page))
+    lower = QSplitter(Qt.Orientation.Horizontal)
+    lower.setChildrenCollapsible(False)
+    lower.addWidget(ctx._unmix_image_panel(page))
+    lower.addWidget(ctx._unmix_matrix_settings_panel(page))
+    lower.setStretchFactor(0, 1)
+    lower.setStretchFactor(1, 1)
+    lower.setSizes([400, 400])
+    right.addWidget(lower)
+    right.setStretchFactor(0, 3)
+    right.setStretchFactor(1, 1)
+    right.setSizes([560, 260])
+
+    splitter = QSplitter(Qt.Orientation.Horizontal)
+    splitter.setChildrenCollapsible(False)
+    splitter.addWidget(left)
+    splitter.addWidget(right)
+    splitter.setStretchFactor(0, 1)
+    splitter.setStretchFactor(1, 2)
+    splitter.setSizes([400, 800])
+    row.addWidget(splitter, 1)
+    return w
+
+
+def _unmix_matrix_panel(ctx, page) -> QWidget:
+    """The matrix area: spectral matrix / curve / similarity sub-pages."""
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(8, 8, 8, 8)
+    lay.setSpacing(6)
+
+    tabs = QTabWidget()
+    tabs.setDocumentMode(True)
+    tabs.addTab(ctx._unmix_matrix_tab_page(page), "Spectral matrix")
+    tabs.addTab(ctx._unmix_curve_tab_page(page), "Spectral curve")
+    tabs.addTab(ctx._unmix_similarity_tab_page(page), "Similarity matrix")
+    lay.addWidget(tabs, 1)
+
+    page._unmix_matrix_tabs = tabs
+    page._unmix_matrix_tab_keys = ("matrix", "curve", "similarity")
+    key = page._unmix_params.get("matrix_tab")
+    if key not in page._unmix_matrix_tab_keys:
+        key = "matrix"
+    page._unmix_matrix_tab = key
+    tabs.blockSignals(True)
+    tabs.setCurrentIndex(page._unmix_matrix_tab_keys.index(key))
+    tabs.blockSignals(False)
+    tabs.currentChanged.connect(lambda index: ctx._unmix_on_matrix_tab(page, index))
+    return panel
+
+
+def _unmix_matrix_tab_page(ctx, page) -> QWidget:
+    """Sub-page 1: the matrix heatmap (rendered to an image)."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(False)
+    scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    scroll.setStyleSheet("background: #ffffff; border: none;")
+    label = _ZoomPixmapLabel(
+        on_zoom=lambda f, pos: ctx._unmix_zoom_matrix(page, f, pos)
+    )
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    label.setStyleSheet("background: #ffffff; color: #888888;")
+    label.setText("Add a signature to build the matrix.")
+    scroll.setWidget(label)
+    page._unmix_matrix_label = label
+    page._unmix_matrix_image = None
+    page._unmix_matrix_scroll = scroll
+    return scroll
+
+
+def _unmix_curve_tab_page(ctx, page) -> QWidget:
+    """Sub-page 2: one normalized curve per signature."""
+    host = QWidget()
+    host.setStyleSheet("background: #ffffff;")
+    lay = QVBoxLayout(host)
+    lay.setContentsMargins(8, 8, 8, 8)
+    lay.setSpacing(6)
+
+    legend = QWidget()
+    legend.setStyleSheet("background: transparent;")
+    legend_lay = QGridLayout(legend)
+    legend_lay.setContentsMargins(0, 0, 0, 0)
+    legend_lay.setHorizontalSpacing(12)
+    legend_lay.setVerticalSpacing(4)
+    lay.addWidget(legend)
+
+    plot = pg.PlotWidget(background=_plot_background())
+    plot.showGrid(x=True, y=True, alpha=0.2)
+    plot.getPlotItem().setAxisItems({
+        "bottom": _make_rotated_axis("bottom"),
+        # Plain decimals: normalized intensities are small values and a
+        # scientific axis makes them hard to read.
+        "left": _make_fixed_axis("left", decimals=1),
+    })
+    plot.getPlotItem().setLabel("left", "Normalized intensity")
+    plot.getPlotItem().setLabel("bottom", "Channel")
+    lay.addWidget(plot, 1)
+
+    page._unmix_curve_legend = legend
+    page._unmix_curve_legend_lay = legend_lay
+    page._unmix_curve_plot = plot
+    return host
+
+
+def _unmix_similarity_tab_page(ctx, page) -> QWidget:
+    """Sub-page 3: pairwise cosine similarity between the signatures."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(False)
+    scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    scroll.setStyleSheet("background: #ffffff; border: none;")
+    label = _ZoomPixmapLabel(
+        on_zoom=lambda f, pos: ctx._unmix_zoom_matrix(page, f, pos)
+    )
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    label.setStyleSheet("background: #ffffff; color: #888888;")
+    label.setText("Add at least two signatures to compare them.")
+    scroll.setWidget(label)
+    page._unmix_similarity_label = label
+    page._unmix_similarity_image = None
+    page._unmix_similarity_scroll = scroll
+    return scroll
+
+
+def _unmix_on_matrix_tab(ctx, page, index) -> None:
+    keys = getattr(page, "_unmix_matrix_tab_keys", ("matrix", "curve", "similarity"))
+    key = keys[index] if 0 <= index < len(keys) else "matrix"
+    page._unmix_matrix_tab = key
+    page._unmix_params["matrix_tab"] = key
+    ctx._unmix_rebuild_matrix_settings(page)
+    ctx._unmix_refresh_matrix_views(page)
+
+
+def _unmix_matrix_settings_panel(ctx, page) -> QWidget:
+    """Settings for the active matrix sub-page (content swaps with the tab)."""
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    title = QLabel("<b>Matrix settings</b>")
+    lay.addWidget(title)
+
+    # Scrollable so a long signature list (Curve settings) does not raise
+    # the panel's minimum height and freeze the splitter above it.
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setStyleSheet("background: transparent;")
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    host = QWidget()
+    host.setStyleSheet("background: transparent;")
+    host_lay = QVBoxLayout(host)
+    host_lay.setContentsMargins(0, 0, 6, 0)
+    host_lay.setSpacing(6)
+    scroll.setWidget(host)
+    lay.addWidget(scroll, 1)
+
+    page._unmix_matrix_settings_title = title
+    page._unmix_matrix_settings_lay = host_lay
+    ctx._unmix_rebuild_matrix_settings(page)
+    return panel
+
+
+def _unmix_rebuild_matrix_settings(ctx, page) -> None:
+    lay = getattr(page, "_unmix_matrix_settings_lay", None)
+    if lay is None:
+        return
+    key = getattr(page, "_unmix_matrix_tab", "matrix")
+    title = getattr(page, "_unmix_matrix_settings_title", None)
+    if title is not None:
+        title.setText({
+            "matrix": "<b>Matrix settings</b>",
+            "curve": "<b>Curve settings</b>",
+            "similarity": "<b>Similarity settings</b>",
+        }.get(key, "<b>Matrix settings</b>"))
+    ctx._clear_layout(lay)
+    if key == "curve":
+        ctx._unmix_curve_settings_content(page, lay)
+    else:
+        ctx._unmix_grid_settings_content(page, lay, key)
+    lay.addStretch(1)
+
+
+def _unmix_grid_settings_content(ctx, page, lay, section: str) -> None:
+    """Cell geometry, colours and number display for a matrix-style image."""
+    cfg = ctx._unmix_matrix_cfg(page, section)
+    editable = not page._unmix_locked
+    grid = QGridLayout()
+    grid.setHorizontalSpacing(8)
+    grid.setVerticalSpacing(6)
+
+    grid.addWidget(QLabel("Cell width"), 0, 0)
+    width_spin = _NoWheelSpinBox()
+    width_spin.setRange(12, 400)
+    width_spin.setValue(int(cfg["cell_width"]))
+    width_spin.setEnabled(editable)
+    grid.addWidget(width_spin, 0, 1)
+
+    grid.addWidget(QLabel("Cell height"), 0, 2)
+    height_spin = _NoWheelSpinBox()
+    height_spin.setRange(12, 200)
+    height_spin.setValue(int(cfg["cell_height"]))
+    height_spin.setEnabled(editable)
+    grid.addWidget(height_spin, 0, 3)
+
+    grid.addWidget(QLabel("Colormap"), 1, 0)
+    cmap_combo = _NoWheelComboBox()
+    ctx._populate_palette_combo(
+        cmap_combo, cfg.get("colormap") or _default_palette()
+    )
+    cmap_combo.setEnabled(editable)
+    grid.addWidget(cmap_combo, 1, 1, 1, 3)
+
+    show_numbers = QCheckBox("Show numbers")
+    show_numbers.setChecked(bool(cfg["show_numbers"]))
+    show_numbers.setEnabled(editable)
+    grid.addWidget(show_numbers, 2, 0, 1, 2)
+
+    auto_color = QCheckBox("Auto number color")
+    auto_color.setChecked(bool(cfg["auto_text_color"]))
+    auto_color.setEnabled(editable)
+    grid.addWidget(auto_color, 2, 2, 1, 2)
+
+    grid.addWidget(QLabel("Number color"), 3, 0)
+    color_btn = QPushButton()
+    color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    color_btn.setFixedHeight(26)
+    color_btn.setEnabled(editable and not auto_color.isChecked())
+    grid.addWidget(color_btn, 3, 1)
+
+    copy_btn = QPushButton(
+        "Copy similarity to clipboard" if section == "similarity"
+        else "Copy matrix to clipboard"
+    )
+    copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    grid.addWidget(copy_btn, 3, 2, 1, 2)
+    lay.addLayout(grid)
+
+    if section == "similarity":
+        hint = QLabel(
+            "Cosine similarity, fixed scale −1 … 1 (diverging colormap)."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+
+    def update_color_button():
+        color = QColor(cfg["text_color"])
+        text_color = "#ffffff" if color.lightness() < 128 else "#000000"
+        color_btn.setText(color.name())
+        color_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {color.name()}; "
+            f"color: {text_color}; border: 1px solid #999; }}"
+        )
+
+    def refresh():
+        ctx._unmix_refresh_matrix_views(page)
+        ctx._unmix_mark_dirty(page, data=False)
+
+    def on_width(value):
+        cfg["cell_width"] = int(value)
+        refresh()
+
+    def on_height(value):
+        cfg["cell_height"] = int(value)
+        refresh()
+
+    def on_colormap():
+        cfg["colormap"] = cmap_combo.currentData()
+        refresh()
+
+    def on_show_numbers(checked):
+        cfg["show_numbers"] = bool(checked)
+        refresh()
+
+    def on_auto_color(checked):
+        cfg["auto_text_color"] = bool(checked)
+        color_btn.setEnabled(editable and not checked)
+        refresh()
+
+    def pick_color():
+        color = QColorDialog.getColor(
+            QColor(cfg["text_color"]), ctx.host, "Matrix number color"
+        )
+        if color.isValid():
+            cfg["text_color"] = color.name()
+            update_color_button()
+            refresh()
+
+    width_spin.valueChanged.connect(on_width)
+    height_spin.valueChanged.connect(on_height)
+    cmap_combo.currentIndexChanged.connect(lambda _=0: on_colormap())
+    show_numbers.toggled.connect(on_show_numbers)
+    auto_color.toggled.connect(on_auto_color)
+    color_btn.clicked.connect(lambda _=False: pick_color())
+    copy_btn.clicked.connect(
+        lambda _=False: (
+            ctx._unmix_copy_similarity(page) if section == "similarity"
+            else ctx._unmix_copy_matrix(page)
+        )
+    )
+    update_color_button()
+
+
+def _unmix_curve_settings_content(ctx, page, lay) -> None:
+    """Line width and one colour per signature for the curve sub-page."""
+    cfg = ctx._unmix_matrix_cfg(page, "curve")
+    editable = not page._unmix_locked
+
+    row = QHBoxLayout()
+    row.addWidget(QLabel("Line width"))
+    width_spin = _NoWheelSpinBox()
+    width_spin.setRange(1, 6)
+    width_spin.setValue(int(cfg.get("line_width", 2)))
+    width_spin.setEnabled(editable)
+    row.addWidget(width_spin)
+    row.addStretch()
+    lay.addLayout(row)
+
+    lay.addWidget(QLabel("Signatures (tick to draw)"))
+    rows = list(getattr(page, "_unmix_matrix", []) or [])
+    if not rows:
+        hint = QLabel("Add a signature to give it a colour.")
+        hint.setStyleSheet("color: #6b7785;")
+        lay.addWidget(hint)
+    colors = ctx._unmix_curve_colors(page, rows)
+    visible = cfg.setdefault("visible", {})
+    grid = QGridLayout()
+    grid.setHorizontalSpacing(8)
+    grid.setVerticalSpacing(4)
+    for i, row_def in enumerate(rows):
+        sid = str(row_def.get("id") or row_def.get("name") or "")
+        name = QCheckBox(str(row_def.get("name") or ""))
+        name.setToolTip(sid)
+        name.setChecked(bool(visible.get(sid, True)))
+        name.setEnabled(editable)
+
+        def on_visible(checked, sid=sid, button=None):
+            ctx._unmix_matrix_cfg(page, "curve").setdefault("visible", {})[
+                sid
+            ] = bool(checked)
+            ctx._unmix_render_curve(page)
+            ctx._unmix_mark_dirty(page, data=False)
+
+        name.toggled.connect(on_visible)
+        grid.addWidget(name, i, 0)
+
+        def color_style(color):
+            qc = QColor(color)
+            text = "#ffffff" if qc.lightness() < 128 else "#000000"
+            return (
+                f"QPushButton {{ background-color: {color}; color: {text}; "
+                f"border: 1px solid #999; }}"
+            )
+
+        btn = QPushButton(colors.get(sid, ""))
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(24)
+        btn.setEnabled(editable)
+        btn.setStyleSheet(color_style(colors.get(sid, "#ffffff")))
+
+        def pick_color(_=False, sid=sid, button=btn):
+            color = QColorDialog.getColor(
+                QColor(button.text()), ctx.host, "Signature line colour"
+            )
+            if not color.isValid():
+                return
+            ctx._unmix_matrix_cfg(page, "curve").setdefault("colors", {})[sid] = (
+                color.name()
+            )
+            button.setText(color.name())
+            button.setStyleSheet(color_style(color.name()))
+            ctx._unmix_render_curve(page)
+            ctx._unmix_mark_dirty(page, data=False)
+
+        btn.clicked.connect(pick_color)
+        grid.addWidget(btn, i, 1)
+    lay.addLayout(grid)
+
+    reset_btn = QPushButton("Reset colours to defaults")
+    reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    reset_btn.setEnabled(editable and bool(rows))
+
+    def reset_colors(_=False):
+        cfg["colors"] = {}
+        ctx._unmix_rebuild_matrix_settings(page)
+        ctx._unmix_render_curve(page)
+        ctx._unmix_mark_dirty(page, data=False)
+
+    reset_btn.clicked.connect(reset_colors)
+    lay.addWidget(reset_btn)
+
+    def on_width(value):
+        cfg["line_width"] = int(value)
+        ctx._unmix_render_curve(page)
+        ctx._unmix_mark_dirty(page, data=False)
+
+    width_spin.valueChanged.connect(on_width)
+
+
+def _unmix_matrix_cfg(ctx, page, section: str='matrix') -> dict:
+    """Display settings of one matrix sub-page (``matrix``/``curve``/
+    ``similarity``). Older projects stored the matrix keys at the top
+    level; they are migrated into the ``matrix`` section once."""
+    store = page._unmix_params.setdefault("matrix_settings", {})
+    legacy_keys = (
+        "cell_width", "cell_height", "colormap",
+        "show_numbers", "auto_text_color", "text_color",
+    )
+    legacy = {k: store.pop(k) for k in legacy_keys if k in store}
+    if legacy and not isinstance(store.get("matrix"), dict):
+        store["matrix"] = dict(legacy)
+    cfg = store.setdefault(section, {})
+    defaults = {
+        "matrix": {
+            "cell_width": 35,
+            "cell_height": 28,
+            "colormap": "viridis",
+            "show_numbers": True,
+            "auto_text_color": True,
+            "text_color": "#5b6b82",
+        },
+        "curve": {
+            "line_width": 2,
+            "colors": {},
+            "visible": {},
+        },
+        "similarity": {
+            "cell_width": 62,
+            "cell_height": 28,
+            "colormap": "coolwarm",
+            "show_numbers": True,
+            "auto_text_color": True,
+            "text_color": "#5b6b82",
+        },
+    }.get(section, {})
+    for key, value in defaults.items():
+        cfg.setdefault(key, value)
+    if section == "curve":
+        for key in ("colors", "visible"):
+            if not isinstance(cfg.get(key), dict):
+                cfg[key] = {}
+    return cfg
+
+
+def _unmix_curve_colors(ctx, page, rows) -> dict:
+    """One stable line colour per signature ({signature id: #rrggbb})."""
+    import zlib
+
+    cfg = ctx._unmix_matrix_cfg(page, "curve")
+    saved = cfg.setdefault("colors", {})
+    palette = UNMIX_CURVE_COLORS
+    used = set()
+    out = {}
+    for row in rows:
+        sid = str(row.get("id") or row.get("name") or "")
+        color = saved.get(sid)
+        if not (isinstance(color, str) and color):
+            # Deterministic default: reordering or renaming keeps it, and
+            # unsaved sessions show the same colours.
+            base = zlib.crc32(sid.encode("utf-8"))
+            for step in range(len(palette)):
+                candidate = palette[(base + step) % len(palette)]
+                if candidate not in used:
+                    color = candidate
+                    break
+            else:
+                color = palette[base % len(palette)]
+        out[sid] = color
+        used.add(color)
+    return out
+
+
+def _unmix_similarity_values(ctx, page):
+    """(names, matrix) of pairwise cosine similarity between signatures.
+
+    Channels missing on either side are ignored (spectra are required to
+    share their channels, so this only guards against incomplete rows).
+    """
+    import numpy as np
+
+    _columns, rows = ctx._unmix_matrix_table_values(page)
+    names = [str(row.get("name", "")) for row, _values in rows]
+    vectors = [
+        np.asarray(values, dtype="float64") for _row, values in rows
+    ]
+    count = len(vectors)
+    matrix = np.full((count, count), np.nan, dtype="float64")
+    for i in range(count):
+        for j in range(i, count):
+            a, b = vectors[i], vectors[j]
+            ok = np.isfinite(a) & np.isfinite(b)
+            value = np.nan
+            if ok.any():
+                va, vb = a[ok], b[ok]
+                denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+                if denom > 0:
+                    value = float(np.dot(va, vb) / denom)
+            matrix[i, j] = matrix[j, i] = value
+    return names, matrix
+
+
+def _unmix_copy_similarity(ctx, page) -> None:
+    """Copy the similarity matrix as tab-separated text."""
+    import numpy as np
+
+    names, matrix = ctx._unmix_similarity_values(page)
+    if len(names) < 2:
+        QMessageBox.information(
+            ctx.host, "Copy similarity", "There is no similarity matrix to copy."
+        )
+        return
+    lines = ["\t".join(["Signature"] + names)]
+    for i, name in enumerate(names):
+        cells = [name] + [
+            f"{v:.4f}" if np.isfinite(v) else "" for v in matrix[i]
+        ]
+        lines.append("\t".join(cells))
+    QApplication.clipboard().setText("\n".join(lines))
+    ctx.statusBar().showMessage("Similarity matrix copied to clipboard")
+
+
+def _unmix_copy_matrix(ctx, page) -> None:
+    """Copy the matrix as tab-separated text (pasteable into Excel)."""
+    import numpy as np
+
+    columns, rows = ctx._unmix_matrix_table_values(page)
+    if not rows or not columns:
+        QMessageBox.information(
+            ctx.host, "Copy matrix", "There is no matrix to copy."
+        )
+        return
+    lines = ["\t".join(["Signature"] + list(columns))]
+    for row, values in rows:
+        cells = [str(row.get("name", ""))]
+        cells += [
+            f"{v:.4f}" if np.isfinite(v) else "" for v in values
+        ]
+        lines.append("\t".join(cells))
+    QApplication.clipboard().setText("\n".join(lines))
+    ctx.statusBar().showMessage("Matrix copied to clipboard")
+
+
+def _unmix_signature_panel(ctx, page) -> QWidget:
+    """Positive/negative/normalize/name rows that define the matrix."""
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    lay.addWidget(QLabel("<b>Signatures</b>"))
+
+    add_btn = QPushButton("Add signature")
+    add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    add_btn.setEnabled(not page._unmix_locked)
+    add_btn.clicked.connect(lambda _=False: ctx._unmix_add_signature(page))
+    add_row = QHBoxLayout()
+    add_row.addWidget(add_btn)
+    add_row.addStretch()
+    lay.addLayout(add_row)
+
+    table = QTableWidget()
+    table.setColumnCount(4)
+    table.setHorizontalHeaderLabels(
+        ["Positive signature", "Negative signature", "Normalize", "Name"]
+    )
+    table.setStyleSheet(
+        "QTableWidget { background: #ffffff; border: none; }"
+    )
+    table.verticalHeader().setDefaultSectionSize(30)
+    table.verticalHeader().setSectionsMovable(True)
+    table.horizontalHeader().setSectionResizeMode(
+        0, QHeaderView.ResizeMode.Stretch
+    )
+    table.horizontalHeader().setSectionResizeMode(
+        1, QHeaderView.ResizeMode.Stretch
+    )
+    table.horizontalHeader().setSectionResizeMode(
+        2, QHeaderView.ResizeMode.ResizeToContents
+    )
+    table.horizontalHeader().setSectionResizeMode(
+        3, QHeaderView.ResizeMode.Stretch
+    )
+    table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    table.customContextMenuRequested.connect(
+        lambda pos: ctx._unmix_signature_menu(page, pos)
+    )
+    header = table.verticalHeader()
+    header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    header.customContextMenuRequested.connect(
+        lambda pos: ctx._unmix_signature_header_menu(page, pos)
+    )
+    header.sectionMoved.connect(
+        lambda *_: page._unmix_sig_order_timer.start()
+    )
+    page._unmix_signature_table = table
+    lay.addWidget(table, 1)
+    return panel
+
+
+def _unmix_sample_panel(ctx, page) -> QWidget:
+    """Which imported samples this matrix is applied to."""
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+
+    head = QHBoxLayout()
+    head.addWidget(QLabel("<b>Samples to be unmixed</b>"))
+    head.addStretch()
+    all_btn = QPushButton("All")
+    none_btn = QPushButton("None")
+    for btn in (all_btn, none_btn):
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedWidth(56)
+        btn.setEnabled(not page._unmix_locked)
+    all_btn.clicked.connect(lambda _=False: ctx._unmix_set_all_samples(page, True))
+    none_btn.clicked.connect(
+        lambda _=False: ctx._unmix_set_all_samples(page, False)
+    )
+    head.addWidget(all_btn)
+    head.addWidget(none_btn)
+    lay.addLayout(head)
+
+    samples_list = QListWidget()
+    samples_list.setStyleSheet(
+        "QListWidget { background: #ffffff; border: none; }"
+    )
+    samples_list.setEnabled(not page._unmix_locked)
+    samples_list.itemChanged.connect(
+        lambda _item: ctx._unmix_on_samples_changed(page)
+    )
+    page._unmix_samples_list = samples_list
+    lay.addWidget(samples_list, 1)
+    return panel
+
+
+def _unmix_image_panel(ctx, page) -> QWidget:
+    """Unmixing method, the "Unmix for image" action and its log."""
+    panel = ctx._build_panel_frame()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    lay.addWidget(QLabel("<b>Unmixing</b>"))
+
+    method_row = QHBoxLayout()
+    method_row.addWidget(QLabel("Unmixing method"))
+    method_combo = _NoWheelComboBox()
+    method_combo.addItem("OLS (ordinary least squares)", "ols")
+    method_index = method_combo.findData(
+        page._unmix_params.get("method", "ols")
+    )
+    method_combo.setCurrentIndex(method_index if method_index >= 0 else 0)
+    method_combo.setEnabled(not page._unmix_locked)
+    method_combo.currentIndexChanged.connect(
+        lambda _=0: ctx._unmix_on_method_changed(page, method_combo)
+    )
+    method_row.addWidget(method_combo, 1)
+    lay.addLayout(method_row)
+
+    run_btn = QPushButton("Unmix for image")
+    run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    run_btn.setEnabled(not page._unmix_locked)
+    run_btn.setToolTip(
+        "Precompute the unmixed channels of every selected image file "
+        "and save them as image pyramids for downstream image plots"
+    )
+    run_btn.clicked.connect(lambda _=False: ctx._unmix_start_image(page))
+    lay.addWidget(run_btn)
+    page._unmix_image_btn = run_btn
+
+    log = QPlainTextEdit()
+    log.setReadOnly(True)
+    log.setStyleSheet(
+        "background: #1e1e1e; color: #d4d4d4; "
+        "font-family: Consolas, monospace; font-size: 9pt;"
+    )
+    for line in page._unmix_params.get("image_log") or []:
+        log.appendPlainText(str(line))
+    lay.addWidget(log, 1)
+    page._unmix_image_log = log
+    return panel
+
+
+def _unmix_rebuild_signature_table(ctx, page) -> None:
+    """(Re)build the four-column signature editor from the data model."""
+    table = page._unmix_signature_table
+    spectra = page._unmix_spectra
+    rows = page._unmix_matrix
+    editable = not page._unmix_locked
+    table.setRowCount(0)
+    table.setRowCount(len(rows))
+    for i, row in enumerate(rows):
+        pos_combo = _NoWheelComboBox()
+        for spectrum in spectra:
+            pos_combo.addItem(spectrum["name"], spectrum["id"])
+        index = pos_combo.findData(row.get("positive"))
+        pos_combo.setCurrentIndex(index if index >= 0 else 0)
+        pos_combo.setEnabled(editable)
+
+        neg_combo = _NoWheelComboBox()
+        neg_combo.addItem("NA", None)
+        for spectrum in spectra:
+            neg_combo.addItem(spectrum["name"], spectrum["id"])
+        index = neg_combo.findData(row.get("negative"))
+        neg_combo.setCurrentIndex(index if index >= 0 else 0)
+        neg_combo.setEnabled(editable)
+
+        norm_box = QCheckBox()
+        norm_box.setChecked(bool(row.get("normalize", True)))
+        norm_box.setEnabled(editable)
+        norm_host = QWidget()
+        norm_lay = QHBoxLayout(norm_host)
+        norm_lay.setContentsMargins(0, 0, 0, 0)
+        norm_lay.addStretch()
+        norm_lay.addWidget(norm_box)
+        norm_lay.addStretch()
+
+        name_edit = QLineEdit(row.get("name", ""))
+        name_edit.setEnabled(editable)
+
+        pos_combo.currentIndexChanged.connect(
+            lambda _=0, r=row, c=pos_combo: ctx._unmix_on_signature_field(
+                page, r, "positive", c.currentData()
+            )
+        )
+        neg_combo.currentIndexChanged.connect(
+            lambda _=0, r=row, c=neg_combo: ctx._unmix_on_signature_field(
+                page, r, "negative", c.currentData()
+            )
+        )
+        norm_box.toggled.connect(
+            lambda checked, r=row: ctx._unmix_on_signature_field(
+                page, r, "normalize", bool(checked)
+            )
+        )
+        name_edit.editingFinished.connect(
+            lambda r=row, e=name_edit: ctx._unmix_set_signature_name(
+                page, r, e
+            )
+        )
+        # Cell widgets swallow the table's context menu, so each one gets
+        # its own "Remove signature" entry.
+        for widget in (pos_combo, neg_combo, norm_box, norm_host, name_edit):
+            widget.setContextMenuPolicy(
+                Qt.ContextMenuPolicy.CustomContextMenu
+            )
+            widget.customContextMenuRequested.connect(
+                lambda pos, w=widget, r=row: ctx._unmix_signature_widget_menu(
+                    page, r, w, pos
+                )
+            )
+
+        table.setCellWidget(i, 0, pos_combo)
+        table.setCellWidget(i, 1, neg_combo)
+        table.setCellWidget(i, 2, norm_host)
+        table.setCellWidget(i, 3, name_edit)
+    table.setVerticalHeaderLabels([r.get("name", "") for r in rows])
+    table.resizeRowsToContents()
+
+
+def _unmix_signature_reordered(ctx, page) -> None:
+    """Apply the visual row order (from dragging the header) to the model."""
+    table = page._unmix_signature_table
+    header = table.verticalHeader()
+    count = len(page._unmix_matrix)
+    order = sorted(range(count), key=lambda i: header.visualIndex(i))
+    if order == list(range(count)):
+        return
+    page._unmix_matrix[:] = [page._unmix_matrix[i] for i in order]
+    ctx._unmix_rebuild_signature_table(page)
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page, data=False)
+
+
+def _unmix_signature_menu(ctx, page, pos) -> None:
+    table = page._unmix_signature_table
+    index = table.rowAt(pos.y())
+    if index < 0 or index >= len(page._unmix_matrix):
+        return
+    menu = QMenu(table)
+    act = QAction("Remove signature", menu)
+    act.setEnabled(not page._unmix_locked)
+    act.triggered.connect(
+        lambda _=False: ctx._unmix_remove_signature(page, index)
+    )
+    menu.addAction(act)
+    menu.exec(table.viewport().mapToGlobal(pos))
+
+
+def _unmix_signature_header_menu(ctx, page, pos) -> None:
+    """Right-click on a row header: remove that signature."""
+    header = page._unmix_signature_table.verticalHeader()
+    index = header.logicalIndexAt(pos)
+    if index < 0 or index >= len(page._unmix_matrix):
+        return
+    menu = QMenu(header)
+    act = QAction("Remove signature", menu)
+    act.setEnabled(not page._unmix_locked)
+    act.triggered.connect(
+        lambda _=False: ctx._unmix_remove_signature(page, index)
+    )
+    menu.addAction(act)
+    menu.exec(header.mapToGlobal(pos))
+
+
+def _unmix_signature_widget_menu(ctx, page, row, widget, pos) -> None:
+    """Right-click inside a signature row's cell widgets."""
+    index = next(
+        (
+            i
+            for i, other in enumerate(page._unmix_matrix)
+            if other is row
+        ),
+        -1,
+    )
+    if index < 0:
+        return
+    if isinstance(widget, QLineEdit):
+        menu = widget.createStandardContextMenu()
+        menu.addSeparator()
+    else:
+        menu = QMenu(widget)
+    act = QAction("Remove signature", menu)
+    act.setEnabled(not page._unmix_locked)
+    act.triggered.connect(
+        lambda _=False: ctx._unmix_remove_signature(page, index)
+    )
+    menu.addAction(act)
+    menu.exec(widget.mapToGlobal(pos))
+    menu.deleteLater()
+
+
+def _unmix_add_signature(ctx, page) -> None:
+    if not page._unmix_spectra:
+        QMessageBox.information(
+            ctx.host,
+            "Add signature",
+            "Create a spectrum first on the Spectrum Extraction tab.",
+        )
+        return
+    spectrum = page._unmix_spectra[0]
+    row = {
+        "id": uuid4().hex[:8],
+        "positive": spectrum["id"],
+        "negative": None,
+        "normalize": True,
+        "name": ctx._unmix_unique_signature_name(page, spectrum["name"]),
+    }
+    page._unmix_matrix.append(row)
+    ctx._unmix_rebuild_signature_table(page)
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_remove_signature(ctx, page, index: int) -> None:
+    if 0 <= index < len(page._unmix_matrix):
+        del page._unmix_matrix[index]
+        ctx._unmix_rebuild_signature_table(page)
+        ctx._unmix_refresh_matrix_views(page)
+        ctx._unmix_mark_dirty(page)
+
+
+def _unmix_unique_signature_name(ctx, page, base: str) -> str:
+    """A name that avoids other signatures and every data parameter name."""
+    taken = {r.get("name") for r in page._unmix_matrix}
+    taken |= set(ctx._unmix_spectrum_parameters(page))
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base} {n}" in taken:
+        n += 1
+    return f"{base} {n}"
+
+
+def _unmix_on_signature_field(ctx, page, row, key: str, value) -> None:
+    if row.get(key) == value:
+        return
+    row[key] = value
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_set_signature_name(ctx, page, row, edit) -> None:
+    name = edit.text().strip()
+    current = row.get("name", "")
+    if name == current:
+        return
+    if not name:
+        QMessageBox.information(
+            ctx.host, "Signature name", "The name cannot be empty."
+        )
+        edit.setText(current)
+        return
+    if any(
+        other is not row and other.get("name") == name
+        for other in page._unmix_matrix
+    ):
+        QMessageBox.information(
+            ctx.host,
+            "Signature name",
+            "Another signature already uses this name.",
+        )
+        edit.setText(current)
+        return
+    if name in set(ctx._unmix_spectrum_parameters(page)):
+        QMessageBox.information(
+            ctx.host,
+            "Signature name",
+            "The name cannot match a parameter name of the sample data.",
+        )
+        edit.setText(current)
+        return
+    row["name"] = name
+    try:
+        index = page._unmix_matrix.index(row)
+        page._unmix_signature_table.setVerticalHeaderItem(
+            index, QTableWidgetItem(name)
+        )
+    except ValueError:
+        pass
+    ctx._unmix_refresh_matrix_views(page)
+    ctx._unmix_mark_dirty(page, data=False)
+
+
+def _unmix_rebuild_sample_list(ctx, page) -> None:
+    samples_list = page._unmix_samples_list
+    selected = set(page._unmix_params.get("samples") or [])
+    samples_list.blockSignals(True)
+    samples_list.clear()
+    for rec in ctx._available_files(page._unmix_task_id):
+        path = rec.get("parquet")
+        item = QListWidgetItem(rec.get("name", ""))
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(
+            Qt.CheckState.Checked
+            if path in selected
+            else Qt.CheckState.Unchecked
+        )
+        samples_list.addItem(item)
+    samples_list.blockSignals(False)
+
+
+def _unmix_on_samples_changed(ctx, page) -> None:
+    samples_list = page._unmix_samples_list
+    page._unmix_params["samples"] = [
+        samples_list.item(i).data(Qt.ItemDataRole.UserRole)
+        for i in range(samples_list.count())
+        if samples_list.item(i).checkState() == Qt.CheckState.Checked
+    ]
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_set_all_samples(ctx, page, checked: bool) -> None:
+    samples_list = page._unmix_samples_list
+    samples_list.blockSignals(True)
+    state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+    for i in range(samples_list.count()):
+        samples_list.item(i).setCheckState(state)
+    samples_list.blockSignals(False)
+    ctx._unmix_on_samples_changed(page)
+
+
+def _unmix_on_method_changed(ctx, page, combo) -> None:
+    page._unmix_params["method"] = combo.currentData()
+    ctx._unmix_mark_dirty(page)
+
+
+def _unmix_matrix_table_values(ctx, page):
+    """Return (columns, [(row, values)]) for the signature matrix."""
+    import numpy as np
+
+    columns = ctx._unmix_selected_parameters(page)
+    by_id = {s["id"]: s for s in page._unmix_spectra}
+    result = []
+    for row in page._unmix_matrix:
+        positive = by_id.get(row.get("positive"))
+        negative = by_id.get(row.get("negative"))
+        if positive is None:
+            result.append((row, [float("nan")] * len(columns)))
+            continue
+        pos_values, _err = ctx._unmix_spectrum_vector(page, positive)
+        if pos_values is None:
+            result.append((row, [float("nan")] * len(columns)))
+            continue
+        neg_values = {}
+        if negative is not None:
+            neg_values = ctx._unmix_spectrum_vector(page, negative)[0] or {}
+        values = []
+        for column in columns:
+            p = pos_values.get(column, float("nan"))
+            n = neg_values.get(column, 0.0) if negative is not None else 0.0
+            values.append(p - n if np.isfinite(p) else float("nan"))
+        if row.get("normalize", True):
+            finite = [v for v in values if np.isfinite(v)]
+            peak = max(finite) if finite else None
+            if peak is not None and peak > 0:
+                values = [
+                    (v / peak) if np.isfinite(v) else v for v in values
+                ]
+        result.append((row, values))
+    return columns, result
+
+
+def _unmix_paint_matrix_image(ctx, page, row_names, columns, values_rows, cfg, lo, hi, decimals):
+    """Paint a labelled cell grid: row names left, channel names rotated below."""
+    import numpy as np
+
+    label = getattr(page, "_unmix_matrix_label", None)
+    base_font = label.font() if label is not None else QFont()
+    cell_w = max(12, int(cfg["cell_width"]))
+    cell_h = max(12, int(cfg["cell_height"]))
+    font = QFont(base_font)
+    font.setPixelSize(max(9, min(13, cell_h // 2 + 2)))
+    metrics = QFontMetrics(font)
+
+    left = max((metrics.horizontalAdvance(n) for n in row_names), default=0)
+    bottom = max((metrics.horizontalAdvance(c) for c in columns), default=0)
+    left += 12
+    bottom += 12
+    top = 8
+    right = 8
+    width = left + cell_w * len(columns) + right
+    height = top + cell_h * len(values_rows) + bottom
+
+    image = QImage(width, height, QImage.Format.Format_ARGB32)
+    image.fill(QColor("#ffffff"))
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    painter.setFont(font)
+
+    lut = _figure_colormap(cfg["colormap"]).getLookupTable(0.0, 1.0, 256)
+    show_numbers = bool(cfg["show_numbers"])
+    auto_color = bool(cfg["auto_text_color"])
+    fixed_text = QColor(cfg["text_color"])
+    grid_pen = QPen(QColor(255, 255, 255, 140))
+    grid_pen.setWidth(1)
+
+    for i, values in enumerate(values_rows):
+        y = top + i * cell_h
+        for j, value in enumerate(values):
+            x = left + j * cell_w
+            if np.isfinite(value):
+                frac = 0.5 if hi <= lo else (value - lo) / (hi - lo)
+                frac = min(1.0, max(0.0, frac))
+                r, g, b = (int(c) for c in lut[int(frac * 255)])
+                painter.fillRect(x, y, cell_w, cell_h, QColor(r, g, b))
+                luma = 0.299 * r + 0.587 * g + 0.114 * b
+                text_color = (
+                    QColor("#ffffff") if luma < 140 else QColor("#111111")
+                ) if auto_color else fixed_text
+            else:
+                painter.fillRect(x, y, cell_w, cell_h, QColor("#f2f4f7"))
+                text_color = QColor("#9aa4b2")
+            painter.setPen(grid_pen)
+            painter.drawRect(x, y, cell_w, cell_h)
+            if show_numbers:
+                painter.setPen(text_color)
+                painter.drawText(
+                    QRect(x, y, cell_w, cell_h),
+                    Qt.AlignmentFlag.AlignCenter,
+                    f"{value:.{decimals}f}" if np.isfinite(value) else "—",
+                )
+        painter.setPen(QColor("#333333"))
+        painter.drawText(
+            QRect(0, y, left - 10, cell_h),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            row_names[i],
+        )
+
+    # Column names rotated -90°, ending just below the grid.
+    grid_bottom = top + cell_h * len(values_rows)
+    shift = (metrics.ascent() - metrics.descent()) / 2.0
+    for j, name in enumerate(columns):
+        text_width = metrics.horizontalAdvance(name)
+        cx = left + j * cell_w + cell_w / 2.0
+        painter.save()
+        painter.translate(cx + shift, grid_bottom + 6 + text_width)
+        painter.rotate(-90)
+        painter.setPen(QColor("#333333"))
+        painter.drawText(0, 0, name)
+        painter.restore()
+    painter.end()
+    return image
+
+
+def _unmix_render_matrix(ctx, page) -> None:
+    """Paint the matrix as an image with rotated column names."""
+    import numpy as np
+
+    label = page._unmix_matrix_label
+    columns, rows = ctx._unmix_matrix_table_values(page)
+    if not rows or not columns:
+        page._unmix_matrix_image = None
+        label.clear()
+        label.setText(
+            "Add a signature to build the matrix."
+            if not rows
+            else "No parameters selected."
+        )
+        return
+
+    cfg = dict(ctx._unmix_matrix_cfg(page, "matrix"))
+    zoom = float(getattr(page, "_unmix_matrix_zoom", 1.0) or 1.0)
+    cfg["cell_width"] = max(8, int(round(cfg["cell_width"] * zoom)))
+    cfg["cell_height"] = max(8, int(round(cfg["cell_height"] * zoom)))
+    finite = [v for _r, values in rows for v in values if np.isfinite(v)]
+    lo = min(finite) if finite else 0.0
+    hi = max(finite) if finite else 0.0
+    image = ctx._unmix_paint_matrix_image(
+        page,
+        [row.get("name", "") for row, _values in rows],
+        list(columns),
+        [values for _row, values in rows],
+        cfg,
+        lo,
+        hi,
+        int(page._unmix_spectrum_cfg.get("decimals", 2)),
+    )
+
+    page._unmix_matrix_image = image
+    label.setText("")
+    label.setPixmap(QPixmap.fromImage(image))
+    label.resize(image.size())
+
+
+def _unmix_render_curve(ctx, page) -> None:
+    """One normalized curve per signature, with a wrapped legend above."""
+    import numpy as np
+
+    plot = getattr(page, "_unmix_curve_plot", None)
+    if plot is None:
+        return
+    item = plot.getPlotItem()
+    plot.clear()
+    legend_lay = getattr(page, "_unmix_curve_legend_lay", None)
+    if legend_lay is not None:
+        ctx._clear_layout(legend_lay)
+
+    columns, rows = ctx._unmix_matrix_table_values(page)
+    if not rows or not columns:
+        item.setTitle(
+            "Add a signature to build the curves.",
+            color="#888888", size="10pt",
+        )
+        return
+    item.setTitle(None)
+
+    cfg = ctx._unmix_matrix_cfg(page, "curve")
+    line_width = max(1, int(cfg.get("line_width", 2)))
+    colors = ctx._unmix_curve_colors(page, [row for row, _ in rows])
+    visible = cfg.get("visible") or {}
+
+    ticks = [(float(i), str(name)) for i, name in enumerate(columns)]
+    bottom = item.getAxis("bottom")
+    bottom.setTicks([ticks])
+    # Rotated labels need as much height as the widest channel name, or
+    # they are cut off and overlap the axis title.
+    font = bottom.style.get("tickFont") or bottom.font()
+    metrics = QFontMetrics(font)
+    widest = max(
+        (metrics.horizontalAdvance(str(name)) for name in columns), default=0
+    )
+    bottom.setHeight(min(int(widest) + 26, 260))
+    xs = np.arange(len(columns), dtype="float64")
+    entries = []
+    for row, values in rows:
+        y = np.asarray(values, dtype="float64")
+        if not np.isfinite(y).any():
+            continue
+        sid = str(row.get("id") or row.get("name") or "")
+        if not visible.get(sid, True):
+            continue
+        color = colors.get(sid, UNMIX_CURVE_COLORS[0])
+        plot.plot(
+            xs, y,
+            pen=pg.mkPen(color, width=line_width),
+            connect="finite",
+        )
+        entries.append((str(row.get("name") or sid), color))
+
+    if legend_lay is not None:
+        per_row = 6
+        for index, (name, color) in enumerate(entries):
+            chip = QLabel(
+                f"<span style='color:{color}; font-size:13pt;'>■</span>"
+                f" {name}"
+            )
+            chip.setTextFormat(Qt.TextFormat.RichText)
+            legend_lay.addWidget(chip, index // per_row, index % per_row)
+
+
+def _unmix_render_similarity(ctx, page) -> None:
+    """Cosine similarity between the signatures, fixed scale −1 … 1."""
+    import numpy as np
+
+    label = getattr(page, "_unmix_similarity_label", None)
+    if label is None:
+        return
+    names, matrix = ctx._unmix_similarity_values(page)
+    if len(names) < 2:
+        page._unmix_similarity_image = None
+        label.clear()
+        label.setText(
+            "Add at least two signatures to compare them."
+            if names else "Add a signature to build the matrix."
+        )
+        return
+    cfg = dict(ctx._unmix_matrix_cfg(page, "similarity"))
+    zoom = float(getattr(page, "_unmix_matrix_zoom", 1.0) or 1.0)
+    cfg["cell_width"] = max(8, int(round(cfg["cell_width"] * zoom)))
+    cfg["cell_height"] = max(8, int(round(cfg["cell_height"] * zoom)))
+    image = ctx._unmix_paint_matrix_image(
+        page, list(names), list(names),
+        [list(row) for row in matrix],
+        cfg, -1.0, 1.0, 2,
+    )
+    page._unmix_similarity_image = image
+    label.setText("")
+    label.setPixmap(QPixmap.fromImage(image))
+    label.resize(image.size())
+
+
+def _unmix_zoom_matrix(ctx, page, factor, pos=None) -> None:
+    """Wheel zoom for the matrix / similarity heatmaps (re-rendered)."""
+    old = float(getattr(page, "_unmix_matrix_zoom", 1.0) or 1.0)
+    new = max(0.35, min(4.0, old * float(factor)))
+    if abs(new - old) < 1e-6:
+        return
+    page._unmix_matrix_zoom = new
+    key = getattr(page, "_unmix_matrix_tab", "matrix")
+    scroll = getattr(
+        page,
+        "_unmix_similarity_scroll" if key == "similarity"
+        else "_unmix_matrix_scroll",
+        None,
+    )
+    h_frac = v_frac = None
+    if scroll is not None:
+        hb = scroll.horizontalScrollBar()
+        vb = scroll.verticalScrollBar()
+        h_frac = hb.value() / max(1, hb.maximum())
+        v_frac = vb.value() / max(1, vb.maximum())
+    ctx._unmix_render_matrix(page)
+    ctx._unmix_render_similarity(page)
+    if scroll is not None:
+        def restore() -> None:
+            hb.setValue(int(round(h_frac * hb.maximum())))
+            vb.setValue(int(round(v_frac * vb.maximum())))
+        QTimer.singleShot(0, restore)
+
+
+def _unmix_refresh_matrix_views(ctx, page) -> None:
+    """Redraw the three matrix sub-pages from the current signatures."""
+    ctx._unmix_render_matrix(page)
+    ctx._unmix_render_curve(page)
+    ctx._unmix_render_similarity(page)
+
+
+def _unmix_refresh_outputs(ctx, page) -> None:
+    """Recompute everything derived from the spectra."""
+    ctx._unmix_render_spectrum_plot(page)
+    ctx._unmix_refresh_matrix_views(page)
+
+
+def _unmix_spectrum_vector(ctx, page, spectrum):
+    """Return ({parameter: statistic}, error) for one spectrum, cached."""
+    import numpy as np
+
+    cache = getattr(page, "_unmix_spectrum_cache", None)
+    if cache is None:
+        cache = {}
+        page._unmix_spectrum_cache = cache
+    cached = cache.get(spectrum["id"])
+    if cached is not None:
+        return cached, None
+    names, arrays, error = ctx._unmix_spectrum_arrays(page, spectrum)
+    if error:
+        return None, error
+    stat = page._unmix_spectrum_cfg.get("stat", "median")
+    values = {}
+    for name, arr in zip(names, arrays):
+        if arr.size == 0:
+            values[name] = float("nan")
+        elif stat == "mean":
+            values[name] = float(arr.mean())
+        else:
+            values[name] = float(np.median(arr))
+    cache[spectrum["id"]] = values
+    return values, None
+
+
+def _unmix_mark_dirty(ctx, page, data: bool=True) -> None:
+    """Mark the module modified.
+
+    `data=False` is for display-only settings (matrix/curve colours, cell
+    sizes, line width, visibility): the cached spectrum vectors stay valid,
+    so changing them does not re-read every channel of every sample file.
+    """
+    page._unmix_dirty = True
+    if data:
+        page._unmix_spectrum_cache = {}
+    ctx._unmix_update_save_btn(page)
+    ctx._module_set_state(page, MODULE_STATE_MODIFIED)
+
+
+def _unmix_save_now(ctx, page) -> None:
+    page._unmix_params["trees"] = [
+        {
+            "id": tree["id"],
+            "params": tree["store"].get("params", {}),
+            "spectrum_id": tree["spectrum_id"],
+        }
+        for tree in page._unmix_trees
+    ]
+    active = page._unmix_active_tree
+    page._unmix_params["active_tree"] = active["id"] if active else None
+    active_spectrum = page._unmix_active_spectrum
+    page._unmix_params["active_spectrum"] = (
+        active_spectrum["id"] if active_spectrum else None
+    )
+    page._unmix_task_def["params"] = page._unmix_params
+    if ctx.project is not None:
+        ctx.project.save()
+    page._unmix_snapshot = copy.deepcopy(page._unmix_params)
+    page._unmix_dirty = False
+    ctx._unmix_update_save_btn(page)
+    ctx.statusBar().showMessage("Unmix saved")
+    ctx._module_saved(page)
+
+
+def _unmix_update_save_btn(ctx, page) -> None:
+    page._unmix_save_btn.setEnabled(page._unmix_dirty and not page._unmix_locked)
+
+
+def _unmix_close(ctx, page) -> None:
+    """Close the page, prompting first if there are unsaved changes."""
+    if page._unmix_dirty:
+        reply = QMessageBox.question(
+            ctx.host,
+            "Close Unmix",
+            "There are unsaved changes.\nClose without saving? Unsaved changes will be lost.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        page._unmix_task_def["params"] = page._unmix_snapshot
+    ctx._unmix_cleanup(page)
+    ctx._close_module_page(page)
+
+
+UNMIX_CURVE_COLORS = [
+    "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
+    "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f",
+    "#aec7e8", "#ff9896", "#98df8a", "#ffbb78", "#c5b0d5",
+    "#c49c94", "#f7b6d2", "#9edae5", "#dbdb8d", "#c7c7c7",
+]
+

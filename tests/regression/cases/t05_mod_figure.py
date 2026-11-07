@@ -1,0 +1,202 @@
+"""L4: Figure — add/duplicate/delete plots, breaks and saved plot definitions."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from PySide6.QtWidgets import QDialog
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import harness  # noqa: E402
+import _e2e_helpers as e2e  # noqa: E402
+
+from smage.modules.figure.page import _FigurePermuteDialog  # noqa: E402
+
+
+def _open(case_id: str):
+    task = harness.task_def("figure", task_id="fig-1", name="Figure")
+    project = harness.new_project(case_id, rows=60, tasks=[task])
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("fig-1", "figure", "Figure")
+    harness.pump(450)
+    return window, project, window.tabs.currentWidget()
+
+
+def _close(window) -> None:
+    harness.close_window(window)
+
+
+@harness.case("mod.figure.add", "L4", "figure", tags=("fast",))
+def add_plots() -> None:
+    window, _project, page = _open("figure_add")
+    try:
+        ctx = window._ctx
+        harness.eq(page._fig_plots, [])
+        ctx._figure_add_plot(page, "scatter")
+        harness.pump(300)
+        harness.eq(len(page._fig_plots), 1)
+        harness.eq(len(page._fig_cards), 1)
+        plot = page._fig_plots[0]
+        harness.eq(plot["type"], "scatter")
+        harness.check(plot["file"] is not None)
+        harness.check(bool(plot["x"]) and bool(plot["y"]))
+        harness.eq(page._fig_selected, [0])
+
+        ctx._figure_add_plot(page, "histogram")
+        harness.pump(250)
+        harness.eq(len(page._fig_plots), 2)
+        harness.eq(page._fig_plots[1]["type"], "histogram")
+        harness.eq(page._fig_plots[1]["y"], None)
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.duplicate_delete", "L4", "figure", tags=("fast",))
+def duplicate_delete() -> None:
+    window, _project, page = _open("figure_dup")
+    try:
+        ctx = window._ctx
+        ctx._figure_add_plot(page, "scatter")
+        harness.pump(250)
+        ctx._figure_duplicate_selected(page)
+        harness.pump(250)
+        harness.eq(len(page._fig_plots), 2)
+        harness.eq(len(page._fig_cards), 2)
+        harness.eq(page._fig_plots[0]["type"], page._fig_plots[1]["type"])
+
+        page._fig_selected = [0]
+        ctx._figure_delete_selected(page)
+        harness.pump(250)
+        harness.eq(len(page._fig_plots), 1)
+        harness.eq(len(page._fig_cards), 1)
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.break_and_save", "L4", "figure", tags=("fast",))
+def break_and_save() -> None:
+    window, _project, page = _open("figure_save")
+    try:
+        ctx = window._ctx
+        ctx._figure_add_plot(page, "scatter")
+        harness.pump(250)
+        plot = page._fig_plots[0]
+        harness.check(not plot.get("break_before"))
+        ctx._figure_toggle_break(page, [0])
+        harness.check(page._fig_plots[0].get("break_before"))
+
+        ctx._figure_save_now(page)
+        task = window.project.workflow["tasks"][0]["children"][0]
+        harness.eq(len(task["params"]["plots"]), 1)
+        harness.check(task["params"]["plots"][0]["break_before"])
+
+        from smage.project import Project
+
+        saved = Project.load(window.project.path)
+        child = saved.workflow["tasks"][0]["children"][0]
+        harness.eq(len(child["params"]["plots"]), 1)
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.nxn", "L4", "figure", tags=("fast",))
+def nxn() -> None:
+    window, _project, page = _open("figure_nxn")
+    try:
+        ctx = window._ctx
+        window._pick_items_dialog = lambda *a, **k: ["x", "y", "FL1-A"]
+        ctx._figure_add_nxn(page)
+        harness.pump(600)
+        harness.eq(len(page._fig_plots), 3, "three variables give three pairs")
+        harness.eq(len(page._fig_cards), 3)
+        axes = {(plot["x"], plot["y"]) for plot in page._fig_plots}
+        harness.eq(axes, {("x", "y"), ("x", "FL1-A"), ("y", "FL1-A")})
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.permute", "L4", "figure", tags=("fast",))
+def permute() -> None:
+    window, _project, page = _open("figure_permute")
+    try:
+        ctx = window._ctx
+        ctx._figure_add_plot(page, "scatter")
+        harness.pump(250)
+
+        class FakeDialog:
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+            def dimension(self):
+                return _FigurePermuteDialog.X_AXIS
+
+            def values(self):
+                return ["FL1-A", "FL2-A"]
+
+            def new_row(self):
+                return False
+
+        window._figure_permute_dialog = lambda *a, **k: FakeDialog()
+        ctx._figure_permute(page, 0)
+        harness.pump(500)
+        harness.eq(len(page._fig_plots), 3)
+        harness.eq(
+            [plot["x"] for plot in page._fig_plots],
+            ["x", "FL1-A", "FL2-A"],
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.image_overlay", "L4", "figure", tags=("fast",))
+def image_overlay() -> None:
+    task = harness.task_def("figure", task_id="fig-img", name="Figure")
+    project, _parquet = e2e.image_project("figure_image", tasks=[task])
+    window = e2e.open_window(project)
+    try:
+        page = e2e.open_page(window, "fig-img", "figure", "Figure")
+        ctx = window._ctx
+        ctx._figure_add_plot(page, "image")
+        harness.pump(500)
+        harness.eq(page._fig_plots[0]["type"], "image")
+        harness.check(bool(page._fig_plots[0].get("layers")),
+                      "the image plot starts with one color layer")
+        harness.eq(len(page._fig_cards), 1)
+        harness.check(
+            hasattr(page._fig_cards[0]._plot_widget, "_legend_widget"),
+            "the image card has a side legend widget",
+        )
+
+        ctx._figure_add_plot(page, "overlay")
+        harness.pump(400)
+        harness.eq(page._fig_plots[1]["type"], "overlay")
+        harness.eq(page._fig_plots[1]["color_mode"], "overlay")
+        harness.eq(len(page._fig_cards), 2)
+    finally:
+        e2e.close_window(window)
+
+
+@harness.case("mod.figure.box_select", "L4", "figure", tags=("fast",))
+def box_select() -> None:
+    window, _project, page = _open("figure_box")
+    try:
+        ctx = window._ctx
+        ctx._figure_add_plot(page, "scatter")
+        harness.pump(250)
+        ctx._figure_set_selection(page, [1])
+        ctx._figure_add_plot(page, "histogram")
+        harness.pump(250)
+
+        bounds = page._fig_scene.itemsBoundingRect().adjusted(-20, -20, 20, 20)
+        ctx._figure_box_select(page, bounds, False)
+        harness.eq(sorted(page._fig_selected), [0, 1])
+
+        positions = ctx._figure_flow_positions(page._fig_cards, page._fig_plots)
+        harness.eq(len(positions), 2)
+    finally:
+        _close(window)
+
+
+if __name__ == "__main__":
+    raise SystemExit(harness.main())

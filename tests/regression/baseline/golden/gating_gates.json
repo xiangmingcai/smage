@@ -1,0 +1,14 @@
+[
+  {
+    "has_source": false,
+    "type": "range",
+    "x1": 1.0,
+    "x2": 9.0
+  },
+  {
+    "has_source": true,
+    "type": "not",
+    "x1": null,
+    "x2": null
+  }
+]

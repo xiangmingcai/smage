@@ -1,0 +1,5 @@
+# Known-flaky cases. One case id per line; anything after # is a comment.
+# A failing quarantined case is reported separately and does not fail the run.
+# Remove a line once the underlying timing/behaviour issue is fixed.
+#
+# No known issues currently.
