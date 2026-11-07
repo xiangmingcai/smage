@@ -72,5 +72,9 @@
   - [ ] 用户协议/EULA 不得附加与 GPL 冲突的限制（禁止再分发、禁止商用等）。
   - [ ] 决定是否接受外部代码贡献；若接受，先确定 CLA / DCO 策略，以保留将来双许可的可能性。
   - [ ] 发布前用 `pip-licenses` / ScanCode 审计全部依赖的许可证（重点排查 GPL-2.0-only 等与 GPL-3.0 不兼容的项，以及 Cellpose/StarDist 模型权重的独立条款），生成 `LICENSES/` 目录随安装包分发。
+- [ ] **代码签名**：给 `Smage.exe` 和安装包都签名，避免用户看到 SmartScreen“未知发布者”警告，并降低杀软误报。
+  - [ ] 首选申请 **SignPath Foundation**（面向开源项目的免费代码签名）；备选 Azure Trusted Signing 或商业 OV/EV 证书。
+  - [ ] 签名流程写进发布构建（先 `Smage.exe`，再 `Setup.exe`），并加可信时间戳。
+  - [ ] 不启用 UPX 等压缩/加壳；若仍被误报，向 Microsoft 提交样本申诉。
 - [ ] 补齐 README（功能列表、截图、安装说明）。
 - [ ] 统一错误提示与日志格式。
