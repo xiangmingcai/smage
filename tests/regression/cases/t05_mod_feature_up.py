@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
 from smage.modules.feature_up import page as feature_up_page  # noqa: E402
+from smage.modules.feature_up import page as feature_up_page
 
 
 def _open(case_id: str):
@@ -72,7 +73,7 @@ def calculate() -> None:
     window, project, page, to_path = _open("feature_up_calc")
     try:
         ctx = window._ctx
-        ctx._fup_calculate(page)
+        feature_up_page._fup_calculate(ctx, page)
         outputs = page._fup_params.get("outputs") or {}
         harness.check(to_path in outputs, f"outputs: {outputs}")
         record = outputs[to_path]
@@ -99,14 +100,14 @@ def validation() -> None:
         page._fup_params["from_files"] = []
         with harness.patch_dialogs(feature_up_page,
                                    warning=QMessageBox.StandardButton.Ok):
-            ctx._fup_calculate(page)
+            feature_up_page._fup_calculate(ctx, page)
         harness.check(not page._fup_params.get("outputs"))
 
         page._fup_params["from_files"] = list(page._fup_params["matches"].keys())
         page._fup_params["features"] = []
         with harness.patch_dialogs(feature_up_page,
                                    warning=QMessageBox.StandardButton.Ok):
-            ctx._fup_calculate(page)
+            feature_up_page._fup_calculate(ctx, page)
         harness.check(not page._fup_params.get("outputs"))
     finally:
         _close(window)

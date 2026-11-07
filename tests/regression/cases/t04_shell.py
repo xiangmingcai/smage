@@ -13,11 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
 from smage.app import project_io, workflow_tree  # noqa: E402
+from smage.modules.scale import page as _scale_page  # noqa: E402
 from smage.widgets.controls import (  # noqa: E402
     _HoverLabel,
     _NoWheelComboBox,
     _NoWheelSpinBox,
 )
+from smage.widgets import settings as _widgets_settings
 
 
 def _open(case_id: str, tasks=(), rows: int = 20):
@@ -309,7 +311,7 @@ def settings_and_extension_dialogs() -> None:
     try:
         timer = _reject_dialog("Global Settings")
         try:
-            window._open_settings()
+            _widgets_settings._open_settings(window._ctx)
         finally:
             timer.stop()
 
@@ -347,7 +349,7 @@ def close_prompt() -> None:
         window._open_module("s-1", "scale", "Scale")
         harness.pump(300)
         page = window.tabs.currentWidget()
-        window._ctx._scaling_mark_dirty(page)
+        _scale_page._scaling_mark_dirty(window._ctx, page)
         harness.check(window._has_unsaved_module_changes())
 
         with harness.patch_dialogs(

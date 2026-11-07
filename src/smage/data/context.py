@@ -32,6 +32,14 @@ class AppContext:
         object.__setattr__(self, "session", Session(host))
 
     def __getattr__(self, name):
+        # Cross-layer helpers that would otherwise form an import cycle are
+        # imported lazily; see ``smage.data.registry``.
+        from smage.data.registry import resolve
+
+        bound = resolve(self, name)
+        if bound is not None:
+            object.__setattr__(self, name, bound)
+            return bound
         return getattr(self.session, name)
 
     def __setattr__(self, name, value) -> None:

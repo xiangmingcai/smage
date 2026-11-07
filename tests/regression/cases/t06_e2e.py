@@ -17,6 +17,17 @@ import _e2e_helpers as e2e  # noqa: E402
 from smage.app import workflow_tree  # noqa: E402
 from smage.modules.feature import page as feature_page  # noqa: E402
 from smage.modules.scale import page as scale_page  # noqa: E402
+from smage.data import columns as _data_columns
+from smage.data import feature_outputs as _data_feature_outputs
+from smage.data import files as _data_files
+from smage.data import sampling as _data_sampling
+from smage.data import stores as _data_stores
+from smage.modules.export import page as _export_page
+from smage.modules.feature import page as feature_page
+from smage.modules.gate2col import page as _gate2col_page
+from smage.modules.heatmap import page as _heatmap_page
+from smage.modules.scale import page as scale_page
+from smage.modules.segmentation import page as _segmentation_page
 
 
 def _close_window(window) -> None:
@@ -68,7 +79,7 @@ def gating_gate2col_export() -> None:
         window._open_module("g2c-1", "gate2col", "Gate2Col")
         harness.pump(350)
         page = window.tabs.currentWidget()
-        ctx._g2c_calculate(page)
+        _gate2col_page._g2c_calculate(ctx, page)
         window._close_module_page(page)
         harness.pump(80)
 
@@ -77,7 +88,7 @@ def gating_gate2col_export() -> None:
         harness.pump(300)
         export_page = window.tabs.currentWidget()
         q = queue.Queue()
-        ctx._export_job_table(export_page, q, {
+        _export_page._export_job_table(ctx, export_page, q, {
             "files": [parquet],
             "columns": ["x", "in_gate"],
             "format": "csv",
@@ -132,7 +143,7 @@ def feature_export() -> None:
         window._open_module("f-1", "feature", "Feature")
         harness.pump(350)
         page = window.tabs.currentWidget()
-        ctx._feat_calculate(page)
+        feature_page._feat_calculate(ctx, page)
         record = page._feat_params["outputs"][str(parquet)]
         feature_path = str(project.path / record["path"])
         window._close_module_page(page)
@@ -143,7 +154,7 @@ def feature_export() -> None:
         harness.pump(300)
         export_page = window.tabs.currentWidget()
         q = queue.Queue()
-        ctx._export_job_table(export_page, q, {
+        _export_page._export_job_table(ctx, export_page, q, {
             "files": [feature_path],
             "columns": ["group", "n", "mean_v"],
             "format": "csv",
@@ -201,12 +212,12 @@ def lock_draft() -> None:
         page._scaling_apply_method.setCurrentIndex(
             page._scaling_apply_method.findData("log10")
         )
-        ctx._scaling_apply_batch(page)
+        scale_page._scaling_apply_batch(ctx, page)
         harness.check(page._scaling_dirty)
 
         with harness.patch_dialogs(scale_page,
                                    question=QMessageBox.StandardButton.Yes):
-            ctx._scaling_close(page)
+            scale_page._scaling_close(ctx, page)
         harness.pump(120)
 
         harness.check(not (project.path / "Module" / "s-1" / "draft").exists(),
@@ -243,9 +254,9 @@ def subset_export() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
-        available = ctx._available_files("e-1")
+        available = _data_files._available_files(ctx, "e-1")
         harness.eq([rec["parquet"] for rec in available], [parquet_a])
-        harness.eq(ctx._columns_for(parquet_a, "e-1"), ["x", "FL1-A"])
+        harness.eq(_data_columns._columns_for(ctx, parquet_a, "e-1"), ["x", "FL1-A"])
 
         out_dir = harness.RUN_DIR / "cases" / "e2e_subset" / "out"
         e2e.export_table(window, "e-1", [parquet_a], ["x", "FL1-A"], out_dir)
@@ -292,7 +303,7 @@ def subsample_heatmap() -> None:
     try:
         ctx = window._ctx
         page = e2e.open_page(window, "h-1", "heatmap", "Heatmap")
-        ctx._heatmap_calculate(page)
+        _heatmap_page._heatmap_calculate(ctx, page)
         harness.wait_for(lambda: not page._heatmap_running, timeout=30,
                          message="sampled heatmap")
         payload = json.loads(
@@ -303,11 +314,11 @@ def subsample_heatmap() -> None:
         harness.eq(payload["used_rows"][parquet], 10)
         harness.eq(payload["row_counts"][parquet], 10,
                    "upstream sampling is what the heatmap sees")
-        harness.eq(ctx._data_row_count(parquet), 100,
+        harness.eq(_data_columns._data_row_count(ctx, parquet), 100,
                    "the full file still has 100 rows")
 
         raw = pd.read_parquet(parquet)
-        index = ctx._subsample_row_index("h-1", parquet)
+        index = _data_sampling._subsample_row_index(ctx, "h-1", parquet)
         sampled = raw.iloc[index]
         selected = sampled[(sampled["FL1-A"] >= 0) & (sampled["FL1-A"] <= 1e12)]
         harness.eq(len(selected), 10, "the gate keeps every sampled row")
@@ -356,9 +367,9 @@ def rename_feature_export() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
-        harness.check("Cluster" in ctx._columns_for(str(parquet), "f-1"))
+        harness.check("Cluster" in _data_columns._columns_for(ctx, str(parquet), "f-1"))
         page = e2e.open_page(window, "f-1", "feature", "Feature")
-        ctx._feat_calculate(page)
+        feature_page._feat_calculate(ctx, page)
         record = page._feat_params["outputs"][str(parquet)]
         harness.eq(record["columns"], ["Cluster", "n", "mean_x"])
         output = project.path / record["path"]
@@ -428,11 +439,11 @@ def map_pipeline_feature() -> None:
     try:
         ctx = window._ctx
         harness.eq(
-            [kind for kind, _stage in ctx._map_stages("f-1")],
+            [kind for kind, _stage in _data_columns._map_stages(ctx, "f-1")],
             ["scale", "compensation", "illumination"],
         )
         page = e2e.open_page(window, "f-1", "feature", "Feature")
-        ctx._feat_calculate(page)
+        feature_page._feat_calculate(ctx, page)
         record = page._feat_params["outputs"][parquet]
         output = pd.read_parquet(project.path / record["path"]).sort_values("group")
 
@@ -480,18 +491,18 @@ def image_seg_feature_export() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
-        mask, error = ctx._seg_nuclear_expansion(parquet, {
+        mask, error = _segmentation_page._seg_nuclear_expansion(ctx, parquet, {
             "channel": "Channel 1", "threshold_mode": "manual",
             "threshold": 100.0, "min_area": 4, "expand": 0,
         })
         harness.eq(error, None)
-        rel = ctx._seg_write_mask("seg-1", parquet, mask)
+        rel = _segmentation_page._seg_write_mask(ctx, "seg-1", parquet, mask)
         mask_path = project.path / rel
 
         task = window._find_task_by_id("seg-1")
         params = task.setdefault("params", {})
         params["masks"] = {parquet: {"path": rel}}
-        params["applied"] = {parquet: ctx._seg_signature(str(mask_path))}
+        params["applied"] = {parquet: _segmentation_page._seg_signature(ctx, str(mask_path))}
         params["column"] = "Mask"
 
         feature_task = window._find_task_by_id("f-1")
@@ -502,7 +513,7 @@ def image_seg_feature_export() -> None:
         with harness.patch_dialogs(feature_page,
                                    warning=QMessageBox.StandardButton.Ok,
                                    information=QMessageBox.StandardButton.Ok):
-            ctx._feat_calculate(page)
+            feature_page._feat_calculate(ctx, page)
         harness.check(
             parquet in (page._feat_params.get("outputs") or {}),
             "feature validation/calculation produced no output",
@@ -547,7 +558,7 @@ def mixed_import_export() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
-        harness.eq(len(ctx._available_files("e-1")), 3)
+        harness.eq(len(_data_files._available_files(ctx, "e-1")), 3)
         out_dir = harness.RUN_DIR / "cases" / "e2e_mixed" / "out"
 
         e2e.export_table(window, "e-1", [fcs],
@@ -606,7 +617,7 @@ def project_roundtrip() -> None:
     try:
         ctx = window._ctx
         page = e2e.open_page(window, "f-1", "feature", "Feature")
-        ctx._feat_calculate(page)
+        feature_page._feat_calculate(ctx, page)
         record = page._feat_params["outputs"][parquet]
         feature_path = str(project.path / record["path"])
     finally:
@@ -618,22 +629,22 @@ def project_roundtrip() -> None:
     try:
         ctx = reopened._ctx
         harness.eq(
-            [kind for kind, _stage in ctx._map_stages("e-1")],
+            [kind for kind, _stage in _data_columns._map_stages(ctx, "e-1")],
             ["scale"],
         )
         gating_task = reopened._find_task_by_id("g-1")
-        gates = ctx._gating_gates_for(gating_task, parquet)
+        gates = _data_stores._gating_gates_for(ctx, gating_task, parquet)
         harness.eq([gate["id"] for gate in gates], ["in"])
 
-        outputs = ctx._feature_outputs("e-1")
+        outputs = _data_feature_outputs._feature_outputs(ctx, "e-1")
         harness.eq(len(outputs), 1)
         harness.eq(outputs[0]["parquet"], feature_path)
-        available = ctx._available_files("e-1")
+        available = _data_files._available_files(ctx, "e-1")
         harness.check(
             any(rec["parquet"] == feature_path for rec in available),
             "the feature output survives the reopen",
         )
-        values = ctx._column_data("e-1", feature_path, ["n"])
+        values = _data_columns._column_data(ctx, "e-1", feature_path, ["n"])
         harness.eq(len(values["n"]), 3)
     finally:
         e2e.close_window(reopened)

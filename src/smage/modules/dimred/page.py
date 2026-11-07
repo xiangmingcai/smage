@@ -38,6 +38,15 @@ import hashlib
 import json
 import queue
 import threading
+from functools import partial
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import sampling as _data_sampling
+from smage.widgets import image_raster as _widgets_image_raster
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 _DIMRED_SEED = 42
@@ -65,7 +74,7 @@ def _dimred_signature(ctx, params, parquet_path, task_id=None) -> str:
         "source": str(parquet_path),
         "stat": stat,
     }
-    sample = ctx._subsample_sig(task_id, parquet_path)
+    sample = _data_sampling._subsample_sig(ctx, task_id, parquet_path)
     if sample:
         payload["sample"] = sample
     payload = json.dumps(payload, sort_keys=True)
@@ -92,7 +101,7 @@ def _dimred_column_values(ctx, parquet_path, rec, name):
         return None
     dparquet = rec["parquet"]
     if rec.get("kind") == "image":
-        man = ctx._image_load_manifest(dparquet)
+        man = _data_image_index._image_load_manifest(ctx, dparquet)
         if man is None:
             return None
         try:
@@ -126,10 +135,10 @@ def _dimred_raster(ctx, rec, bbox, spacing):
     """Return (scalar_2d, data_rect) for a Dimension Reduction channel."""
     if not isinstance(rec, dict) or not rec.get("parquet"):
         return None, None
-    ent = ctx._ensure_image_index(rec["parquet"])
+    ent = _data_image_index._ensure_image_index(ctx, rec["parquet"])
     if ent is None or ent.get("manifest") is None:
         return None, None
-    crop, rect, _frac = ctx._image_raster(
+    crop, rect, _frac = _widgets_image_raster._image_raster(ctx,
         rec["parquet"], ent["manifest"], bbox, spacing, rec.get("channel"), None, None
     )
     return crop, rect
@@ -147,7 +156,7 @@ def _build_dimred_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -163,7 +172,7 @@ def _build_dimred_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._dimred_close(page))
+    close_btn.clicked.connect(lambda _=False: _dimred_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -193,7 +202,7 @@ def _build_dimred_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._dimred_running = False
     page._dimred_cancel = False
     page._dimred_updating = False
-    save_btn.clicked.connect(lambda _=False: ctx._dimred_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _dimred_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -203,20 +212,20 @@ def _build_dimred_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._dimred_left_panel(page))
-    splitter.addWidget(ctx._dimred_center_panel(page))
-    splitter.addWidget(ctx._dimred_right_panel(page))
+    splitter.addWidget(_dimred_left_panel(ctx, page))
+    splitter.addWidget(_dimred_center_panel(ctx, page))
+    splitter.addWidget(_dimred_right_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
     splitter.setStretchFactor(2, 1)
     splitter.setSizes([320, 320, 420])
     row.addWidget(splitter, 1)
 
-    row.addWidget(ctx._dimred_log_panel(page))
+    row.addWidget(_dimred_log_panel(ctx, page))
     layout.addWidget(content, 1)
 
-    ctx._dimred_refresh(page)
-    ctx._dimred_warm_umap()
+    _dimred_refresh(ctx, page)
+    _dimred_warm_umap(ctx)
     return page
 
 
@@ -269,7 +278,7 @@ def _dimred_warm_opentsne(ctx) -> None:
 
 
 def _dimred_log_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -310,7 +319,7 @@ def _dimred_log(ctx, page, text) -> None:
 
 
 def _dimred_left_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -338,13 +347,13 @@ def _dimred_left_panel(ctx, page) -> QWidget:
     lay.addWidget(files_count)
     page._dimred_files_count = files_count
 
-    method.currentIndexChanged.connect(lambda _=0: ctx._dimred_on_method(page))
-    files_btn.clicked.connect(lambda _=False: ctx._dimred_select_files(page))
+    method.currentIndexChanged.connect(lambda _=0: _dimred_on_method(ctx, page))
+    files_btn.clicked.connect(lambda _=False: _dimred_select_files(ctx, page))
     return panel
 
 
 def _dimred_center_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -371,12 +380,12 @@ def _dimred_center_panel(ctx, page) -> QWidget:
     lay.addWidget(vars_count)
     page._dimred_vars_count = vars_count
 
-    vars_btn.clicked.connect(lambda _=False: ctx._dimred_select_vars(page))
+    vars_btn.clicked.connect(lambda _=False: _dimred_select_vars(ctx, page))
     return panel
 
 
 def _dimred_right_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -388,14 +397,14 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     max_events.setValue(5000)
     max_events.setEnabled(not page._dimred_locked)
     lay.addWidget(max_events)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Randomly cap the points each table (flow) file contributes "
         "(0 = use everything). 5,000–10,000 per file is a good default for "
         "UMAP, fewer for t-SNE. Image files always use every pixel. Fixed "
         "seed, so the sample is reproducible."
     ))
     page._dimred_max_events = max_events
-    max_events.valueChanged.connect(lambda _=0: ctx._dimred_on_max_events(page))
+    max_events.valueChanged.connect(lambda _=0: _dimred_on_max_events(ctx, page))
 
     # UMAP parameters
     umap_host = QWidget()
@@ -410,7 +419,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     nn.setValue(15)
     umap_l.addWidget(nn, row, 1)
     row += 1
-    umap_l.addWidget(ctx._param_hint(
+    umap_l.addWidget(_widgets_panels._param_hint(ctx,
         "Neighbours each point balances. Higher = more global structure."
     ), row, 0, 1, 2)
     row += 1
@@ -422,7 +431,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     md.setValue(0.1)
     umap_l.addWidget(md, row, 1)
     row += 1
-    umap_l.addWidget(ctx._param_hint(
+    umap_l.addWidget(_widgets_panels._param_hint(ctx,
         "How tightly points may pack. Lower = denser, more separated clumps."
     ), row, 0, 1, 2)
     page._dimred_umap_host = umap_host
@@ -443,7 +452,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     perp.setValue(30.0)
     tsne_l.addWidget(perp, row, 1)
     row += 1
-    tsne_l.addWidget(ctx._param_hint(
+    tsne_l.addWidget(_widgets_panels._param_hint(ctx,
         "Roughly the number of neighbours per point; 5–50 is typical."
     ), row, 0, 1, 2)
     row += 1
@@ -453,7 +462,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     nit.setValue(1000)
     tsne_l.addWidget(nit, row, 1)
     row += 1
-    tsne_l.addWidget(ctx._param_hint(
+    tsne_l.addWidget(_widgets_panels._param_hint(ctx,
         "Optimisation steps. More = slower but more settled."
     ), row, 0, 1, 2)
     row += 1
@@ -464,7 +473,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     backend.addItem("openTSNE (experimental)", "opentsne")
     tsne_l.addWidget(backend, row, 1)
     row += 1
-    tsne_l.addWidget(ctx._param_hint(
+    tsne_l.addWidget(_widgets_panels._param_hint(ctx,
         "sklearn is the default; openTSNE is experimental and was slower "
         "on this machine."
     ), row, 0, 1, 2)
@@ -481,7 +490,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     normalize.setChecked(True)
     normalize.setEnabled(not page._dimred_locked)
     lay.addWidget(normalize)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Z-score every variable first, so no channel dominates the distance."
     ))
     page._dimred_normalize = normalize
@@ -490,7 +499,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     pca.setChecked(True)
     pca.setEnabled(not page._dimred_locked)
     lay.addWidget(pca)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Reduce to 50 dimensions with PCA before fitting, when more "
         "variables are selected. Standard practice, usually faster."
     ))
@@ -500,7 +509,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     parallel.setChecked(True)
     parallel.setEnabled(not page._dimred_locked)
     lay.addWidget(parallel)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Use every CPU core. Much faster, but the result changes on every "
         "run (the fixed seed is dropped)."
     ))
@@ -553,17 +562,17 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     name1.setEnabled(not page._dimred_locked)
     name2.setEnabled(not page._dimred_locked)
 
-    nn.valueChanged.connect(lambda _=0: ctx._dimred_on_param(page, "umap", "n_neighbors", nn.value()))
-    md.valueChanged.connect(lambda _=0: ctx._dimred_on_param(page, "umap", "min_dist", md.value()))
-    perp.valueChanged.connect(lambda _=0: ctx._dimred_on_param(page, "tsne", "perplexity", perp.value()))
-    nit.valueChanged.connect(lambda _=0: ctx._dimred_on_param(page, "tsne", "n_iter", nit.value()))
-    backend.currentIndexChanged.connect(lambda _=0: ctx._dimred_on_backend(page))
-    normalize.toggled.connect(lambda _=0: ctx._dimred_on_normalize(page))
-    pca.toggled.connect(lambda _=0: ctx._dimred_on_pca(page))
-    parallel.toggled.connect(lambda _=0: ctx._dimred_on_parallel(page))
-    name1.textEdited.connect(lambda _=0: ctx._dimred_on_names(page))
-    name2.textEdited.connect(lambda _=0: ctx._dimred_on_names(page))
-    calc_btn.clicked.connect(lambda _=False: ctx._dimred_calculate(page))
+    nn.valueChanged.connect(lambda _=0: _dimred_on_param(ctx, page, "umap", "n_neighbors", nn.value()))
+    md.valueChanged.connect(lambda _=0: _dimred_on_param(ctx, page, "umap", "min_dist", md.value()))
+    perp.valueChanged.connect(lambda _=0: _dimred_on_param(ctx, page, "tsne", "perplexity", perp.value()))
+    nit.valueChanged.connect(lambda _=0: _dimred_on_param(ctx, page, "tsne", "n_iter", nit.value()))
+    backend.currentIndexChanged.connect(lambda _=0: _dimred_on_backend(ctx, page))
+    normalize.toggled.connect(lambda _=0: _dimred_on_normalize(ctx, page))
+    pca.toggled.connect(lambda _=0: _dimred_on_pca(ctx, page))
+    parallel.toggled.connect(lambda _=0: _dimred_on_parallel(ctx, page))
+    name1.textEdited.connect(lambda _=0: _dimred_on_names(ctx, page))
+    name2.textEdited.connect(lambda _=0: _dimred_on_names(ctx, page))
+    calc_btn.clicked.connect(lambda _=False: _dimred_calculate(ctx, page))
     return panel
 
 
@@ -583,50 +592,50 @@ def _dimred_on_method(ctx, page) -> None:
     method = page._dimred_method.currentData() or "umap"
     params = page._dimred_params
     old = params.get("method", "umap")
-    old_defaults = ["umap_1", "umap_2"] if not ctx._dimred_is_tsne(old) else ["tsne_1", "tsne_2"]
-    new_defaults = ["tsne_1", "tsne_2"] if ctx._dimred_is_tsne(method) else ["umap_1", "umap_2"]
+    old_defaults = ["umap_1", "umap_2"] if not _dimred_is_tsne(ctx, old) else ["tsne_1", "tsne_2"]
+    new_defaults = ["tsne_1", "tsne_2"] if _dimred_is_tsne(ctx, method) else ["umap_1", "umap_2"]
     if params.get("names") == old_defaults:
         params["names"] = list(new_defaults)
     params["method"] = method
-    ctx._dimred_refresh(page)
-    ctx._dimred_mark_dirty(page)
+    _dimred_refresh(ctx, page)
+    _dimred_mark_dirty(ctx, page)
 
 
 def _dimred_on_param(ctx, page, group, key, value) -> None:
     if getattr(page, "_dimred_updating", False):
         return
     page._dimred_params.setdefault(group, {})[key] = value
-    ctx._dimred_mark_dirty(page)
+    _dimred_mark_dirty(ctx, page)
 
 
 def _dimred_on_normalize(ctx, page) -> None:
     if getattr(page, "_dimred_updating", False):
         return
     page._dimred_params["normalize"] = page._dimred_normalize.isChecked()
-    ctx._dimred_mark_dirty(page)
+    _dimred_mark_dirty(ctx, page)
 
 
 def _dimred_on_pca(ctx, page) -> None:
     if getattr(page, "_dimred_updating", False):
         return
     page._dimred_params["pca"] = page._dimred_pca.isChecked()
-    ctx._dimred_mark_dirty(page)
+    _dimred_mark_dirty(ctx, page)
 
 
 def _dimred_on_parallel(ctx, page) -> None:
     if getattr(page, "_dimred_updating", False):
         return
     page._dimred_params["parallel"] = page._dimred_parallel.isChecked()
-    ctx._dimred_mark_dirty(page)
-    ctx._dimred_refresh(page)
+    _dimred_mark_dirty(ctx, page)
+    _dimred_refresh(ctx, page)
 
 
 def _dimred_on_max_events(ctx, page) -> None:
     if getattr(page, "_dimred_updating", False):
         return
     page._dimred_params["max_events"] = int(page._dimred_max_events.value())
-    ctx._dimred_mark_dirty(page)
-    ctx._dimred_refresh(page)
+    _dimred_mark_dirty(ctx, page)
+    _dimred_refresh(ctx, page)
 
 
 def _dimred_on_backend(ctx, page) -> None:
@@ -634,9 +643,9 @@ def _dimred_on_backend(ctx, page) -> None:
         return
     value = page._dimred_backend.currentData() or "sklearn"
     page._dimred_params["tsne_backend"] = value
-    ctx._dimred_mark_dirty(page)
+    _dimred_mark_dirty(ctx, page)
     if value == "opentsne":
-        ctx._dimred_warm_opentsne()
+        _dimred_warm_opentsne(ctx)
 
 
 def _dimred_on_names(ctx, page) -> None:
@@ -646,41 +655,41 @@ def _dimred_on_names(ctx, page) -> None:
         page._dimred_name1.text().strip(),
         page._dimred_name2.text().strip(),
     ]
-    ctx._dimred_mark_dirty(page)
-    ctx._dimred_update_names(page)
+    _dimred_mark_dirty(ctx, page)
+    _dimred_update_names(ctx, page)
 
 
 def _dimred_common_columns(ctx, page) -> list:
     files = page._dimred_params.get("files") or []
     if not files:
         return []
-    common = set(ctx._columns_for(files[0], page._dimred_task_id))
+    common = set(_data_columns._columns_for(ctx, files[0], page._dimred_task_id))
     for p in files[1:]:
-        common &= set(ctx._columns_for(p, page._dimred_task_id))
+        common &= set(_data_columns._columns_for(ctx, p, page._dimred_task_id))
     return sorted(common)
 
 
 def _dimred_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._dimred_task_id)
+    records = _data_files._available_files(ctx, page._dimred_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     current = [
-        ctx._comp_file_name(p, page._dimred_task_id)
+        _data_naming._comp_file_name(ctx, p, page._dimred_task_id)
         for p in page._dimred_params.get("files") or []
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
         return
     page._dimred_params["files"] = [by_name[n] for n in chosen if n in by_name]
     # Variables that are no longer common are dropped.
-    common = set(ctx._dimred_common_columns(page))
+    common = set(_dimred_common_columns(ctx, page))
     page._dimred_params["columns"] = [
         c for c in page._dimred_params.get("columns") or [] if c in common
     ]
-    ctx._dimred_refresh(page)
-    ctx._dimred_mark_dirty(page)
+    _dimred_refresh(ctx, page)
+    _dimred_mark_dirty(ctx, page)
 
 
 def _dimred_select_vars(ctx, page) -> None:
@@ -690,7 +699,7 @@ def _dimred_select_vars(ctx, page) -> None:
             ctx.host, "Select variables", "Select data files first."
         )
         return
-    options = ctx._dimred_common_columns(page)
+    options = _dimred_common_columns(ctx, page)
     if not options:
         QMessageBox.information(
             ctx.host, "Select variables",
@@ -698,7 +707,7 @@ def _dimred_select_vars(ctx, page) -> None:
             "Dimension reduction needs variables shared by every file.",
         )
         return
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select variables",
         options,
         page._dimred_params.get("columns") or [],
@@ -707,20 +716,20 @@ def _dimred_select_vars(ctx, page) -> None:
     if chosen is None:
         return
     page._dimred_params["columns"] = list(chosen)
-    ctx._dimred_refresh(page)
-    ctx._dimred_mark_dirty(page)
+    _dimred_refresh(ctx, page)
+    _dimred_mark_dirty(ctx, page)
 
 
 def _dimred_existing_columns(ctx, page) -> set:
     cols = set()
     for path in page._dimred_params.get("files") or []:
-        cols |= set(ctx._columns_for(path, page._dimred_task_id))
+        cols |= set(_data_columns._columns_for(ctx, path, page._dimred_task_id))
     return cols
 
 
 def _dimred_name_conflicts(ctx, page) -> list:
     names = page._dimred_params.get("names") or ["", ""]
-    existing = ctx._dimred_existing_columns(page)
+    existing = _dimred_existing_columns(ctx, page)
     conflicts = []
     for name in names:
         if name and name in existing:
@@ -732,11 +741,11 @@ def _dimred_name_conflicts(ctx, page) -> list:
 
 
 def _dimred_update_names(ctx, page) -> None:
-    conflicts = set(ctx._dimred_name_conflicts(page))
+    conflicts = set(_dimred_name_conflicts(ctx, page))
     names = page._dimred_params.get("names") or ["", ""]
     page._dimred_warn1.setVisible(bool(names[0]) and names[0] in conflicts)
     page._dimred_warn2.setVisible(bool(names[1]) and names[1] in conflicts)
-    ctx._dimred_update_calc_btn(page)
+    _dimred_update_calc_btn(ctx, page)
 
 
 def _dimred_update_calc_btn(ctx, page) -> None:
@@ -747,7 +756,7 @@ def _dimred_update_calc_btn(ctx, page) -> None:
         and params.get("columns")
         and names[0] and names[1]
         and names[0] != names[1]
-        and not ctx._dimred_name_conflicts(page)
+        and not _dimred_name_conflicts(ctx, page)
     )
     page._dimred_calc_btn.setEnabled(ok and not page._dimred_locked)
 
@@ -763,8 +772,8 @@ def _dimred_estimate(ctx, page):
         max_events = int(params.get("max_events") or 0)
         n = 0
         for p in files:
-            vis = ctx._subsample_visible_count(page._dimred_task_id, p)
-            n += min(vis, max_events) if (max_events > 0 and ctx._ensure_image_index(p) is None) else vis
+            vis = _data_sampling._subsample_visible_count(ctx, page._dimred_task_id, p)
+            n += min(vis, max_events) if (max_events > 0 and _data_image_index._ensure_image_index(ctx, p) is None) else vis
     except Exception:  # noqa: BLE001
         return None
     if n <= 0:
@@ -789,7 +798,7 @@ def _dimred_estimate(ctx, page):
 
 
 def _dimred_estimate_text(ctx, page) -> str:
-    est = ctx._dimred_estimate(page)
+    est = _dimred_estimate(ctx, page)
     if est is None:
         return ""
     secs, n, d_eff = est
@@ -870,7 +879,7 @@ def _dimred_refresh(ctx, page) -> None:
         page._dimred_files_box.clear()
         for path in files:
             page._dimred_files_box.addItem(
-                ctx._comp_file_name(path, page._dimred_task_id)
+                _data_naming._comp_file_name(ctx, path, page._dimred_task_id)
             )
         page._dimred_files_count.setText(f"{len(files)} file(s) selected")
 
@@ -881,8 +890,8 @@ def _dimred_refresh(ctx, page) -> None:
         page._dimred_vars_count.setText(f"{len(columns)} variable(s) selected")
     finally:
         page._dimred_updating = False
-    ctx._dimred_update_names(page)
-    page._dimred_estimate.setText(ctx._dimred_estimate_text(page))
+    _dimred_update_names(ctx, page)
+    page._dimred_estimate.setText(_dimred_estimate_text(ctx, page))
 
 
 def _dimred_validate(ctx, page):
@@ -896,7 +905,7 @@ def _dimred_validate(ctx, page):
         return False, "Set both new column names."
     if names[0] == names[1]:
         return False, "The two new column names must differ."
-    if ctx._dimred_name_conflicts(page):
+    if _dimred_name_conflicts(ctx, page):
         return False, "A new column name collides with an existing column."
     return True, ""
 
@@ -968,16 +977,16 @@ def _dimred_run(ctx, page, q):
         total_before = 0
         total_after = 0
         for i, path in enumerate(files):
-            name = ctx._comp_file_name(path, page._dimred_task_id)
+            name = _data_naming._comp_file_name(ctx, path, page._dimred_task_id)
             q.put(("log", f"Reading {i + 1}/{n_files}: {name}"))
             q.put(("status", f"Reading {i + 1}/{n_files} ({25 * (i + 1) // n_files}%)"))
-            values = ctx._column_data(page._dimred_task_id, path, columns)
+            values = _data_columns._column_data(ctx, page._dimred_task_id, path, columns)
             if any(c not in values for c in columns):
                 raise ValueError(f"{name} is missing a column")
             X = np.column_stack([values[c] for c in columns]).astype("float64")
             n_vis = len(X)
             total_before += n_vis
-            up_idx = ctx._subsample_row_index(page._dimred_task_id, path)
+            up_idx = _data_sampling._subsample_row_index(ctx, page._dimred_task_id, path)
             full_rows = (
                 np.asarray(up_idx, dtype=np.int64)
                 if up_idx is not None else np.arange(n_vis, dtype=np.int64)
@@ -985,9 +994,9 @@ def _dimred_run(ctx, page, q):
             # This module's own per-file downsample (like FlowJo). Pixel-level
             # (image) files are reduced in full: downsampling would leave
             # holes that render black.
-            is_image = ctx._ensure_image_index(path) is not None
+            is_image = _data_image_index._ensure_image_index(ctx, path) is not None
             if max_events > 0 and not is_image and n_vis > max_events:
-                seed = ctx._dimred_sample_seed(page, path)
+                seed = _dimred_sample_seed(ctx, page, path)
                 keep = np.sort(
                     np.random.default_rng(seed).permutation(n_vis)[:max_events]
                 )
@@ -1008,12 +1017,12 @@ def _dimred_run(ctx, page, q):
         pca_on = bool(params.get("pca", True)) and X.shape[1] > _DIMRED_PCA_DIMS
         q.put(("log", "Normalizing (z-score)…" if params.get("normalize")
                else "Normalization skipped"))
-        X = ctx._dimred_prepare(X, bool(params.get("normalize")), pca_on)
+        X = _dimred_prepare(ctx, X, bool(params.get("normalize")), pca_on)
         if pca_on:
             q.put(("log", f"PCA: reduced to {X.shape[1]} dimensions (faster)"))
 
         method = params.get("method", "umap")
-        base = "tsne" if ctx._dimred_is_tsne(method) else "umap"
+        base = "tsne" if _dimred_is_tsne(ctx, method) else "umap"
         cfg = params.get("umap") if base == "umap" else params.get("tsne")
         detail = ", ".join(f"{k}={v}" for k, v in (cfg or {}).items())
         q.put(("log", f"Fitting {method.upper()} ({detail})…"))
@@ -1022,7 +1031,7 @@ def _dimred_run(ctx, page, q):
         writer = _FitWriter(q, base, int((cfg or {}).get("n_iter", 1000)))
         import contextlib
         with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-            embedding = ctx._dimred_fit(
+            embedding = _dimred_fit(ctx,
                 base, cfg, X, _DIMRED_SEED,
                 verbose=True, parallel=bool(params.get("parallel", False)),
                 tsne_backend=params.get("tsne_backend", "sklearn"),
@@ -1038,12 +1047,12 @@ def _dimred_run(ctx, page, q):
             if getattr(page, "_dimred_cancel", False):
                 q.put(("log", "Calculation cancelled."))
                 break
-            name = ctx._comp_file_name(path, page._dimred_task_id)
+            name = _data_naming._comp_file_name(ctx, path, page._dimred_task_id)
             coords = embedding[offset:offset + n]
             offset += n
             q.put(("status", f"Writing {i + 1}/{n_files} ({90 + 10 * (i + 1) // n_files}%)"))
             try:
-                rel, cols, kind = ctx._dimred_write_file(
+                rel, cols, kind = _dimred_write_file(ctx,
                     page, path, coords, row_indices[i]
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1054,7 +1063,7 @@ def _dimred_run(ctx, page, q):
                 "path": rel,
                 "columns": cols,
                 "kind": kind,
-                "signature": ctx._dimred_signature(
+                "signature": _dimred_signature(ctx,
                     params, path, page._dimred_task_id
                 ),
             }
@@ -1143,13 +1152,13 @@ def _dimred_write_file(ctx, page, path, coords, row_indices=None):
     params = page._dimred_params
     names = params.get("names") or ["dim_1", "dim_2"]
     stem = Path(str(path)).stem
-    rel = ctx._module_rel(page._dimred_task_id, f"{stem}_dimred.parquet")
+    rel = _data_files._module_rel(ctx, page._dimred_task_id, f"{stem}_dimred.parquet")
     out_path = ctx.project.path / rel
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ent = ctx._ensure_image_index(path)
+    ent = _data_image_index._ensure_image_index(ctx, path)
     is_image = ent is not None and ent.get("manifest") is not None
-    n_full = ctx._data_row_count(path)
+    n_full = _data_columns._data_row_count(ctx, path)
     sel = np.asarray(row_indices) if row_indices is not None else np.arange(len(coords))
     sel = sel.astype(np.int64)
 
@@ -1193,7 +1202,7 @@ def _dimred_write_file(ctx, page, path, coords, row_indices=None):
 
 
 def _dimred_calculate(ctx, page) -> None:
-    ok, message = ctx._dimred_validate(page)
+    ok, message = _dimred_validate(ctx, page)
     if not ok:
         QMessageBox.warning(ctx.host, "Calculate", message)
         return
@@ -1218,13 +1227,13 @@ def _dimred_calculate(ctx, page) -> None:
     q = queue.Queue()
     page._dimred_queue = q
     page._dimred_thread = threading.Thread(
-        target=ctx._dimred_run, args=(page, q), daemon=True
+        target=partial(_dimred_run, ctx), args=(page, q), daemon=True
     )
     page._dimred_thread.start()
 
     timer = QTimer(ctx.host)
     timer.setInterval(100)
-    timer.timeout.connect(lambda: ctx._dimred_poll(page))
+    timer.timeout.connect(lambda: _dimred_poll(ctx, page))
     timer.start()
     page._dimred_timer = timer
 
@@ -1242,13 +1251,13 @@ def _dimred_poll(ctx, page) -> None:
             break
         kind = msg[0]
         if kind == "log":
-            ctx._dimred_log(page, msg[1])
+            _dimred_log(ctx, page, msg[1])
         elif kind == "status":
             page._dimred_status.setText(msg[1])
         elif kind == "fit_time":
             params = page._dimred_params
             params["last_fit_seconds"] = float(msg[1])
-            page._dimred_estimate.setText(ctx._dimred_estimate_text(page))
+            page._dimred_estimate.setText(_dimred_estimate_text(ctx, page))
         elif kind == "fitprogress":
             pct, eta = msg[1], msg[2]
             text = f"Fitting… {pct:.0f}%"
@@ -1265,7 +1274,7 @@ def _dimred_poll(ctx, page) -> None:
                 ctx.project.save()
             page._dimred_snapshot = copy.deepcopy(params)
             page._dimred_dirty = False
-            ctx._dimred_update_save_btn(page)
+            _dimred_update_save_btn(ctx, page)
             page._dimred_done = done
             page._dimred_failed = failed
             finished = True
@@ -1279,9 +1288,9 @@ def _dimred_poll(ctx, page) -> None:
     if timer is not None:
         timer.stop()
         page._dimred_timer = None
-    ctx._dimred_update_calc_btn(page)
+    _dimred_update_calc_btn(ctx, page)
     if error:
-        ctx._dimred_log(page, f"✗ {error}")
+        _dimred_log(ctx, page, f"✗ {error}")
         QMessageBox.warning(ctx.host, "Calculate", error)
         page._dimred_status.setText("Failed")
     else:
@@ -1289,14 +1298,14 @@ def _dimred_poll(ctx, page) -> None:
         if getattr(page, "_dimred_failed", 0):
             summary += f" {page._dimred_failed} failed — see the log."
         page._dimred_status.setText(summary)
-        ctx._dimred_log(page, summary)
+        _dimred_log(ctx, page, summary)
         ctx.statusBar().showMessage(summary)
         ctx._module_saved(page)
 
 
 def _dimred_mark_dirty(ctx, page) -> None:
     page._dimred_dirty = True
-    ctx._dimred_update_save_btn(page)
+    _dimred_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -1313,8 +1322,8 @@ def _dimred_save_now(ctx, page) -> None:
         ctx.project.save()
     page._dimred_snapshot = copy.deepcopy(params)
     page._dimred_dirty = False
-    ctx._dimred_update_save_btn(page)
-    ctx._dimred_log(page, "Settings saved")
+    _dimred_update_save_btn(ctx, page)
+    _dimred_log(ctx, page, "Settings saved")
     ctx.statusBar().showMessage("Dimension Reduction settings saved")
     ctx._module_saved(page)
 
@@ -1332,7 +1341,7 @@ def _dimred_close(ctx, page) -> None:
         # The fit itself cannot be interrupted; signal it to stop at the
         # next file and stay open until the worker finishes.
         page._dimred_cancel = True
-        ctx._dimred_log(page, "Stopping after the current file…")
+        _dimred_log(ctx, page, "Stopping after the current file…")
         return
     if getattr(page, "_dimred_dirty", False):
         reply = QMessageBox.question(

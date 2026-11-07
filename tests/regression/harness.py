@@ -379,17 +379,19 @@ def new_project(case_id: str, name: str = "case", rows: int = 500,
 
 def open_project(window, project):
     """Attach *project* to *window* the same way the File > Open path does."""
+    from smage.data import stores as _data_stores
+    from smage.modules.import_ import page as _import_page
     from smage.project import Project
     from smage.runlog import runlog
 
     runlog.stop("test switch")
-    window._discard_draft_folders()
+    _data_stores._discard_draft_folders(window._ctx)
     window.project = Project.load(project.path)
     runlog.start(window.project.path, window._log_environment())
     window.setWindowTitle(f"Smage — {window.project.name}")
     window._column_index = window.project.load_columns()
     window._reset_module_tabs()
-    window._load_import_files()
+    _import_page._load_import_files(window._ctx)
     window._refresh_workflow_tree()
     pump(120)
     return window.project

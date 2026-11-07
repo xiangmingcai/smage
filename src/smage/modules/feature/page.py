@@ -47,6 +47,15 @@ import json
 import math
 import queue
 import threading
+from functools import partial
+from smage.data import columns as _data_columns
+from smage.data import feature_outputs as _data_feature_outputs
+from smage.data import files as _data_files
+from smage.data import naming as _data_naming
+from smage.data import outputs as _data_outputs
+from smage.data import sampling as _data_sampling
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 _FEAT_IGNORE_CACHE_NAME = "feature_values.json"
@@ -68,7 +77,7 @@ def _build_feature_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -84,7 +93,7 @@ def _build_feature_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._feat_close(page))
+    close_btn.clicked.connect(lambda _=False: _feat_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -116,7 +125,7 @@ def _build_feature_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     page._feat_log_lines = list(params.get("log") or [])
     page._feat_running = False
     page._feat_cancel = False
-    save_btn.clicked.connect(lambda _=False: ctx._feat_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _feat_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -126,24 +135,24 @@ def _build_feature_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._feat_files_panel(page))
-    splitter.addWidget(ctx._feat_rules_panel(page))
+    splitter.addWidget(_feat_files_panel(ctx, page))
+    splitter.addWidget(_feat_rules_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 3)
     splitter.setSizes([320, 880])
     row.addWidget(splitter, 1)
 
-    row.addWidget(ctx._feat_log_panel(page))
+    row.addWidget(_feat_log_panel(ctx, page))
     layout.addWidget(content, 1)
 
-    ctx._feat_refresh_files(page)
-    ctx._feat_update_save_btn(page)
+    _feat_refresh_files(ctx, page)
+    _feat_update_save_btn(ctx, page)
     return page
 
 
 def _feat_log_panel(ctx, page) -> QWidget:
     """Timestamped log area shared by the whole module."""
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -189,15 +198,15 @@ def _feat_log(ctx, page, text) -> None:
 def _feat_all_columns(ctx, page) -> list:
     """Every column visible at this module (union across available files)."""
     columns = []
-    for rec in ctx._available_files(page._feat_task_id):
-        for name in ctx._columns_for(rec.get("parquet"), page._feat_task_id):
+    for rec in _data_files._available_files(ctx, page._feat_task_id):
+        for name in _data_columns._columns_for(ctx, rec.get("parquet"), page._feat_task_id):
             if name not in columns:
                 columns.append(name)
     return columns
 
 
 def _feat_file_columns(ctx, page, parquet_path) -> list:
-    return ctx._columns_for(parquet_path, page._feat_task_id)
+    return _data_columns._columns_for(ctx, parquet_path, page._feat_task_id)
 
 
 def _feat_common_columns(ctx, page) -> list:
@@ -205,15 +214,15 @@ def _feat_common_columns(ctx, page) -> list:
     files = list(page._feat_params.get("files") or [])
     if not files:
         return []
-    common = set(ctx._feat_file_columns(page, files[0]))
+    common = set(_feat_file_columns(ctx, page, files[0]))
     for path in files[1:]:
-        common &= set(ctx._feat_file_columns(page, path))
+        common &= set(_feat_file_columns(ctx, page, path))
     return sorted(common)
 
 
 def _feat_files_panel(ctx, page) -> QWidget:
     """Left panel: feature variable, file picker and per-file status."""
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -221,7 +230,7 @@ def _feat_files_panel(ctx, page) -> QWidget:
 
     combo = _NoWheelComboBox()
     combo.addItem("", None)
-    for name in ctx._feat_all_columns(page):
+    for name in _feat_all_columns(ctx, page):
         combo.addItem(name, name)
     idx = combo.findData(page._feat_params.get("feature"))
     if idx >= 0:
@@ -243,8 +252,8 @@ def _feat_files_panel(ctx, page) -> QWidget:
     page._feat_ignore_results = None
     page._feat_ignore_thread = None
     page._feat_ignore_timer = None
-    page._feat_ignore_cache = ctx._feat_ignore_cache_load(page)
-    lay.addWidget(ctx._feat_ignore_section(page))
+    page._feat_ignore_cache = _feat_ignore_cache_load(ctx, page)
+    lay.addWidget(_feat_ignore_section(ctx, page))
 
     lay.addWidget(QLabel("Data files"))
     select_btn = QPushButton("Select files…")
@@ -273,14 +282,14 @@ def _feat_files_panel(ctx, page) -> QWidget:
         if feature:
             files = [
                 p for p in page._feat_params.get("files") or []
-                if feature in ctx._feat_file_columns(page, p)
+                if feature in _feat_file_columns(ctx, page, p)
             ]
             page._feat_params["files"] = files
-        ctx._feat_refresh_files(page)
-        ctx._feat_mark_dirty(page)
+        _feat_refresh_files(ctx, page)
+        _feat_mark_dirty(ctx, page)
 
     combo.currentIndexChanged.connect(on_column_changed)
-    select_btn.clicked.connect(lambda _=False: ctx._feat_select_files(page))
+    select_btn.clicked.connect(lambda _=False: _feat_select_files(ctx, page))
     return panel
 
 
@@ -327,7 +336,7 @@ def _feat_ignore_section(ctx, page) -> QWidget:
     table.setFixedHeight(30 + 5 * 24)
     table.setEnabled(not page._feat_locked)
     table.itemChanged.connect(
-        lambda item: ctx._feat_ignore_toggled(page, item)
+        lambda item: _feat_ignore_toggled(ctx, page, item)
     )
     lay.addWidget(table)
 
@@ -372,7 +381,7 @@ def _feat_ignore_cache_path(ctx, page):
 
 def _feat_ignore_cache_load(ctx, page) -> dict:
     """Per-file value counts saved with the module (key -> [[v, n]])."""
-    path = ctx._feat_ignore_cache_path(page)
+    path = _feat_ignore_cache_path(ctx, page)
     if path is None or not path.is_file():
         return {}
     try:
@@ -397,7 +406,7 @@ def _feat_ignore_cache_load(ctx, page) -> dict:
 
 
 def _feat_ignore_cache_save(ctx, page) -> None:
-    path = ctx._feat_ignore_cache_path(page)
+    path = _feat_ignore_cache_path(ctx, page)
     if path is None:
         return
     cache = page._feat_ignore_cache
@@ -437,17 +446,17 @@ def _feat_feature_source_sig(ctx, task_id, path, feature) -> str:
     """Change signature of columns the feature value may come from."""
     parts = []
     try:
-        mask_path = ctx._seg_applied_columns(task_id, path).get(feature)
+        mask_path = _data_outputs._seg_applied_columns(ctx, task_id, path).get(feature)
     except Exception:  # noqa: BLE001
         mask_path = None
     if mask_path:
-        parts.append(["seg", ctx._feat_file_stat(mask_path)])
+        parts.append(["seg", _feat_file_stat(ctx, mask_path)])
     for kind, getter in (
-        ("gate2col", ctx._gate2col_applied_columns),
-        ("feature_up", ctx._feature_up_applied_columns),
-        ("dimred", ctx._dimred_applied_columns),
-        ("cluster", ctx._cluster_applied_columns),
-        ("dc", ctx._dc_applied_columns),
+        ("gate2col", partial(_data_feature_outputs._gate2col_applied_columns, ctx)),
+        ("feature_up", partial(_data_feature_outputs._feature_up_applied_columns, ctx)),
+        ("dimred", partial(_data_outputs._dimred_applied_columns, ctx)),
+        ("cluster", partial(_data_outputs._cluster_applied_columns, ctx)),
+        ("dc", partial(_data_outputs._dc_applied_columns, ctx)),
     ):
         try:
             rec = getter(task_id, path).get(feature)
@@ -457,7 +466,7 @@ def _feat_feature_source_sig(ctx, task_id, path, feature) -> str:
             continue
         rec_path = rec.get("parquet") or rec.get("path") or ""
         parts.append([
-            kind, str(rec_path), ctx._feat_file_stat(rec_path),
+            kind, str(rec_path), _feat_file_stat(ctx, rec_path),
             str(rec.get("signature") or ""),
         ])
     return hashlib.sha1(
@@ -468,14 +477,14 @@ def _feat_feature_source_sig(ctx, task_id, path, feature) -> str:
 def _feat_ignore_cache_key(ctx, page, feature, path) -> str:
     """Identifies one file's worth of counts (invalidated when inputs change)."""
     try:
-        stages = _json_stable(ctx._map_stages(page._feat_task_id))
+        stages = _json_stable(_data_columns._map_stages(ctx, page._feat_task_id))
     except Exception:  # noqa: BLE001
         stages = ""
     payload = [
-        str(path), ctx._feat_file_stat(path), str(feature),
+        str(path), _feat_file_stat(ctx, path), str(feature),
         hashlib.sha1(stages.encode("utf-8")).hexdigest(),
-        ctx._subsample_sig(page._feat_task_id, path) or "",
-        ctx._feat_feature_source_sig(
+        _data_sampling._subsample_sig(ctx, page._feat_task_id, path) or "",
+        _feat_feature_source_sig(ctx,
             page._feat_task_id, path, feature
         ),
     ]
@@ -488,7 +497,7 @@ def _feat_ignore_file_counts(ctx, page, feature, path) -> list:
     """[[value, count]] of the feature variable in one file."""
     import numpy as np
 
-    values = ctx._column_data(page._feat_task_id, path, [feature])
+    values = _data_columns._column_data(ctx, page._feat_task_id, path, [feature])
     array = values.get(feature)
     if array is None:
         return []
@@ -517,7 +526,7 @@ def _feat_ignore_combine(ctx, page, only_cached: bool=False):
     totals = {}
     found = False
     for path in files:
-        key = ctx._feat_ignore_cache_key(page, feature, path)
+        key = _feat_ignore_cache_key(ctx, page, feature, path)
         counts = page._feat_ignore_cache.get(key)
         if counts is None:
             if only_cached:
@@ -538,7 +547,7 @@ def _feat_ignore_apply(ctx, page, counts) -> None:
     # stays implicit until the user toggles a box or calculates, so simply
     # opening and saving the module does not invalidate saved outputs.
     page._feat_ignore_default = float(counts[0][0]) if counts else None
-    ctx._feat_ignore_fill(page, counts)
+    _feat_ignore_fill(ctx, page, counts)
 
 
 def _feat_ignore_start_worker(ctx, page) -> None:
@@ -547,7 +556,7 @@ def _feat_ignore_start_worker(ctx, page) -> None:
     page._feat_ignore_requests = queue.Queue()
     page._feat_ignore_results = queue.Queue()
     page._feat_ignore_thread = threading.Thread(
-        target=ctx._feat_ignore_worker, args=(page,), daemon=True
+        target=partial(_feat_ignore_worker, ctx), args=(page,), daemon=True
     )
     page._feat_ignore_thread.start()
 
@@ -557,7 +566,7 @@ def _feat_ignore_start_timer(ctx, page) -> None:
         return
     timer = QTimer(ctx.host)
     timer.setInterval(100)
-    timer.timeout.connect(lambda: ctx._feat_ignore_poll(page))
+    timer.timeout.connect(lambda: _feat_ignore_poll(ctx, page))
     timer.start()
     page._feat_ignore_timer = timer
 
@@ -578,7 +587,7 @@ def _feat_ignore_worker(ctx, page) -> None:
             if int(getattr(page, "_feat_ignore_token", 0)) != token:
                 break
             try:
-                counts = ctx._feat_ignore_file_counts(page, feature, path)
+                counts = _feat_ignore_file_counts(ctx, page, feature, path)
             except Exception:  # noqa: BLE001
                 counts = []
             results = getattr(page, "_feat_ignore_results", None)
@@ -621,15 +630,15 @@ def _feat_ignore_poll(ctx, page) -> None:
                 continue
             page._feat_ignore_pending = set()
             page._feat_ignore_active = None
-            combined = ctx._feat_ignore_combine(page)
+            combined = _feat_ignore_combine(ctx, page)
             if combined is not None:
-                ctx._feat_ignore_apply(page, combined)
+                _feat_ignore_apply(ctx, page, combined)
             timer = getattr(page, "_feat_ignore_timer", None)
             if timer is not None:
                 timer.stop()
                 page._feat_ignore_timer = None
     if cache_changed:
-        ctx._feat_ignore_cache_save(page)
+        _feat_ignore_cache_save(ctx, page)
 
 
 def _feat_ignore_cleanup(ctx, page) -> None:
@@ -670,14 +679,14 @@ def _feat_ignore_refresh(ctx, page) -> None:
         page._feat_ignore_batch_total = 0
         page._feat_ignore_counts = None
         page._feat_ignore_default = None
-        ctx._feat_ignore_fill(page, [])
+        _feat_ignore_fill(ctx, page, [])
         if status is not None:
             status.setText("Select a feature variable and files")
         return
-    ctx._feat_ignore_start_worker(page)
+    _feat_ignore_start_worker(ctx, page)
     pending = []
     for path in files:
-        key = ctx._feat_ignore_cache_key(page, feature, path)
+        key = _feat_ignore_cache_key(ctx, page, feature, path)
         if key not in page._feat_ignore_cache:
             pending.append((path, key))
     if not pending:
@@ -687,9 +696,9 @@ def _feat_ignore_refresh(ctx, page) -> None:
         page._feat_ignore_active = None
         page._feat_ignore_pending = set()
         page._feat_ignore_batch_total = 0
-        combined = ctx._feat_ignore_combine(page)
+        combined = _feat_ignore_combine(ctx, page)
         if combined is not None:
-            ctx._feat_ignore_apply(page, combined)
+            _feat_ignore_apply(ctx, page, combined)
         if status is not None:
             status.setText("Most frequent values")
         return
@@ -704,11 +713,11 @@ def _feat_ignore_refresh(ctx, page) -> None:
     page._feat_ignore_pending = {key for _path, key in pending}
     page._feat_ignore_batch_total = len(pending)
     # Show what is already cached; the rest arrives from the worker.
-    cached = ctx._feat_ignore_combine(page, only_cached=True)
-    ctx._feat_ignore_fill(page, cached or [])
+    cached = _feat_ignore_combine(ctx, page, only_cached=True)
+    _feat_ignore_fill(ctx, page, cached or [])
     if status is not None:
         status.setText(f"Counting values… 0/{len(pending)}")
-    ctx._feat_ignore_start_timer(page)
+    _feat_ignore_start_timer(ctx, page)
     page._feat_ignore_requests.put(
         (page._feat_ignore_token, feature, pending)
     )
@@ -743,7 +752,7 @@ def _feat_ignore_fill(ctx, page, counts) -> None:
         table.blockSignals(True)
         table.setRowCount(len(rows))
         for row, (value, count) in enumerate(rows):
-            vitem = QTableWidgetItem(ctx._feat_value_text(value))
+            vitem = QTableWidgetItem(_feat_value_text(ctx, value))
             vitem.setData(Qt.ItemDataRole.UserRole, float(value))
             vitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
             vitem.setTextAlignment(
@@ -791,12 +800,12 @@ def _feat_ignore_toggled(ctx, page, item) -> None:
         if cell.checkState() == Qt.CheckState.Checked:
             value = name.data(Qt.ItemDataRole.UserRole)
             if value is not None:
-                values.append(ctx._feat_value_json(value))
+                values.append(_feat_value_json(ctx, value))
     values = sorted(set(values))
     params = page._feat_params
     if params.get("ignore_values") != values:
         params["ignore_values"] = values
-        ctx._feat_mark_dirty(page)
+        _feat_mark_dirty(ctx, page)
 
 
 def _feat_ignore_prepare(ctx, page) -> None:
@@ -810,24 +819,24 @@ def _feat_ignore_prepare(ctx, page) -> None:
         return
     changed = False
     for path in files:
-        key = ctx._feat_ignore_cache_key(page, feature, path)
+        key = _feat_ignore_cache_key(ctx, page, feature, path)
         if key in page._feat_ignore_cache:
             continue
         try:
-            counts = ctx._feat_ignore_file_counts(page, feature, path)
+            counts = _feat_ignore_file_counts(ctx, page, feature, path)
         except Exception:  # noqa: BLE001
             counts = []
         page._feat_ignore_cache[key] = counts
         changed = True
     if changed:
-        ctx._feat_ignore_cache_save(page)
-    combined = ctx._feat_ignore_combine(page)
+        _feat_ignore_cache_save(ctx, page)
+    combined = _feat_ignore_combine(ctx, page)
     if combined:
         page._feat_ignore_default = float(combined[0][0])
         params["ignore_values"] = [
-            ctx._feat_value_json(combined[0][0])
+            _feat_value_json(ctx, combined[0][0])
         ]
-        ctx._feat_ignore_fill(page, combined)
+        _feat_ignore_fill(ctx, page, combined)
 
 
 def _feat_select_files(ctx, page) -> None:
@@ -839,13 +848,13 @@ def _feat_select_files(ctx, page) -> None:
         )
         return
     candidates = [
-        rec for rec in ctx._available_files(page._feat_task_id)
-        if feature in ctx._feat_file_columns(page, rec.get("parquet"))
+        rec for rec in _data_files._available_files(ctx, page._feat_task_id)
+        if feature in _feat_file_columns(ctx, page, rec.get("parquet"))
     ]
     names = [rec.get("name", "") for rec in candidates]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in candidates}
-    current = [ctx._comp_file_name(p, page._feat_task_id) for p in page._feat_params.get("files") or []]
-    chosen = ctx._pick_items_dialog(
+    current = [_data_naming._comp_file_name(ctx, p, page._feat_task_id) for p in page._feat_params.get("files") or []]
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -856,8 +865,8 @@ def _feat_select_files(ctx, page) -> None:
         if path and path not in files:
             files.append(path)
     page._feat_params["files"] = files
-    ctx._feat_refresh_files(page)
-    ctx._feat_mark_dirty(page)
+    _feat_refresh_files(ctx, page)
+    _feat_mark_dirty(ctx, page)
 
 
 def _feat_file_status(ctx, page, parquet_path) -> str:
@@ -871,7 +880,7 @@ def _feat_file_status(ctx, page, parquet_path) -> str:
     path = ctx.project.path / rec["path"]
     if not path.is_file():
         return FEATURE_STATUS_PENDING
-    if rec.get("signature") != ctx._feature_signature(params, parquet_path):
+    if rec.get("signature") != _data_feature_outputs._feature_signature(ctx, params, parquet_path):
         return FEATURE_STATUS_PENDING
     return FEATURE_STATUS_DONE
 
@@ -884,10 +893,10 @@ def _feat_refresh_files(ctx, page) -> None:
         table.blockSignals(True)
         table.setRowCount(len(files))
         for i, path in enumerate(files):
-            name_item = QTableWidgetItem(ctx._comp_file_name(path, page._feat_task_id))
+            name_item = QTableWidgetItem(_data_naming._comp_file_name(ctx, path, page._feat_task_id))
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             table.setItem(i, 0, name_item)
-            status = ctx._feat_file_status(page, path)
+            status = _feat_file_status(ctx, page, path)
             sitem = QTableWidgetItem(status)
             sitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
             sitem.setForeground(
@@ -896,13 +905,13 @@ def _feat_refresh_files(ctx, page) -> None:
             )
             table.setItem(i, 1, sitem)
         table.blockSignals(False)
-    ctx._feat_rebuild_rules(page)
-    ctx._feat_ignore_refresh(page)
+    _feat_rebuild_rules(ctx, page)
+    _feat_ignore_refresh(ctx, page)
 
 
 def _feat_rules_panel(ctx, page) -> QWidget:
     """Right panel: the 4-column aggregation rules table."""
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -960,8 +969,8 @@ def _feat_rules_panel(ctx, page) -> QWidget:
             {"source": None, "method": "mean", "lo": 0, "hi": 100,
              "perc": None, "name": ""}
         )
-        ctx._feat_refresh_rules(page)
-        ctx._feat_mark_dirty(page)
+        _feat_refresh_rules(ctx, page)
+        _feat_mark_dirty(ctx, page)
 
     def on_delete():
         row = table.currentRow()
@@ -973,12 +982,12 @@ def _feat_rules_panel(ctx, page) -> QWidget:
                 )
             return
         del rules[row]
-        ctx._feat_refresh_rules(page)
-        ctx._feat_mark_dirty(page)
+        _feat_refresh_rules(ctx, page)
+        _feat_mark_dirty(ctx, page)
 
     add_btn.clicked.connect(lambda _=False: on_add())
     del_btn.clicked.connect(lambda _=False: on_delete())
-    calc_btn.clicked.connect(lambda _=False: ctx._feat_calculate(page))
+    calc_btn.clicked.connect(lambda _=False: _feat_calculate(ctx, page))
     return panel
 
 
@@ -989,7 +998,7 @@ def _feat_rebuild_rules(ctx, page) -> None:
         return
     params = page._feat_params
     rules = params.get("rules") or []
-    common = ctx._feat_common_columns(page)
+    common = _feat_common_columns(ctx, page)
     enabled = not page._feat_locked
 
     table.blockSignals(True)
@@ -999,13 +1008,13 @@ def _feat_rebuild_rules(ctx, page) -> None:
     table.setRowCount(len(rules))
 
     def mark():
-        ctx._feat_mark_dirty(page)
-        ctx._feat_refresh_statuses(page)
+        _feat_mark_dirty(ctx, page)
+        _feat_refresh_statuses(ctx, page)
 
     def rebuild_soon():
         # Rebuilding the table destroys the widget whose signal we are
         # handling, so defer the rebuild to the next event-loop turn.
-        QTimer.singleShot(0, lambda: ctx._feat_rebuild_rules(page))
+        QTimer.singleShot(0, lambda: _feat_rebuild_rules(ctx, page))
 
     for i, rule in enumerate(rules):
         is_count = rule.get("method") == "count"
@@ -1029,11 +1038,11 @@ def _feat_rebuild_rules(ctx, page) -> None:
             combo.setEnabled(enabled)
 
             def on_source(value, r=rule):
-                old_auto = ctx._feat_auto_name(r)
+                old_auto = _feat_auto_name(ctx, r)
                 r["source"] = value
                 current = (r.get("name") or "").strip()
                 if not current or current == old_auto:
-                    r["name"] = ctx._feat_auto_name(r)
+                    r["name"] = _feat_auto_name(ctx, r)
                 rebuild_soon()
                 mark()
 
@@ -1122,8 +1131,8 @@ def _feat_rebuild_rules(ctx, page) -> None:
         # Column 3: new column name.
         if is_count:
             # Default 'count'; resolved to count_1, count_2… on a clash.
-            rule["name"] = ctx._feat_count_name(params)
-        name_edit = QLineEdit(str(rule.get("name") or ctx._feat_auto_name(rule)))
+            rule["name"] = _feat_count_name(ctx, params)
+        name_edit = QLineEdit(str(rule.get("name") or _feat_auto_name(ctx, rule)))
         name_edit.setEnabled(enabled)
 
         def on_name(text, r=rule):
@@ -1138,7 +1147,7 @@ def _feat_rebuild_rules(ctx, page) -> None:
 
 def _feat_refresh_rules(ctx, page) -> None:
     """Rebuild the rules table after a structural change."""
-    ctx._feat_rebuild_rules(page)
+    _feat_rebuild_rules(ctx, page)
 
 
 def _feat_auto_name(ctx, rule) -> str:
@@ -1164,7 +1173,7 @@ def _feat_refresh_statuses(ctx, page) -> None:
     for i, path in enumerate(files):
         if i >= table.rowCount():
             break
-        status = ctx._feat_file_status(page, path)
+        status = _feat_file_status(ctx, page, path)
         item = table.item(i, 1)
         if item is None:
             item = QTableWidgetItem()
@@ -1179,7 +1188,7 @@ def _feat_refresh_statuses(ctx, page) -> None:
 
 def _feat_mark_dirty(ctx, page) -> None:
     page._feat_dirty = True
-    ctx._feat_update_save_btn(page)
+    _feat_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
     if getattr(page, "_feat_calc_status", None) is not None:
         page._feat_calc_status.setText("")
@@ -1199,8 +1208,8 @@ def _feat_save_now(ctx, page) -> None:
         ctx.project.save()
     page._feat_snapshot = copy.deepcopy(params)
     page._feat_dirty = False
-    ctx._feat_update_save_btn(page)
-    ctx._feat_log(page, "Settings saved")
+    _feat_update_save_btn(ctx, page)
+    _feat_log(ctx, page, "Settings saved")
     ctx.statusBar().showMessage("Feature settings saved")
     ctx._module_saved(page)
 
@@ -1215,7 +1224,7 @@ def _feat_validate(ctx, page):
     rules = params.get("rules") or []
     if not rules:
         return False, "Add at least one aggregation rule."
-    common = set(ctx._feat_common_columns(page))
+    common = set(_feat_common_columns(ctx, page))
     names = []
     for i, rule in enumerate(rules):
         if rule.get("method") == "count":
@@ -1277,7 +1286,7 @@ def _feat_output_stem(ctx, page, parquet_path) -> str:
         Path(existing["path"]).stem
         if isinstance(existing, dict) and existing.get("path") else None
     )
-    display = ctx._comp_file_name(parquet_path, page._feat_task_id) or Path(str(parquet_path)).name
+    display = _data_naming._comp_file_name(ctx, parquet_path, page._feat_task_id) or Path(str(parquet_path)).name
     base = _feature_safe_stem(f"{Path(display).stem}_{feature}")
     if old_stem == base:
         return base
@@ -1287,7 +1296,7 @@ def _feat_output_stem(ctx, page, parquet_path) -> str:
         if source != parquet_path and isinstance(rec, dict) and rec.get("path")
     }
     if ctx.project is not None:
-        folder = ctx._module_dir(page._feat_task_id)
+        folder = _data_files._module_dir(ctx, page._feat_task_id)
         if folder is not None and folder.is_dir():
             used |= {
                 p.stem for p in folder.glob("*.parquet") if p.stem != old_stem
@@ -1298,7 +1307,7 @@ def _feat_output_stem(ctx, page, parquet_path) -> str:
         n += 1
         stem = f"{base}_new" if n == 1 else f"{base}_new{n}"
     if n:
-        ctx._feat_log(
+        _feat_log(ctx,
             page,
             f"'{base}' already exists — writing as '{stem}' instead.",
         )
@@ -1307,13 +1316,13 @@ def _feat_output_stem(ctx, page, parquet_path) -> str:
 
 def _feat_calculate(ctx, page) -> None:
     """Aggregate every selected file and save the generated parquet files."""
-    ok, message = ctx._feat_validate(page)
+    ok, message = _feat_validate(ctx, page)
     if not ok:
         QMessageBox.warning(ctx.host, "Calculate", message)
         return
     # A default ignore value is suggested by the Background ignore widget;
     # make sure it is set even if the user calculated immediately.
-    ctx._feat_ignore_prepare(page)
+    _feat_ignore_prepare(ctx, page)
     params = page._feat_params
     outputs = params.get("outputs") or {}
     selected = params.get("files") or []
@@ -1340,18 +1349,18 @@ def _feat_calculate(ctx, page) -> None:
     try:
         for path in selected:
             if getattr(page, "_feat_cancel", False):
-                ctx._feat_log(page, "Calculation cancelled.")
+                _feat_log(ctx, page, "Calculation cancelled.")
                 break
-            name = ctx._comp_file_name(path, page._feat_task_id)
+            name = _data_naming._comp_file_name(ctx, path, page._feat_task_id)
             if status is not None:
                 status.setText(f"Calculating… {name}")
             QApplication.processEvents()
             previous = outputs.get(path)
             try:
-                rel, columns, warnings = ctx._feat_compute_file(page, path)
+                rel, columns, warnings = _feat_compute_file(ctx, page, path)
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{name}: {exc}")
-                ctx._feat_log(page, f"✗ {name}: {exc}")
+                _feat_log(ctx, page, f"✗ {name}: {exc}")
                 continue
             # A renamed output (e.g. after this file's name scheme changed)
             # leaves its old parquet behind; remove it.
@@ -1364,17 +1373,17 @@ def _feat_calculate(ctx, page) -> None:
                     except OSError:
                         pass
             for warning in warnings:
-                ctx._feat_log(page, warning)
+                _feat_log(ctx, page, warning)
             outputs[path] = {
                 "path": rel,
                 "name": Path(rel).stem,
                 "columns": columns,
-                "signature": ctx._feature_signature(
+                "signature": _data_feature_outputs._feature_signature(ctx,
                     params, path, page._feat_task_id
                 ),
             }
             done += 1
-            ctx._feat_log(
+            _feat_log(ctx,
                 page,
                 f"✓ {name} → {Path(rel).name} "
                 f"({len(columns)} column(s))",
@@ -1394,15 +1403,15 @@ def _feat_calculate(ctx, page) -> None:
         ctx.project.save()
     page._feat_snapshot = copy.deepcopy(params)
     page._feat_dirty = False
-    ctx._feat_update_save_btn(page)
-    ctx._feat_refresh_files(page)
+    _feat_update_save_btn(ctx, page)
+    _feat_refresh_files(ctx, page)
 
     summary = f"Calculated {done} file(s)."
     if failed:
         summary += f" {len(failed)} failed — see the log."
     if status is not None:
         status.setText(summary)
-    ctx._feat_log(page, summary)
+    _feat_log(ctx, page, summary)
     ctx.statusBar().showMessage(summary)
     ctx._module_saved(page)
 
@@ -1415,10 +1424,10 @@ def _feat_compute_file(ctx, page, parquet_path):
     params = page._feat_params
     feature = params["feature"]
     rules = params.get("rules") or []
-    count_name = ctx._feat_count_name(params)
+    count_name = _feat_count_name(ctx, params)
     sources = [r["source"] for r in rules if r.get("source")]
 
-    values = ctx._column_data(
+    values = _data_columns._column_data(ctx,
         page._feat_task_id, parquet_path, [feature] + sources
     )
     if feature not in values:
@@ -1435,7 +1444,7 @@ def _feat_compute_file(ctx, page, parquet_path):
     warnings = []
     if dropped:
         warnings.append(
-            f"{ctx._comp_file_name(parquet_path, page._feat_task_id)}: skipped {dropped} row(s) "
+            f"{_data_naming._comp_file_name(ctx, parquet_path, page._feat_task_id)}: skipped {dropped} row(s) "
             f"with an empty '{feature}' value"
         )
     # Values the user marked "ignore" in Background ignore are left out
@@ -1449,12 +1458,12 @@ def _feat_compute_file(ctx, page, parquet_path):
         if skipped:
             df = df[~drop]
             labels = ", ".join(
-                ctx._feat_value_text(v) for v in ignored[:6]
+                _feat_value_text(ctx, v) for v in ignored[:6]
             )
             if len(ignored) > 6:
                 labels += " …"
             warnings.append(
-                f"{ctx._comp_file_name(parquet_path, page._feat_task_id)}: "
+                f"{_data_naming._comp_file_name(ctx, parquet_path, page._feat_task_id)}: "
                 f"skipped {skipped} row(s) with ignored value(s) "
                 f"{labels}"
             )
@@ -1466,8 +1475,8 @@ def _feat_compute_file(ctx, page, parquet_path):
     )
     warnings.extend(agg_warnings)
 
-    stem = ctx._feat_output_stem(page, parquet_path)
-    rel = ctx._module_rel(page._feat_task_id, f"{stem}.parquet")
+    stem = _feat_output_stem(ctx, page, parquet_path)
+    rel = _data_files._module_rel(ctx, page._feat_task_id, f"{stem}.parquet")
     if ctx.project is None:
         raise RuntimeError("no project")
     path = ctx.project.path / rel
@@ -1490,7 +1499,7 @@ def _feat_close(ctx, page) -> None:
         # Stop at the next file; the page stays open until the loop ends so
         # its widgets are never destroyed mid-calculation.
         page._feat_cancel = True
-        ctx._feat_log(page, "Stopping after the current file…")
+        _feat_log(ctx, page, "Stopping after the current file…")
         return
     if getattr(page, "_feat_dirty", False):
         reply = QMessageBox.question(

@@ -9,6 +9,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
+from smage.data import columns as _data_columns
+from smage.modules.unmix import page as _unmix_page
 
 
 def _open(case_id: str):
@@ -31,22 +33,22 @@ def signatures() -> None:
     try:
         ctx = window._ctx
         page._unmix_spectra.append({"id": "sp-1", "name": "Signature 1"})
-        ctx._unmix_rebuild_spectrum_list(page)
+        _unmix_page._unmix_rebuild_spectrum_list(ctx, page)
 
-        ctx._unmix_add_signature(page)
+        _unmix_page._unmix_add_signature(ctx, page)
         harness.eq(len(page._unmix_matrix), 1)
         row = page._unmix_matrix[0]
         harness.eq(row["positive"], "sp-1")
         harness.eq(row["name"], "Signature 1")
 
-        ctx._unmix_add_signature(page)
+        _unmix_page._unmix_add_signature(ctx, page)
         harness.eq(page._unmix_matrix[1]["name"], "Signature 1 2",
                    "signature names are made unique")
 
-        ctx._unmix_remove_signature(page, 0)
+        _unmix_page._unmix_remove_signature(ctx, page, 0)
         harness.eq(len(page._unmix_matrix), 1)
 
-        ctx._unmix_save_now(page)
+        _unmix_page._unmix_save_now(ctx, page)
         task = window.project.workflow["tasks"][0]["children"][0]
         harness.eq(len(task["params"]["spectra"]), 1)
         harness.eq(len(task["params"]["matrix"]), 1)
@@ -60,10 +62,10 @@ def unique_name() -> None:
     try:
         ctx = window._ctx
         page._unmix_matrix.append({"id": "s1", "name": "A"})
-        harness.eq(ctx._unmix_unique_signature_name(page, "A"), "A 2")
+        harness.eq(_unmix_page._unmix_unique_signature_name(ctx, page, "A"), "A 2")
         page._unmix_matrix.append({"id": "s2", "name": "A 2"})
-        harness.eq(ctx._unmix_unique_signature_name(page, "A"), "A 3")
-        harness.eq(ctx._unmix_unique_signature_name(page, "B"), "B")
+        harness.eq(_unmix_page._unmix_unique_signature_name(ctx, page, "A"), "A 3")
+        harness.eq(_unmix_page._unmix_unique_signature_name(ctx, page, "B"), "B")
     finally:
         _close(window)
 
@@ -73,9 +75,9 @@ def flow_config() -> None:
     window, _project, page = _open("unmix_flow")
     try:
         ctx = window._ctx
-        harness.eq(ctx._unmix_flow_config(page._unmix_task_def), None,
+        harness.eq(_unmix_page._unmix_flow_config(ctx, page._unmix_task_def), None,
                    "an empty configuration cannot unmix")
-        harness.eq(ctx._unmix_output_names("g-1", "x"), [])
+        harness.eq(_unmix_page._unmix_output_names(ctx, "g-1", "x"), [])
     finally:
         _close(window)
 
@@ -126,7 +128,7 @@ def unmix_values() -> None:
     try:
         ctx = window._ctx
         ctx._unmix_flow_cache = {}
-        config = ctx._unmix_flow_config(window._find_task_by_id("u-1"))
+        config = _unmix_page._unmix_flow_config(ctx, window._find_task_by_id("u-1"))
         harness.check(config is not None, "a complete configuration is valid")
         harness.eq(config["names"], ["Signal"])
         harness.eq(config["columns"], ["FL1-A", "FL2-A"])
@@ -142,8 +144,8 @@ def unmix_values() -> None:
         harness.check(np.allclose(config["matrix"], expected),
                       f"{config['matrix']} vs {expected}")
 
-        harness.eq(ctx._unmix_output_names("g-1", parquet), ["Signal"])
-        values = ctx._column_data("g-1", parquet, ["Signal"])["Signal"]
+        harness.eq(_unmix_page._unmix_output_names(ctx, "g-1", parquet), ["Signal"])
+        values = _data_columns._column_data(ctx, "g-1", parquet, ["Signal"])["Signal"]
         weights = np.linalg.pinv(config["matrix"]).T
         expected_values = (
             raw[["FL1-A", "FL2-A"]].to_numpy(dtype=float) @ weights[0]

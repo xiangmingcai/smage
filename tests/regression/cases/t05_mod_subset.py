@@ -8,6 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
 from smage.data.files import _subset_visible_columns  # noqa: E402
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.modules.subset import page as _subset_page
 
 
 def _open(case_id: str):
@@ -35,11 +38,11 @@ def save_filters() -> None:
         parquet = str(project.data_dir / "case.parquet")
         page._subset_draft_files = [parquet]
         page._subset_draft_columns = ["x", "FL1-A"]
-        ctx._subset_save_now(page)
+        _subset_page._subset_save_now(ctx, page)
 
-        harness.eq(ctx._subset_visible_files("g-1"), {parquet})
+        harness.eq(_data_files._subset_visible_files(ctx, "g-1"), {parquet})
         harness.eq(_subset_visible_columns(ctx, "g-1"), {"x", "FL1-A"})
-        harness.eq(ctx._columns_for(parquet, "g-1"), ["x", "FL1-A"])
+        harness.eq(_data_columns._columns_for(ctx, parquet, "g-1"), ["x", "FL1-A"])
 
         from smage.project import Project
 
@@ -58,10 +61,10 @@ def clear_filters() -> None:
         ctx = window._ctx
         page._subset_draft_files = []
         page._subset_draft_columns = []
-        ctx._subset_save_now(page)
-        harness.eq(ctx._subset_visible_files("g-1"), None)
+        _subset_page._subset_save_now(ctx, page)
+        harness.eq(_data_files._subset_visible_files(ctx, "g-1"), None)
         harness.eq(_subset_visible_columns(ctx, "g-1"), None)
-        harness.eq(ctx._subset_filters("g-1"), [(None, None)],
+        harness.eq(_data_files._subset_filters(ctx, "g-1"), [(None, None)],
                    "an empty saved selection is recorded but filters nothing")
     finally:
         _close(window)
@@ -75,14 +78,14 @@ def summary_text() -> None:
         parquet = str(project.data_dir / "case.parquet")
         page._subset_draft_files = [parquet]
         page._subset_draft_columns = ["x"]
-        ctx._subset_refresh(page)
+        _subset_page._subset_refresh(ctx, page)
         text = page._subset_summary.text()
         harness.check("1 file(s) selected" in text, text)
         harness.check("1 column(s) selected" in text, text)
 
         page._subset_draft_files = []
         page._subset_draft_columns = []
-        ctx._subset_refresh(page)
+        _subset_page._subset_refresh(ctx, page)
         text = page._subset_summary.text()
         harness.check("All files visible" in text, text)
         harness.check("All columns visible" in text, text)

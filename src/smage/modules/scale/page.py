@@ -30,20 +30,28 @@ from smage.core.settings import _default_palette
 from smage.widgets.controls import _NoWheelComboBox
 from smage.widgets.resources import _lock_pixmap
 import copy
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import naming as _data_naming
+from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
+from smage.widgets import image_level as _widgets_image_level
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
+from smage.widgets.plot import renderer as _widgets_plot_renderer
 
 
 def _scaling_column_set(ctx, task_id=None) -> list:
     """Return the sorted, de-duplicated set of input column names."""
     cols = set()
-    for rec in ctx._available_files(task_id):
-        for c in ctx._columns_for(rec.get("parquet"), task_id):
+    for rec in _data_files._available_files(ctx, task_id):
+        for c in _data_columns._columns_for(ctx, rec.get("parquet"), task_id):
             cols.add(c)
     return sorted(cols)
 
 
 def _scaling_load_config(ctx, task_def: dict) -> list:
     """Return the per-column scaling config, merged with the current columns."""
-    cols = ctx._scaling_column_set(task_def.get("id"))
+    cols = _scaling_column_set(ctx, task_def.get("id"))
     params = task_def.setdefault("params", {})
     existing = params.get("columns") or []
     by_name = {c.get("name"): c for c in existing}
@@ -80,13 +88,13 @@ def _scaling_union_columns(ctx, page) -> list:
     """Columns of the selected files (union), sorted."""
     columns = set()
     for path in page._scaling_files or []:
-        columns |= set(ctx._columns_for(path, page._scaling_task_id))
+        columns |= set(_data_columns._columns_for(ctx, path, page._scaling_task_id))
     return sorted(columns)
 
 
 def _scaling_visible_configs(ctx, page) -> list:
     """Configs whose column exists in at least one selected file."""
-    visible = set(ctx._scaling_union_columns(page))
+    visible = set(_scaling_union_columns(ctx, page))
     return [c for c in page._scaling_columns if c.get("name") in visible]
 
 
@@ -97,7 +105,7 @@ def _scaling_refresh_files_box(ctx, page) -> None:
     box.blockSignals(True)
     box.clear()
     for path in page._scaling_files or []:
-        box.addItem(ctx._comp_file_name(path, page._scaling_task_id))
+        box.addItem(_data_naming._comp_file_name(ctx, path, page._scaling_task_id))
     box.blockSignals(False)
     count = getattr(page, "_scaling_files_count", None)
     if count is not None:
@@ -105,7 +113,7 @@ def _scaling_refresh_files_box(ctx, page) -> None:
 
 
 def _scaling_files_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -120,7 +128,7 @@ def _scaling_files_panel(ctx, page) -> QWidget:
     button = QPushButton("Select files…")
     button.setCursor(Qt.CursorShape.PointingHandCursor)
     button.setEnabled(not page._scaling_locked)
-    button.clicked.connect(lambda _=False: ctx._scaling_select_files(page))
+    button.clicked.connect(lambda _=False: _scaling_select_files(ctx, page))
     lay.addWidget(button)
     page._scaling_files_btn = button
 
@@ -136,19 +144,19 @@ def _scaling_files_panel(ctx, page) -> QWidget:
     count.setStyleSheet("color: #6b7785;")
     lay.addWidget(count)
     page._scaling_files_count = count
-    ctx._scaling_refresh_files_box(page)
+    _scaling_refresh_files_box(ctx, page)
     return panel
 
 
 def _scaling_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._scaling_task_id)
+    records = _data_files._available_files(ctx, page._scaling_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     current = [
-        ctx._comp_file_name(path, page._scaling_task_id)
+        _data_naming._comp_file_name(ctx, path, page._scaling_task_id)
         for path in (page._scaling_files or [])
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -156,22 +164,22 @@ def _scaling_select_files(ctx, page) -> None:
     page._scaling_files = [
         str(by_name[name]) for name in chosen if name in by_name
     ]
-    ctx._scaling_refresh_files_box(page)
-    ctx._scaling_rebuild_visible(page)
-    ctx._scaling_mark_dirty(page)
+    _scaling_refresh_files_box(ctx, page)
+    _scaling_rebuild_visible(ctx, page)
+    _scaling_mark_dirty(ctx, page)
 
 
 def _scaling_rebuild_visible(ctx, page) -> None:
     """Re-filter the table and the batch list to the selected files."""
-    page._scaling_rows = ctx._scaling_visible_configs(page)
-    ctx._scaling_populate_table(page)
-    ctx._scaling_rebuild_apply_list(page)
-    ctx._scaling_render_preview(page)
-    ctx._scaling_rebuild_settings(page)
+    page._scaling_rows = _scaling_visible_configs(ctx, page)
+    _scaling_populate_table(ctx, page)
+    _scaling_rebuild_apply_list(ctx, page)
+    _scaling_render_preview(ctx, page)
+    _scaling_rebuild_settings(ctx, page)
 
 
 def _scaling_apply_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -189,7 +197,7 @@ def _scaling_apply_panel(ctx, page) -> QWidget:
     select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     select_btn.setEnabled(not page._scaling_locked)
     select_btn.clicked.connect(
-        lambda _=False: ctx._scaling_select_apply_vars(page)
+        lambda _=False: _scaling_select_apply_vars(ctx, page)
     )
     lay.addWidget(select_btn)
     page._scaling_apply_select = select_btn
@@ -247,14 +255,14 @@ def _scaling_apply_panel(ctx, page) -> QWidget:
     apply_btn = QPushButton("Apply")
     apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     apply_btn.setEnabled(not page._scaling_locked)
-    apply_btn.clicked.connect(lambda _=False: ctx._scaling_apply_batch(page))
+    apply_btn.clicked.connect(lambda _=False: _scaling_apply_batch(ctx, page))
     lay.addWidget(apply_btn)
     page._scaling_apply_btn = apply_btn
     return panel
 
 
 def _scaling_select_apply_vars(ctx, page) -> None:
-    options = ctx._scaling_union_columns(page)
+    options = _scaling_union_columns(ctx, page)
     if not options:
         QMessageBox.information(
             ctx.host, "Apply", "Select data files first."
@@ -264,20 +272,20 @@ def _scaling_select_apply_vars(ctx, page) -> None:
         name for name in (page._scaling_apply_vars or [])
         if name in options
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select variables", options, current, "Filter variables..."
     )
     if chosen is None:
         return
     page._scaling_apply_vars = list(chosen)
-    ctx._scaling_rebuild_apply_list(page)
+    _scaling_rebuild_apply_list(ctx, page)
 
 
 def _scaling_rebuild_apply_list(ctx, page) -> None:
     listing = getattr(page, "_scaling_apply_list", None)
     if listing is None:
         return
-    union = set(ctx._scaling_union_columns(page))
+    union = set(_scaling_union_columns(ctx, page))
     page._scaling_apply_vars = [
         name for name in (getattr(page, "_scaling_apply_vars", []) or [])
         if name in union
@@ -334,10 +342,10 @@ def _scaling_apply_batch(ctx, page) -> None:
         if max_value is not None:
             config["max"] = max_value
 
-    ctx._scaling_populate_table(page)
-    ctx._scaling_mark_dirty(page)
-    ctx._scaling_render_preview(page)
-    ctx._scaling_rebuild_settings(page)
+    _scaling_populate_table(ctx, page)
+    _scaling_mark_dirty(ctx, page)
+    _scaling_render_preview(ctx, page)
+    _scaling_rebuild_settings(ctx, page)
     ctx.statusBar().showMessage(
         f"Applied settings to {len(names)} column(s)", 3000
     )
@@ -355,7 +363,7 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -371,7 +379,7 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._scaling_close(page))
+    close_btn.clicked.connect(lambda _=False: _scaling_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -379,8 +387,8 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     page._scaling_task_def = task_def
     page._scaling_task_id = task_def.get("id")
     page._scaling_locked = locked
-    page._scaling_columns = ctx._scaling_load_config(task_def)
-    page._scaling_files = ctx._scaling_load_files(task_def)
+    page._scaling_columns = _scaling_load_config(ctx, task_def)
+    page._scaling_files = _scaling_load_files(ctx, task_def)
     page._scaling_rows = []
     page._scaling_dirty = False
     page._scaling_minmax_filled = set()
@@ -395,14 +403,14 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     # Left: data files (top) + batch apply (bottom), equal heights.
     left_split = QSplitter(Qt.Orientation.Vertical)
     left_split.setChildrenCollapsible(False)
-    left_split.addWidget(ctx._scaling_files_panel(page))
-    left_split.addWidget(ctx._scaling_apply_panel(page))
+    left_split.addWidget(_scaling_files_panel(ctx, page))
+    left_split.addWidget(_scaling_apply_panel(ctx, page))
     left_split.setStretchFactor(0, 1)
     left_split.setStretchFactor(1, 1)
     left_split.setSizes([320, 320])
 
     # Middle: columns table.
-    colnames_panel = ctx._build_panel_frame()
+    colnames_panel = _widgets_panels._build_panel_frame(ctx)
     cll = QVBoxLayout(colnames_panel)
     cll.setContentsMargins(10, 10, 10, 10)
     cll.setSpacing(6)
@@ -423,9 +431,9 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
 
     # Build the preview config first so the plot widget's A/F buttons can
     # bind to it (same dict object is mutated in place later).
-    records = ctx._available_files(task_def.get("id"))
+    records = _data_files._available_files(ctx, task_def.get("id"))
     rec = records[0] if records else None
-    cols = ctx._columns_for(
+    cols = _data_columns._columns_for(ctx,
         rec.get("parquet"), task_def.get("id")
     ) if rec else []
     page._scaling_preview = {
@@ -458,12 +466,12 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     }
 
     # Right: preview (scatter + settings).
-    preview_panel = ctx._build_panel_frame()
+    preview_panel = _widgets_panels._build_panel_frame(ctx)
     pl = QVBoxLayout(preview_panel)
     pl.setContentsMargins(10, 10, 10, 10)
     pl.setSpacing(6)
     pl.addWidget(QLabel("<b>Preview</b>"))
-    plot_widget = ctx._figure_make_plot_widget(page._scaling_preview)
+    plot_widget = _widgets_plot_renderer._figure_make_plot_widget(ctx, page._scaling_preview)
     # The preview column is narrow: never let the plot demand more than
     # the panel gives it (it used to be clipped on the right).
     plot_widget.setMinimumSize(120, 120)
@@ -532,14 +540,14 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     page._scaling_overlay = overlay
     page._scaling_overlay_box = overlay_box
     page._scaling_save_btn = save_btn
-    save_btn.clicked.connect(lambda _=False: ctx._scaling_save_now(page))
-    ctx._scaling_update_save_btn(page)
+    save_btn.clicked.connect(lambda _=False: _scaling_save_now(ctx, page))
+    _scaling_update_save_btn(ctx, page)
 
-    page._scaling_rows = ctx._scaling_visible_configs(page)
-    ctx._scaling_populate_table(page)
-    ctx._scaling_rebuild_apply_list(page)
-    table.itemSelectionChanged.connect(lambda: ctx._scaling_on_selection(page))
-    ctx._scaling_on_selection(page)
+    page._scaling_rows = _scaling_visible_configs(ctx, page)
+    _scaling_populate_table(ctx, page)
+    _scaling_rebuild_apply_list(ctx, page)
+    table.itemSelectionChanged.connect(lambda: _scaling_on_selection(ctx, page))
+    _scaling_on_selection(ctx, page)
     return page
 
 
@@ -563,7 +571,7 @@ def _scaling_populate_table(ctx, page) -> None:
         method_combo.setEnabled(not locked)
         method_combo.currentIndexChanged.connect(
             lambda _=0, r=row_idx, c=config, m=method_combo:
-                ctx._scaling_method_changed(page, r, c, m)
+                _scaling_method_changed(ctx, page, r, c, m)
         )
         table.setCellWidget(row_idx, 1, method_combo)
 
@@ -572,11 +580,11 @@ def _scaling_populate_table(ctx, page) -> None:
         param_val = config.get("param")
         param_edit.setText("" if param_val is None else str(param_val))
         param_edit.editingFinished.connect(
-            lambda e=param_edit, c=config: ctx._scaling_field_edited(page, c, "param", e)
+            lambda e=param_edit, c=config: _scaling_field_edited(ctx, page, c, "param", e)
         )
         table.setCellWidget(row_idx, 2, param_edit)
         page._scaling_param_edits[row_idx] = param_edit
-        ctx._scaling_update_param_cell(page, config, param_edit)
+        _scaling_update_param_cell(ctx, page, config, param_edit)
 
         for col_idx, key in ((3, "min"), (4, "max")):
             edit = QLineEdit()
@@ -584,7 +592,7 @@ def _scaling_populate_table(ctx, page) -> None:
             edit.setText("" if val is None else str(val))
             edit.setEnabled(not locked)
             edit.editingFinished.connect(
-                lambda e=edit, c=config, k=key: ctx._scaling_field_edited(page, c, k, e)
+                lambda e=edit, c=config, k=key: _scaling_field_edited(ctx, page, c, k, e)
             )
             table.setCellWidget(row_idx, col_idx, edit)
             if key == "min":
@@ -612,10 +620,10 @@ def _scaling_method_changed(ctx, page, row_idx, config, combo) -> None:
     config["method"] = combo.currentText()
     param_edit = page._scaling_param_edits.get(row_idx)
     if param_edit is not None:
-        ctx._scaling_update_param_cell(page, config, param_edit)
-    ctx._scaling_mark_dirty(page)
-    ctx._scaling_render_preview(page)
-    ctx._scaling_rebuild_settings(page)
+        _scaling_update_param_cell(ctx, page, config, param_edit)
+    _scaling_mark_dirty(ctx, page)
+    _scaling_render_preview(ctx, page)
+    _scaling_rebuild_settings(ctx, page)
 
 
 def _scaling_field_edited(ctx, page, config, key, edit) -> None:
@@ -633,14 +641,14 @@ def _scaling_field_edited(ctx, page, config, key, edit) -> None:
         except ValueError:
             edit.setText("" if config.get(key) is None else str(config[key]))
             return
-    ctx._scaling_mark_dirty(page)
-    ctx._scaling_render_preview(page)
-    ctx._scaling_rebuild_settings(page)
+    _scaling_mark_dirty(ctx, page)
+    _scaling_render_preview(ctx, page)
+    _scaling_rebuild_settings(ctx, page)
 
 
 def _scaling_mark_dirty(ctx, page) -> None:
     page._scaling_dirty = True
-    ctx._scaling_update_save_btn(page)
+    _scaling_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -652,7 +660,7 @@ def _scaling_save_now(ctx, page) -> None:
         ctx.project.save()
     page._scaling_snapshot = copy.deepcopy(page._scaling_task_def.get("params", {}))
     page._scaling_dirty = False
-    ctx._scaling_update_save_btn(page)
+    _scaling_update_save_btn(ctx, page)
     ctx.statusBar().showMessage("Scale saved")
     ctx._module_saved(page)
 
@@ -693,9 +701,9 @@ def _scaling_on_selection(ctx, page) -> None:
         preview["image_max"] = None
     else:
         preview["x"] = name
-    ctx._scaling_autofill_minmax(page, row)
-    ctx._scaling_render_preview(page)
-    ctx._scaling_rebuild_settings(page)
+    _scaling_autofill_minmax(ctx, page, row)
+    _scaling_render_preview(ctx, page)
+    _scaling_rebuild_settings(ctx, page)
 
 
 def _scaling_config_for(ctx, page, column):
@@ -716,7 +724,7 @@ def _scaling_autofill_minmax(ctx, page, row_idx) -> None:
         return
     config = rows[row_idx]
     name = config.get("name")
-    rec = ctx._figure_record(page._scaling_preview.get("file"))
+    rec = _widgets_plot_renderer._figure_record(ctx, page._scaling_preview.get("file"))
     if not rec or not name:
         return
     import numpy as np
@@ -741,8 +749,8 @@ def _scaling_autofill_minmax(ctx, page, row_idx) -> None:
 
 def _scaling_render_preview(ctx, page) -> None:
     preview = page._scaling_preview
-    rec = ctx._figure_record(preview.get("file"))
-    cols = ctx._columns_for(
+    rec = _widgets_plot_renderer._figure_record(ctx, preview.get("file"))
+    cols = _data_columns._columns_for(ctx,
         rec.get("parquet"), page._scaling_task_id
     ) if rec else []
     plot_type = preview.get("type", "scatter")
@@ -771,8 +779,8 @@ def _scaling_render_preview(ctx, page) -> None:
 
     # Drive the preview axes from each column's min/max. Those are stored
     # as ORIGINAL values, so they are mapped into plot units here.
-    x_cfg = ctx._scaling_config_for(page, preview.get("x"))
-    y_cfg = ctx._scaling_config_for(page, preview.get("y"))
+    x_cfg = _scaling_config_for(ctx, page, preview.get("x"))
+    y_cfg = _scaling_config_for(ctx, page, preview.get("y"))
 
     def plot_bound(config, key, column):
         if not config or plot_type == "image":
@@ -780,7 +788,7 @@ def _scaling_render_preview(ctx, page) -> None:
         value = config.get(key)
         if value is None:
             return None
-        configs = ctx._figure_axis_scale_configs(
+        configs = _widgets_plot_renderer._figure_axis_scale_configs(ctx,
             page._scaling_task_id, preview.get("file"), column, transforms
         )
         return _forward_scale_value(value, configs)
@@ -816,13 +824,13 @@ def _scaling_render_preview(ctx, page) -> None:
                 "min": preview.get("image_min"),
                 "max": preview.get("image_max"),
             }]
-        ctx._figure_render_image(
+        _widgets_plot_renderer._figure_render_image(ctx,
             plot_dict, page._scaling_plot_widget,
             task_id=page._scaling_task_id,
         )
         return
 
-    ctx._figure_render(
+    _widgets_plot_renderer._figure_render(ctx,
         preview, page._scaling_plot_widget,
         column_transforms=transforms, task_id=page._scaling_task_id,
     )
@@ -831,19 +839,19 @@ def _scaling_render_preview(ctx, page) -> None:
 def _scaling_set_image_levels(ctx, page, lo, hi) -> None:
     page._scaling_preview["image_min"] = lo
     page._scaling_preview["image_max"] = hi
-    ctx._scaling_render_preview(page)
+    _scaling_render_preview(ctx, page)
 
 
 def _scaling_rebuild_settings(ctx, page) -> None:
     layout = page._scaling_settings_layout
-    ctx._clear_settings_layout(layout)
+    _widgets_panels._clear_settings_layout(ctx, layout)
     preview = page._scaling_preview
     enabled = not page._scaling_locked
     plot_widget = page._scaling_plot_widget
 
-    records = ctx._available_files(page._scaling_task_id)
-    rec = ctx._figure_record(preview.get("file"))
-    columns = ctx._columns_for(
+    records = _data_files._available_files(ctx, page._scaling_task_id)
+    rec = _widgets_plot_renderer._figure_record(ctx, preview.get("file"))
+    columns = _data_columns._columns_for(ctx,
         rec.get("parquet"), page._scaling_task_id
     ) if rec else []
     # Scale configs at this point: upstream scales plus this module's
@@ -879,20 +887,20 @@ def _scaling_rebuild_settings(ctx, page) -> None:
     if plot_type == "image":
         layout.addWidget(QLabel("Channel"))
         channels = [c for c in columns if c not in ("x", "y")]
-        channel_combo = ctx._gating_param_combo(
+        channel_combo = _widgets_gate_editor_editor._gating_param_combo(ctx,
             channels, preview.get("image_channel"), enabled
         )
         layout.addWidget(channel_combo)
-        ctx._image_level_controls(
+        _widgets_image_level._image_level_controls(ctx,
             layout, preview.get("image_channel"),
             preview.get("image_min"), preview.get("image_max"),
             enabled,
-            on_minmax=lambda lo, hi: ctx._scaling_set_image_levels(
+            on_minmax=lambda lo, hi: _scaling_set_image_levels(ctx,
                 page, lo, hi
             ),
             task_id=page._scaling_task_id,
             parquet_path=rec.get("parquet") if rec else None,
-            configs=ctx._figure_axis_scale_configs(
+            configs=_widgets_plot_renderer._figure_axis_scale_configs(ctx,
                 page._scaling_task_id,
                 rec.get("parquet") if rec else None,
                 preview.get("image_channel"),
@@ -901,46 +909,46 @@ def _scaling_rebuild_settings(ctx, page) -> None:
         )
     else:
         layout.addWidget(QLabel("X parameter"))
-        x_combo = ctx._gating_param_combo(columns, preview.get("x"), enabled)
+        x_combo = _widgets_gate_editor_editor._gating_param_combo(ctx, columns, preview.get("x"), enabled)
         layout.addWidget(x_combo)
         if plot_type == "scatter":
             layout.addWidget(QLabel("Y parameter"))
-            y_combo = ctx._gating_param_combo(columns, preview.get("y"), enabled)
+            y_combo = _widgets_gate_editor_editor._gating_param_combo(ctx, columns, preview.get("y"), enabled)
             layout.addWidget(y_combo)
 
     if plot_type == "scatter":
-        ctx._figure_scatter_color_settings(
+        _widgets_plot_renderer._figure_scatter_color_settings(ctx,
             layout, preview, plot_widget, columns, enabled,
-            on_change=lambda: ctx._scaling_render_preview(page),
+            on_change=lambda: _scaling_render_preview(ctx, page),
             on_rebuild=lambda: (
-                ctx._scaling_rebuild_settings(page),
-                ctx._scaling_render_preview(page),
+                _scaling_rebuild_settings(ctx, page),
+                _scaling_render_preview(ctx, page),
             ),
             task_id=page._scaling_task_id,
         )
 
     if plot_type != "image":
         layout.addWidget(QLabel("X range"))
-        layout.addWidget(ctx._figure_range_row(
+        layout.addWidget(_widgets_plot_renderer._figure_range_row(ctx,
             preview, "x", plot_widget, enabled,
-            configs=ctx._figure_axis_scale_configs(
+            configs=_widgets_plot_renderer._figure_axis_scale_configs(ctx,
                 page._scaling_task_id, preview.get("file"),
                 preview.get("x"), live_transforms,
             ),
         ))
     if plot_type == "scatter":
         layout.addWidget(QLabel("Y range"))
-        layout.addWidget(ctx._figure_range_row(
+        layout.addWidget(_widgets_plot_renderer._figure_range_row(ctx,
             preview, "y", plot_widget, enabled,
-            configs=ctx._figure_axis_scale_configs(
+            configs=_widgets_plot_renderer._figure_axis_scale_configs(ctx,
                 page._scaling_task_id, preview.get("file"),
                 preview.get("y"), live_transforms,
             ),
         ))
 
-    ctx._figure_display_toggles(
+    _widgets_plot_renderer._figure_display_toggles(ctx,
         layout, preview, enabled,
-        on_change=lambda: ctx._figure_apply_display_options(
+        on_change=lambda: _widgets_plot_renderer._figure_apply_display_options(ctx,
             preview, plot_widget
         ),
     )
@@ -958,14 +966,14 @@ def _scaling_rebuild_settings(ctx, page) -> None:
             rows = getattr(page, "_scaling_rows", [])
             if 0 <= row < len(rows):
                 preview["x"] = rows[row]["name"]
-        ctx._scaling_rebuild_settings(page)
-        ctx._scaling_render_preview(page)
+        _scaling_rebuild_settings(ctx, page)
+        _scaling_render_preview(ctx, page)
 
     def on_file_changed():
         preview["file"] = file_combo.currentData()
         preview["file_name"] = file_combo.currentText()
-        new_rec = ctx._figure_record(preview["file"])
-        new_cols = ctx._columns_for(
+        new_rec = _widgets_plot_renderer._figure_record(ctx, preview["file"])
+        new_cols = _data_columns._columns_for(ctx,
             new_rec.get("parquet"), page._scaling_task_id
         ) if new_rec else []
         preview["x"] = new_cols[0] if new_cols else None
@@ -978,13 +986,13 @@ def _scaling_rebuild_settings(ctx, page) -> None:
         preview["image_channel"] = channels[0] if channels else None
         preview["image_min"] = None
         preview["image_max"] = None
-        ctx._scaling_render_preview(page)
-        ctx._scaling_rebuild_settings(page)
+        _scaling_render_preview(ctx, page)
+        _scaling_rebuild_settings(ctx, page)
 
     def on_param(attr):
         def handler(value):
             preview[attr] = value
-            ctx._scaling_render_preview(page)
+            _scaling_render_preview(ctx, page)
         return handler
 
     file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())

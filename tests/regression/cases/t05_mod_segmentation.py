@@ -13,6 +13,7 @@ import harness  # noqa: E402
 from smage.data.image_index import _build_image_index_files  # noqa: E402
 from smage.importer import import_file  # noqa: E402
 from smage.modules.segmentation import page as seg_page  # noqa: E402
+from smage.modules.segmentation import page as seg_page
 
 
 def _open(case_id: str):
@@ -64,7 +65,7 @@ def nuclear_expansion() -> None:
             "min_area": 4,
             "expand": 1,
         }
-        mask, error = ctx._seg_nuclear_expansion(parquet, params)
+        mask, error = seg_page._seg_nuclear_expansion(ctx, parquet, params)
         harness.eq(error, None)
         harness.check(mask is not None)
         harness.eq(mask.shape, (32, 32))
@@ -88,7 +89,7 @@ def mask_io() -> None:
         mask[5:10, 5:10] = 1
         mask[20:25, 20:25] = 2
 
-        rel = ctx._seg_write_mask("seg-1", parquet, mask)
+        rel = seg_page._seg_write_mask(ctx, "seg-1", parquet, mask)
         path = project.path / rel
         harness.check(path.is_file(), "the mask parquet is written")
         harness.check(
@@ -96,7 +97,7 @@ def mask_io() -> None:
             "the mask label pyramid is built",
         )
 
-        loaded = ctx._seg_load_mask(str(path))
+        loaded = seg_page._seg_load_mask(ctx, str(path))
         harness.check(loaded is not None)
         harness.eq(loaded.shape, (32, 32))
         harness.eq(sorted(set(np.unique(loaded).tolist()) - {0}), [1, 2])
@@ -110,11 +111,11 @@ def errors() -> None:
     window, _project, _page, parquet = _open("seg_errors")
     try:
         ctx = window._ctx
-        mask, error = ctx._seg_nuclear_expansion(parquet, {"channel": ""})
+        mask, error = seg_page._seg_nuclear_expansion(ctx, parquet, {"channel": ""})
         harness.eq(mask, None)
         harness.check("nucleus channel" in error, error)
 
-        mask, error = ctx._seg_nuclear_expansion(
+        mask, error = seg_page._seg_nuclear_expansion(ctx,
             parquet,
             {"channel": "Channel 1", "threshold_mode": "manual",
              "threshold": 255.0, "min_area": 4, "expand": 0},
@@ -133,7 +134,7 @@ def import_mask() -> None:
         ctx = window._ctx
         page._seg_params["files"] = [parquet]
         page._seg_params["method"] = "mask_input"
-        ctx._seg_rebuild_method_panel(page)
+        seg_page._seg_rebuild_method_panel(ctx, page)
         mask = np.zeros((32, 32), dtype=np.uint16)
         mask[5:10, 5:10] = 1
         mask[20:25, 20:25] = 2
@@ -141,9 +142,9 @@ def import_mask() -> None:
         source.parent.mkdir(parents=True, exist_ok=True)
         tifffile.imwrite(source, mask)
 
-        record = ctx._seg_mask_record_live(page, parquet, create=True)
+        record = seg_page._seg_mask_record_live(ctx, page, parquet, create=True)
         record["input"] = str(source)
-        ctx._seg_import_masks(page)
+        seg_page._seg_import_masks(ctx, page)
 
         harness.eq(record["state"], seg_page.SEG_IMPORT_DONE)
         harness.check("Imported 1 mask" in page._seg_import_status.text(),
@@ -151,7 +152,7 @@ def import_mask() -> None:
         path = project.path / record["path"]
         harness.check(path.is_file(), "the imported mask is written")
 
-        loaded = ctx._seg_load_mask(str(path))
+        loaded = seg_page._seg_load_mask(ctx, str(path))
         harness.eq(sorted(set(np.unique(loaded).tolist()) - {0}), [1, 2])
     finally:
         _close(window)

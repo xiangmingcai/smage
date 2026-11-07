@@ -6,6 +6,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.modules.rename import page as _rename_page
 
 
 def _open(case_id: str):
@@ -35,11 +38,11 @@ def column_rename() -> None:
         cfg = page._rename_params["column"]
         cfg["files"] = [parquet]
         cfg["rows"] = [{"original": "FL2-A", "new": "NewFL2"}]
-        ctx._rename_save_now(page)
+        _rename_page._rename_save_now(ctx, page)
 
         harness.eq(cfg["rename"], {"FL2-A": "NewFL2"})
-        harness.check("NewFL2" in ctx._columns_for(parquet, "g-1"))
-        harness.check("FL2-A" not in ctx._columns_for(parquet, "g-1"))
+        harness.check("NewFL2" in _data_columns._columns_for(ctx, parquet, "g-1"))
+        harness.check("FL2-A" not in _data_columns._columns_for(ctx, parquet, "g-1"))
 
         from smage.project import Project
 
@@ -64,7 +67,7 @@ def rename_validation() -> None:
             {"original": "FL2-A", "new": "Bad/Name"},
             {"original": "FL3-A", "new": "Good"},
         ]
-        ctx._rename_save_now(page)
+        _rename_page._rename_save_now(ctx, page)
         harness.eq(cfg["rename"], {"FL3-A": "Good"},
                    "empty and invalid names are skipped")
     finally:
@@ -81,12 +84,12 @@ def file_rename() -> None:
         cfg = page._rename_params["file"]
         cfg["files"] = [parquet]
         cfg["rows"] = [{"original": parquet, "new": "renamed.fcs"}]
-        ctx._rename_save_now(page)
+        _rename_page._rename_save_now(ctx, page)
 
         harness.eq(cfg["rename"], {parquet: "renamed.fcs"})
-        available = ctx._available_files("g-1")
+        available = _data_files._available_files(ctx, "g-1")
         harness.eq(available[0]["name"], "renamed.fcs")
-        harness.eq(ctx._imported_files()[0]["name"], "case.fcs")
+        harness.eq(_data_files._imported_files(ctx)[0]["name"], "case.fcs")
     finally:
         _close(window)
 
@@ -101,10 +104,10 @@ def file_conflict() -> None:
         cfg = page._rename_params["file"]
         cfg["files"] = [parquet]
         cfg["rows"] = [{"original": parquet, "new": "case.fcs"}]
-        ctx._rename_save_now(page)
+        _rename_page._rename_save_now(ctx, page)
         harness.eq(cfg["rename"], {parquet: "case.fcs"},
                    "the map may repeat the current name")
-        harness.eq(ctx._available_files("g-1")[0]["name"], "case.fcs")
+        harness.eq(_data_files._available_files(ctx, "g-1")[0]["name"], "case.fcs")
     finally:
         _close(window)
 

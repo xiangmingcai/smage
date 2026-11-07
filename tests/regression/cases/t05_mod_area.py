@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
+from smage.modules.area import page as _area_page
 
 
 def _open(case_id: str):
@@ -32,17 +33,17 @@ def compute() -> None:
         ctx = window._ctx
         page._area_params["files"] = [parquet]
         page._area_params["grid"] = 5
-        cfg = ctx._area_row_cfg(page, parquet)
+        cfg = _area_page._area_row_cfg(ctx, page, parquet)
         cfg.update({"x": "x", "y": "y", "signal": "FL1-A",
                     "low": 0.0, "high": 1e9, "density": 0.0})
-        sig = ctx._area_signature(page, parquet, cfg)
+        sig = _area_page._area_signature(ctx, page, parquet, cfg)
         job = {
             "path": parquet,
             "cfg": dict(cfg),
             "sig": sig,
             "cancel": threading.Event(),
         }
-        result = ctx._area_compute(page, job, queue.Queue())
+        result = _area_page._area_compute(ctx, page, job, queue.Queue())
 
         harness.eq(result["rows"], 100)
         harness.eq(result["points"], 100)
@@ -63,11 +64,11 @@ def signature() -> None:
     try:
         ctx = window._ctx
         page._area_params["files"] = [parquet]
-        cfg = ctx._area_row_cfg(page, parquet)
-        first = ctx._area_signature(page, parquet, cfg)
-        harness.eq(ctx._area_signature(page, parquet, cfg), first)
+        cfg = _area_page._area_row_cfg(ctx, page, parquet)
+        first = _area_page._area_signature(ctx, page, parquet, cfg)
+        harness.eq(_area_page._area_signature(ctx, page, parquet, cfg), first)
         cfg["density"] = 3
-        harness.check(ctx._area_signature(page, parquet, cfg) != first)
+        harness.check(_area_page._area_signature(ctx, page, parquet, cfg) != first)
     finally:
         _close(window)
 
@@ -79,9 +80,9 @@ def save_params() -> None:
         ctx = window._ctx
         page._area_params["files"] = [parquet]
         page._area_params["grid"] = 8
-        cfg = ctx._area_row_cfg(page, parquet)
+        cfg = _area_page._area_row_cfg(ctx, page, parquet)
         cfg["density"] = 2
-        ctx._area_save_now(page)
+        _area_page._area_save_now(ctx, page)
 
         task = window.project.workflow["tasks"][0]["children"][0]
         harness.eq(task["params"]["files"], [parquet])
@@ -96,11 +97,11 @@ def format_values() -> None:
     window, _project, page, _parquet = _open("area_format")
     try:
         ctx = window._ctx
-        harness.eq(ctx._area_format(0), "0")
-        harness.eq(ctx._area_format(12.0), "12")
-        harness.eq(ctx._area_format(1234.5), "1,234.5")
-        harness.eq(ctx._area_format("bad"), "")
-        harness.eq(ctx._area_format(float("nan")), "")
+        harness.eq(_area_page._area_format(ctx, 0), "0")
+        harness.eq(_area_page._area_format(ctx, 12.0), "12")
+        harness.eq(_area_page._area_format(ctx, 1234.5), "1,234.5")
+        harness.eq(_area_page._area_format(ctx, "bad"), "")
+        harness.eq(_area_page._area_format(ctx, float("nan")), "")
     finally:
         _close(window)
 

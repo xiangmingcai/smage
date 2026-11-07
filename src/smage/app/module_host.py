@@ -31,6 +31,31 @@ from smage.widgets.resources import (
 )
 import copy
 import shutil
+from smage.data import files as _data_files
+from smage.data import pool as _data_pool
+from smage.data import stores as _data_stores
+from smage.modules.area import page as _area_page
+from smage.modules.batch_align import page as _batch_align_page
+from smage.modules.cluster import page as _cluster_page
+from smage.modules.compensation import page as _compensation_page
+from smage.modules.data_clean import page as _data_clean_page
+from smage.modules.dimred import page as _dimred_page
+from smage.modules.export import page as _export_page
+from smage.modules.feature import page as _feature_page
+from smage.modules.feature_up import page as _feature_up_page
+from smage.modules.figure import page as _figure_page
+from smage.modules.gate2col import page as _gate2col_page
+from smage.modules.gating import page as _gating_page
+from smage.modules.heatmap import page as _heatmap_page
+from smage.modules.illumination import page as _illumination_page
+from smage.modules.import_ import page as _import__page
+from smage.modules.rename import page as _rename_page
+from smage.modules.scale import page as _scale_page
+from smage.modules.segmentation import page as _segmentation_page
+from smage.modules.subsample import page as _subsample_page
+from smage.modules.subset import page as _subset_page
+from smage.modules.unmix import page as _unmix_page
+from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
 
 
 class _DraftSaveGuard(QObject):
@@ -98,7 +123,7 @@ class ModuleHostMixin:
         tl = QHBoxLayout(bar)
         tl.setContentsMargins(12, 6, 12, 6)
         tl.setSpacing(4)
-        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_id, name)}</b>"))
+        tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(self._ctx, task_id, name)}</b>"))
         if locked:
             lock = QLabel()
             lock.setPixmap(_lock_pixmap())
@@ -165,7 +190,7 @@ class ModuleHostMixin:
         tl = QHBoxLayout(bar)
         tl.setContentsMargins(12, 6, 12, 6)
         tl.setSpacing(4)
-        tl.addWidget(QLabel(f"<b>{self._module_display_title(task_def.get('id'), name)}</b>"))
+        tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(self._ctx, task_def.get('id'), name)}</b>"))
         lock_label = QLabel()
         lock_label.setPixmap(_lock_pixmap())
         lock_label.setFixedSize(14, 14)
@@ -395,9 +420,9 @@ class ModuleHostMixin:
 
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""
-        self._write_draft_params(page)
+        _data_stores._write_draft_params(self._ctx, page)
         # Any saved change can alter the data flowing downstream.
-        self._pool_clear()
+        _data_pool._pool_clear(self._ctx)
         self._channel_range_cache = {}
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
@@ -425,7 +450,7 @@ class ModuleHostMixin:
         self._refresh_workflow_tree()
         task_id = page.property("task_id")
         if task_id:
-            path = self._module_size_path(task_id)
+            path = _data_files._module_size_path(self._ctx, task_id)
             label = self._size_labels.get(str(task_id))
             if path is not None and Path(path).is_dir():
                 self._schedule_module_size(task_id)
@@ -440,39 +465,39 @@ class ModuleHostMixin:
         """Refresh a downstream module's content (visualization only) after an
         upstream save. This module's own unsaved edits are left untouched."""
         if task_type == "figure":
-            self._figure_refresh_all(page)
-            self._figure_rebuild_settings(page)
+            _figure_page._figure_refresh_all(self._ctx, page)
+            _figure_page._figure_rebuild_settings(self._ctx, page)
         elif task_type == "scale":
-            self._scaling_render_preview(page)
+            _scale_page._scaling_render_preview(self._ctx, page)
         elif task_type == "gating":
-            self._gating_render(page)
-            self._gating_rebuild_settings(page)
+            _widgets_gate_editor_editor._gating_render(self._ctx, page)
+            _widgets_gate_editor_editor._gating_rebuild_settings(self._ctx, page)
         elif task_type == "segmentation":
-            self._seg_refresh_files(page)
+            _segmentation_page._seg_refresh_files(self._ctx, page)
         elif task_type == "feature":
-            self._feat_refresh_files(page)
+            _feature_page._feat_refresh_files(self._ctx, page)
         elif task_type == "gate2col":
-            self._g2c_refresh_files(page)
+            _gate2col_page._g2c_refresh_files(self._ctx, page)
         elif task_type == "feature_up":
-            self._fup_refresh_files(page)
+            _feature_up_page._fup_refresh_files(self._ctx, page)
         elif task_type == "subset":
-            self._subset_refresh(page)
+            _subset_page._subset_refresh(self._ctx, page)
         elif task_type == "subsample":
-            self._subs_refresh(page)
+            _subsample_page._subs_refresh(self._ctx, page)
         elif task_type == "rename":
-            self._rename_refresh(page)
+            _rename_page._rename_refresh(self._ctx, page)
         elif task_type == "dimred":
-            self._dimred_refresh(page)
+            _dimred_page._dimred_refresh(self._ctx, page)
         elif task_type == "cluster":
-            self._cluster_refresh(page)
+            _cluster_page._cluster_refresh(self._ctx, page)
         elif task_type == "area":
-            self._area_refresh(page)
+            _area_page._area_refresh(self._ctx, page)
         elif task_type == "data_clean":
-            self._dc_refresh(page)
+            _data_clean_page._dc_refresh(self._ctx, page)
         elif task_type == "batch_align":
-            self._ba_refresh(page)
+            _batch_align_page._ba_refresh(self._ctx, page)
         elif task_type == "export":
-            self._export_refresh(page)
+            _export_page._export_refresh(self._ctx, page)
 
     def _open_module(self, task_id: str | None, task_type: str | None, name: str) -> None:
         """Open (or focus) the module tab for the given task (identified by id)."""
@@ -521,47 +546,47 @@ class ModuleHostMixin:
                                 pass
 
         if task_type == "import":
-            page = self._build_data_import_page()
+            page = _import__page._build_data_import_page(self._ctx)
         elif task_type == "figure":
-            page = self._build_figure_page(name, task_def, locked)
+            page = _figure_page._build_figure_page(self._ctx, name, task_def, locked)
         elif task_type == "heatmap":
-            page = self._build_heatmap_page(name, task_def, locked)
+            page = _heatmap_page._build_heatmap_page(self._ctx, name, task_def, locked)
         elif task_type == "export":
-            page = self._build_export_page(name, task_def, locked)
+            page = _export_page._build_export_page(self._ctx, name, task_def, locked)
         elif task_type == "scale":
-            page = self._build_scaling_page(name, task_def, locked)
+            page = _scale_page._build_scaling_page(self._ctx, name, task_def, locked)
         elif task_type == "gating":
-            page = self._build_gating_page(name, task_def, locked)
+            page = _gating_page._build_gating_page(self._ctx, name, task_def, locked)
         elif task_type == "unmix":
-            page = self._build_unmix_page(name, task_def, locked)
+            page = _unmix_page._build_unmix_page(self._ctx, name, task_def, locked)
         elif task_type == "compensation":
-            page = self._build_compensation_page(name, task_def, locked)
+            page = _compensation_page._build_compensation_page(self._ctx, name, task_def, locked)
         elif task_type == "illumination":
-            page = self._build_illumination_page(name, task_def, locked)
+            page = _illumination_page._build_illumination_page(self._ctx, name, task_def, locked)
         elif task_type == "segmentation":
-            page = self._build_segmentation_page(name, task_def, locked)
+            page = _segmentation_page._build_segmentation_page(self._ctx, name, task_def, locked)
         elif task_type == "feature":
-            page = self._build_feature_page(name, task_def, locked)
+            page = _feature_page._build_feature_page(self._ctx, name, task_def, locked)
         elif task_type == "gate2col":
-            page = self._build_gate2col_page(name, task_def, locked)
+            page = _gate2col_page._build_gate2col_page(self._ctx, name, task_def, locked)
         elif task_type == "feature_up":
-            page = self._build_feature_up_page(name, task_def, locked)
+            page = _feature_up_page._build_feature_up_page(self._ctx, name, task_def, locked)
         elif task_type == "subset":
-            page = self._build_subset_page(name, task_def, locked)
+            page = _subset_page._build_subset_page(self._ctx, name, task_def, locked)
         elif task_type == "subsample":
-            page = self._build_subsample_page(name, task_def, locked)
+            page = _subsample_page._build_subsample_page(self._ctx, name, task_def, locked)
         elif task_type == "rename":
-            page = self._build_rename_page(name, task_def, locked)
+            page = _rename_page._build_rename_page(self._ctx, name, task_def, locked)
         elif task_type == "dimred":
-            page = self._build_dimred_page(name, task_def, locked)
+            page = _dimred_page._build_dimred_page(self._ctx, name, task_def, locked)
         elif task_type == "cluster":
-            page = self._build_cluster_page(name, task_def, locked)
+            page = _cluster_page._build_cluster_page(self._ctx, name, task_def, locked)
         elif task_type == "area":
-            page = self._build_area_page(name, task_def, locked)
+            page = _area_page._build_area_page(self._ctx, name, task_def, locked)
         elif task_type == "data_clean":
-            page = self._build_dc_page(name, task_def, locked)
+            page = _data_clean_page._build_dc_page(self._ctx, name, task_def, locked)
         elif task_type == "batch_align":
-            page = self._build_ba_page(name, task_def, locked)
+            page = _batch_align_page._build_ba_page(self._ctx, name, task_def, locked)
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
@@ -629,20 +654,20 @@ class ModuleHostMixin:
         """
         try:
             if task_type == "gating":
-                self._gating_cleanup(page)
+                _widgets_gate_editor_editor._gating_cleanup(self._ctx, page)
             elif task_type == "heatmap":
-                self._heatmap_cleanup(page)
+                _heatmap_page._heatmap_cleanup(self._ctx, page)
             elif task_type == "export":
-                self._export_cleanup(page)
+                _export_page._export_cleanup(self._ctx, page)
             elif task_type == "figure":
-                self._figure_cancel_rendering(page)
+                _figure_page._figure_cancel_rendering(self._ctx, page)
         except Exception:  # noqa: BLE001 - teardown must never raise
             pass
         # Feature Down counts values in a background thread regardless of how
         # the page was opened.
         if hasattr(page, "_feat_ignore_requests"):
             try:
-                self._feat_ignore_cleanup(page)
+                _feature_page._feat_ignore_cleanup(self._ctx, page)
             except Exception:  # noqa: BLE001
                 pass
         timer = getattr(page, "_fig_filter_timer", None)

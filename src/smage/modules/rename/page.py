@@ -13,6 +13,11 @@ from smage.core.constants import MODULE_STATE_MODIFIED
 from smage.core.pipeline import _rename_applies
 from smage.widgets.controls import _NoWheelComboBox
 from smage.widgets.resources import _lock_pixmap
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import naming as _data_naming
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 def _rename_task(ctx, task_def: dict) -> None:
@@ -32,7 +37,7 @@ def _rename_task(ctx, task_def: dict) -> None:
 def _rename_columns_forward(ctx, task_id, parquet_path, names) -> list:
     """Map a list of column names through upstream renames (for UI names)."""
     out = list(names)
-    for stage in ctx._column_rename_stages(task_id):
+    for stage in _data_columns._column_rename_stages(ctx, task_id):
         if not _rename_applies(stage, parquet_path):
             continue
         out = [stage["map"].get(n, n) for n in out]
@@ -51,7 +56,7 @@ def _build_rename_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -67,7 +72,7 @@ def _build_rename_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._rename_close(page))
+    close_btn.clicked.connect(lambda _=False: _rename_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -82,7 +87,7 @@ def _build_rename_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._rename_locked = locked
     page._rename_save_btn = save_btn
     page._rename_dirty = False
-    save_btn.clicked.connect(lambda _=False: ctx._rename_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _rename_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -102,14 +107,14 @@ def _build_rename_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._rename_mode = mode
 
     stack = QStackedWidget()
-    stack.addWidget(ctx._rename_file_panel(page))
-    stack.addWidget(ctx._rename_column_panel(page))
+    stack.addWidget(_rename_file_panel(ctx, page))
+    stack.addWidget(_rename_column_panel(ctx, page))
     row.addWidget(stack, 1)
     page._rename_stack = stack
     layout.addWidget(content, 1)
 
-    mode.currentIndexChanged.connect(lambda _=0: ctx._rename_on_mode(page))
-    ctx._rename_refresh(page)
+    mode.currentIndexChanged.connect(lambda _=0: _rename_on_mode(ctx, page))
+    _rename_refresh(ctx, page)
     return page
 
 
@@ -121,7 +126,7 @@ def _rename_file_panel(ctx, page) -> QWidget:
     top = QHBoxLayout()
     sel = QPushButton("Select files…")
     sel.setCursor(Qt.CursorShape.PointingHandCursor)
-    sel.clicked.connect(lambda _=False: ctx._rename_select_files(page))
+    sel.clicked.connect(lambda _=False: _rename_select_files(ctx, page))
     top.addWidget(sel)
     top.addStretch()
     lay.addLayout(top)
@@ -132,8 +137,8 @@ def _rename_file_panel(ctx, page) -> QWidget:
     hint.setWordWrap(True)
     hint.setStyleSheet("color: #6b7785;")
     lay.addWidget(hint)
-    lay.addWidget(ctx._rename_table(page, "file"), 1)
-    lay.addLayout(ctx._rename_copy_paste(page))
+    lay.addWidget(_rename_table(ctx, page, "file"), 1)
+    lay.addLayout(_rename_copy_paste(ctx, page))
     return panel
 
 
@@ -145,7 +150,7 @@ def _rename_column_panel(ctx, page) -> QWidget:
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
 
-    left = ctx._build_panel_frame()
+    left = _widgets_panels._build_panel_frame(ctx)
     ll = QVBoxLayout(left)
     ll.setContentsMargins(10, 10, 10, 10)
     ll.setSpacing(6)
@@ -159,7 +164,7 @@ def _rename_column_panel(ctx, page) -> QWidget:
     ll.addWidget(hint_files)
     files_btn = QPushButton("Select files…")
     files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    files_btn.clicked.connect(lambda _=False: ctx._rename_select_files(page))
+    files_btn.clicked.connect(lambda _=False: _rename_select_files(ctx, page))
     ll.addWidget(files_btn)
     files_box = QListWidget()
     files_box.setStyleSheet(
@@ -168,7 +173,7 @@ def _rename_column_panel(ctx, page) -> QWidget:
     ll.addWidget(files_box, 1)
     page._rename_column_files_box = files_box
 
-    right = ctx._build_panel_frame()
+    right = _widgets_panels._build_panel_frame(ctx)
     rl = QVBoxLayout(right)
     rl.setContentsMargins(10, 10, 10, 10)
     rl.setSpacing(6)
@@ -181,7 +186,7 @@ def _rename_column_panel(ctx, page) -> QWidget:
     rl.addWidget(hint_vars)
     vars_btn = QPushButton("Select variables…")
     vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    vars_btn.clicked.connect(lambda _=False: ctx._rename_select_vars(page))
+    vars_btn.clicked.connect(lambda _=False: _rename_select_vars(ctx, page))
     rl.addWidget(vars_btn)
     vars_box = QListWidget()
     vars_box.setStyleSheet(
@@ -195,13 +200,13 @@ def _rename_column_panel(ctx, page) -> QWidget:
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
     lay.addWidget(splitter, 3)
-    lay.addWidget(ctx._rename_table(page, "column"), 4)
-    lay.addLayout(ctx._rename_copy_paste(page))
+    lay.addWidget(_rename_table(ctx, page, "column"), 4)
+    lay.addLayout(_rename_copy_paste(ctx, page))
     return panel
 
 
 def _rename_table(ctx, page, mode) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -219,7 +224,7 @@ def _rename_table(ctx, page, mode) -> QWidget:
     attr = "_rename_file_table" if mode == "file" else "_rename_column_table"
     setattr(page, attr, table)
     table.itemChanged.connect(
-        lambda item, m=mode: ctx._rename_on_cell(page, item, m)
+        lambda item, m=mode: _rename_on_cell(ctx, page, item, m)
     )
     return panel
 
@@ -230,8 +235,8 @@ def _rename_copy_paste(ctx, page) -> QHBoxLayout:
     copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     paste_btn = QPushButton("Paste")
     paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    copy_btn.clicked.connect(lambda _=False: ctx._rename_copy(page))
-    paste_btn.clicked.connect(lambda _=False: ctx._rename_paste(page))
+    copy_btn.clicked.connect(lambda _=False: _rename_copy(ctx, page))
+    paste_btn.clicked.connect(lambda _=False: _rename_paste(ctx, page))
     btns.addWidget(copy_btn)
     btns.addWidget(paste_btn)
     btns.addStretch()
@@ -244,9 +249,9 @@ def _rename_on_mode(ctx, page) -> None:
     mode = page._rename_mode.currentData() or "file"
     if mode != page._rename_params.get("mode"):
         page._rename_params["mode"] = mode
-        ctx._rename_mark_dirty(page)
+        _rename_mark_dirty(ctx, page)
     page._rename_stack.setCurrentIndex(0 if mode == "file" else 1)
-    ctx._rename_refresh(page)
+    _rename_refresh(ctx, page)
 
 
 def _rename_cfg(ctx, page, mode=None):
@@ -256,15 +261,15 @@ def _rename_cfg(ctx, page, mode=None):
 
 
 def _rename_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._rename_task_id)
+    records = _data_files._available_files(ctx, page._rename_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     mode = page._rename_params.get("mode", "file")
-    cfg = ctx._rename_cfg(page, mode)
+    cfg = _rename_cfg(ctx, page, mode)
     current = [
-        ctx._comp_file_name(p, page._rename_task_id) for p in cfg.get("files") or []
+        _data_naming._comp_file_name(ctx, p, page._rename_task_id) for p in cfg.get("files") or []
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -281,42 +286,42 @@ def _rename_select_files(ctx, page) -> None:
             else:
                 rows.append({
                     "original": path,
-                    "new": ctx._comp_file_name(path, page._rename_task_id),
+                    "new": _data_naming._comp_file_name(ctx, path, page._rename_task_id),
                 })
         cfg["rows"] = rows
     else:
         # Column mode: files only set the scope; the variable rows are
         # picked separately. Drop rows whose column is no longer offered.
-        union = set(ctx._rename_column_union(page))
+        union = set(_rename_column_union(ctx, page))
         cfg["rows"] = [
             r for r in (cfg.get("rows") or [])
             if r.get("original") in union
         ]
-    ctx._rename_refresh(page)
-    ctx._rename_mark_dirty(page)
+    _rename_refresh(ctx, page)
+    _rename_mark_dirty(ctx, page)
 
 
 def _rename_column_union(ctx, page) -> list:
-    cfg = ctx._rename_cfg(page, "column")
+    cfg = _rename_cfg(ctx, page, "column")
     paths = list(cfg.get("files") or [])
     columns = []
     for path in paths:
-        for name in ctx._columns_for(path, page._rename_task_id):
+        for name in _data_columns._columns_for(ctx, path, page._rename_task_id):
             if name not in columns:
                 columns.append(name)
     return columns
 
 
 def _rename_select_vars(ctx, page) -> None:
-    options = ctx._rename_column_union(page)
+    options = _rename_column_union(ctx, page)
     if not options:
         QMessageBox.information(
             ctx.host, "Select variables", "Select data files first."
         )
         return
-    cfg = ctx._rename_cfg(page, "column")
+    cfg = _rename_cfg(ctx, page, "column")
     existing = [r["original"] for r in cfg.get("rows") or []]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select variables", options, existing, "Filter variables..."
     )
     if chosen is None:
@@ -329,8 +334,8 @@ def _rename_select_vars(ctx, page) -> None:
         else:
             rows.append({"original": name, "new": name})
     cfg["rows"] = rows
-    ctx._rename_refresh(page)
-    ctx._rename_mark_dirty(page)
+    _rename_refresh(ctx, page)
+    _rename_mark_dirty(ctx, page)
 
 
 def _rename_file_status(ctx, page, path, new_name, taken) -> tuple:
@@ -367,16 +372,16 @@ def _rename_refresh(ctx, page) -> None:
         page._rename_mode.blockSignals(False)
         page._rename_stack.setCurrentIndex(0 if mode == "file" else 1)
         if mode == "file":
-            ctx._rename_refresh_file(page)
+            _rename_refresh_file(ctx, page)
         else:
-            ctx._rename_refresh_column(page)
+            _rename_refresh_column(ctx, page)
     finally:
         page._rename_updating = False
-    ctx._rename_update_save_btn(page)
+    _rename_update_save_btn(ctx, page)
 
 
 def _rename_refresh_file(ctx, page) -> None:
-    cfg = ctx._rename_cfg(page, "file")
+    cfg = _rename_cfg(ctx, page, "file")
     rows = cfg.get("rows") or []
 
     table = page._rename_file_table
@@ -384,19 +389,19 @@ def _rename_refresh_file(ctx, page) -> None:
     table.setRowCount(len(rows))
     for i, r in enumerate(rows):
         orig_item = QTableWidgetItem(
-            ctx._comp_file_name(r["original"], page._rename_task_id)
+            _data_naming._comp_file_name(ctx, r["original"], page._rename_task_id)
         )
         orig_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         table.setItem(i, 0, orig_item)
         new_item = QTableWidgetItem(r.get("new", ""))
         table.setItem(i, 1, new_item)
     table.blockSignals(False)
-    ctx._rename_statuses_file(page)
+    _rename_statuses_file(ctx, page)
 
 
 def _rename_statuses_file(ctx, page) -> None:
-    cfg = ctx._rename_cfg(page, "file")
-    records = ctx._available_files(page._rename_task_id)
+    cfg = _rename_cfg(ctx, page, "file")
+    records = _data_files._available_files(ctx, page._rename_task_id)
     selected = set(cfg.get("files") or [])
     rows = cfg.get("rows") or []
     taken = set()
@@ -410,22 +415,22 @@ def _rename_statuses_file(ctx, page) -> None:
     table = page._rename_file_table
     table.blockSignals(True)
     for i, r in enumerate(rows):
-        status, sev = ctx._rename_file_status(
+        status, sev = _rename_file_status(ctx,
             page, r["original"], r.get("new"),
             taken - {(r.get("new") or "").strip()},
         )
-        table.setItem(i, 2, ctx._rename_status_item(status, sev))
+        table.setItem(i, 2, _rename_status_item(ctx, status, sev))
     table.blockSignals(False)
 
 
 def _rename_refresh_column(ctx, page) -> None:
-    cfg = ctx._rename_cfg(page, "column")
+    cfg = _rename_cfg(ctx, page, "column")
     rows = cfg.get("rows") or []
 
     files_box = page._rename_column_files_box
     files_box.clear()
     for path in cfg.get("files") or []:
-        files_box.addItem(ctx._comp_file_name(path, page._rename_task_id))
+        files_box.addItem(_data_naming._comp_file_name(ctx, path, page._rename_task_id))
     vars_box = page._rename_column_vars_box
     vars_box.clear()
     for r in rows:
@@ -441,20 +446,20 @@ def _rename_refresh_column(ctx, page) -> None:
         new_item = QTableWidgetItem(r.get("new", ""))
         table.setItem(i, 1, new_item)
     table.blockSignals(False)
-    ctx._rename_statuses_column(page)
+    _rename_statuses_column(ctx, page)
 
 
 def _rename_statuses_column(ctx, page) -> None:
-    cfg = ctx._rename_cfg(page, "column")
-    union = set(ctx._rename_column_union(page))
+    cfg = _rename_cfg(ctx, page, "column")
+    union = set(_rename_column_union(ctx, page))
     rows = cfg.get("rows") or []
     table = page._rename_column_table
     table.blockSignals(True)
     for i, r in enumerate(rows):
-        status, sev = ctx._rename_column_status(
+        status, sev = _rename_column_status(ctx,
             page, r["original"], r.get("new"), union
         )
-        table.setItem(i, 2, ctx._rename_status_item(status, sev))
+        table.setItem(i, 2, _rename_status_item(ctx, status, sev))
     table.blockSignals(False)
 
 
@@ -473,22 +478,22 @@ def _rename_on_cell(ctx, page, item, mode) -> None:
         return
     if item.column() != 1:
         return
-    cfg = ctx._rename_cfg(page, mode)
+    cfg = _rename_cfg(ctx, page, mode)
     rows = cfg.get("rows") or []
     if item.row() >= len(rows):
         return
     rows[item.row()]["new"] = item.text()
-    ctx._rename_mark_dirty(page)
+    _rename_mark_dirty(ctx, page)
     # Only the validation column changes; rebuild just that, so the editor
     # keeps focus while the user types.
     if mode == "file":
-        ctx._rename_statuses_file(page)
+        _rename_statuses_file(ctx, page)
     else:
-        ctx._rename_statuses_column(page)
+        _rename_statuses_column(ctx, page)
 
 
 def _rename_table_rows(ctx, page, mode) -> list:
-    cfg = ctx._rename_cfg(page, mode)
+    cfg = _rename_cfg(ctx, page, mode)
     table = (
         page._rename_file_table if mode == "file" else page._rename_column_table
     )
@@ -503,11 +508,11 @@ def _rename_table_rows(ctx, page, mode) -> list:
 
 def _rename_copy(ctx, page) -> None:
     mode = page._rename_params.get("mode", "file")
-    rows = ctx._rename_table_rows(page, mode)
+    rows = _rename_table_rows(ctx, page, mode)
     lines = ["original name\tnew name"]
     for r in rows:
         original = (
-            ctx._comp_file_name(r["original"], page._rename_task_id)
+            _data_naming._comp_file_name(ctx, r["original"], page._rename_task_id)
             if mode == "file" else str(r["original"])
         )
         lines.append(f"{original}\t{r['new']}")
@@ -529,10 +534,10 @@ def _rename_paste(ctx, page) -> None:
         )
         return
     pasted = [ln.split("\t") for ln in lines[1:]]
-    cfg = ctx._rename_cfg(page, mode)
+    cfg = _rename_cfg(ctx, page, mode)
     rows = cfg.get("rows") or []
     current_originals = [
-        ctx._comp_file_name(r["original"], page._rename_task_id)
+        _data_naming._comp_file_name(ctx, r["original"], page._rename_task_id)
         if mode == "file" else str(r["original"])
         for r in rows
     ]
@@ -551,14 +556,14 @@ def _rename_paste(ctx, page) -> None:
             return
     for r, row in zip(rows, pasted):
         r["new"] = (row[1] if len(row) > 1 else "").strip()
-    ctx._rename_refresh(page)
-    ctx._rename_mark_dirty(page)
+    _rename_refresh(ctx, page)
+    _rename_mark_dirty(ctx, page)
 
 
 def _rename_apply(ctx, page) -> None:
     """Store the valid-only rename map for the current mode."""
     mode = page._rename_params.get("mode", "file")
-    cfg = ctx._rename_cfg(page, mode)
+    cfg = _rename_cfg(ctx, page, mode)
     rows = cfg.get("rows") or []
     applied = {}
     for r in rows:
@@ -574,15 +579,15 @@ def _rename_apply(ctx, page) -> None:
                 n = (other.get("new") or "").strip()
                 if n:
                     taken.add(n)
-            for rec in ctx._available_files(page._rename_task_id):
+            for rec in _data_files._available_files(ctx, page._rename_task_id):
                 if rec.get("parquet") not in (cfg.get("files") or []):
                     taken.add(rec.get("name", ""))
-            status, _sev = ctx._rename_file_status(page, original, new, taken)
+            status, _sev = _rename_file_status(ctx, page, original, new, taken)
             if status:
                 continue
         else:
-            status, _sev = ctx._rename_column_status(
-                page, original, new, set(ctx._rename_column_union(page))
+            status, _sev = _rename_column_status(ctx,
+                page, original, new, set(_rename_column_union(ctx, page))
             )
             if status == "Empty name" or status == "Invalid characters":
                 continue
@@ -592,7 +597,7 @@ def _rename_apply(ctx, page) -> None:
 
 def _rename_mark_dirty(ctx, page) -> None:
     page._rename_dirty = True
-    ctx._rename_update_save_btn(page)
+    _rename_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -603,12 +608,12 @@ def _rename_update_save_btn(ctx, page) -> None:
 
 
 def _rename_save_now(ctx, page) -> None:
-    ctx._rename_apply(page)
+    _rename_apply(ctx, page)
     page._rename_task_def["params"] = page._rename_params
     if ctx.project is not None:
         ctx.project.save()
     page._rename_dirty = False
-    ctx._rename_update_save_btn(page)
+    _rename_update_save_btn(ctx, page)
     ctx.statusBar().showMessage("Rename settings saved")
     ctx._module_saved(page)
 

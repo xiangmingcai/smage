@@ -6,6 +6,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
+from smage.data import sampling as _data_sampling
+from smage.modules.subsample import page as _subsample_page
 
 
 def _open(case_id: str):
@@ -43,16 +45,16 @@ def count_sampling() -> None:
         ctx = window._ctx
         _configure(page, parquet, count=10)
         ctx._subsample_cache = {}
-        ctx._subs_save_now(page)
+        _subsample_page._subs_save_now(ctx, page)
 
-        index = ctx._subsample_row_index("g-1", parquet)
+        index = _data_sampling._subsample_row_index(ctx, "g-1", parquet)
         harness.check(index is not None, "downstream sees a row filter")
         harness.eq(len(index), 10)
-        harness.eq(ctx._subsample_visible_count("g-1", parquet), 10)
+        harness.eq(_data_sampling._subsample_visible_count(ctx, "g-1", parquet), 10)
         harness.check(len(set(index.tolist())) == 10, "indices are unique")
         harness.check(all(0 <= int(i) < 100 for i in index))
 
-        again = ctx._subsample_row_index("g-1", parquet)
+        again = _data_sampling._subsample_row_index(ctx, "g-1", parquet)
         harness.check(
             (index == again).all(), "the selection is stable between calls"
         )
@@ -67,13 +69,13 @@ def stable_growth() -> None:
         ctx = window._ctx
         _configure(page, parquet, count=10)
         ctx._subsample_cache = {}
-        ctx._subs_save_now(page)
-        small = ctx._subsample_row_index("g-1", parquet)
+        _subsample_page._subs_save_now(ctx, page)
+        small = _data_sampling._subsample_row_index(ctx, "g-1", parquet)
 
         _configure(page, parquet, count=25)
         ctx._subsample_cache = {}
-        ctx._subs_save_now(page)
-        large = ctx._subsample_row_index("g-1", parquet)
+        _subsample_page._subs_save_now(ctx, page)
+        large = _data_sampling._subsample_row_index(ctx, "g-1", parquet)
 
         harness.eq(len(small), 10)
         harness.eq(len(large), 25)
@@ -92,15 +94,15 @@ def override_and_percent() -> None:
         ctx = window._ctx
         _configure(page, parquet, count=20, overrides={parquet: 4})
         ctx._subsample_cache = {}
-        ctx._subs_save_now(page)
-        harness.eq(len(ctx._subsample_row_index("g-1", parquet)), 4,
+        _subsample_page._subs_save_now(ctx, page)
+        harness.eq(len(_data_sampling._subsample_row_index(ctx, "g-1", parquet)), 4,
                    "a manual override wins")
 
         _configure(page, parquet, basis="per_file", unit="percent",
                    count=None, percent=10)
         ctx._subsample_cache = {}
-        ctx._subs_save_now(page)
-        harness.eq(len(ctx._subsample_row_index("g-1", parquet)), 10,
+        _subsample_page._subs_save_now(ctx, page)
+        harness.eq(len(_data_sampling._subsample_row_index(ctx, "g-1", parquet)), 10,
                    "10% of 100 rows")
     finally:
         _close(window)
@@ -112,7 +114,7 @@ def save_params() -> None:
     try:
         ctx = window._ctx
         _configure(page, parquet, count=7)
-        ctx._subs_save_now(page)
+        _subsample_page._subs_save_now(ctx, page)
 
         from smage.project import Project
 

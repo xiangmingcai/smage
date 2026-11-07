@@ -9,6 +9,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
+from smage.data import columns as _data_columns
 
 
 def _open(case_id: str, tasks=(), rows: int = 60):
@@ -52,19 +53,19 @@ def columns_lookup() -> None:
     harness.open_project(window, project)
     try:
         ctx = window._ctx
-        base = ctx._columns_for(parquet)
+        base = _data_columns._columns_for(ctx, parquet)
         harness.check("FL2-A" in base and "NewFL2" not in base)
-        harness.eq(ctx._columns_for(None), [])
+        harness.eq(_data_columns._columns_for(ctx, None), [])
 
-        renamed = ctx._columns_for(parquet, "g-1")
+        renamed = _data_columns._columns_for(ctx, parquet, "g-1")
         harness.check("NewFL2" in renamed, f"downstream sees the rename: {renamed}")
         harness.check("FL2-A" not in renamed)
 
-        unchanged = ctx._columns_for(parquet, "s-1")
+        unchanged = _data_columns._columns_for(ctx, parquet, "s-1")
         harness.check("FL2-A" in unchanged, "a rename below the reader is not applied")
 
-        harness.eq(ctx._data_row_count(parquet), 40)
-        harness.eq(ctx._data_row_count(str(project.data_dir / "missing.parquet")), 0)
+        harness.eq(_data_columns._data_row_count(ctx, parquet), 40)
+        harness.eq(_data_columns._data_row_count(ctx, str(project.data_dir / "missing.parquet")), 0)
     finally:
         _close(window)
 
@@ -84,7 +85,7 @@ def columns_subset() -> None:
     window = harness.new_window()
     harness.open_project(window, project)
     try:
-        harness.eq(window._ctx._columns_for(parquet, "g-1"), ["x", "FL1-A"])
+        harness.eq(_data_columns._columns_for(window._ctx, parquet, "g-1"), ["x", "FL1-A"])
     finally:
         _close(window)
 
@@ -104,20 +105,20 @@ def column_values() -> None:
         ctx = window._ctx
         raw = pd.read_parquet(parquet)["FL1-A"].to_numpy(dtype="float64")
 
-        values = ctx._column_data("g-1", parquet, ["FL1-A"])
+        values = _data_columns._column_data(ctx, "g-1", parquet, ["FL1-A"])
         harness.check(
             np.allclose(values["FL1-A"], np.log10(raw)),
             "the upstream scale transform is applied",
         )
 
-        renamed = ctx._column_data("g-1", parquet, ["NewFL2"])
+        renamed = _data_columns._column_data(ctx, "g-1", parquet, ["NewFL2"])
         expected = pd.read_parquet(parquet)["FL2-A"].to_numpy(dtype="float64")
         harness.check(np.allclose(renamed["NewFL2"], expected))
 
-        missing = ctx._column_data("g-1", parquet, ["missing"])
+        missing = _data_columns._column_data(ctx, "g-1", parquet, ["missing"])
         harness.eq(missing, {})
 
-        frame = ctx._read_columns(parquet, ["x", "FL1-A"], "g-1")
+        frame = _data_columns._read_columns(ctx, parquet, ["x", "FL1-A"], "g-1")
         harness.eq(list(frame.columns), ["x", "FL1-A"])
         harness.eq(len(frame), 60)
     finally:
@@ -138,12 +139,12 @@ def text_columns() -> None:
     window = harness.new_window()
     harness.open_project(window, project)
     try:
-        values = window._ctx._column_data(
-            None, str(parquet), ["label"], numeric=False
+        values = _data_columns._column_data(
+            window._ctx, None, str(parquet), ["label"], numeric=False
         )
         harness.eq(values["label"].tolist(), ["A", "B", "A", "B", "A", "B"])
 
-        coerced = window._ctx._column_data(None, str(parquet), ["label"])
+        coerced = _data_columns._column_data(window._ctx, None, str(parquet), ["label"])
         harness.check(
             np.all(np.isnan(coerced["label"])),
             "numeric coercion turns text into NaN",
@@ -178,7 +179,7 @@ def map_stages() -> None:
     harness.open_project(window, project)
     try:
         ctx = window._ctx
-        stages = ctx._map_stages("g-1")
+        stages = _data_columns._map_stages(ctx, "g-1")
         harness.eq([kind for kind, _stage in stages], ["scale", "compensation"])
         harness.eq(stages[0][1]["columns"]["FL1-A"]["method"], "arcsinh")
         harness.eq(stages[0][1]["files"], {parquet})
@@ -188,19 +189,19 @@ def map_stages() -> None:
             "the matrix is stored as percentages",
         )
 
-        transforms = ctx._upstream_scale_transforms("g-1")
+        transforms = _data_columns._upstream_scale_transforms(ctx, "g-1")
         harness.eq(list(transforms), ["FL1-A"])
         harness.eq(transforms["FL1-A"][0]["method"], "arcsinh")
-        harness.eq(ctx._upstream_scale_transforms("s-1"), {})
+        harness.eq(_data_columns._upstream_scale_transforms(ctx, "s-1"), {})
 
-        token = ctx._map_stage_token("g-1")
-        harness.eq(ctx._map_stage_token("g-1"), token, "the token is deterministic")
+        token = _data_columns._map_stage_token(ctx, "g-1")
+        harness.eq(_data_columns._map_stage_token(ctx, "g-1"), token, "the token is deterministic")
         for task in window.project.workflow["tasks"][0]["children"]:
             if task.get("id") == "s-1":
                 task["params"]["columns"][0]["method"] = "log10"
         window.project.save()
         harness.check(
-            ctx._map_stage_token("g-1") != token,
+            _data_columns._map_stage_token(ctx, "g-1") != token,
             "changing a stage changes the token",
         )
     finally:

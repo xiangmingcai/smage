@@ -27,6 +27,14 @@ from smage.modules.export.state import (
 )
 from smage.runlog import runlog
 from smage.widgets.controls import _NoWheelComboBox
+from functools import partial
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import outputs as _data_outputs
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 def _export_params_for(ctx, page, kind: str) -> dict:
@@ -44,7 +52,7 @@ def _export_pane(ctx, page, kind: str) -> _ExportPane:
 
 
 def _export_default_columns(ctx, page, kind: str) -> list:
-    return ctx._export_params_for(page, kind)[
+    return _export_params_for(ctx, page, kind)[
         "columns" if kind == "table" else "channels"
     ]
 
@@ -61,7 +69,7 @@ def _build_export_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
     tl.addWidget(QLabel(
-        f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"
+        f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"
     ))
     if locked:
         draft = QLabel("Draft (locked)")
@@ -73,7 +81,7 @@ def _build_export_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._export_close(page))
+    close_btn.clicked.connect(lambda _=False: _export_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -91,7 +99,7 @@ def _build_export_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
         "table": _ExportPane("table"),
         "image": _ExportPane("image"),
     }
-    save_btn.clicked.connect(lambda _=False: ctx._export_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _export_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -100,23 +108,23 @@ def _build_export_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     cl.setSpacing(8)
 
     tabs = QTabWidget()
-    tabs.addTab(ctx._export_subpage(page, "table"), "Table Export")
-    tabs.addTab(ctx._export_subpage(page, "image"), "Image Export")
+    tabs.addTab(_export_subpage(ctx, page, "table"), "Table Export")
+    tabs.addTab(_export_subpage(ctx, page, "image"), "Image Export")
     tabs.setCurrentIndex(0 if params.get("tab") != "image" else 1)
     tabs.currentChanged.connect(
-        lambda index: ctx._export_on_tab(page, index)
+        lambda index: _export_on_tab(ctx, page, index)
     )
     page._export_tabs = tabs
     cl.addWidget(tabs, 1)
     layout.addWidget(content, 1)
 
-    ctx._export_refresh(page)
-    ctx._export_update_save_btn(page)
+    _export_refresh(ctx, page)
+    _export_update_save_btn(ctx, page)
     return page
 
 
 def _export_subpage(ctx, page, kind: str) -> QWidget:
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     pane.log_box = None
 
     host = QWidget()
@@ -126,9 +134,9 @@ def _export_subpage(ctx, page, kind: str) -> QWidget:
 
     split = QSplitter(Qt.Orientation.Horizontal)
     split.setChildrenCollapsible(False)
-    split.addWidget(ctx._export_files_panel(page, kind))
-    split.addWidget(ctx._export_columns_panel(page, kind))
-    split.addWidget(ctx._export_settings_panel(page, kind))
+    split.addWidget(_export_files_panel(ctx, page, kind))
+    split.addWidget(_export_columns_panel(ctx, page, kind))
+    split.addWidget(_export_settings_panel(ctx, page, kind))
     # Files | Columns | Settings share the width 1:1:1.
     for index in range(3):
         split.setStretchFactor(index, 1)
@@ -153,8 +161,8 @@ def _export_subpage(ctx, page, kind: str) -> QWidget:
 
 
 def _export_files_panel(ctx, page, kind: str) -> QWidget:
-    pane = ctx._export_pane(page, kind)
-    panel = ctx._build_panel_frame()
+    pane = _export_pane(ctx, page, kind)
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -167,7 +175,7 @@ def _export_files_panel(ctx, page, kind: str) -> QWidget:
     btn = QPushButton("Select files…")
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setEnabled(not page._export_locked)
-    btn.clicked.connect(lambda _=False: ctx._export_select_files(page, kind))
+    btn.clicked.connect(lambda _=False: _export_select_files(ctx, page, kind))
     lay.addWidget(btn)
     box = QListWidget()
     box.setStyleSheet(
@@ -191,8 +199,8 @@ def _export_files_panel(ctx, page, kind: str) -> QWidget:
 
 
 def _export_columns_panel(ctx, page, kind: str) -> QWidget:
-    pane = ctx._export_pane(page, kind)
-    panel = ctx._build_panel_frame()
+    pane = _export_pane(ctx, page, kind)
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -214,7 +222,7 @@ def _export_columns_panel(ctx, page, kind: str) -> QWidget:
     )
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setEnabled(not page._export_locked)
-    btn.clicked.connect(lambda _=False: ctx._export_select_columns(page, kind))
+    btn.clicked.connect(lambda _=False: _export_select_columns(ctx, page, kind))
     lay.addWidget(btn)
     box = QListWidget()
     box.setStyleSheet(
@@ -225,7 +233,7 @@ def _export_columns_panel(ctx, page, kind: str) -> QWidget:
     box.setDragEnabled(not page._export_locked)
     box.setToolTip("Drag rows to change their order in the exported file")
     box.model().rowsMoved.connect(
-        lambda *a: ctx._export_on_order(page, kind)
+        lambda *a: _export_on_order(ctx, page, kind)
     )
     lay.addWidget(box, 1)
     hint = QLabel(
@@ -246,9 +254,9 @@ def _export_columns_panel(ctx, page, kind: str) -> QWidget:
 
 
 def _export_settings_panel(ctx, page, kind: str) -> QWidget:
-    pane = ctx._export_pane(page, kind)
-    section = ctx._export_params_for(page, kind)
-    panel = ctx._build_panel_frame()
+    pane = _export_pane(ctx, page, kind)
+    section = _export_params_for(ctx, page, kind)
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -266,7 +274,7 @@ def _export_settings_panel(ctx, page, kind: str) -> QWidget:
     browse_btn = QPushButton("Browse…")
     browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     browse_btn.setEnabled(not page._export_locked)
-    browse_btn.clicked.connect(lambda _=False: ctx._export_browse(page, kind))
+    browse_btn.clicked.connect(lambda _=False: _export_browse(ctx, page, kind))
     grid.addWidget(browse_btn, 1, 1)
     grid.addWidget(QLabel("Format"), 2, 0, 1, 2)
     fmt_combo = _NoWheelComboBox()
@@ -278,7 +286,7 @@ def _export_settings_panel(ctx, page, kind: str) -> QWidget:
         not page._export_locked and len(_EXPORT_FORMATS[kind]) > 1
     )
     fmt_combo.currentIndexChanged.connect(
-        lambda _i=0: ctx._export_on_format(page, kind)
+        lambda _i=0: _export_on_format(ctx, page, kind)
     )
     grid.addWidget(fmt_combo, 3, 0, 1, 2)
     lay.addLayout(grid)
@@ -286,11 +294,11 @@ def _export_settings_panel(ctx, page, kind: str) -> QWidget:
     row = QHBoxLayout()
     export_btn = QPushButton("Export")
     export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    export_btn.clicked.connect(lambda _=False: ctx._export_start(page, kind))
+    export_btn.clicked.connect(lambda _=False: _export_start(ctx, page, kind))
     cancel_btn = QPushButton("Cancel")
     cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     cancel_btn.setVisible(False)
-    cancel_btn.clicked.connect(lambda _=False: ctx._export_cancel(page, kind))
+    cancel_btn.clicked.connect(lambda _=False: _export_cancel(ctx, page, kind))
     row.addWidget(export_btn, 1)
     row.addWidget(cancel_btn)
     lay.addLayout(row)
@@ -329,10 +337,10 @@ def _export_settings_panel(ctx, page, kind: str) -> QWidget:
 
 
 def _export_records(ctx, page, kind: str) -> list:
-    records = ctx._available_files(page._export_task_id)
+    records = _data_files._available_files(ctx, page._export_task_id)
     if kind == "image":
         records = [
-            rec for rec in records if ctx._seg_is_image_file(rec)
+            rec for rec in records if _data_outputs._seg_is_image_file(ctx, rec)
         ]
     return records
 
@@ -360,7 +368,7 @@ def _export_schema_types(ctx, path) -> tuple:
 
 def _export_source_column(ctx, task_id, path, name: str) -> str:
     """Map a display column name back through upstream Rename modules."""
-    for stage in reversed(ctx._column_rename_stages(task_id)):
+    for stage in reversed(_data_columns._column_rename_stages(ctx, task_id)):
         if not _rename_applies(stage, path):
             continue
         reverse = {v: k for k, v in stage["map"].items()}
@@ -369,11 +377,11 @@ def _export_source_column(ctx, task_id, path, name: str) -> str:
 
 
 def _export_common_columns(ctx, page, kind: str) -> list:
-    files = list(ctx._export_params_for(page, kind).get("files") or [])
+    files = list(_export_params_for(ctx, page, kind).get("files") or [])
     if not files:
         return []
     lists = [
-        ctx._columns_for(path, page._export_task_id) for path in files
+        _data_columns._columns_for(ctx, path, page._export_task_id) for path in files
     ]
     if not lists:
         return []
@@ -386,10 +394,10 @@ def _export_common_columns(ctx, page, kind: str) -> list:
         # A channel must be numeric in every selected file.
         numeric_ok = None
         for path in files:
-            schema_names, numeric = ctx._export_schema_types(path)
+            schema_names, numeric = _export_schema_types(ctx, path)
             ok = set()
             for name in columns:
-                source = ctx._export_source_column(
+                source = _export_source_column(ctx,
                     page._export_task_id, path, name
                 )
                 # Columns generated by modules (masks, labels…) are numeric.
@@ -401,7 +409,7 @@ def _export_common_columns(ctx, page, kind: str) -> list:
 
 
 def _export_select_files(ctx, page, kind: str) -> None:
-    records = ctx._export_records(page, kind)
+    records = _export_records(ctx, page, kind)
     labels = []
     by_label = {}
     seen = Counter()
@@ -409,19 +417,19 @@ def _export_select_files(ctx, page, kind: str) -> None:
         path = rec.get("parquet")
         if not path:
             continue
-        label = ctx._comp_file_name(path, page._export_task_id)
+        label = _data_naming._comp_file_name(ctx, path, page._export_task_id)
         seen[label] += 1
         if seen[label] > 1:
-            label = f"{label} [{ctx._rel_data_key(path)}]"
+            label = f"{label} [{_data_files._rel_data_key(ctx, path)}]"
         labels.append(label)
         by_label[label] = path
-    section = ctx._export_params_for(page, kind)
+    section = _export_params_for(ctx, page, kind)
     current = [
-        ctx._comp_file_name(path, page._export_task_id)
+        _data_naming._comp_file_name(ctx, path, page._export_task_id)
         for path in section.get("files") or []
         if path
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files" if kind == "table" else "Select image files",
         labels, [c for c in current if c in by_label],
         "Filter files...", reorder=True,
@@ -433,22 +441,22 @@ def _export_select_files(ctx, page, kind: str) -> None:
     ]
     if kind == "image" and not section.get("channels"):
         # Convenience: start with every available channel selected.
-        section["channels"] = ctx._export_common_columns(page, kind)
-    ctx._export_mark_dirty(page)
-    ctx._export_refresh(page)
+        section["channels"] = _export_common_columns(ctx, page, kind)
+    _export_mark_dirty(ctx, page)
+    _export_refresh(ctx, page)
 
 
 def _export_select_columns(ctx, page, kind: str) -> None:
-    section = ctx._export_params_for(page, kind)
+    section = _export_params_for(ctx, page, kind)
     key = "columns" if kind == "table" else "channels"
-    options = ctx._export_common_columns(page, kind)
+    options = _export_common_columns(ctx, page, kind)
     if not options:
         QMessageBox.information(
             ctx.host, "Select " + ("columns" if kind == "table" else "channels"),
             "Select data files with common columns first.",
         )
         return
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select columns" if kind == "table" else "Select channels",
         options, section.get(key) or [],
         "Filter columns...", reorder=True,
@@ -456,12 +464,12 @@ def _export_select_columns(ctx, page, kind: str) -> None:
     if chosen is None:
         return
     section[key] = list(chosen)
-    ctx._export_mark_dirty(page)
-    ctx._export_refresh(page)
+    _export_mark_dirty(ctx, page)
+    _export_refresh(ctx, page)
 
 
 def _export_on_order(ctx, page, kind: str) -> None:
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     if pane.syncing:
         return
     values = [
@@ -469,15 +477,15 @@ def _export_on_order(ctx, page, kind: str) -> None:
         for i in range(pane.cols_box.count())
     ]
     key = "columns" if kind == "table" else "channels"
-    ctx._export_params_for(page, kind)[key] = [
+    _export_params_for(ctx, page, kind)[key] = [
         value for value in values if value
     ]
-    ctx._export_mark_dirty(page)
+    _export_mark_dirty(ctx, page)
 
 
 def _export_browse(ctx, page, kind: str) -> None:
-    pane = ctx._export_pane(page, kind)
-    section = ctx._export_params_for(page, kind)
+    pane = _export_pane(ctx, page, kind)
+    section = _export_params_for(ctx, page, kind)
     start = str(section.get("dir") or "")
     folder = QFileDialog.getExistingDirectory(
         ctx.host, "Select export folder", start
@@ -486,17 +494,17 @@ def _export_browse(ctx, page, kind: str) -> None:
         return
     section["dir"] = folder
     pane.dir_edit.setText(folder)
-    ctx._export_mark_dirty(page)
-    ctx._export_update_buttons(page, kind)
+    _export_mark_dirty(ctx, page)
+    _export_update_buttons(ctx, page, kind)
 
 
 def _export_on_format(ctx, page, kind: str) -> None:
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     value = pane.format_combo.currentData()
-    if value and value != ctx._export_params_for(page, kind).get("format"):
-        ctx._export_params_for(page, kind)["format"] = value
-        ctx._export_mark_dirty(page)
-        ctx._export_update_buttons(page, kind)
+    if value and value != _export_params_for(ctx, page, kind).get("format"):
+        _export_params_for(ctx, page, kind)["format"] = value
+        _export_mark_dirty(ctx, page)
+        _export_update_buttons(ctx, page, kind)
 
 
 def _export_on_tab(ctx, page, index: int) -> None:
@@ -504,20 +512,20 @@ def _export_on_tab(ctx, page, index: int) -> None:
     page._export_params["tab"] = kind
     # A hidden sub-page kept the splitter sizes it had before it was shown;
     # re-apply the 1:1:1 layout once the newly visible page has a size.
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     if pane.apply_ratio is not None:
         QTimer.singleShot(0, pane.apply_ratio)
 
 
 def _export_refresh(ctx, page) -> None:
     for kind in ("table", "image"):
-        ctx._export_refresh_pane(page, kind)
+        _export_refresh_pane(ctx, page, kind)
 
 
 def _export_refresh_pane(ctx, page, kind: str) -> None:
-    pane = ctx._export_pane(page, kind)
-    section = ctx._export_params_for(page, kind)
-    records = ctx._export_records(page, kind)
+    pane = _export_pane(ctx, page, kind)
+    section = _export_params_for(ctx, page, kind)
+    records = _export_records(ctx, page, kind)
     by_path = {
         rec.get("parquet"): rec for rec in records if rec.get("parquet")
     }
@@ -525,14 +533,14 @@ def _export_refresh_pane(ctx, page, kind: str) -> None:
         path for path in section.get("files") or [] if path in by_path
     ]
     key = "columns" if kind == "table" else "channels"
-    common = ctx._export_common_columns(page, kind)
+    common = _export_common_columns(ctx, page, kind)
     section[key] = [c for c in section.get(key) or [] if c in common]
 
     pane.files_box.blockSignals(True)
     pane.files_box.clear()
     for path in section["files"]:
         item = QListWidgetItem(
-            ctx._comp_file_name(path, page._export_task_id)
+            _data_naming._comp_file_name(ctx, path, page._export_task_id)
         )
         item.setToolTip(str(path))
         pane.files_box.addItem(item)
@@ -565,12 +573,12 @@ def _export_refresh_pane(ctx, page, kind: str) -> None:
         pane.cols_count.setText(
             f"{count} channel{'s' if count != 1 else ''} selected"
         )
-    ctx._export_update_buttons(page, kind)
+    _export_update_buttons(ctx, page, kind)
 
 
 def _export_update_buttons(ctx, page, kind: str) -> None:
-    pane = ctx._export_pane(page, kind)
-    section = ctx._export_params_for(page, kind)
+    pane = _export_pane(ctx, page, kind)
+    section = _export_params_for(ctx, page, kind)
     key = "columns" if kind == "table" else "channels"
     ready = bool(
         section.get("files") and section.get(key)
@@ -591,7 +599,7 @@ def _export_update_buttons(ctx, page, kind: str) -> None:
 
 def _export_mark_dirty(ctx, page) -> None:
     page._export_dirty = True
-    ctx._export_update_save_btn(page)
+    _export_update_save_btn(ctx, page)
 
 
 def _export_update_save_btn(ctx, page) -> None:
@@ -602,14 +610,14 @@ def _export_update_save_btn(ctx, page) -> None:
 
 def _export_log(ctx, page, kind: str, text) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    section = ctx._export_params_for(page, kind)
+    section = _export_params_for(ctx, page, kind)
     lines = section.setdefault("log", [])
     for line in str(text).splitlines():
         if line.strip():
             lines.append(f"[{ts}] {line}")
     if len(lines) > _FEATURE_LOG_LIMIT:
         del lines[:-_FEATURE_LOG_LIMIT]
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     if pane.log_box is not None:
         for line in str(text).splitlines():
             if line.strip():
@@ -631,8 +639,8 @@ def _export_file_name(ctx, label: str, ext: str) -> str:
 def _export_targets(ctx, page, files, ext: str) -> list:
     items = []
     for path in files:
-        label = ctx._comp_file_name(path, page._export_task_id)
-        items.append((path, label, ctx._export_file_name(label, ext)))
+        label = _data_naming._comp_file_name(ctx, path, page._export_task_id)
+        items.append((path, label, _export_file_name(ctx, label, ext)))
     return items
 
 
@@ -655,10 +663,10 @@ def _export_conflicts(ctx, out_dir: Path, items) -> list:
 
 
 def _export_start(ctx, page, kind: str) -> None:
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     if pane.running:
         return
-    section = ctx._export_params_for(page, kind)
+    section = _export_params_for(ctx, page, kind)
     key = "columns" if kind == "table" else "channels"
     files = list(section.get("files") or [])
     selected = list(section.get(key) or [])
@@ -678,7 +686,7 @@ def _export_start(ctx, page, kind: str) -> None:
             ctx.host, "Export", "Choose an export folder first."
         )
         return
-    if not ctx._export_confirm(page, kind, files, selected, folder):
+    if not _export_confirm(ctx, page, kind, files, selected, folder):
         return
 
     pane.running = True
@@ -687,7 +695,7 @@ def _export_start(ctx, page, kind: str) -> None:
     pane.progress.setValue(0)
     pane.progress.setVisible(True)
     pane.status.setText("Exporting…")
-    ctx._export_update_buttons(page, kind)
+    _export_update_buttons(ctx, page, kind)
 
     runlog.action(
         "export.start", module=str(page._export_task_id), tab=kind,
@@ -697,20 +705,20 @@ def _export_start(ctx, page, kind: str) -> None:
     q = queue.Queue()
     pane.queue = q
     pane.thread = threading.Thread(
-        target=ctx._export_job,
+        target=partial(_export_job, ctx),
         args=(page, kind, q, copy.deepcopy(section)),
         daemon=True,
     )
     pane.thread.start()
     timer = QTimer(ctx.host)
     timer.setInterval(100)
-    timer.timeout.connect(lambda: ctx._export_poll(page, kind))
+    timer.timeout.connect(lambda: _export_poll(ctx, page, kind))
     timer.start()
     pane.timer = timer
 
 
 def _export_confirm(ctx, page, kind: str, files, selected, folder: str) -> bool:
-    section = ctx._export_params_for(page, kind)
+    section = _export_params_for(ctx, page, kind)
     fmt = str(section.get("format") or "")
     preview = ", ".join(selected[:8])
     if len(selected) > 8:
@@ -735,7 +743,7 @@ def _export_confirm(ctx, page, kind: str, files, selected, folder: str) -> bool:
 
 
 def _export_cancel(ctx, page, kind: str) -> None:
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     if not pane.running:
         return
     pane.cancel = True
@@ -743,15 +751,15 @@ def _export_cancel(ctx, page, kind: str) -> None:
 
 
 def _export_cancelled(ctx, page, kind: str) -> bool:
-    return bool(ctx._export_pane(page, kind).cancel)
+    return bool(_export_pane(ctx, page, kind).cancel)
 
 
 def _export_job(ctx, page, kind: str, q, params) -> None:
     try:
         if kind == "table":
-            ctx._export_job_table(page, q, params)
+            _export_job_table(ctx, page, q, params)
         else:
-            ctx._export_job_image(page, q, params)
+            _export_job_image(ctx, page, q, params)
     except _ExportCancelled:
         q.put(("cancelled", ""))
     except Exception as exc:  # noqa: BLE001
@@ -768,17 +776,17 @@ def _export_job_table(ctx, page, q, params) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     q.put(("log", f"Table export ({fmt.upper()}) — {len(files)} file(s), "
                   f"{len(columns)} column(s)"))
-    items = ctx._export_targets(page, files, ext)
-    conflicts = ctx._export_conflicts(out_dir, items)
+    items = _export_targets(ctx, page, files, ext)
+    conflicts = _export_conflicts(ctx, out_dir, items)
     if conflicts:
         q.put(("conflict", conflicts))
         return
     total_rows = 0
     for index, (path, label, name) in enumerate(items):
-        if ctx._export_cancelled(page, "table"):
+        if _export_cancelled(ctx, page, "table"):
             raise _ExportCancelled
         q.put(("log", f"[{index + 1}/{len(items)}] {label} → {name}"))
-        frame = ctx._export_frame(page, path, columns)
+        frame = _export_frame(ctx, page, path, columns)
         target = out_dir / name
         try:
             if fmt == "csv":
@@ -786,7 +794,7 @@ def _export_job_table(ctx, page, q, params) -> None:
             elif fmt == "parquet":
                 frame.to_parquet(target, index=False)
             else:
-                for note in ctx._export_write_fcs(target, frame):
+                for note in _export_write_fcs(ctx, target, frame):
                     q.put(("log", "  " + note))
         except Exception:
             # Never leave a half-written file behind: a retry would treat
@@ -811,21 +819,21 @@ def _export_frame(ctx, page, path, columns):
     import pandas as pd
 
     task_id = page._export_task_id
-    schema_names, numeric = ctx._export_schema_types(path)
+    schema_names, numeric = _export_schema_types(ctx, path)
     num_cols = []
     txt_cols = []
     for name in columns:
-        source = ctx._export_source_column(task_id, path, name)
+        source = _export_source_column(ctx, task_id, path, name)
         if source in schema_names and source not in numeric:
             txt_cols.append(name)
         else:
             num_cols.append(name)
     values = {}
     if num_cols:
-        values.update(ctx._column_data(task_id, path, num_cols))
+        values.update(_data_columns._column_data(ctx, task_id, path, num_cols))
     if txt_cols:
         values.update(
-            ctx._column_data(task_id, path, txt_cols, numeric=False)
+            _data_columns._column_data(ctx, task_id, path, txt_cols, numeric=False)
         )
     length = len(next(iter(values.values()))) if values else 0
     data = {}
@@ -873,8 +881,8 @@ def _export_write_fcs(ctx, target: Path, frame) -> list:
 
 def _export_image_geometry(ctx, path):
     """(xmin, ymin, width, height) of an image parquet, or None."""
-    manifest = ctx._image_load_manifest(path)
-    if manifest is not None and ctx._image_index_valid(path, manifest):
+    manifest = _data_image_index._image_load_manifest(ctx, path)
+    if manifest is not None and _data_image_index._image_index_valid(ctx, path, manifest):
         xmin = float(manifest["xmin"])
         xmax = float(manifest["xmax"])
         ymin = float(manifest["ymin"])
@@ -900,15 +908,15 @@ def _export_job_image(ctx, page, q, params) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     q.put(("log", f"Image export (TIFF) — {len(files)} file(s), "
                   f"{len(channels)} channel(s)"))
-    items = ctx._export_targets(page, files, ".tif")
-    conflicts = ctx._export_conflicts(out_dir, items)
+    items = _export_targets(ctx, page, files, ".tif")
+    conflicts = _export_conflicts(ctx, out_dir, items)
     if conflicts:
         q.put(("conflict", conflicts))
         return
     for index, (path, label, name) in enumerate(items):
-        if ctx._export_cancelled(page, "image"):
+        if _export_cancelled(ctx, page, "image"):
             raise _ExportCancelled
-        geometry = ctx._export_image_geometry(path)
+        geometry = _export_image_geometry(ctx, path)
         if geometry is None:
             q.put(("log", f"[{index + 1}/{len(items)}] {label}: "
                           "skipped — no image pixels found"))
@@ -917,7 +925,7 @@ def _export_job_image(ctx, page, q, params) -> None:
         xmin, ymin, width, height = geometry
         q.put(("log", f"[{index + 1}/{len(items)}] {label} → {name} — "
                       f"{len(channels)} channel(s), {width}×{height}"))
-        result = ctx._export_image_data(
+        result = _export_image_data(ctx,
             page, path, channels, geometry, q,
         )
         array, missing, duplicates, outside, missing_channels = result
@@ -964,7 +972,7 @@ def _export_image_data(ctx, page, path, channels, geometry, q):
 
     xmin, ymin, width, height = geometry
     task_id = page._export_task_id
-    stages = ctx._map_stages(task_id)
+    stages = _data_columns._map_stages(ctx, task_id)
     parquet = pq.ParquetFile(path)
     schema_names = set(parquet.schema_arrow.names)
     if "x" not in schema_names or "y" not in schema_names:
@@ -977,12 +985,12 @@ def _export_image_data(ctx, page, path, channels, geometry, q):
     ]
     virtual = [
         name for name in channels
-        if ctx._export_source_column(task_id, path, name)
+        if _export_source_column(ctx, task_id, path, name)
         not in schema_names
     ]
     virtual_values = {}
     if virtual:
-        virtual_values = ctx._column_data(
+        virtual_values = _data_columns._column_data(ctx,
             task_id, path, virtual, row_filter=False
         )
 
@@ -996,7 +1004,7 @@ def _export_image_data(ctx, page, path, channels, geometry, q):
     for batch in parquet.iter_batches(
         batch_size=1_000_000, columns=read_columns
     ):
-        if ctx._export_cancelled(page, "image"):
+        if _export_cancelled(ctx, page, "image"):
             raise _ExportCancelled
         frame = batch.to_pandas()
         rows = len(frame)
@@ -1059,7 +1067,7 @@ def _export_image_data(ctx, page, path, channels, geometry, q):
 
 
 def _export_poll(ctx, page, kind: str) -> None:
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     if pane.queue is None:
         return
     finished = None
@@ -1070,7 +1078,7 @@ def _export_poll(ctx, page, kind: str) -> None:
             break
         tag = message[0]
         if tag == "log":
-            ctx._export_log(page, kind, message[1])
+            _export_log(ctx, page, kind, message[1])
         elif tag == "progress":
             _tag, done, total = message
             pane.progress.setRange(0, max(1, int(total)))
@@ -1080,16 +1088,16 @@ def _export_poll(ctx, page, kind: str) -> None:
             )
         elif tag == "conflict":
             for line in message[1]:
-                ctx._export_log(page, kind, "CONFLICT: " + line)
-            ctx._export_log(
+                _export_log(ctx, page, kind, "CONFLICT: " + line)
+            _export_log(ctx,
                 page, kind, "Export stopped — no files were written."
             )
             finished = ("conflict", list(message[1]))
         elif tag == "error":
-            ctx._export_log(page, kind, "ERROR: " + message[1])
+            _export_log(ctx, page, kind, "ERROR: " + message[1])
             finished = ("error", message[1])
         elif tag == "cancelled":
-            ctx._export_log(page, kind, "Export cancelled.")
+            _export_log(ctx, page, kind, "Export cancelled.")
             finished = ("cancelled", "")
         elif tag == "done":
             info = message[1]
@@ -1100,14 +1108,14 @@ def _export_poll(ctx, page, kind: str) -> None:
                 )
             else:
                 text = f"Done — {info['files']} file(s) → {info['dir']}"
-            ctx._export_log(page, kind, text)
+            _export_log(ctx, page, kind, text)
             finished = ("done", info)
     if finished is not None:
-        ctx._export_finish(page, kind, finished)
+        _export_finish(ctx, page, kind, finished)
 
 
 def _export_finish(ctx, page, kind: str, finished) -> None:
-    pane = ctx._export_pane(page, kind)
+    pane = _export_pane(ctx, page, kind)
     state, payload = finished
     pane.running = False
     pane.cancel = False
@@ -1116,7 +1124,7 @@ def _export_finish(ctx, page, kind: str, finished) -> None:
         pane.timer = None
     pane.queue = None
     pane.progress.setVisible(False)
-    ctx._export_update_buttons(page, kind)
+    _export_update_buttons(ctx, page, kind)
     if state == "done":
         pane.status.setText("Export finished")
         runlog.info(
@@ -1150,7 +1158,7 @@ def _export_save_now(ctx, page) -> None:
         ctx.project.save()
     page._export_snapshot = copy.deepcopy(page._export_params)
     page._export_dirty = False
-    ctx._export_update_save_btn(page)
+    _export_update_save_btn(ctx, page)
     ctx.statusBar().showMessage("Export settings saved")
     ctx._module_saved(page)
 
@@ -1168,7 +1176,7 @@ def _export_close(ctx, page) -> None:
         page._export_task_def["params"] = copy.deepcopy(
             page._export_snapshot
         )
-    ctx._export_cleanup(page)
+    _export_cleanup(ctx, page)
     ctx._close_module_page(page)
 
 

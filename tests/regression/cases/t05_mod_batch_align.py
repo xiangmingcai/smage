@@ -13,6 +13,8 @@ import harness  # noqa: E402
 import _e2e_helpers as e2e  # noqa: E402
 
 from smage.modules.batch_align import page as ba_page  # noqa: E402
+from smage.data import columns as _data_columns
+from smage.modules.batch_align import page as ba_page
 
 
 def _open(case_id: str):
@@ -34,24 +36,24 @@ def validate() -> None:
     window, _project, page, parquet = _open("ba_validate")
     try:
         ctx = window._ctx
-        ok, message = ctx._ba_validate(page)
+        ok, message = ba_page._ba_validate(ctx, page)
         harness.check(not ok and "data file" in message, message)
 
         page._ba_params["files"] = [parquet]
-        ok, message = ctx._ba_validate(page)
+        ok, message = ba_page._ba_validate(ctx, page)
         harness.check("variable" in message, message)
 
         page._ba_params["columns"] = ["FL1-A"]
-        ok, message = ctx._ba_validate(page)
+        ok, message = ba_page._ba_validate(ctx, page)
         harness.check("Every file needs a batch" in message, message)
 
         page._ba_params["batches"] = {parquet: "A"}
         page._ba_params["method"] = "cytonorm"
-        ok, message = ctx._ba_validate(page)
+        ok, message = ba_page._ba_validate(ctx, page)
         harness.check("reference sample" in message, message)
 
         page._ba_params["references"] = [parquet]
-        ok, message = ctx._ba_validate(page)
+        ok, message = ba_page._ba_validate(ctx, page)
         harness.check(ok, message)
     finally:
         _close(window)
@@ -62,7 +64,7 @@ def matrix_read() -> None:
     window, _project, page, parquet = _open("ba_matrix")
     try:
         ctx = window._ctx
-        matrix = ctx._ba_read_matrix(page, parquet, ["FL1-A", "FL2-A"])
+        matrix = ba_page._ba_read_matrix(ctx, page, parquet, ["FL1-A", "FL2-A"])
         harness.eq(matrix.shape, (40, 2))
         harness.check(np.isfinite(matrix).all())
     finally:
@@ -77,11 +79,11 @@ def signature() -> None:
         params = {"method": "combat", "files": [parquet],
                   "columns": ["FL1-A"], "batches": {parquet: "A"},
                   "combat": {"eb": True}}
-        first = ctx._ba_config_sig(params)
-        harness.eq(ctx._ba_config_sig(params), first)
+        first = ba_page._ba_config_sig(ctx, params)
+        harness.eq(ba_page._ba_config_sig(ctx, params), first)
         params = dict(params, method="cytonorm")
-        harness.check(ctx._ba_config_sig(params) != first)
-        harness.eq(ctx._ba_stage(page._ba_task_def), None,
+        harness.check(ba_page._ba_config_sig(ctx, params) != first)
+        harness.eq(ba_page._ba_stage(ctx, page._ba_task_def), None,
                    "no model means no pipeline stage")
     finally:
         _close(window)
@@ -103,7 +105,7 @@ def extension_guard() -> None:
             with harness.patch_dialogs(
                 ba_page, information=QMessageBox.StandardButton.Ok
             ):
-                ctx._ba_calculate(page)
+                ba_page._ba_calculate(ctx, page)
             harness.check(not page._ba_running,
                           "CytoNorm cannot start without FlowSOM")
     finally:
@@ -147,7 +149,7 @@ def combat_fit() -> None:
     page = window.tabs.currentWidget()
     try:
         ctx = window._ctx
-        ctx._ba_calculate(page)
+        ba_page._ba_calculate(ctx, page)
         harness.check(page._ba_running)
         harness.wait_for(lambda: not page._ba_running, timeout=60,
                          message="ComBat fit")
@@ -157,7 +159,7 @@ def combat_fit() -> None:
         harness.check((project.path / model["npz"]).is_file())
 
         task = window._find_task_by_id("ba-1")
-        stage = ctx._ba_stage(task)
+        stage = ba_page._ba_stage(ctx, task)
         harness.check(stage is not None)
         harness.eq(stage["method"], "combat")
 
@@ -171,7 +173,7 @@ def combat_fit() -> None:
                 * float(affine[batch, 0, 0])
                 + float(affine[batch, 0, 1])
             )
-            values = ctx._column_data("g-1", path, ["FL1-A"])["FL1-A"]
+            values = _data_columns._column_data(ctx, "g-1", path, ["FL1-A"])["FL1-A"]
             harness.check(np.allclose(values, expected),
                           f"{path}: corrected values differ")
     finally:

@@ -49,6 +49,17 @@ import math
 import queue
 import threading
 import time
+from functools import partial
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import sampling as _data_sampling
+from smage.widgets import colormap as _widgets_colormap
+from smage.widgets import image_level as _widgets_image_level
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
+from smage.widgets.plot import renderer as _widgets_plot_renderer
 
 
 _AREA_LOW_DEFAULT = 100.0
@@ -73,7 +84,7 @@ def _build_area_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -89,7 +100,7 @@ def _build_area_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._area_close(page))
+    close_btn.clicked.connect(lambda _=False: _area_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -125,7 +136,7 @@ def _build_area_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._area_timer = None
     page._area_updating = False
     page._area_closing = False
-    save_btn.clicked.connect(lambda _=False: ctx._area_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _area_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -135,9 +146,9 @@ def _build_area_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._area_left_panel(page))
-    splitter.addWidget(ctx._area_center_panel(page))
-    splitter.addWidget(ctx._area_right_panel(page))
+    splitter.addWidget(_area_left_panel(ctx, page))
+    splitter.addWidget(_area_center_panel(ctx, page))
+    splitter.addWidget(_area_right_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 2)
     splitter.setStretchFactor(2, 1)
@@ -145,12 +156,12 @@ def _build_area_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     row.addWidget(splitter, 1)
     layout.addWidget(content, 1)
 
-    ctx._area_refresh(page)
+    _area_refresh(ctx, page)
     return page
 
 
 def _area_left_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -158,13 +169,13 @@ def _area_left_panel(ctx, page) -> QWidget:
     lay.addWidget(QLabel("<b>Files</b>"))
     pick = QPushButton("Select files…")
     pick.setCursor(Qt.CursorShape.PointingHandCursor)
-    pick.clicked.connect(lambda _=False: ctx._area_select_files(page))
+    pick.clicked.connect(lambda _=False: _area_select_files(ctx, page))
     lay.addWidget(pick)
 
     files = QListWidget()
     files.setAlternatingRowColors(True)
     files.setToolTip("Checked files receive the batch settings below.")
-    files.itemChanged.connect(lambda item: ctx._area_on_file_toggle(page, item))
+    files.itemChanged.connect(lambda item: _area_on_file_toggle(ctx, page, item))
     lay.addWidget(files, 1)
     page._area_file_list = files
 
@@ -220,7 +231,7 @@ def _area_left_panel(ctx, page) -> QWidget:
 
     apply_btn = QPushButton("Apply to checked files")
     apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    apply_btn.clicked.connect(lambda _=False: ctx._area_apply_batch(page))
+    apply_btn.clicked.connect(lambda _=False: _area_apply_batch(ctx, page))
     grid.addWidget(apply_btn, 6, 0, 1, 2)
     page._area_batch_apply = apply_btn
     lay.addWidget(box)
@@ -228,7 +239,7 @@ def _area_left_panel(ctx, page) -> QWidget:
 
 
 def _area_center_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -246,11 +257,11 @@ def _area_center_panel(ctx, page) -> QWidget:
         "area but make the density threshold stricter and the calculation "
         "slower on large images."
     )
-    grid_spin.valueChanged.connect(lambda value: ctx._area_on_grid(page, value))
+    grid_spin.valueChanged.connect(lambda value: _area_on_grid(ctx, page, value))
     top.addWidget(grid_spin)
     page._area_grid_spin = grid_spin
     lay.addLayout(top)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Density grid used for every file. Finer = more precise area, but "
         "each cell then holds fewer points — lower the density threshold "
         "when you raise this."
@@ -277,7 +288,7 @@ def _area_center_panel(ctx, page) -> QWidget:
     table.setColumnWidth(7, 110)
     table.setColumnWidth(8, 120)
     table.currentCellChanged.connect(
-        lambda row, *_a: ctx._area_on_row_selected(page, row)
+        lambda row, *_a: _area_on_row_selected(ctx, page, row)
     )
     page._area_table = table
     lay.addWidget(table, 1)
@@ -286,7 +297,7 @@ def _area_center_panel(ctx, page) -> QWidget:
     copy_btn = QPushButton("Copy")
     copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     copy_btn.setToolTip("Copy the table to the clipboard (tab-separated)")
-    copy_btn.clicked.connect(lambda _=False: ctx._area_copy(page))
+    copy_btn.clicked.connect(lambda _=False: _area_copy(ctx, page))
     footer.addWidget(copy_btn)
     footer.addStretch()
     progress = QLabel("")
@@ -303,7 +314,7 @@ def _area_right_panel(ctx, page) -> QWidget:
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(8)
 
-    plot_panel = ctx._build_panel_frame()
+    plot_panel = _widgets_panels._build_panel_frame(ctx)
     pl = QVBoxLayout(plot_panel)
     pl.setContentsMargins(10, 10, 10, 10)
     pl.setSpacing(6)
@@ -318,22 +329,22 @@ def _area_right_panel(ctx, page) -> QWidget:
         "Auto shows image files as images and table files as scatter plots."
     )
     type_combo.currentIndexChanged.connect(
-        lambda _=0: ctx._area_on_plot_type(page)
+        lambda _=0: _area_on_plot_type(ctx, page)
     )
     top.addWidget(type_combo)
     pl.addLayout(top)
-    pl.addWidget(ctx._param_hint(
+    pl.addWidget(_widgets_panels._param_hint(ctx,
         "Auto shows image files as images and table files as scatter plots."
     ))
 
-    plot_widget = ctx._figure_make_plot_widget({"type": "scatter"})
+    plot_widget = _widgets_plot_renderer._figure_make_plot_widget(ctx, {"type": "scatter"})
     plot_widget.setMinimumHeight(240)
     pl.addWidget(plot_widget, 1)
     page._area_plot = plot_widget
     page._area_type_combo = type_combo
     lay.addWidget(plot_panel, 1)
 
-    settings = ctx._build_panel_frame()
+    settings = _widgets_panels._build_panel_frame(ctx)
     sl = QVBoxLayout(settings)
     sl.setContentsMargins(10, 10, 10, 10)
     sl.setSpacing(6)
@@ -342,16 +353,16 @@ def _area_right_panel(ctx, page) -> QWidget:
     row = QHBoxLayout()
     row.addWidget(QLabel("Palette"))
     palette = _NoWheelComboBox()
-    ctx._populate_palette_combo(
+    _widgets_colormap._populate_palette_combo(ctx,
         palette,
         (page._area_params.get("plot") or {}).get("palette") or _default_palette(),
     )
     palette.currentIndexChanged.connect(
-        lambda _=0: ctx._area_on_plot_param(page)
+        lambda _=0: _area_on_plot_param(ctx, page)
     )
     row.addWidget(palette)
     sl.addLayout(row)
-    sl.addWidget(ctx._param_hint(
+    sl.addWidget(_widgets_panels._param_hint(ctx,
         "Colour map used for the signal variable."
     ))
     page._area_palette = palette
@@ -362,11 +373,11 @@ def _area_right_panel(ctx, page) -> QWidget:
     size.setRange(1.0, 20.0)
     size.setSingleStep(0.5)
     size.setDecimals(1)
-    size.valueChanged.connect(lambda _=0.0: ctx._area_on_plot_param(page))
+    size.valueChanged.connect(lambda _=0.0: _area_on_plot_param(ctx, page))
     row.addWidget(size)
     row.addStretch()
     sl.addLayout(row)
-    sl.addWidget(ctx._param_hint(
+    sl.addWidget(_widgets_panels._param_hint(ctx,
         "Scatter dot size; ignored in the Image view."
     ))
     page._area_point_size = size
@@ -392,14 +403,14 @@ def _area_right_panel(ctx, page) -> QWidget:
 
 def _area_select_files(ctx, page) -> None:
     params = page._area_params
-    records = ctx._available_files(page._area_task_id)
+    records = _data_files._available_files(ctx, page._area_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     current = [
-        ctx._comp_file_name(p, page._area_task_id)
+        _data_naming._comp_file_name(ctx, p, page._area_task_id)
         for p in params.get("files") or []
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -410,8 +421,8 @@ def _area_select_files(ctx, page) -> None:
     params["apply"] = apply_list or list(files)
     if params.get("selected") not in files:
         params["selected"] = files[0] if files else None
-    ctx._area_refresh(page)
-    ctx._area_mark_dirty(page)
+    _area_refresh(ctx, page)
+    _area_mark_dirty(ctx, page)
 
 
 def _area_refresh(ctx, page) -> None:
@@ -429,7 +440,7 @@ def _area_refresh(ctx, page) -> None:
     lst.blockSignals(True)
     lst.clear()
     for path in files:
-        item = QListWidgetItem(ctx._comp_file_name(path, page._area_task_id))
+        item = QListWidgetItem(_data_naming._comp_file_name(ctx, path, page._area_task_id))
         item.setData(Qt.ItemDataRole.UserRole, path)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(
@@ -438,14 +449,14 @@ def _area_refresh(ctx, page) -> None:
         lst.addItem(item)
     lst.blockSignals(False)
 
-    ctx._area_update_summary(page)
-    ctx._area_rebuild_batch_combos(page)
-    ctx._area_rebuild_table(page)
-    ctx._area_sync_plot_settings(page)
-    ctx._area_render_plot(page)
+    _area_update_summary(ctx, page)
+    _area_rebuild_batch_combos(ctx, page)
+    _area_rebuild_table(ctx, page)
+    _area_sync_plot_settings(ctx, page)
+    _area_render_plot(ctx, page)
     for path in files:
-        ctx._area_enqueue(page, path)
-    ctx._area_update_progress(page)
+        _area_enqueue(ctx, page, path)
+    _area_update_progress(ctx, page)
 
 
 def _area_update_summary(ctx, page) -> None:
@@ -468,8 +479,8 @@ def _area_on_file_toggle(ctx, page, item) -> None:
         apply_list.append(path)
     elif not checked and path in apply_list:
         apply_list.remove(path)
-    ctx._area_update_summary(page)
-    ctx._area_rebuild_batch_combos(page)
+    _area_update_summary(ctx, page)
+    _area_rebuild_batch_combos(ctx, page)
 
 
 def _area_batch_common_columns(ctx, page) -> list:
@@ -479,14 +490,14 @@ def _area_batch_common_columns(ctx, page) -> list:
     ]
     if not paths:
         return []
-    common = set(ctx._columns_for(paths[0], page._area_task_id))
+    common = set(_data_columns._columns_for(ctx, paths[0], page._area_task_id))
     for path in paths[1:]:
-        common &= set(ctx._columns_for(path, page._area_task_id))
+        common &= set(_data_columns._columns_for(ctx, path, page._area_task_id))
     return sorted(common)
 
 
 def _area_rebuild_batch_combos(ctx, page) -> None:
-    options = ctx._area_batch_common_columns(page)
+    options = _area_batch_common_columns(ctx, page)
     for key in ("x", "y", "signal"):
         combo = getattr(page, f"_area_batch_{key}", None)
         if combo is None:
@@ -534,17 +545,17 @@ def _area_apply_batch(ctx, page) -> None:
     }
     rows = page._area_params.setdefault("rows", {})
     for path in paths:
-        row_cfg = ctx._area_row_cfg(page, path)
+        row_cfg = _area_row_cfg(ctx, page, path)
         row_cfg.update(cfg)
-        ctx._area_sync_row(page, path)
-        ctx._area_enqueue(page, path)
+        _area_sync_row(ctx, page, path)
+        _area_enqueue(ctx, page, path)
     if page._area_params.get("selected") in paths:
-        ctx._area_render_plot(page)
-    ctx._area_mark_dirty(page)
+        _area_render_plot(ctx, page)
+    _area_mark_dirty(ctx, page)
 
 
 def _area_default_cfg(ctx, page, path) -> dict:
-    columns = list(ctx._columns_for(path, page._area_task_id))
+    columns = list(_data_columns._columns_for(ctx, path, page._area_task_id))
     lower = {c.lower(): c for c in columns}
     x_name = lower.get("x") or (columns[0] if columns else "")
     y_name = lower.get("y") or next(
@@ -564,7 +575,7 @@ def _area_default_cfg(ctx, page, path) -> dict:
 def _area_row_cfg(ctx, page, path) -> dict:
     rows = page._area_params.setdefault("rows", {})
     cfg = rows.get(path)
-    defaults = ctx._area_default_cfg(page, path)
+    defaults = _area_default_cfg(ctx, page, path)
     if not isinstance(cfg, dict):
         cfg = defaults
         rows[path] = cfg
@@ -590,13 +601,13 @@ def _area_rebuild_table(ctx, page) -> None:
     table.setRowCount(0)
     table.setRowCount(len(paths))
     for row, path in enumerate(paths):
-        cfg = ctx._area_row_cfg(page, path)
-        name_item = QTableWidgetItem(ctx._comp_file_name(path, page._area_task_id))
+        cfg = _area_row_cfg(ctx, page, path)
+        name_item = QTableWidgetItem(_data_naming._comp_file_name(ctx, path, page._area_task_id))
         name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         name_item.setToolTip(path)
         table.setItem(row, 0, name_item)
 
-        columns = list(ctx._columns_for(path, page._area_task_id))
+        columns = list(_data_columns._columns_for(ctx, path, page._area_task_id))
         for col, key in ((1, "x"), (2, "y"), (3, "signal")):
             combo = _NoWheelComboBox()
             combo.setMinimumContentsLength(6)
@@ -613,7 +624,7 @@ def _area_rebuild_table(ctx, page) -> None:
                 idx = combo.count() - 1
             combo.setCurrentIndex(max(0, idx))
             combo.currentIndexChanged.connect(
-                lambda _=0, p=path, k=key, c=combo: ctx._area_on_row_param(
+                lambda _=0, p=path, k=key, c=combo: _area_on_row_param(ctx,
                     page, p, k, c.currentData()
                 )
             )
@@ -630,7 +641,7 @@ def _area_rebuild_table(ctx, page) -> None:
             spin.setSingleStep(step)
             spin.setValue(float(cfg.get(key) or 0.0))
             spin.valueChanged.connect(
-                lambda value, p=path, k=key: ctx._area_on_row_param(page, p, k, value)
+                lambda value, p=path, k=key: _area_on_row_param(ctx, page, p, k, value)
             )
             table.setCellWidget(row, col, spin)
 
@@ -647,7 +658,7 @@ def _area_rebuild_table(ctx, page) -> None:
     page._area_updating = False
 
     for row, path in enumerate(paths):
-        ctx._area_update_area_cell(page, path)
+        _area_update_area_cell(ctx, page, path)
         text, color = page._area_status.get(path, ("", "#5f6368"))
         item = table.item(row, 8)
         if item is not None and text:
@@ -655,7 +666,7 @@ def _area_rebuild_table(ctx, page) -> None:
             item.setForeground(QColor(color))
 
     selected = page._area_params.get("selected")
-    row = ctx._area_row_index(page, selected) if selected else None
+    row = _area_row_index(ctx, page, selected) if selected else None
     if row is not None:
         table.blockSignals(True)
         table.setCurrentCell(row, 0)
@@ -665,10 +676,10 @@ def _area_rebuild_table(ctx, page) -> None:
 
 def _area_sync_row(ctx, page, path) -> None:
     """Push a file's stored parameters into its table row widgets."""
-    row = ctx._area_row_index(page, path)
+    row = _area_row_index(ctx, page, path)
     if row is None:
         return
-    cfg = ctx._area_row_cfg(page, path)
+    cfg = _area_row_cfg(ctx, page, path)
     table = page._area_table
     previous = page._area_updating
     page._area_updating = True
@@ -698,7 +709,7 @@ def _area_sync_row(ctx, page, path) -> None:
 def _area_on_row_param(ctx, page, path, key, value) -> None:
     if getattr(page, "_area_updating", False):
         return
-    cfg = ctx._area_row_cfg(page, path)
+    cfg = _area_row_cfg(ctx, page, path)
     if key in ("x", "y", "signal"):
         value = "" if value is None else str(value)
     else:
@@ -707,16 +718,16 @@ def _area_on_row_param(ctx, page, path, key, value) -> None:
         return
     cfg[key] = value
     page._area_params["selected"] = path
-    row = ctx._area_row_index(page, path)
+    row = _area_row_index(ctx, page, path)
     if row is not None:
         table = page._area_table
         table.blockSignals(True)
         table.setCurrentCell(row, 0)
         table.selectRow(row)
         table.blockSignals(False)
-    ctx._area_enqueue(page, path)
-    ctx._area_render_plot(page)
-    ctx._area_mark_dirty(page)
+    _area_enqueue(ctx, page, path)
+    _area_render_plot(ctx, page)
+    _area_mark_dirty(ctx, page)
 
 
 def _area_on_row_selected(ctx, page, row) -> None:
@@ -726,7 +737,7 @@ def _area_on_row_selected(ctx, page, row) -> None:
     if page._area_params.get("selected") == path:
         return
     page._area_params["selected"] = path
-    ctx._area_render_plot(page)
+    _area_render_plot(ctx, page)
 
 
 def _area_on_grid(ctx, page, value) -> None:
@@ -738,9 +749,9 @@ def _area_on_grid(ctx, page, value) -> None:
     page._area_params["results"] = {}
     page._area_counts.clear()
     for path in page._area_params.get("files") or []:
-        ctx._area_update_area_cell(page, path)
-        ctx._area_enqueue(page, path)
-    ctx._area_mark_dirty(page)
+        _area_update_area_cell(ctx, page, path)
+        _area_enqueue(ctx, page, path)
+    _area_mark_dirty(ctx, page)
 
 
 def _area_format(ctx, value) -> str:
@@ -754,23 +765,23 @@ def _area_format(ctx, value) -> str:
 
 
 def _area_update_area_cell(ctx, page, path) -> None:
-    row = ctx._area_row_index(page, path)
+    row = _area_row_index(ctx, page, path)
     if row is None:
         return
     item = page._area_table.item(row, 7)
     if item is None:
         return
-    cfg = ctx._area_row_cfg(page, path)
+    cfg = _area_row_cfg(ctx, page, path)
     result = (page._area_params.get("results") or {}).get(path)
     if (
         isinstance(result, dict)
         and result.get("area") is not None
-        and result.get("sig") == ctx._area_signature(page, path, cfg)
+        and result.get("sig") == _area_signature(ctx, page, path, cfg)
     ):
-        item.setText(ctx._area_format(result["area"]))
+        item.setText(_area_format(ctx, result["area"]))
         item.setToolTip(
             f"{int(result.get('cells') or 0)} cell(s) × "
-            f"{ctx._area_format(result.get('cell'))}² "
+            f"{_area_format(ctx, result.get('cell'))}² "
             f"(grid {result.get('nx')}×{result.get('ny')}, "
             f"{int(result.get('points') or 0)} point(s) in the signal range)"
         )
@@ -781,7 +792,7 @@ def _area_update_area_cell(ctx, page, path) -> None:
 
 def _area_set_status(ctx, page, path, text, color) -> None:
     page._area_status[path] = (text, color)
-    row = ctx._area_row_index(page, path)
+    row = _area_row_index(ctx, page, path)
     if row is None:
         return
     item = page._area_table.item(row, 8)
@@ -817,12 +828,12 @@ def _area_signature(ctx, page, path, cfg, include_density=True) -> str:
         "high": float(cfg.get("high") or 0.0),
         "source": str(path),
         "stat": stat,
-        "stages": ctx._map_stage_token(page._area_task_id),
-        "columns": sorted(ctx._columns_for(path, page._area_task_id)),
+        "stages": _data_columns._map_stage_token(ctx, page._area_task_id),
+        "columns": sorted(_data_columns._columns_for(ctx, path, page._area_task_id)),
     }
     if include_density:
         payload["density"] = float(cfg.get("density") or 0.0)
-    sample = ctx._subsample_sig(page._area_task_id, path)
+    sample = _data_sampling._subsample_sig(ctx, page._area_task_id, path)
     if sample:
         payload["sample"] = sample
     return hashlib.sha1(
@@ -838,12 +849,12 @@ def _area_start_worker(ctx, page) -> None:
     page._area_job_queue = jobs
     page._area_result_queue = results
     page._area_thread = threading.Thread(
-        target=ctx._area_run, args=(page, jobs, results), daemon=True
+        target=partial(_area_run, ctx), args=(page, jobs, results), daemon=True
     )
     page._area_thread.start()
     timer = QTimer(ctx.host)
     timer.setInterval(150)
-    timer.timeout.connect(lambda: ctx._area_poll(page))
+    timer.timeout.connect(lambda: _area_poll(ctx, page))
     timer.start()
     page._area_timer = timer
 
@@ -852,21 +863,21 @@ def _area_enqueue(ctx, page, path) -> None:
     """Queue a row for calculation when its stored result is out of date."""
     if getattr(page, "_area_closing", False):
         return
-    cfg = ctx._area_row_cfg(page, path)
-    sig = ctx._area_signature(page, path, cfg)
+    cfg = _area_row_cfg(ctx, page, path)
+    sig = _area_signature(ctx, page, path, cfg)
     page._area_latest[path] = sig
     results = page._area_params.setdefault("results", {})
     result = results.get(path)
     if isinstance(result, dict) and result.get("sig") == sig:
-        ctx._area_set_status(page, path, "Done", "#2e7d32")
-        ctx._area_update_area_cell(page, path)
+        _area_set_status(ctx, page, path, "Done", "#2e7d32")
+        _area_update_area_cell(ctx, page, path)
         return
     if not (cfg.get("x") and cfg.get("y") and cfg.get("signal")):
-        ctx._area_set_status(page, path, "Set parameters", "#808080")
-        ctx._area_update_area_cell(page, path)
+        _area_set_status(ctx, page, path, "Set parameters", "#808080")
+        _area_update_area_cell(ctx, page, path)
         return
 
-    ctx._area_start_worker(page)
+    _area_start_worker(ctx, page)
     events = page._area_cancel_events
     previous = events.get(path)
     if previous is not None:
@@ -879,8 +890,8 @@ def _area_enqueue(ctx, page, path) -> None:
         "sig": sig,
         "cancel": event,
     })
-    ctx._area_set_status(page, path, "Queued", "#b58900")
-    ctx._area_update_progress(page)
+    _area_set_status(ctx, page, path, "Queued", "#b58900")
+    _area_update_progress(ctx, page)
 
 
 def _area_run(ctx, page, jobs, results) -> None:
@@ -894,7 +905,7 @@ def _area_run(ctx, page, jobs, results) -> None:
         path = job["path"]
         sig = job["sig"]
         try:
-            result = ctx._area_compute(page, job, results)
+            result = _area_compute(ctx, page, job, results)
         except _AreaCancelled:
             continue
         except Exception as exc:  # noqa: BLE001
@@ -909,12 +920,12 @@ def _area_compute(ctx, page, job, q):
 
     path = job["path"]
     cfg = job["cfg"]
-    base_sig = ctx._area_signature(page, path, cfg, include_density=False)
+    base_sig = _area_signature(ctx, page, path, cfg, include_density=False)
     cached = page._area_counts.get(path)
     if isinstance(cached, dict) and cached.get("sig") == base_sig:
         hist = cached
     else:
-        hist = ctx._area_histogram(page, job, q)
+        hist = _area_histogram(ctx, page, job, q)
         if job["cancel"].is_set():
             raise _AreaCancelled()
         hist["sig"] = base_sig
@@ -964,17 +975,17 @@ def _area_histogram(ctx, page, job, q):
         schema_names = set(pf.schema_arrow.names)
     except Exception:  # noqa: BLE001
         schema_names = set()
-    stages = ctx._map_stages(task_id) if task_id else []
+    stages = _data_columns._map_stages(ctx, task_id) if task_id else []
     needed = _pipeline_dependencies(stages, names, path) if stages else set(names)
     needed = set(needed) | set(names)
     if not needed <= schema_names:
         # A virtual column (Segment mask, Cluster label, …) is not stored in
         # the data parquet: fall back to the materialised arrays.
-        return ctx._area_histogram_loaded(page, job, q)
+        return _area_histogram_loaded(ctx, page, job, q)
 
-    bounds = ctx._area_bounds(pf, x_name, y_name, stages)
+    bounds = _area_bounds(ctx, pf, x_name, y_name, stages)
     if bounds is None:
-        return ctx._area_histogram_loaded(page, job, q)
+        return _area_histogram_loaded(ctx, page, job, q)
     xmin, xmax, ymin, ymax = bounds
     cell = max(xmax - xmin, ymax - ymin) / float(grid)
     if not math.isfinite(cell) or cell <= 0:
@@ -985,7 +996,7 @@ def _area_histogram(ctx, page, job, q):
     total = int(pf.metadata.num_rows or 0)
     counts = np.zeros(nx * ny, dtype=np.int64)
     points = 0
-    keep_index = ctx._subsample_row_index(task_id, path)
+    keep_index = _data_sampling._subsample_row_index(ctx, task_id, path)
     origin = None
     if any(kind == "illumination" for kind, _stage in stages):
         origin = (float(xmin), float(ymin))
@@ -1057,7 +1068,7 @@ def _area_histogram_loaded(ctx, page, job, q):
     grid = max(2, int(page._area_params.get("grid") or _AREA_GRID_DEFAULT))
     started = time.time()
     q.put(("progress", path, job["sig"], 0.05))
-    values = ctx._column_data(page._area_task_id, path, names)
+    values = _data_columns._column_data(ctx, page._area_task_id, path, names)
     if cancel.is_set():
         raise _AreaCancelled()
     if any(name not in values for name in names):
@@ -1148,7 +1159,7 @@ def _area_poll(ctx, page) -> None:
         sig = msg[2]
         if kind == "progress":
             if page._area_latest.get(path) == sig:
-                ctx._area_set_status(
+                _area_set_status(ctx,
                     page, path, f"Computing… {msg[3] * 100:.0f}%", "#b58900"
                 )
         elif kind == "done":
@@ -1156,19 +1167,19 @@ def _area_poll(ctx, page) -> None:
             if page._area_latest.get(path) != sig:
                 continue
             page._area_params.setdefault("results", {})[path] = msg[3]
-            ctx._area_set_status(page, path, "Done", "#2e7d32")
-            ctx._area_update_area_cell(page, path)
+            _area_set_status(ctx, page, path, "Done", "#2e7d32")
+            _area_update_area_cell(ctx, page, path)
             if page._area_params.get("selected") == path:
-                ctx._area_render_plot(page)
-            ctx._area_mark_dirty(page)
+                _area_render_plot(ctx, page)
+            _area_mark_dirty(ctx, page)
         elif kind == "error":
             page._area_cancel_events.pop(path, None)
             if page._area_latest.get(path) != sig:
                 continue
             page._area_params.setdefault("results", {}).pop(path, None)
-            ctx._area_set_status(page, path, f"Error: {msg[3]}", "#c0392b")
-            ctx._area_update_area_cell(page, path)
-    ctx._area_update_progress(page)
+            _area_set_status(ctx, page, path, f"Error: {msg[3]}", "#c0392b")
+            _area_update_area_cell(ctx, page, path)
+    _area_update_progress(ctx, page)
 
 
 def _area_sync_plot_settings(ctx, page) -> None:
@@ -1195,16 +1206,16 @@ def _area_on_plot_type(ctx, page) -> None:
     if plot_cfg.get("type") == value:
         return
     plot_cfg["type"] = value
-    ctx._area_render_plot(page)
-    ctx._area_mark_dirty(page)
+    _area_render_plot(ctx, page)
+    _area_mark_dirty(ctx, page)
 
 
 def _area_on_plot_param(ctx, page) -> None:
     plot_cfg = page._area_params.setdefault("plot", {})
     plot_cfg["palette"] = page._area_palette.currentData() or "viridis"
     plot_cfg["point_size"] = float(page._area_point_size.value())
-    ctx._area_render_plot(page)
-    ctx._area_mark_dirty(page)
+    _area_render_plot(ctx, page)
+    _area_mark_dirty(ctx, page)
 
 
 def _area_resolved_plot_type(ctx, page, path=None):
@@ -1213,7 +1224,7 @@ def _area_resolved_plot_type(ctx, page, path=None):
     path = path if path is not None else params.get("selected")
     if not path:
         return None
-    is_image = ctx._image_load_manifest(path) is not None
+    is_image = _data_image_index._image_load_manifest(ctx, path) is not None
     ptype = plot_cfg.get("type") or "auto"
     if ptype == "auto":
         ptype = "image" if is_image else "scatter"
@@ -1226,11 +1237,11 @@ def _area_set_image_levels(ctx, page, lo, hi) -> None:
     path = page._area_params.get("selected")
     if not path:
         return
-    cfg = ctx._area_row_cfg(page, path)
+    cfg = _area_row_cfg(ctx, page, path)
     cfg["image_min"] = lo
     cfg["image_max"] = hi
-    ctx._area_render_plot(page)
-    ctx._area_mark_dirty(page)
+    _area_render_plot(ctx, page)
+    _area_mark_dirty(ctx, page)
 
 
 def _area_rebuild_levels(ctx, page) -> None:
@@ -1241,8 +1252,8 @@ def _area_rebuild_levels(ctx, page) -> None:
         return
     params = page._area_params
     path = params.get("selected")
-    ptype = ctx._area_resolved_plot_type(page, path)
-    cfg = ctx._area_row_cfg(page, path) if path else {}
+    ptype = _area_resolved_plot_type(ctx, page, path)
+    cfg = _area_row_cfg(ctx, page, path) if path else {}
     sig = (cfg or {}).get("signal")
     locked = bool(getattr(page, "_area_locked", False))
     signature = (path, sig if ptype == "image" else None, ptype, locked)
@@ -1258,10 +1269,10 @@ def _area_rebuild_levels(ctx, page) -> None:
         host.setVisible(False)
         return
     host.setVisible(True)
-    ctx._image_level_controls(
+    _widgets_image_level._image_level_controls(ctx,
         lay, sig, cfg.get("image_min"), cfg.get("image_max"),
         not locked,
-        on_minmax=lambda lo, hi: ctx._area_set_image_levels(page, lo, hi),
+        on_minmax=lambda lo, hi: _area_set_image_levels(ctx, page, lo, hi),
         task_id=page._area_task_id,
         parquet_path=path,
     )
@@ -1272,18 +1283,18 @@ def _area_render_plot(ctx, page) -> None:
     params = page._area_params
     plot_cfg = params.get("plot") or {}
     path = params.get("selected")
-    ctx._area_rebuild_levels(page)
+    _area_rebuild_levels(ctx, page)
     if not path:
         pw.clear()
         pw.setTitle("Select a file row to preview", color="#808080", size="10pt")
         return
-    cfg = ctx._area_row_cfg(page, path)
+    cfg = _area_row_cfg(ctx, page, path)
     x_name, y_name, sig_name = cfg.get("x"), cfg.get("y"), cfg.get("signal")
     if not (x_name and y_name):
         pw.clear()
         pw.setTitle("Set X and Y for this row", color="#b58900", size="10pt")
         return
-    is_image = ctx._image_load_manifest(path) is not None
+    is_image = _data_image_index._image_load_manifest(ctx, path) is not None
     ptype = plot_cfg.get("type") or "auto"
     if ptype == "auto":
         ptype = "image" if is_image else "scatter"
@@ -1293,7 +1304,7 @@ def _area_render_plot(ctx, page) -> None:
         "type": ptype,
         "file": path,
         "palette": plot_cfg.get("palette", "viridis"),
-        "file_name": ctx._comp_file_name(path, page._area_task_id),
+        "file_name": _data_naming._comp_file_name(ctx, path, page._area_task_id),
         "xmin": None,
         "xmax": None,
         "ymin": None,
@@ -1317,21 +1328,21 @@ def _area_render_plot(ctx, page) -> None:
                 "min": cfg.get("image_min"),
                 "max": cfg.get("image_max"),
             }]
-            ctx._figure_render_image(plot_dict, pw, task_id=page._area_task_id)
+            _widgets_plot_renderer._figure_render_image(ctx, plot_dict, pw, task_id=page._area_task_id)
         else:
             plot_dict["x"] = x_name
             plot_dict["y"] = y_name
             plot_dict["color_mode"] = "parameter" if sig_name else "density"
             if sig_name:
                 plot_dict["color_param"] = sig_name
-            ctx._figure_render_scatter(
+            _widgets_plot_renderer._figure_render_scatter(ctx,
                 plot_dict, pw, task_id=page._area_task_id
             )
     except Exception as exc:  # noqa: BLE001
         pw.clear()
         pw.setTitle(f"Preview failed: {exc}", color="#c0392b", size="10pt")
         return
-    ctx._area_draw_overlay(page, path)
+    _area_draw_overlay(ctx, page, path)
 
 
 def _area_draw_overlay(ctx, page, path) -> None:
@@ -1389,18 +1400,18 @@ def _area_copy(ctx, page) -> None:
     ]
     lines = ["\t".join(headers)]
     for path in page._area_paths:
-        cfg = ctx._area_row_cfg(page, path)
+        cfg = _area_row_cfg(ctx, page, path)
         result = (params.get("results") or {}).get(path) or {}
         status = page._area_status.get(path, ("", ""))[0]
         lines.append("\t".join([
-            ctx._comp_file_name(path, page._area_task_id),
+            _data_naming._comp_file_name(ctx, path, page._area_task_id),
             str(cfg.get("x") or ""),
             str(cfg.get("y") or ""),
             str(cfg.get("signal") or ""),
-            ctx._area_format(cfg.get("low")),
-            ctx._area_format(cfg.get("high")),
-            ctx._area_format(cfg.get("density")),
-            ctx._area_format(result.get("area")),
+            _area_format(ctx, cfg.get("low")),
+            _area_format(ctx, cfg.get("high")),
+            _area_format(ctx, cfg.get("density")),
+            _area_format(ctx, result.get("area")),
             status,
         ]))
     QApplication.clipboard().setText("\n".join(lines))
@@ -1409,7 +1420,7 @@ def _area_copy(ctx, page) -> None:
 
 def _area_mark_dirty(ctx, page) -> None:
     page._area_dirty = True
-    ctx._area_update_save_btn(page)
+    _area_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -1425,7 +1436,7 @@ def _area_save_now(ctx, page) -> None:
         ctx.project.save()
     page._area_snapshot = copy.deepcopy(page._area_params)
     page._area_dirty = False
-    ctx._area_update_save_btn(page)
+    _area_update_save_btn(ctx, page)
     ctx.statusBar().showMessage("Area settings saved")
     ctx._module_saved(page)
 

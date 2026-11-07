@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
 from smage.modules.compensation import page as comp_page  # noqa: E402
+from smage.data import columns as _data_columns
+from smage.modules.compensation import page as comp_page
 
 
 def _open(case_id: str):
@@ -39,15 +41,15 @@ def save_matrix() -> None:
         page._comp_files[:] = [parquet]
         page._comp_names[:] = ["FL1-A", "FL2-A"]
         page._comp_matrix[:] = [[100.0, 10.0], [0.0, 100.0]]
-        ctx._comp_mark_dirty(page)
-        ctx._comp_save_now(page)
+        comp_page._comp_mark_dirty(ctx, page)
+        comp_page._comp_save_now(ctx, page)
 
         task = window.project.workflow["tasks"][0]["children"][0]
         harness.eq(task["params"]["params"], ["FL1-A", "FL2-A"])
         harness.eq(task["params"]["matrix"], [[100.0, 10.0], [0.0, 100.0]])
 
         raw = pd.read_parquet(parquet)
-        values = ctx._column_data("g-1", parquet, ["FL1-A", "FL2-A"])
+        values = _data_columns._column_data(ctx, "g-1", parquet, ["FL1-A", "FL2-A"])
         expected_a = raw["FL1-A"].to_numpy() + 0.1 * raw["FL2-A"].to_numpy()
         harness.check(np.allclose(values["FL1-A"], expected_a))
         harness.check(
@@ -68,7 +70,7 @@ def paste_matrix() -> None:
         QApplication.clipboard().setText(
             "\tFL1-A\tFL2-A\nFL1-A\t100\t25\nFL2-A\t5\t100"
         )
-        ctx._comp_paste_matrix(page)
+        comp_page._comp_paste_matrix(ctx, page)
         harness.eq(page._comp_matrix, [[100.0, 25.0], [5.0, 100.0]])
 
         QApplication.clipboard().setText(
@@ -76,7 +78,7 @@ def paste_matrix() -> None:
         )
         with harness.patch_dialogs(comp_page,
                                    warning=QMessageBox.StandardButton.Ok):
-            ctx._comp_paste_matrix(page)
+            comp_page._comp_paste_matrix(ctx, page)
         harness.eq(page._comp_matrix, [[100.0, 25.0], [5.0, 100.0]],
                    "a matrix with different names is rejected")
     finally:
@@ -90,7 +92,7 @@ def apply_params() -> None:
         ctx = window._ctx
         page._comp_names[:] = ["A", "B"]
         page._comp_matrix[:] = [[100.0, 10.0], [20.0, 100.0]]
-        ctx._comp_apply_params(page, ["A", "C"])
+        comp_page._comp_apply_params(ctx, page, ["A", "C"])
         harness.eq(page._comp_names, ["A", "C"])
         harness.eq(page._comp_matrix, [[100.0, 0.0], [0.0, 100.0]],
                    "new names start with an empty off-diagonal")

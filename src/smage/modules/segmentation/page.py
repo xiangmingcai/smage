@@ -57,6 +57,14 @@ from smage.widgets.plot_axes import _make_sci_axis
 from smage.widgets.resources import _lock_pixmap
 import copy
 import time
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import outputs as _data_outputs
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
+from smage.widgets.plot import renderer as _widgets_plot_renderer
 
 
 def _seg_params_for(ctx, task_def) -> dict:
@@ -107,11 +115,11 @@ def _seg_load_mask(ctx, mask_path):
         cache = {}
         ctx._seg_mask_cache = cache
     key = str(mask_path)
-    sign = ctx._seg_signature(mask_path)
+    sign = _seg_signature(ctx, mask_path)
     hit = cache.get(key)
     if hit is not None and hit[0] == sign:
         return hit[1]
-    man = ctx._image_load_manifest(mask_path)
+    man = _data_image_index._image_load_manifest(ctx, mask_path)
     if man is None:
         return None
     width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
@@ -156,7 +164,7 @@ def _seg_clear_edge_cache(ctx) -> None:
     if cache is not None:
         cache.clear()
     try:
-        shutil.rmtree(ctx._seg_temp_dir(), ignore_errors=True)
+        shutil.rmtree(_seg_temp_dir(ctx), ignore_errors=True)
     except Exception:  # noqa: BLE001
         pass
 
@@ -165,10 +173,10 @@ def _seg_edge_map(ctx, mask_path):
     """Return (and disk-cache) the boolean edge map of a mask."""
     import numpy as np
 
-    mask = ctx._seg_load_mask(mask_path)
+    mask = _seg_load_mask(ctx, mask_path)
     if mask is None:
         return None
-    sign = ctx._seg_signature(mask_path)
+    sign = _seg_signature(ctx, mask_path)
     cache = getattr(ctx, "_seg_edge_cache", None)
     if cache is None:
         cache = {}
@@ -177,7 +185,7 @@ def _seg_edge_map(ctx, mask_path):
     hit = cache.get(key)
     if hit is not None and hit[0] == sign:
         return hit[1]
-    path = ctx._seg_temp_dir() / f"{Path(str(mask_path)).stem}.{sign}.npy"
+    path = _seg_temp_dir(ctx) / f"{Path(str(mask_path)).stem}.{sign}.npy"
     edge = None
     if path.is_file():
         try:
@@ -212,7 +220,7 @@ def _build_segmentation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -228,7 +236,7 @@ def _build_segmentation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._seg_close(page))
+    close_btn.clicked.connect(lambda _=False: _seg_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -259,7 +267,7 @@ def _build_segmentation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     page._seg_mask_cache = {}
     page._seg_ext_running = False
     page._seg_log_lines = []
-    save_btn.clicked.connect(lambda _=False: ctx._seg_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _seg_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -268,10 +276,10 @@ def _build_segmentation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     row.setSpacing(12)
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._seg_files_panel(page))
-    splitter.addWidget(ctx._seg_method_panel(page))
-    page._seg_preview_panel = ctx._seg_preview_panel(page)
-    page._seg_settings_panel = ctx._seg_plot_settings_panel(page)
+    splitter.addWidget(_seg_files_panel(ctx, page))
+    splitter.addWidget(_seg_method_panel(ctx, page))
+    page._seg_preview_panel = _seg_preview_panel(ctx, page)
+    page._seg_settings_panel = _seg_plot_settings_panel(ctx, page)
     splitter.addWidget(page._seg_preview_panel)
     splitter.addWidget(page._seg_settings_panel)
     splitter.setStretchFactor(0, 1)
@@ -283,18 +291,18 @@ def _build_segmentation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     layout.addWidget(content, 1)
     page._seg_splitter = splitter
 
-    ctx._seg_refresh_files(page)
-    ctx._seg_update_preview_visibility(page)
-    ctx._seg_update_save_btn(page)
+    _seg_refresh_files(ctx, page)
+    _seg_update_preview_visibility(ctx, page)
+    _seg_update_save_btn(ctx, page)
     return page
 
 
 def _seg_default_plot(ctx, parquet_path, task_id=None) -> dict:
     """A fresh image plot config for the preview panel."""
     columns = []
-    rec = ctx._figure_record(parquet_path)
+    rec = _widgets_plot_renderer._figure_record(ctx, parquet_path)
     if rec is not None:
-        columns = ctx._columns_for(rec.get("parquet"), task_id)
+        columns = _data_columns._columns_for(ctx, rec.get("parquet"), task_id)
     channel = next((c for c in columns if c not in ("x", "y")), None)
     return {
         "type": "image",
@@ -332,28 +340,28 @@ def _seg_file_rows(ctx, page) -> list:
 def _seg_file_status(ctx, page, parquet_path) -> str:
     """no mask / pending / applied for one file."""
     params = page._seg_params
-    rec = ctx._seg_mask_record(params, parquet_path)
-    path = ctx._seg_mask_file(rec)
+    rec = _seg_mask_record(ctx, params, parquet_path)
+    path = _seg_mask_file(ctx, rec)
     if path is None:
         return SEG_STATUS_NO_MASK
     saved = page._seg_applied_snapshot.get(parquet_path) if hasattr(
         page, "_seg_applied_snapshot"
     ) else None
-    if saved and saved == ctx._seg_signature(path):
+    if saved and saved == _seg_signature(ctx, path):
         return SEG_STATUS_APPLIED
     return SEG_STATUS_PENDING
 
 
 def _seg_any_mask(ctx, page) -> bool:
-    for path in ctx._seg_file_rows(page):
-        rec = ctx._seg_mask_record(page._seg_params, path)
-        if ctx._seg_mask_file(rec) is not None:
+    for path in _seg_file_rows(ctx, page):
+        rec = _seg_mask_record(ctx, page._seg_params, path)
+        if _seg_mask_file(ctx, rec) is not None:
             return True
     return False
 
 
 def _seg_files_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -371,7 +379,7 @@ def _seg_files_panel(ctx, page) -> QWidget:
     method_combo.setCurrentIndex(idx if idx >= 0 else 0)
     method_combo.setEnabled(not page._seg_locked)
     method_combo.currentIndexChanged.connect(
-        lambda _=0: ctx._seg_on_method_changed(page)
+        lambda _=0: _seg_on_method_changed(ctx, page)
     )
     tlay.addWidget(method_combo)
     page._seg_method_combo = method_combo
@@ -383,7 +391,7 @@ def _seg_files_panel(ctx, page) -> QWidget:
     set_btn = QPushButton("Set Files")
     set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     set_btn.setEnabled(not page._seg_locked)
-    set_btn.clicked.connect(lambda _=False: ctx._seg_set_files(page))
+    set_btn.clicked.connect(lambda _=False: _seg_set_files(ctx, page))
     blay.addWidget(set_btn)
     page._seg_setfiles_btn = set_btn
 
@@ -402,7 +410,7 @@ def _seg_files_panel(ctx, page) -> QWidget:
         "QTableWidget { background: #ffffff; border: none; }"
         "QTableWidget::item:selected { background: #dbeafa; }"
     )
-    table.itemChanged.connect(lambda item: ctx._seg_expose_changed(page, item))
+    table.itemChanged.connect(lambda item: _seg_expose_changed(ctx, page, item))
     blay.addWidget(table, 1)
     page._seg_files_table = table
 
@@ -410,7 +418,7 @@ def _seg_files_panel(ctx, page) -> QWidget:
     name_edit = QLineEdit(str(page._seg_params.get("column") or "Mask"))
     name_edit.setEnabled(not page._seg_locked)
     name_edit.editingFinished.connect(
-        lambda: ctx._seg_column_edited(page)
+        lambda: _seg_column_edited(ctx, page)
     )
     blay.addWidget(name_edit)
     page._seg_column_edit = name_edit
@@ -437,18 +445,18 @@ def _seg_refresh_files(ctx, page) -> None:
     """Rebuild the file table and the mask-column status snapshot."""
     table = page._seg_files_table
     table.blockSignals(True)
-    rows = ctx._seg_file_rows(page)
+    rows = _seg_file_rows(ctx, page)
     table.setRowCount(len(rows))
     expose = page._seg_params.get("expose") or {}
     editable = not page._seg_locked
     for i, path in enumerate(rows):
-        name_item = QTableWidgetItem(ctx._comp_file_name(path, page._seg_task_id))
+        name_item = QTableWidgetItem(_data_naming._comp_file_name(ctx, path, page._seg_task_id))
         name_item.setData(Qt.ItemDataRole.UserRole, path)
         name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         table.setItem(i, 0, name_item)
 
-        has_mask = ctx._seg_mask_file(
-            ctx._seg_mask_record(page._seg_params, path)
+        has_mask = _seg_mask_file(ctx,
+            _seg_mask_record(ctx, page._seg_params, path)
         ) is not None
         chk = QTableWidgetItem()
         chk.setFlags(
@@ -462,7 +470,7 @@ def _seg_refresh_files(ctx, page) -> None:
             chk.setFlags(Qt.ItemFlag.ItemIsSelectable)
         table.setItem(i, 1, chk)
 
-        status = ctx._seg_file_status(page, path)
+        status = _seg_file_status(ctx, page, path)
         sitem = QTableWidgetItem(status)
         sitem.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         if status == SEG_STATUS_APPLIED:
@@ -473,9 +481,9 @@ def _seg_refresh_files(ctx, page) -> None:
             sitem.setForeground(QColor("#9aa0a6"))
         table.setItem(i, 2, sitem)
     table.blockSignals(False)
-    ctx._seg_rebuild_method_panel(page)
-    ctx._seg_refresh_plot_settings(page)
-    ctx._seg_update_preview_visibility(page)
+    _seg_rebuild_method_panel(ctx, page)
+    _seg_refresh_plot_settings(ctx, page)
+    _seg_update_preview_visibility(ctx, page)
 
 
 def _seg_expose_changed(ctx, page, item) -> None:
@@ -483,20 +491,20 @@ def _seg_expose_changed(ctx, page, item) -> None:
         return
     table = page._seg_files_table
     row = table.row(item)
-    rows = ctx._seg_file_rows(page)
+    rows = _seg_file_rows(ctx, page)
     if not (0 <= row < len(rows)):
         return
     path = rows[row]
     expose = page._seg_params.setdefault("expose", {})
     expose[path] = item.checkState() == Qt.CheckState.Checked
-    ctx._seg_refresh_status(page)
-    ctx._seg_mark_dirty(page)
+    _seg_refresh_status(ctx, page)
+    _seg_mark_dirty(ctx, page)
 
 
 def _seg_refresh_status(ctx, page) -> None:
     """Update only the status cells (no widget rebuild)."""
     table = page._seg_files_table
-    rows = ctx._seg_file_rows(page)
+    rows = _seg_file_rows(ctx, page)
     table.blockSignals(True)
     for i, path in enumerate(rows):
         if i >= table.rowCount():
@@ -504,7 +512,7 @@ def _seg_refresh_status(ctx, page) -> None:
         item = table.item(i, 2)
         if item is None:
             continue
-        status = ctx._seg_file_status(page, path)
+        status = _seg_file_status(ctx, page, path)
         item.setText(status)
         if status == SEG_STATUS_APPLIED:
             item.setForeground(QColor("#1a7f37"))
@@ -516,17 +524,17 @@ def _seg_refresh_status(ctx, page) -> None:
 
 
 def _seg_set_files(ctx, page) -> None:
-    records = ctx._available_files(page._seg_task_id)
+    records = _data_files._available_files(ctx, page._seg_task_id)
     names = [rec.get("name", "") for rec in records]
-    current = [ctx._comp_file_name(p, page._seg_task_id) for p in ctx._seg_file_rows(page)]
-    chosen = ctx._pick_items_dialog(
+    current = [_data_naming._comp_file_name(ctx, p, page._seg_task_id) for p in _seg_file_rows(ctx, page)]
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
         return
     chosen_set = set(chosen)
     picks = [rec for rec in records if rec.get("name", "") in chosen_set]
-    bad = [rec.get("name", "") for rec in picks if not ctx._seg_is_image_file(rec)]
+    bad = [rec.get("name", "") for rec in picks if not _data_outputs._seg_is_image_file(ctx, rec)]
     if bad:
         QMessageBox.warning(
             ctx.host,
@@ -537,38 +545,38 @@ def _seg_set_files(ctx, page) -> None:
         )
         return
     page._seg_params["files"] = [rec.get("parquet") for rec in picks]
-    ctx._seg_refresh_files(page)
-    ctx._seg_mark_dirty(page)
+    _seg_refresh_files(ctx, page)
+    _seg_mark_dirty(ctx, page)
 
 
 def _seg_column_edited(ctx, page) -> None:
     name = page._seg_column_edit.text().strip() or "Mask"
     page._seg_params["column"] = name
-    ctx._seg_refresh_status(page)
-    ctx._seg_mark_dirty(page)
+    _seg_refresh_status(ctx, page)
+    _seg_mark_dirty(ctx, page)
 
 
 def _seg_on_method_changed(ctx, page) -> None:
     page._seg_params["method"] = page._seg_method_combo.currentData()
-    ctx._seg_rebuild_method_panel(page)
-    ctx._seg_mark_dirty(page)
+    _seg_rebuild_method_panel(ctx, page)
+    _seg_mark_dirty(ctx, page)
 
 
 def _seg_rebuild_method_panel(ctx, page) -> None:
     """Swap the second panel between method params and the mask-input table."""
     host = page._seg_method_host
-    ctx._clear_settings_layout(host.layout())
+    _widgets_panels._clear_settings_layout(ctx, host.layout())
     method = page._seg_params.get("method")
     if method == "mask_input":
-        ctx._seg_mask_input_panel(page, host)
+        _seg_mask_input_panel(ctx, page, host)
     elif _extension_def(method) is not None:
-        ctx._seg_external_method_panel(page, host)
+        _seg_external_method_panel(ctx, page, host)
     else:
-        ctx._seg_method_params_panel(page, host)
+        _seg_method_params_panel(ctx, page, host)
 
 
 def _seg_method_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -616,14 +624,14 @@ def _seg_otsu_value(ctx, page, parquet_path, channel):
 def _seg_method_params_panel(ctx, page, host) -> None:
     """Nuclear Expansion parameters + Calculate."""
     lay = host.layout()
-    params = ctx._seg_map_params(page)
+    params = _seg_map_params(ctx, page)
     enabled = not page._seg_locked
 
     lay.addWidget(QLabel("<b>Nuclear Expansion</b>"))
     lay.addWidget(QLabel("Nucleus channel"))
     columns = []
-    for path in ctx._seg_file_rows(page):
-        for name in ctx._columns_for(path, page._seg_task_id):
+    for path in _seg_file_rows(ctx, page):
+        for name in _data_columns._columns_for(ctx, path, page._seg_task_id):
             if name not in columns:
                 columns.append(name)
     channel_combo = _NoWheelComboBox()
@@ -637,7 +645,7 @@ def _seg_method_params_panel(ctx, page, host) -> None:
         channel_combo.setCurrentIndex(idx)
     channel_combo.setEnabled(enabled)
     lay.addWidget(channel_combo)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Channel used to detect nuclei."
     ))
 
@@ -649,7 +657,7 @@ def _seg_method_params_panel(ctx, page, host) -> None:
     mode_combo.setCurrentIndex(max(0, idx))
     mode_combo.setEnabled(enabled)
     lay.addWidget(mode_combo)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Otsu picks the cut-off from the histogram; Manual uses the value "
         "below."
     ))
@@ -657,10 +665,10 @@ def _seg_method_params_panel(ctx, page, host) -> None:
     def otsu_default():
         """The Otsu value of the chosen channel, used as the default."""
         channel = params.get("channel")
-        rows = ctx._seg_file_rows(page)
+        rows = _seg_file_rows(ctx, page)
         if not channel or not rows:
             return None
-        return ctx._seg_otsu_value(page, rows[0], channel)
+        return _seg_otsu_value(ctx, page, rows[0], channel)
 
     initial = float(params.get("threshold", 0.0))
     if params.get("threshold_mode", "otsu") != "manual":
@@ -674,7 +682,7 @@ def _seg_method_params_panel(ctx, page, host) -> None:
         "switches to a manual threshold."
     )
     lay.addWidget(thr_spin)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Prefilled with the Otsu value. Editing it switches the mode to "
         "Manual."
     ))
@@ -685,7 +693,7 @@ def _seg_method_params_panel(ctx, page, host) -> None:
     area_spin.setValue(int(params.get("min_area", 30)))
     area_spin.setEnabled(enabled)
     lay.addWidget(area_spin)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Objects smaller than this many pixels are discarded as debris."
     ))
 
@@ -695,7 +703,7 @@ def _seg_method_params_panel(ctx, page, host) -> None:
     exp_spin.setValue(int(params.get("expand", 5)))
     exp_spin.setEnabled(enabled)
     lay.addWidget(exp_spin)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "How far each nucleus grows to approximate the cell body."
     ))
 
@@ -723,39 +731,39 @@ def _seg_method_params_panel(ctx, page, host) -> None:
         if params.get("threshold_mode") != "manual":
             params["threshold_mode"] = "manual"
             mode_combo.setCurrentIndex(mode_combo.findData("manual"))
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     def on_channel(_=0):
         params["channel"] = channel_combo.currentData()
         refresh_otsu()
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     def on_mode(_=0):
         params["threshold_mode"] = mode_combo.currentData()
         if params["threshold_mode"] == "otsu":
             refresh_otsu()
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     def on_area(value):
         params["min_area"] = int(value)
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     def on_expand(value):
         params["expand"] = int(value)
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     channel_combo.currentIndexChanged.connect(on_channel)
     mode_combo.currentIndexChanged.connect(on_mode)
     area_spin.valueChanged.connect(on_area)
     exp_spin.valueChanged.connect(on_expand)
-    calc_btn.clicked.connect(lambda _=False: ctx._seg_calculate(page))
+    calc_btn.clicked.connect(lambda _=False: _seg_calculate(ctx, page))
 
 
 def _seg_channel_columns(ctx, page) -> list:
     """Union of non-coordinate columns across the selected files."""
     columns = []
-    for path in ctx._seg_file_rows(page):
-        for name in ctx._columns_for(path, page._seg_task_id):
+    for path in _seg_file_rows(ctx, page):
+        for name in _data_columns._columns_for(ctx, path, page._seg_task_id):
             if name in ("x", "y"):
                 continue
             if name not in columns:
@@ -768,7 +776,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
     method = page._seg_params.get("method")
     entry = _extension_def(method)
     lay = host.layout()
-    params = ctx._seg_map_params(page)
+    params = _seg_map_params(ctx, page)
     enabled = not page._seg_locked
     ready = ctx._ext_ready(method)
 
@@ -808,12 +816,12 @@ def _seg_external_method_panel(ctx, page, host) -> None:
         "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
     )
     files_list.setMaximumHeight(110)
-    for path in ctx._seg_file_rows(page):
-        item = QListWidgetItem(ctx._comp_file_name(path, page._seg_task_id))
+    for path in _seg_file_rows(ctx, page):
+        item = QListWidgetItem(_data_naming._comp_file_name(ctx, path, page._seg_task_id))
         item.setData(Qt.ItemDataRole.UserRole, path)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         has_mask = (
-            ctx._seg_mask_file(ctx._seg_mask_record(page._seg_params, path))
+            _seg_mask_file(ctx, _seg_mask_record(ctx, page._seg_params, path))
             is not None
         )
         item.setCheckState(
@@ -824,7 +832,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
     page._seg_calc_files_list = files_list
 
     lay.addWidget(param_label("Nucleus channel"))
-    columns = ctx._seg_channel_columns(page)
+    columns = _seg_channel_columns(ctx, page)
     channel_combo = _NoWheelComboBox()
     channel_combo.addItem("", None)
     for name in columns:
@@ -834,7 +842,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
         channel_combo.setCurrentIndex(idx)
     channel_combo.setEnabled(enabled)
     lay.addWidget(channel_combo)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Channel used to detect nuclei."
     ))
 
@@ -850,7 +858,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
             cyto_combo.setCurrentIndex(idx)
         cyto_combo.setEnabled(enabled)
         lay.addWidget(cyto_combo)
-        lay.addWidget(ctx._param_hint(
+        lay.addWidget(_widgets_panels._param_hint(ctx,
             "Optional second channel that helps Cellpose follow the cell "
             "body around each nucleus."
         ))
@@ -871,7 +879,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
         prob_spin.setValue(float(params.get("prob", 0.5)))
         prob_spin.setEnabled(enabled)
         lay.addWidget(prob_spin)
-        lay.addWidget(ctx._param_hint(
+        lay.addWidget(_widgets_panels._param_hint(ctx,
             "Lower values detect more cells, and more false positives."
         ))
 
@@ -883,7 +891,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
         nms_spin.setValue(float(params.get("nms", 0.3)))
         nms_spin.setEnabled(enabled)
         lay.addWidget(nms_spin)
-        lay.addWidget(ctx._param_hint(
+        lay.addWidget(_widgets_panels._param_hint(ctx,
             "Non-maximum suppression: higher removes more overlapping "
             "detections."
         ))
@@ -901,7 +909,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
             "pick a good size automatically."
         )
         lay.addWidget(tile_size_spin)
-        lay.addWidget(ctx._param_hint(
+        lay.addWidget(_widgets_panels._param_hint(ctx,
             "Approximate tile edge in pixels; Smage adapts the actual "
             "tiles to the image size. 0 = let StarDist choose."
         ))
@@ -930,23 +938,23 @@ def _seg_external_method_panel(ctx, page, host) -> None:
 
     def on_channel(_=0):
         params["channel"] = channel_combo.currentData()
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     def on_cyto(_=0):
         params["cyto_channel"] = cyto_combo.currentData()
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     def on_prob(value):
         params["prob"] = float(value)
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     def on_nms(value):
         params["nms"] = float(value)
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     def on_tile_size(value):
         params["tile_size"] = int(value)
-        ctx._seg_mark_dirty(page)
+        _seg_mark_dirty(ctx, page)
 
     channel_combo.currentIndexChanged.connect(on_channel)
     if cyto_combo is not None:
@@ -957,7 +965,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
         nms_spin.valueChanged.connect(on_nms)
     if tile_size_spin is not None:
         tile_size_spin.valueChanged.connect(on_tile_size)
-    calc_btn.clicked.connect(lambda _=False: ctx._seg_calculate(page))
+    calc_btn.clicked.connect(lambda _=False: _seg_calculate(ctx, page))
 
 
 def _seg_mask_input_panel(ctx, page, host) -> None:
@@ -995,9 +1003,9 @@ def _seg_mask_input_panel(ctx, page, host) -> None:
     status.setWordWrap(True)
     lay.addWidget(status)
     page._seg_import_status = status
-    import_btn.clicked.connect(lambda _=False: ctx._seg_import_masks(page))
+    import_btn.clicked.connect(lambda _=False: _seg_import_masks(ctx, page))
 
-    ctx._seg_refresh_input_table(page)
+    _seg_refresh_input_table(ctx, page)
 
 
 def _seg_mask_record_live(ctx, page, parquet_path, create=False) -> dict:
@@ -1016,27 +1024,27 @@ def _seg_refresh_input_table(ctx, page) -> None:
     table = getattr(page, "_seg_input_table", None)
     if table is None:
         return
-    rows = ctx._seg_file_rows(page)
+    rows = _seg_file_rows(ctx, page)
     table.blockSignals(True)
     table.setRowCount(len(rows))
     enabled = not page._seg_locked
     for i, path in enumerate(rows):
-        name_item = QTableWidgetItem(ctx._comp_file_name(path, page._seg_task_id))
+        name_item = QTableWidgetItem(_data_naming._comp_file_name(ctx, path, page._seg_task_id))
         name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         table.setItem(i, 0, name_item)
 
-        rec = ctx._seg_mask_record(page._seg_params, path) or {}
+        rec = _seg_mask_record(ctx, page._seg_params, path) or {}
         btn = QPushButton(Path(str(rec.get("input") or "")).name or "…")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setEnabled(enabled)
         btn.setToolTip(rec.get("input") or "Choose a mask file")
         btn.clicked.connect(
-            lambda _=False, p=path: ctx._seg_pick_mask_file(page, p)
+            lambda _=False, p=path: _seg_pick_mask_file(ctx, page, p)
         )
         table.setCellWidget(i, 1, btn)
 
         state = rec.get("state") or (
-            SEG_IMPORT_DONE if ctx._seg_mask_file(rec) else SEG_IMPORT_SELECT
+            SEG_IMPORT_DONE if _seg_mask_file(ctx, rec) else SEG_IMPORT_SELECT
         )
         sitem = QTableWidgetItem(state)
         sitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -1051,8 +1059,8 @@ def _seg_refresh_input_table(ctx, page) -> None:
 
 
 def _seg_pick_mask_file(ctx, page, parquet_path) -> None:
-    rec = ctx._seg_mask_record_live(page, parquet_path, create=True)
-    already = ctx._seg_mask_file(rec) is not None
+    rec = _seg_mask_record_live(ctx, page, parquet_path, create=True)
+    already = _seg_mask_file(ctx, rec) is not None
     if already:
         reply = QMessageBox.question(
             ctx.host,
@@ -1073,20 +1081,20 @@ def _seg_pick_mask_file(ctx, page, parquet_path) -> None:
         return
     ctx._seg_last_mask_dir = str(Path(path).parent)
     if already:
-        ctx._seg_delete_mask(page, parquet_path)
+        _seg_delete_mask(ctx, page, parquet_path)
     rec["input"] = path
     rec["state"] = SEG_IMPORT_WAITING
     rec["path"] = rec.get("path") if rec.get("source") == "builtin" else None
-    ctx._seg_refresh_input_table(page)
-    ctx._seg_refresh_files(page)
-    ctx._seg_mark_dirty(page)
+    _seg_refresh_input_table(ctx, page)
+    _seg_refresh_files(ctx, page)
+    _seg_mark_dirty(ctx, page)
 
 
 def _seg_delete_mask(ctx, page, parquet_path) -> None:
     """Remove a file's mask parquet, its raster pyramid and its record."""
     import shutil
 
-    rec = ctx._seg_mask_record(page._seg_params, parquet_path) or {}
+    rec = _seg_mask_record(ctx, page._seg_params, parquet_path) or {}
     rel = rec.get("path")
     if rel and ctx.project is not None:
         try:
@@ -1107,7 +1115,7 @@ def _seg_import_masks(ctx, page) -> None:
     import numpy as np
     import tifffile
 
-    rows = ctx._seg_file_rows(page)
+    rows = _seg_file_rows(ctx, page)
     if not rows:
         QMessageBox.information(
             ctx.host, "Import", "Select data files first."
@@ -1115,8 +1123,8 @@ def _seg_import_masks(ctx, page) -> None:
         return
     pending = []
     for path in rows:
-        rec = ctx._seg_mask_record_live(page, path, create=True)
-        if rec.get("state") == SEG_IMPORT_DONE and ctx._seg_mask_file(rec):
+        rec = _seg_mask_record_live(ctx, page, path, create=True)
+        if rec.get("state") == SEG_IMPORT_DONE and _seg_mask_file(ctx, rec):
             continue
         if not rec.get("input"):
             continue
@@ -1131,10 +1139,10 @@ def _seg_import_masks(ctx, page) -> None:
     done = 0
     errors = []
     for parquet_path, rec in pending:
-        ent = ctx._ensure_image_index(parquet_path)
+        ent = _data_image_index._ensure_image_index(ctx, parquet_path)
         if ent is None or ent.get("manifest") is None:
             rec["state"] = SEG_IMPORT_UNKNOWN
-            errors.append(f"{ctx._comp_file_name(parquet_path, page._seg_task_id)}: no image index")
+            errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: no image index")
             continue
         man = ent["manifest"]
         height = int(round(man["ymax"] - man["ymin"])) + 1
@@ -1159,7 +1167,7 @@ def _seg_import_masks(ctx, page) -> None:
             rec["state"] = SEG_IMPORT_SIZE
             continue
         try:
-            rel = ctx._seg_write_mask(page._seg_task_id, parquet_path, arr)
+            rel = _seg_write_mask(ctx, page._seg_task_id, parquet_path, arr)
         except Exception:  # noqa: BLE001
             rec["state"] = SEG_IMPORT_UNKNOWN
             continue
@@ -1168,9 +1176,9 @@ def _seg_import_masks(ctx, page) -> None:
         rec["state"] = SEG_IMPORT_DONE
         done += 1
 
-    ctx._seg_after_masks_changed(page)
-    ctx._seg_refresh_input_table(page)
-    ctx._seg_refresh_files(page)
+    _seg_after_masks_changed(ctx, page)
+    _seg_refresh_input_table(ctx, page)
+    _seg_refresh_files(ctx, page)
     msg = f"Imported {done} mask(s)."
     if errors:
         msg += "\n" + "\n".join(errors)
@@ -1191,7 +1199,7 @@ def _seg_write_mask(ctx, task_id, parquet_path, array) -> str:
 
     if ctx.project is None:
         raise RuntimeError("no project")
-    ent = ctx._ensure_image_index(parquet_path)
+    ent = _data_image_index._ensure_image_index(ctx, parquet_path)
     if ent is None or ent.get("manifest") is None:
         raise RuntimeError("source image has no index")
     man = ent["manifest"]
@@ -1205,7 +1213,7 @@ def _seg_write_mask(ctx, task_id, parquet_path, array) -> str:
         height, width = arr.shape
 
     stem = Path(str(parquet_path)).stem
-    rel = ctx._module_rel(task_id, f"{stem}_mask.parquet")
+    rel = _data_files._module_rel(ctx, task_id, f"{stem}_mask.parquet")
     path = ctx.project.path / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
@@ -1231,7 +1239,7 @@ def _seg_after_masks_changed(ctx, page) -> None:
         ctx.project.save()
     page._seg_snapshot = copy.deepcopy(page._seg_params)
     page._seg_dirty = False
-    ctx._seg_update_save_btn(page)
+    _seg_update_save_btn(ctx, page)
     ctx._refresh_workflow_tree()
     ctx._module_saved(page)
 
@@ -1240,15 +1248,15 @@ def _seg_calculate(ctx, page) -> None:
     """Run the selected method on every selected file."""
     method = page._seg_params.get("method")
     if _extension_def(method) is not None:
-        ctx._seg_calculate_external(page)
+        _seg_calculate_external(ctx, page)
         return
-    ctx._seg_calculate_nuclear(page)
+    _seg_calculate_nuclear(ctx, page)
 
 
 def _seg_calculate_nuclear(ctx, page) -> None:
     """Run Nuclear Expansion on every selected file."""
-    rows = ctx._seg_file_rows(page)
-    params = ctx._seg_map_params(page)
+    rows = _seg_file_rows(ctx, page)
+    params = _seg_map_params(ctx, page)
     status = getattr(page, "_seg_calc_status", None)
     if not rows:
         QMessageBox.information(ctx.host, "Calculate", "Select data files first.")
@@ -1267,19 +1275,19 @@ def _seg_calculate_nuclear(ctx, page) -> None:
             if status is not None:
                 status.setText(
                     f"Calculating {i + 1}/{len(rows)}: "
-                    f"{ctx._comp_file_name(parquet_path, page._seg_task_id)}…"
+                    f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}…"
                 )
                 QApplication.processEvents()
-            mask, err = ctx._seg_nuclear_expansion(parquet_path, params)
+            mask, err = _seg_nuclear_expansion(ctx, parquet_path, params)
             if mask is None:
-                errors.append(f"{ctx._comp_file_name(parquet_path, page._seg_task_id)}: {err}")
+                errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {err}")
                 continue
             try:
-                rel = ctx._seg_write_mask(page._seg_task_id, parquet_path, mask)
+                rel = _seg_write_mask(ctx, page._seg_task_id, parquet_path, mask)
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{ctx._comp_file_name(parquet_path, page._seg_task_id)}: {exc}")
+                errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {exc}")
                 continue
-            rec = ctx._seg_mask_record_live(page, parquet_path, create=True)
+            rec = _seg_mask_record_live(ctx, page, parquet_path, create=True)
             rec["path"] = rel
             rec["source"] = "builtin"
             rec["state"] = SEG_IMPORT_DONE
@@ -1288,8 +1296,8 @@ def _seg_calculate_nuclear(ctx, page) -> None:
     finally:
         QApplication.restoreOverrideCursor()
 
-    ctx._seg_after_masks_changed(page)
-    ctx._seg_refresh_files(page)
+    _seg_after_masks_changed(ctx, page)
+    _seg_refresh_files(ctx, page)
     # The refresh rebuilds the parameter panel, so re-read its status label.
     status = getattr(page, "_seg_calc_status", status)
     if status is not None:
@@ -1306,7 +1314,7 @@ def _seg_raster_stack(ctx, parquet_path, channels):
     images = []
     shape = None
     for channel in channels:
-        image, err = ctx._seg_raster_channel(parquet_path, channel)
+        image, err = _seg_raster_channel(ctx, parquet_path, channel)
         if image is None:
             return None, err
         if shape is None:
@@ -1326,7 +1334,7 @@ def _seg_calculate_external(ctx, page) -> None:
 
     method = page._seg_params.get("method")
     entry = _extension_def(method)
-    params = ctx._seg_map_params(page)
+    params = _seg_map_params(ctx, page)
     files_list = getattr(page, "_seg_calc_files_list", None)
     if files_list is not None:
         rows = []
@@ -1335,7 +1343,7 @@ def _seg_calculate_external(ctx, page) -> None:
             if item.checkState() == Qt.CheckState.Checked:
                 rows.append(item.data(Qt.ItemDataRole.UserRole))
     else:
-        rows = ctx._seg_file_rows(page)
+        rows = _seg_file_rows(ctx, page)
     status = getattr(page, "_seg_calc_status", None)
 
     if not rows:
@@ -1367,16 +1375,16 @@ def _seg_calculate_external(ctx, page) -> None:
     cyto = params.get("cyto_channel") if entry["family"] == "cellpose" else None
     # Reconstructing the channel image happens in the main app, before the
     # external subprocess starts, so log it (this is the silent phase).
-    ctx._seg_log(page, f"Rasterizing {len(rows)} file(s)…")
+    _seg_log(ctx, page, f"Rasterizing {len(rows)} file(s)…")
     for i, parquet_path in enumerate(rows):
-        ctx._seg_log(
-            page, f"  rasterizing {ctx._comp_file_name(parquet_path, page._seg_task_id)}…"
+        _seg_log(ctx,
+            page, f"  rasterizing {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}…"
         )
         if cyto:
-            stack, err = ctx._seg_raster_stack(parquet_path, [cyto, nucleus])
+            stack, err = _seg_raster_stack(ctx, parquet_path, [cyto, nucleus])
             nucleus_idx, cyto_idx = 1, 0
         else:
-            stack, err = ctx._seg_raster_stack(parquet_path, [nucleus])
+            stack, err = _seg_raster_stack(ctx, parquet_path, [nucleus])
             nucleus_idx, cyto_idx = 0, None
         if stack is None:
             continue
@@ -1420,7 +1428,7 @@ def _seg_calculate_external(ctx, page) -> None:
     page._seg_ext_running = True
     page._seg_ext_start_time = time.monotonic()
     # Keep appending to the existing log so each run's history is preserved.
-    ctx._seg_log(
+    _seg_log(ctx,
         page,
         f"===== {entry['name']} run — {len(jobs)} file(s) =====",
     )
@@ -1436,7 +1444,7 @@ def _seg_calculate_external(ctx, page) -> None:
 
     timer = QTimer(ctx.host)
     timer.setInterval(150)
-    timer.timeout.connect(lambda: ctx._seg_ext_poll(page))
+    timer.timeout.connect(lambda: _seg_ext_poll(ctx, page))
     timer.start()
     page._seg_ext_timer = timer
 
@@ -1511,7 +1519,7 @@ def _seg_ext_poll(ctx, page) -> None:
                     try:
                         cur, tot = info.split("/", 1)
                         tile = (int(cur), int(tot))
-                        ctx._seg_log_tile(page, int(cur), int(tot))
+                        _seg_log_tile(ctx, page, int(cur), int(tot))
                     except ValueError:
                         pass
             elif line.startswith("done:"):
@@ -1539,10 +1547,10 @@ def _seg_ext_poll(ctx, page) -> None:
                     arr = np.load(out_path)
                     if arr.ndim != 2:
                         raise ValueError("bad mask shape")
-                    rel = ctx._seg_write_mask(
+                    rel = _seg_write_mask(ctx,
                         page._seg_task_id, parquet_path, arr
                     )
-                    rec = ctx._seg_mask_record_live(
+                    rec = _seg_mask_record_live(ctx,
                         page, parquet_path, create=True
                     )
                     rec["path"] = rel
@@ -1550,17 +1558,17 @@ def _seg_ext_poll(ctx, page) -> None:
                     rec["state"] = SEG_IMPORT_DONE
                     cells += int(arr.max())
                     report.append(
-                        f"{ctx._comp_file_name(parquet_path, page._seg_task_id)}: "
+                        f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: "
                         f"{n_cells} cells, {seconds:.1f}s"
                     )
-                    ctx._seg_log(
+                    _seg_log(ctx,
                         page,
-                        f"✓ {ctx._comp_file_name(parquet_path, page._seg_task_id)}: "
+                        f"✓ {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: "
                         f"{n_cells} cells, {seconds:.1f}s",
                     )
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{ctx._comp_file_name(parquet_path, page._seg_task_id)}: {exc}")
-                    ctx._seg_log(page, f"✗ {ctx._comp_file_name(parquet_path, page._seg_task_id)}: {exc}")
+                    errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {exc}")
+                    _seg_log(ctx, page, f"✗ {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {exc}")
                 done.add(out_path)
             else:
                 # Non-progress output (e.g. TensorFlow/model loading lines):
@@ -1568,7 +1576,7 @@ def _seg_ext_poll(ctx, page) -> None:
                 # scrollable log so the user can see and copy the details.
                 if line.strip():
                     activity = line.strip()[-120:]
-                    ctx._seg_log(page, line)
+                    _seg_log(ctx, page, line)
             continue
         if len(item) != 4 or item[1] != "done":
             continue
@@ -1581,16 +1589,16 @@ def _seg_ext_poll(ctx, page) -> None:
                 continue
             if code != 0:
                 errors.append(
-                    f"{ctx._comp_file_name(job['parquet'], page._seg_task_id)}: "
+                    f"{_data_naming._comp_file_name(ctx, job['parquet'], page._seg_task_id)}: "
                     f"{text.strip()[-200:]}"
                 )
             else:
                 errors.append(
-                    f"{ctx._comp_file_name(job['parquet'], page._seg_task_id)}: no output produced"
+                    f"{_data_naming._comp_file_name(ctx, job['parquet'], page._seg_task_id)}: no output produced"
                 )
             done.add(job["output"])
         if text and code != 0:
-            ctx._seg_log(page, text.rstrip())
+            _seg_log(ctx, page, text.rstrip())
 
     page._seg_ext_done = done
     page._seg_ext_errors = errors
@@ -1628,14 +1636,14 @@ def _seg_ext_poll(ctx, page) -> None:
     elapsed = int(time.monotonic() - start) if start else 0
     minutes, seconds = divmod(elapsed, 60)
     elapsed_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
-    ctx._seg_log(
+    _seg_log(ctx,
         page,
         f"Calculated {ok_count} mask(s) · {cells} cell(s) in {elapsed_str}.",
     )
     for err in errors:
-        ctx._seg_log(page, f"✗ {err}")
-    ctx._seg_after_masks_changed(page)
-    ctx._seg_refresh_files(page)
+        _seg_log(ctx, page, f"✗ {err}")
+    _seg_after_masks_changed(ctx, page)
+    _seg_refresh_files(ctx, page)
     status = getattr(page, "_seg_calc_status", None)
     if status is not None:
         msg = f"Calculated {ok_count} mask(s) · {cells} cell(s) in {elapsed_str}."
@@ -1651,7 +1659,7 @@ def _seg_raster_channel(ctx, parquet_path, channel):
     import numpy as np
     import pandas as pd
 
-    ent = ctx._ensure_image_index(parquet_path)
+    ent = _data_image_index._ensure_image_index(ctx, parquet_path)
     if ent is None or ent.get("manifest") is None:
         return None, "no image index — re-import this file as an image"
     man = ent["manifest"]
@@ -1685,7 +1693,7 @@ def _seg_nuclear_expansion(ctx, parquet_path, params):
     channel = params.get("channel")
     if not channel:
         return None, "no nucleus channel"
-    image, err = ctx._seg_raster_channel(parquet_path, channel)
+    image, err = _seg_raster_channel(ctx, parquet_path, channel)
     if image is None:
         return None, err
 
@@ -1711,7 +1719,7 @@ def _seg_nuclear_expansion(ctx, parquet_path, params):
 
 def _seg_mark_dirty(ctx, page) -> None:
     page._seg_dirty = True
-    ctx._seg_update_save_btn(page)
+    _seg_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -1727,10 +1735,10 @@ def _seg_save_now(ctx, page) -> None:
     # that is exposed (checked) in this module — unchecked files don't
     # publish a mask column, so their names don't matter here.
     taken = set()
-    for path in ctx._seg_file_rows(page):
+    for path in _seg_file_rows(ctx, page):
         if not expose.get(path):
             continue
-        for name in ctx._column_index.get(ctx._rel_data_key(path), []):
+        for name in ctx._column_index.get(_data_files._rel_data_key(ctx, path), []):
             taken.add(name)
     if column in taken:
         QMessageBox.warning(
@@ -1742,14 +1750,14 @@ def _seg_save_now(ctx, page) -> None:
         return
     params["column"] = column
     applied = {}
-    for path in ctx._seg_file_rows(page):
+    for path in _seg_file_rows(ctx, page):
         if not expose.get(path):
             continue
-        rec = ctx._seg_mask_record(params, path)
-        mask_path = ctx._seg_mask_file(rec)
+        rec = _seg_mask_record(ctx, params, path)
+        mask_path = _seg_mask_file(ctx, rec)
         if mask_path is None:
             continue
-        applied[path] = ctx._seg_signature(mask_path)
+        applied[path] = _seg_signature(ctx, mask_path)
     params["applied"] = applied
     page._seg_applied_snapshot = dict(applied)
     page._seg_task_def["params"] = params
@@ -1757,8 +1765,8 @@ def _seg_save_now(ctx, page) -> None:
         ctx.project.save()
     page._seg_snapshot = copy.deepcopy(params)
     page._seg_dirty = False
-    ctx._seg_update_save_btn(page)
-    ctx._seg_refresh_status(page)
+    _seg_update_save_btn(ctx, page)
+    _seg_refresh_status(ctx, page)
     ctx._seg_value_cache = {}
     ctx.statusBar().showMessage("Segmentation saved")
     ctx._module_saved(page)
@@ -1796,7 +1804,7 @@ def _seg_close(ctx, page) -> None:
 def _seg_preview_panel(ctx, page) -> QWidget:
     import pyqtgraph as pg
 
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -1812,7 +1820,7 @@ def _seg_preview_panel(ctx, page) -> QWidget:
         "left": _make_sci_axis("left"),
     })
     bh.addWidget(plot, 1)
-    legend = ctx._figure_attach_legend(plot)
+    legend = _widgets_plot_renderer._figure_attach_legend(ctx, plot)
     bh.addWidget(legend, 0)
     lay.addWidget(body, 1)
     page._seg_preview_plot = plot
@@ -1821,7 +1829,7 @@ def _seg_preview_panel(ctx, page) -> QWidget:
     timer = QTimer(ctx.host)
     timer.setSingleShot(True)
     timer.setInterval(30)
-    timer.timeout.connect(lambda: ctx._seg_render_preview(page))
+    timer.timeout.connect(lambda: _seg_render_preview(ctx, page))
     page._seg_overlay_timer = timer
     plot.getPlotItem().getViewBox().sigRangeChanged.connect(
         lambda *_: timer.start()
@@ -1830,7 +1838,7 @@ def _seg_preview_panel(ctx, page) -> QWidget:
 
 
 def _seg_plot_settings_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -1847,11 +1855,11 @@ def _seg_plot_settings_panel(ctx, page) -> QWidget:
 def _seg_plot_dict(ctx, page) -> dict:
     """The preview's plot config, defaulted for the current files."""
     plot_dict = page._seg_params.setdefault("plot", {})
-    rows = ctx._seg_file_rows(page)
+    rows = _seg_file_rows(ctx, page)
     if not rows:
         return plot_dict
     if plot_dict.get("file") not in rows:
-        fresh = ctx._seg_default_plot(rows[0], page._seg_task_id)
+        fresh = _seg_default_plot(ctx, rows[0], page._seg_task_id)
         fresh.update({k: v for k, v in plot_dict.items() if k != "file"})
         plot_dict.clear()
         plot_dict.update(fresh)
@@ -1874,17 +1882,17 @@ def _seg_refresh_plot_settings(ctx, page) -> None:
     host = getattr(page, "_seg_settings_host", None)
     if host is None:
         return
-    ctx._clear_settings_layout(host.layout())
+    _widgets_panels._clear_settings_layout(ctx, host.layout())
     lay = host.layout()
     enabled = not page._seg_locked
-    plot_dict = ctx._seg_plot_dict(page)
-    rows = [p for p in ctx._seg_file_rows(page)
-            if ctx._seg_mask_file(ctx._seg_mask_record(page._seg_params, p))]
+    plot_dict = _seg_plot_dict(ctx, page)
+    rows = [p for p in _seg_file_rows(ctx, page)
+            if _seg_mask_file(ctx, _seg_mask_record(ctx, page._seg_params, p))]
 
     lay.addWidget(QLabel("File"))
     file_combo = _NoWheelComboBox()
     for path in rows:
-        file_combo.addItem(ctx._comp_file_name(path, page._seg_task_id), path)
+        file_combo.addItem(_data_naming._comp_file_name(ctx, path, page._seg_task_id), path)
     idx = file_combo.findData(plot_dict.get("file"))
     if idx >= 0:
         file_combo.setCurrentIndex(idx)
@@ -1892,16 +1900,16 @@ def _seg_refresh_plot_settings(ctx, page) -> None:
     lay.addWidget(file_combo)
 
     columns = []
-    rec = ctx._figure_record(plot_dict.get("file"))
+    rec = _widgets_plot_renderer._figure_record(ctx, plot_dict.get("file"))
     if rec is not None:
-        columns = ctx._columns_for(rec.get("parquet"), page._seg_task_id)
+        columns = _data_columns._columns_for(ctx, rec.get("parquet"), page._seg_task_id)
 
-    ctx._figure_image_layer_settings(
+    _widgets_plot_renderer._figure_image_layer_settings(ctx,
         lay, plot_dict, columns, enabled,
-        on_change=lambda: ctx._seg_render_preview(page),
+        on_change=lambda: _seg_render_preview(ctx, page),
         on_rebuild=lambda: (
-            ctx._seg_refresh_plot_settings(page),
-            ctx._seg_render_preview(page),
+            _seg_refresh_plot_settings(ctx, page),
+            _seg_render_preview(ctx, page),
         ),
         task_id=page._seg_task_id,
     )
@@ -1935,14 +1943,14 @@ def _seg_refresh_plot_settings(ctx, page) -> None:
         alpha_spin.setEnabled(enabled)
         lay.addWidget(alpha_spin)
 
-    ctx._figure_display_toggles(
+    _widgets_plot_renderer._figure_display_toggles(ctx,
         lay, plot_dict, enabled,
         on_change=lambda: (
-            ctx._figure_apply_display_options(
+            _widgets_plot_renderer._figure_apply_display_options(ctx,
                 plot_dict, getattr(page, "_seg_preview_plot", None)
             )
             if getattr(page, "_seg_preview_plot", None) is not None
-            else ctx._seg_render_preview(page)
+            else _seg_render_preview(ctx, page)
         ),
     )
     lay.addStretch(1)
@@ -1953,25 +1961,25 @@ def _seg_refresh_plot_settings(ctx, page) -> None:
             return
         plot_dict["file"] = path
         plot_dict["file_name"] = file_combo.currentText()
-        ctx._seg_refresh_plot_settings(page)
-        ctx._seg_render_preview(page)
-        ctx._seg_mark_dirty(page)
+        _seg_refresh_plot_settings(ctx, page)
+        _seg_render_preview(ctx, page)
+        _seg_mark_dirty(ctx, page)
 
     def on_mode(_=0):
         plot_dict["mask_mode"] = mode_combo.currentData()
-        ctx._seg_refresh_plot_settings(page)
-        ctx._seg_render_preview(page)
-        ctx._seg_mark_dirty(page)
+        _seg_refresh_plot_settings(ctx, page)
+        _seg_render_preview(ctx, page)
+        _seg_mark_dirty(ctx, page)
 
     def on_color_mode(_=0):
         plot_dict["mask_color"] = color_mode_combo.currentData()
-        ctx._seg_render_overlay(page)
-        ctx._seg_mark_dirty(page)
+        _seg_render_overlay(ctx, page)
+        _seg_mark_dirty(ctx, page)
 
     def on_alpha(value):
         plot_dict["mask_alpha"] = int(value)
-        ctx._seg_render_overlay(page)
-        ctx._seg_mark_dirty(page)
+        _seg_render_overlay(ctx, page)
+        _seg_mark_dirty(ctx, page)
 
     file_combo.currentIndexChanged.connect(on_file)
     mode_combo.currentIndexChanged.connect(on_mode)
@@ -1983,26 +1991,26 @@ def _seg_refresh_plot_settings(ctx, page) -> None:
 
 def _seg_update_preview_visibility(ctx, page) -> None:
     """Parts 3 and 4 appear once at least one file has a mask."""
-    has_mask = ctx._seg_any_mask(page)
+    has_mask = _seg_any_mask(ctx, page)
     panel3 = getattr(page, "_seg_preview_panel", None)
     panel4 = getattr(page, "_seg_settings_panel", None)
     for panel in (panel3, panel4):
         if panel is not None:
             panel.setVisible(has_mask)
     if has_mask:
-        ctx._seg_render_preview(page)
+        _seg_render_preview(ctx, page)
 
 
 def _seg_render_preview(ctx, page) -> None:
     plot = getattr(page, "_seg_preview_plot", None)
     if plot is None:
         return
-    plot_dict = ctx._seg_plot_dict(page)
-    rec = ctx._figure_record(plot_dict.get("file"))
+    plot_dict = _seg_plot_dict(ctx, page)
+    rec = _widgets_plot_renderer._figure_record(ctx, plot_dict.get("file"))
     if rec is None:
         return
-    ctx._figure_render(plot_dict, plot, task_id=page._seg_task_id)
-    ctx._seg_render_overlay(page)
+    _widgets_plot_renderer._figure_render(ctx, plot_dict, plot, task_id=page._seg_task_id)
+    _seg_render_overlay(ctx, page)
 
 
 def _seg_render_overlay(ctx, page) -> None:
@@ -2013,7 +2021,7 @@ def _seg_render_overlay(ctx, page) -> None:
     plot = getattr(page, "_seg_preview_plot", None)
     if plot is None:
         return
-    plot_dict = ctx._seg_plot_dict(page)
+    plot_dict = _seg_plot_dict(ctx, page)
     old = getattr(page, "_seg_overlay_item", None)
     if old is not None:
         try:
@@ -2025,11 +2033,11 @@ def _seg_render_overlay(ctx, page) -> None:
     if mode == "none":
         return
     parquet_path = plot_dict.get("file")
-    rec = ctx._seg_mask_record(page._seg_params, parquet_path)
-    mask_path = ctx._seg_mask_file(rec)
+    rec = _seg_mask_record(ctx, page._seg_params, parquet_path)
+    mask_path = _seg_mask_file(ctx, rec)
     if mask_path is None:
         return
-    ent = ctx._ensure_image_index(parquet_path)
+    ent = _data_image_index._ensure_image_index(ctx, parquet_path)
     if ent is None or ent.get("manifest") is None:
         return
     man = ent["manifest"]
@@ -2047,7 +2055,7 @@ def _seg_render_overlay(ctx, page) -> None:
     j1 = min(int(round(float(man["ymax"]) - ymin)) + 1, int(np.ceil(y1 - ymin)))
     if i1 <= i0 or j1 <= j0:
         return
-    mask = ctx._seg_load_mask(mask_path)
+    mask = _seg_load_mask(ctx, mask_path)
     if mask is None:
         return
     i1 = min(i1, mask.shape[1])
@@ -2070,7 +2078,7 @@ def _seg_render_overlay(ctx, page) -> None:
             [ramp * 255.0, ramp * 255.0, ramp * 255.0], axis=1
         ).astype(np.int64)
     if mode == "edges":
-        edges_full = ctx._seg_edge_map(mask_path)
+        edges_full = _seg_edge_map(ctx, mask_path)
         if edges_full is None:
             return
         edge = edges_full[j0:j1:step, i0:i1:step]

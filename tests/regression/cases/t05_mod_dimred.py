@@ -8,6 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
+from smage.modules.dimred import page as _dimred_page
 
 
 def _open(case_id: str):
@@ -32,20 +33,20 @@ def validate() -> None:
     window, _project, page, _parquet = _open("dimred_validate")
     try:
         ctx = window._ctx
-        ok, message = ctx._dimred_validate(page)
+        ok, message = _dimred_page._dimred_validate(ctx, page)
         harness.check(not ok and "data file" in message, message)
 
         page._dimred_params["files"] = [_parquet]
-        ok, message = ctx._dimred_validate(page)
+        ok, message = _dimred_page._dimred_validate(ctx, page)
         harness.check("variable" in message, message)
 
         page._dimred_params["columns"] = ["FL1-A"]
         page._dimred_params["names"] = ["a", "a"]
-        ok, message = ctx._dimred_validate(page)
+        ok, message = _dimred_page._dimred_validate(ctx, page)
         harness.check("differ" in message, message)
 
         page._dimred_params["names"] = ["x", "y"]
-        ok, message = ctx._dimred_validate(page)
+        ok, message = _dimred_page._dimred_validate(ctx, page)
         harness.check("collides" in message, message)
     finally:
         _close(window)
@@ -57,11 +58,11 @@ def prepare() -> None:
     try:
         ctx = window._ctx
         matrix = np.array([[1.0, np.nan], [3.0, 4.0]])
-        filled = ctx._dimred_prepare(matrix, False, False)
+        filled = _dimred_page._dimred_prepare(ctx, matrix, False, False)
         harness.check(np.allclose(filled, [[1.0, 4.0], [3.0, 4.0]]),
                       "NaN is filled with the column mean")
 
-        normalized = ctx._dimred_prepare(matrix, True, False)
+        normalized = _dimred_page._dimred_prepare(ctx, matrix, True, False)
         harness.check(np.allclose(normalized.mean(axis=0), 0.0, atol=1e-9))
         harness.check(np.allclose(normalized[:, 0].std(), 1.0))
         harness.check(np.allclose(normalized[:, 1], 0.0),
@@ -77,7 +78,7 @@ def write_output() -> None:
         ctx = window._ctx
         page._dimred_params["names"] = ["d1", "d2"]
         coords = np.column_stack([np.arange(60), np.arange(60) * 2]).astype(float)
-        rel, columns, kind = ctx._dimred_write_file(page, parquet, coords)
+        rel, columns, kind = _dimred_page._dimred_write_file(ctx, page, parquet, coords)
         harness.eq(columns, ["d1", "d2"])
         harness.eq(kind, "table")
         output = project.path / rel
@@ -106,7 +107,7 @@ def umap_run() -> None:
             "normalize": False,
             "pca": False,
         })
-        ctx._dimred_calculate(page)
+        _dimred_page._dimred_calculate(ctx, page)
         harness.check(page._dimred_running, "the calculation starts")
         harness.wait_for(
             lambda: not page._dimred_running, timeout=120,
@@ -127,7 +128,7 @@ def tsne_fit() -> None:
         ctx = window._ctx
         rng = np.random.default_rng(42)
         matrix = rng.normal(size=(60, 3))
-        coords = ctx._dimred_fit(
+        coords = _dimred_page._dimred_fit(ctx,
             "tsne", {"perplexity": 5, "n_iter": 250}, matrix, 42
         )
         harness.eq(coords.shape, (60, 2))

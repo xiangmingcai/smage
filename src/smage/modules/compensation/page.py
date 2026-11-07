@@ -14,6 +14,11 @@ from PySide6.QtWidgets import (
 from smage.core.constants import MODULE_STATE_MODIFIED
 from smage.widgets.gate_editor.canvas import _ReleaseFilter
 from smage.widgets.resources import _drag_handle_pixmap, _lock_pixmap
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import naming as _data_naming
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 def _comp_cell_color(value, max_positive, min_negative) -> QColor:
@@ -42,7 +47,7 @@ def _build_compensation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -58,7 +63,7 @@ def _build_compensation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._comp_close(page))
+    close_btn.clicked.connect(lambda _=False: _comp_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -81,9 +86,9 @@ def _build_compensation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     page._comp_order_timer.setSingleShot(True)
     page._comp_order_timer.setInterval(400)
     page._comp_order_timer.timeout.connect(
-        lambda: ctx._comp_reordered(page)
+        lambda: _comp_reordered(ctx, page)
     )
-    save_btn.clicked.connect(lambda _=False: ctx._comp_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _comp_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -94,28 +99,28 @@ def _build_compensation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
     # Matrix on the left; the file list (with "Set files") on the right.
-    splitter.addWidget(ctx._comp_matrix_panel(page))
-    splitter.addWidget(ctx._comp_files_panel(page))
+    splitter.addWidget(_comp_matrix_panel(ctx, page))
+    splitter.addWidget(_comp_files_panel(ctx, page))
     splitter.setStretchFactor(0, 5)
     splitter.setStretchFactor(1, 1)
     splitter.setSizes([1100, 220])
     row.addWidget(splitter, 1)
     layout.addWidget(content, 1)
 
-    ctx._comp_refresh(page)
-    ctx._comp_update_save_btn(page)
+    _comp_refresh(ctx, page)
+    _comp_update_save_btn(ctx, page)
     return page
 
 
 def _comp_files_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
     set_btn = QPushButton("Set Files")
     set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     set_btn.setEnabled(not page._comp_locked and bool(page._comp_names))
-    set_btn.clicked.connect(lambda _=False: ctx._comp_set_files(page))
+    set_btn.clicked.connect(lambda _=False: _comp_set_files(ctx, page))
     lay.addWidget(set_btn)
     files_list = QListWidget()
     files_list.setStyleSheet(
@@ -128,7 +133,7 @@ def _comp_files_panel(ctx, page) -> QWidget:
 
 
 def _comp_matrix_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -137,15 +142,15 @@ def _comp_matrix_panel(ctx, page) -> QWidget:
     set_btn = QPushButton("Set Compensation Matrix")
     set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     set_btn.setEnabled(not page._comp_locked)
-    set_btn.clicked.connect(lambda _=False: ctx._comp_set_params(page))
+    set_btn.clicked.connect(lambda _=False: _comp_set_params(ctx, page))
     top.addWidget(set_btn)
     top.addStretch()
     copy_btn = QPushButton("Copy Matrix")
     paste_btn = QPushButton("Paste Matrix")
     for btn in (copy_btn, paste_btn):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    copy_btn.clicked.connect(lambda _=False: ctx._comp_copy_matrix(page))
-    paste_btn.clicked.connect(lambda _=False: ctx._comp_paste_matrix(page))
+    copy_btn.clicked.connect(lambda _=False: _comp_copy_matrix(ctx, page))
+    paste_btn.clicked.connect(lambda _=False: _comp_paste_matrix(ctx, page))
     top.addWidget(copy_btn)
     top.addWidget(paste_btn)
     lay.addLayout(top)
@@ -162,7 +167,7 @@ def _comp_matrix_panel(ctx, page) -> QWidget:
     )
     # Apply the new order as soon as the drag is released (the timer above
     # is only a fallback), so a mid-drag rebuild cannot misplace rows.
-    release_filter = _ReleaseFilter(lambda: ctx._comp_reordered(page))
+    release_filter = _ReleaseFilter(lambda: _comp_reordered(ctx, page))
     table.verticalHeader().viewport().installEventFilter(release_filter)
     page._comp_release_filter = release_filter
     table.horizontalHeader().setDefaultSectionSize(66)
@@ -171,7 +176,7 @@ def _comp_matrix_panel(ctx, page) -> QWidget:
         | QAbstractItemView.EditTrigger.EditKeyPressed
         | QAbstractItemView.EditTrigger.AnyKeyPressed
     )
-    table.itemChanged.connect(lambda item: ctx._comp_item_changed(page, item))
+    table.itemChanged.connect(lambda item: _comp_item_changed(ctx, page, item))
     lay.addWidget(table, 1)
 
     hint = QLabel(
@@ -192,13 +197,13 @@ def _comp_matrix_panel(ctx, page) -> QWidget:
 
 
 def _comp_columns_for(ctx, page, path) -> list:
-    return ctx._columns_for(path, page._comp_task_id)
+    return _data_columns._columns_for(ctx, path, page._comp_task_id)
 
 
 def _comp_all_columns(ctx, page) -> list:
     columns = []
-    for rec in ctx._available_files(page._comp_task_id):
-        for name in ctx._comp_columns_for(page, rec.get("parquet")):
+    for rec in _data_files._available_files(ctx, page._comp_task_id):
+        for name in _comp_columns_for(ctx, page, rec.get("parquet")):
             if name not in columns:
                 columns.append(name)
     return columns
@@ -209,7 +214,7 @@ def _comp_refresh(ctx, page) -> None:
     files_list.blockSignals(True)
     files_list.clear()
     for path in page._comp_files:
-        item = QListWidgetItem(ctx._comp_file_name(path, page._comp_task_id))
+        item = QListWidgetItem(_data_naming._comp_file_name(ctx, path, page._comp_task_id))
         item.setData(Qt.ItemDataRole.UserRole, path)
         files_list.addItem(item)
     files_list.blockSignals(False)
@@ -221,7 +226,7 @@ def _comp_refresh(ctx, page) -> None:
     )
     page._comp_copy_btn.setEnabled(bool(page._comp_names))
     page._comp_paste_btn.setEnabled(editable and bool(page._comp_names))
-    ctx._comp_rebuild_table(page)
+    _comp_rebuild_table(ctx, page)
 
 
 def _comp_rebuild_table(ctx, page) -> None:
@@ -273,7 +278,7 @@ def _comp_rebuild_table(ctx, page) -> None:
             | QAbstractItemView.EditTrigger.AnyKeyPressed
         )
     )
-    ctx._comp_refresh_colors(page)
+    _comp_refresh_colors(ctx, page)
     has_names = bool(names)
     table.setVisible(has_names)
     page._comp_hint.setVisible(not has_names)
@@ -326,8 +331,8 @@ def _comp_item_changed(ctx, page, item) -> None:
     if value == page._comp_matrix[i][j]:
         return
     page._comp_matrix[i][j] = value
-    ctx._comp_refresh_colors(page)
-    ctx._comp_mark_dirty(page)
+    _comp_refresh_colors(ctx, page)
+    _comp_mark_dirty(ctx, page)
 
 
 def _comp_set_files(ctx, page) -> None:
@@ -338,10 +343,10 @@ def _comp_set_files(ctx, page) -> None:
             "Set the compensation matrix parameters first.",
         )
         return
-    records = ctx._available_files(page._comp_task_id)
+    records = _data_files._available_files(ctx, page._comp_task_id)
     names = [rec.get("name", "") for rec in records]
-    current = [ctx._comp_file_name(path, page._comp_task_id) for path in page._comp_files]
-    chosen = ctx._pick_items_dialog(
+    current = [_data_naming._comp_file_name(ctx, path, page._comp_task_id) for path in page._comp_files]
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -353,22 +358,22 @@ def _comp_set_files(ctx, page) -> None:
     ]
     problems = []
     for path in paths:
-        columns = set(ctx._comp_columns_for(page, path))
+        columns = set(_comp_columns_for(ctx, page, path))
         missing = [name for name in page._comp_names if name not in columns]
         if missing:
-            problems.append((ctx._comp_file_name(path, page._comp_task_id), missing))
+            problems.append((_data_naming._comp_file_name(ctx, path, page._comp_task_id), missing))
     if problems:
-        ctx._comp_show_missing(problems)
+        _comp_show_missing(ctx, problems)
         return
     page._comp_files[:] = paths
-    ctx._comp_refresh(page)
-    ctx._comp_mark_dirty(page)
+    _comp_refresh(ctx, page)
+    _comp_mark_dirty(ctx, page)
 
 
 def _comp_set_params(ctx, page) -> None:
-    all_columns = ctx._comp_all_columns(page)
+    all_columns = _comp_all_columns(ctx, page)
     current = list(page._comp_names)
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Compensation parameters", all_columns, current,
         "Filter parameters...",
     )
@@ -379,15 +384,15 @@ def _comp_set_params(ctx, page) -> None:
     added = [name for name in new_names if name not in current]
     problems = []
     for path in page._comp_files:
-        columns = set(ctx._comp_columns_for(page, path))
+        columns = set(_comp_columns_for(ctx, page, path))
         missing = [name for name in added if name not in columns]
         if missing:
-            problems.append((ctx._comp_file_name(path, page._comp_task_id), missing))
+            problems.append((_data_naming._comp_file_name(ctx, path, page._comp_task_id), missing))
     if problems:
-        ctx._comp_show_missing(problems)
+        _comp_show_missing(ctx, problems)
         return
-    ctx._comp_apply_params(page, new_names)
-    ctx._comp_mark_dirty(page)
+    _comp_apply_params(ctx, page, new_names)
+    _comp_mark_dirty(ctx, page)
 
 
 def _comp_show_missing(ctx, problems) -> None:
@@ -417,7 +422,7 @@ def _comp_apply_params(ctx, page, new_names) -> None:
         matrix.append(row)
     page._comp_names[:] = list(new_names)
     page._comp_matrix[:] = matrix
-    ctx._comp_refresh(page)
+    _comp_refresh(ctx, page)
 
 
 def _comp_reordered(ctx, page) -> None:
@@ -431,8 +436,8 @@ def _comp_reordered(ctx, page) -> None:
     page._comp_matrix[:] = [
         [page._comp_matrix[i][j] for j in order] for i in order
     ]
-    ctx._comp_rebuild_table(page)
-    ctx._comp_mark_dirty(page)
+    _comp_rebuild_table(ctx, page)
+    _comp_mark_dirty(ctx, page)
 
 
 def _comp_copy_matrix(ctx, page) -> None:
@@ -511,13 +516,13 @@ def _comp_paste_matrix(ctx, page) -> None:
                 row.append(values.get((row_name, col_name), 0))
         matrix.append(row)
     page._comp_matrix[:] = matrix
-    ctx._comp_rebuild_table(page)
-    ctx._comp_mark_dirty(page)
+    _comp_rebuild_table(ctx, page)
+    _comp_mark_dirty(ctx, page)
 
 
 def _comp_mark_dirty(ctx, page) -> None:
     page._comp_dirty = True
-    ctx._comp_update_save_btn(page)
+    _comp_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -527,7 +532,7 @@ def _comp_save_now(ctx, page) -> None:
         ctx.project.save()
     page._comp_snapshot = copy.deepcopy(page._comp_params)
     page._comp_dirty = False
-    ctx._comp_update_save_btn(page)
+    _comp_update_save_btn(ctx, page)
     ctx.statusBar().showMessage("Compensation saved")
     ctx._module_saved(page)
 

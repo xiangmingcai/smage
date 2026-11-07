@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
 from smage.modules.gate2col import page as gate2col_page  # noqa: E402
+from smage.modules.gate2col import page as gate2col_page
 
 
 def _open(case_id: str):
@@ -57,7 +58,7 @@ def calculate() -> None:
     window, project, page, parquet = _open("gate2col_calc")
     try:
         ctx = window._ctx
-        ctx._g2c_calculate(page)
+        gate2col_page._g2c_calculate(ctx, page)
         outputs = page._g2c_params.get("outputs") or {}
         harness.check(parquet in outputs, f"outputs: {outputs}")
         record = outputs[parquet]
@@ -85,7 +86,7 @@ def validation() -> None:
         page._g2c_params["rules"] = []
         with harness.patch_dialogs(gate2col_page,
                                    warning=QMessageBox.StandardButton.Ok):
-            ctx._g2c_calculate(page)
+            gate2col_page._g2c_calculate(ctx, page)
         harness.check(not page._g2c_params.get("outputs"))
 
         page._g2c_params["rules"] = [
@@ -93,7 +94,7 @@ def validation() -> None:
         ]
         with harness.patch_dialogs(gate2col_page,
                                    warning=QMessageBox.StandardButton.Ok):
-            ctx._g2c_calculate(page)
+            gate2col_page._g2c_calculate(ctx, page)
         harness.check(not page._g2c_params.get("outputs"),
                       "a name colliding with an existing column is rejected")
     finally:

@@ -11,6 +11,7 @@ import tifffile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 import _e2e_helpers as e2e  # noqa: E402
+from smage.modules.export import page as _export_page
 
 
 def _open(case_id: str):
@@ -49,7 +50,7 @@ def _run(window, page, project, out_dir: Path, fmt: str, columns):
         "format": fmt,
         "dir": str(out_dir),
     }
-    window._ctx._export_job_table(page, q, params)
+    _export_page._export_job_table(window._ctx, page, q, params)
     return _drain(q)
 
 
@@ -130,10 +131,10 @@ def export_naming() -> None:
     window, _project, page = _open("export_naming")
     try:
         ctx = window._ctx
-        harness.eq(ctx._export_file_name("a/b:c*", ".csv"), "a_b_c_.csv")
-        harness.eq(ctx._export_file_name("   ", ".csv"), "export.csv")
-        harness.eq(ctx._export_file_name("", ".fcs"), "export.fcs")
-        harness.eq(ctx._export_file_name("data.parquet", ".csv"), "data.csv")
+        harness.eq(_export_page._export_file_name(ctx, "a/b:c*", ".csv"), "a_b_c_.csv")
+        harness.eq(_export_page._export_file_name(ctx, "   ", ".csv"), "export.csv")
+        harness.eq(_export_page._export_file_name(ctx, "", ".fcs"), "export.fcs")
+        harness.eq(_export_page._export_file_name(ctx, "data.parquet", ".csv"), "data.csv")
     finally:
         _close(window)
 
@@ -147,7 +148,7 @@ def export_image() -> None:
         page = e2e.open_page(window, "e-1", "export", "Export")
         out = harness.RUN_DIR / "cases" / "export_image" / "out_image"
         q = queue.Queue()
-        window._ctx._export_job_image(page, q, {
+        _export_page._export_job_image(window._ctx, page, q, {
             "files": [str(project.data_dir / "nuclei.parquet")],
             "channels": ["Channel 1"],
             "dir": str(out),

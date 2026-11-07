@@ -42,6 +42,12 @@ import hashlib
 import json
 import queue
 import threading
+from functools import partial
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import naming as _data_naming
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 _BA_MIN_CELLS = 50          # cells per batch per cluster for a spline
@@ -118,9 +124,9 @@ def _ba_stage(ctx, task_def):
     model = params.get("model")
     if not isinstance(model, dict):
         return None
-    if model.get("config_sig") != ctx._ba_config_sig(params):
+    if model.get("config_sig") != _ba_config_sig(ctx, params):
         return None
-    arrays = ctx._ba_load_model(task_def)
+    arrays = _ba_load_model(ctx, task_def)
     if arrays is None:
         return None
     stage = {
@@ -161,7 +167,7 @@ def _build_ba_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -177,7 +183,7 @@ def _build_ba_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._ba_close(page))
+    close_btn.clicked.connect(lambda _=False: _ba_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -208,7 +214,7 @@ def _build_ba_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._ba_cancel = False
     page._ba_updating = False
     page._ba_reporting = False
-    save_btn.clicked.connect(lambda _=False: ctx._ba_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _ba_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -218,24 +224,24 @@ def _build_ba_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._ba_left_panel(page))
-    splitter.addWidget(ctx._ba_center_panel(page))
-    splitter.addWidget(ctx._ba_right_panel(page))
+    splitter.addWidget(_ba_left_panel(ctx, page))
+    splitter.addWidget(_ba_center_panel(ctx, page))
+    splitter.addWidget(_ba_right_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
     splitter.setStretchFactor(2, 1)
     splitter.setSizes([340, 300, 400])
     row.addWidget(splitter, 1)
 
-    row.addWidget(ctx._ba_log_panel(page))
+    row.addWidget(_ba_log_panel(ctx, page))
     layout.addWidget(content, 1)
 
-    ctx._ba_refresh(page)
+    _ba_refresh(ctx, page)
     return page
 
 
 def _ba_log_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -272,7 +278,7 @@ def _ba_log(ctx, page, text) -> None:
 
 
 def _ba_left_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -311,7 +317,7 @@ def _ba_left_panel(ctx, page) -> QWidget:
     header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
     header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
     table.setColumnWidth(1, 90)
-    table.itemChanged.connect(lambda item: ctx._ba_on_table_item(page, item))
+    table.itemChanged.connect(lambda item: _ba_on_table_item(ctx, page, item))
     lay.addWidget(table, 1)
     page._ba_table = table
 
@@ -328,20 +334,20 @@ def _ba_left_panel(ctx, page) -> QWidget:
     copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     paste_btn = QPushButton("Paste")
     paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    copy_btn.clicked.connect(lambda _=False: ctx._ba_copy(page))
-    paste_btn.clicked.connect(lambda _=False: ctx._ba_paste(page))
+    copy_btn.clicked.connect(lambda _=False: _ba_copy(ctx, page))
+    paste_btn.clicked.connect(lambda _=False: _ba_paste(ctx, page))
     btns.addWidget(copy_btn)
     btns.addWidget(paste_btn)
     btns.addStretch()
     lay.addLayout(btns)
 
-    files_btn.clicked.connect(lambda _=False: ctx._ba_select_files(page))
-    method.currentIndexChanged.connect(lambda _=0: ctx._ba_on_method(page))
+    files_btn.clicked.connect(lambda _=False: _ba_select_files(ctx, page))
+    method.currentIndexChanged.connect(lambda _=0: _ba_on_method(ctx, page))
     return panel
 
 
 def _ba_center_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -368,18 +374,18 @@ def _ba_center_panel(ctx, page) -> QWidget:
     lay.addWidget(vars_count)
     page._ba_vars_count = vars_count
 
-    vars_btn.clicked.connect(lambda _=False: ctx._ba_select_vars(page))
+    vars_btn.clicked.connect(lambda _=False: _ba_select_vars(ctx, page))
     return panel
 
 
 def _ba_right_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
     lay.addWidget(QLabel("<b>Algorithm parameters</b>"))
 
-    _hint = ctx._param_hint
+    _hint = partial(_widgets_panels._param_hint, ctx)
 
     cytonorm_host = QWidget()
     cg = QGridLayout(cytonorm_host)
@@ -525,16 +531,16 @@ def _ba_right_panel(ctx, page) -> QWidget:
     for widget in (nq, xdim, ydim, clusters, cells, seed, eb, adjust_var):
         widget.setEnabled(not page._ba_locked)
 
-    nq.valueChanged.connect(lambda _=0: ctx._ba_on_param(page))
-    xdim.valueChanged.connect(lambda _=0: ctx._ba_on_param(page))
-    ydim.valueChanged.connect(lambda _=0: ctx._ba_on_param(page))
-    clusters.valueChanged.connect(lambda _=0: ctx._ba_on_param(page))
-    cells.valueChanged.connect(lambda _=0: ctx._ba_on_param(page))
-    seed.valueChanged.connect(lambda _=0: ctx._ba_on_param(page))
-    eb.toggled.connect(lambda _=0: ctx._ba_on_param(page))
-    adjust_var.toggled.connect(lambda _=0: ctx._ba_on_param(page))
-    calc_btn.clicked.connect(lambda _=False: ctx._ba_calculate(page))
-    report_btn.clicked.connect(lambda _=False: ctx._ba_report(page))
+    nq.valueChanged.connect(lambda _=0: _ba_on_param(ctx, page))
+    xdim.valueChanged.connect(lambda _=0: _ba_on_param(ctx, page))
+    ydim.valueChanged.connect(lambda _=0: _ba_on_param(ctx, page))
+    clusters.valueChanged.connect(lambda _=0: _ba_on_param(ctx, page))
+    cells.valueChanged.connect(lambda _=0: _ba_on_param(ctx, page))
+    seed.valueChanged.connect(lambda _=0: _ba_on_param(ctx, page))
+    eb.toggled.connect(lambda _=0: _ba_on_param(ctx, page))
+    adjust_var.toggled.connect(lambda _=0: _ba_on_param(ctx, page))
+    calc_btn.clicked.connect(lambda _=False: _ba_calculate(ctx, page))
+    report_btn.clicked.connect(lambda _=False: _ba_report(ctx, page))
     return panel
 
 
@@ -542,21 +548,21 @@ def _ba_common_columns(ctx, page) -> list:
     files = page._ba_params.get("files") or []
     if not files:
         return []
-    common = set(ctx._columns_for(files[0], page._ba_task_id))
+    common = set(_data_columns._columns_for(ctx, files[0], page._ba_task_id))
     for path in files[1:]:
-        common &= set(ctx._columns_for(path, page._ba_task_id))
+        common &= set(_data_columns._columns_for(ctx, path, page._ba_task_id))
     return sorted(common)
 
 
 def _ba_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._ba_task_id)
+    records = _data_files._available_files(ctx, page._ba_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     current = [
-        ctx._comp_file_name(p, page._ba_task_id)
+        _data_naming._comp_file_name(ctx, p, page._ba_task_id)
         for p in page._ba_params.get("files") or []
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -568,15 +574,15 @@ def _ba_select_files(ctx, page) -> None:
     params["batches"] = {p: batches.get(p, "") for p in files}
     refs = set(params.get("references") or [])
     params["references"] = [p for p in files if p in refs]
-    common = set(ctx._ba_common_columns(page))
+    common = set(_ba_common_columns(ctx, page))
     params["columns"] = [c for c in params.get("columns") or [] if c in common]
-    ctx._ba_refresh(page)
-    ctx._ba_mark_dirty(page)
+    _ba_refresh(ctx, page)
+    _ba_mark_dirty(ctx, page)
 
 
 def _ba_select_vars(ctx, page) -> None:
     options = [
-        c for c in ctx._ba_common_columns(page)
+        c for c in _ba_common_columns(ctx, page)
         if c not in ("x", "y")
     ]
     if not options:
@@ -585,23 +591,23 @@ def _ba_select_vars(ctx, page) -> None:
             "Select data files with common columns first."
         )
         return
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select variables", options,
         page._ba_params.get("columns") or [], "Filter variables...",
     )
     if chosen is None:
         return
     page._ba_params["columns"] = list(chosen)
-    ctx._ba_refresh(page)
-    ctx._ba_mark_dirty(page)
+    _ba_refresh(ctx, page)
+    _ba_mark_dirty(ctx, page)
 
 
 def _ba_on_method(ctx, page) -> None:
     if getattr(page, "_ba_updating", False):
         return
     page._ba_params["method"] = page._ba_method.currentData() or "cytonorm"
-    ctx._ba_refresh(page)
-    ctx._ba_mark_dirty(page)
+    _ba_refresh(ctx, page)
+    _ba_mark_dirty(ctx, page)
 
 
 def _ba_update_flowsom_ext(ctx, page) -> None:
@@ -616,7 +622,7 @@ def _ba_update_flowsom_ext(ctx, page) -> None:
     status = getattr(page, "_ba_flowsom_status", None)
     if status is not None:
         status.setVisible(method == "cytonorm" and not ready)
-    ctx._ba_update_calc_btn(page)
+    _ba_update_calc_btn(ctx, page)
 
 
 def _ba_on_param(ctx, page) -> None:
@@ -635,7 +641,7 @@ def _ba_on_param(ctx, page) -> None:
         "eb": bool(page._ba_eb.isChecked()),
         "adjust_variance": bool(page._ba_adjust_var.isChecked()),
     }
-    ctx._ba_mark_dirty(page)
+    _ba_mark_dirty(ctx, page)
 
 
 def _ba_on_table_item(ctx, page, item) -> None:
@@ -663,9 +669,9 @@ def _ba_on_table_item(ctx, page, item) -> None:
         params["references"] = refs
     else:
         return
-    ctx._ba_mark_dirty(page)
-    ctx._ba_update_calc_btn(page)
-    ctx._ba_paint_table(page)
+    _ba_mark_dirty(ctx, page)
+    _ba_update_calc_btn(ctx, page)
+    _ba_paint_table(ctx, page)
 
 
 def _ba_paint_table(ctx, page) -> None:
@@ -693,7 +699,7 @@ def _ba_copy(ctx, page) -> None:
     lines = ["File\tBatch\tReference"]
     for path in params.get("files") or []:
         lines.append("\t".join([
-            ctx._comp_file_name(path, page._ba_task_id),
+            _data_naming._comp_file_name(ctx, path, page._ba_task_id),
             str(batches.get(path, "") or ""),
             "yes" if path in refs else "no",
         ]))
@@ -716,7 +722,7 @@ def _ba_paste(ctx, page) -> None:
         return
     rows = [line.split("\t") for line in lines[1:]]
     files = page._ba_params.get("files") or []
-    current = [ctx._comp_file_name(p, page._ba_task_id) for p in files]
+    current = [_data_naming._comp_file_name(ctx, p, page._ba_task_id) for p in files]
     if len(rows) != len(current):
         QMessageBox.warning(
             ctx.host, "Paste",
@@ -743,8 +749,8 @@ def _ba_paste(ctx, page) -> None:
             refs.append(path)
     page._ba_params["batches"] = batches
     page._ba_params["references"] = refs
-    ctx._ba_refresh(page)
-    ctx._ba_mark_dirty(page)
+    _ba_refresh(ctx, page)
+    _ba_mark_dirty(ctx, page)
 
 
 def _ba_existing_columns(ctx, page) -> set:
@@ -757,7 +763,7 @@ def _ba_model_current(ctx, page) -> bool:
     model = page._ba_params.get("model")
     return (
         isinstance(model, dict)
-        and model.get("config_sig") == ctx._ba_config_sig(page._ba_params)
+        and model.get("config_sig") == _ba_config_sig(ctx, page._ba_params)
     )
 
 
@@ -788,7 +794,7 @@ def _ba_update_calc_btn(ctx, page) -> None:
     else:
         page._ba_calc_btn.setToolTip("")
     page._ba_report_btn.setEnabled(
-        ctx._ba_model_current(page) and not page._ba_locked
+        _ba_model_current(ctx, page) and not page._ba_locked
         and not page._ba_reporting
     )
 
@@ -804,7 +810,7 @@ def _ba_refresh(ctx, page) -> None:
         page._ba_method.blockSignals(False)
         method = params.get("method", "cytonorm")
         page._ba_cytonorm_host.setVisible(method == "cytonorm")
-        ctx._ba_update_flowsom_ext(page)
+        _ba_update_flowsom_ext(ctx, page)
         page._ba_combat_host.setVisible(method == "combat")
         page._ba_method_desc.setText(
             "Aligns every file to the reference samples of its batch: "
@@ -855,7 +861,7 @@ def _ba_refresh(ctx, page) -> None:
         table.setRowCount(len(files))
         for row, path in enumerate(files):
             name_item = QTableWidgetItem(
-                ctx._comp_file_name(path, page._ba_task_id)
+                _data_naming._comp_file_name(ctx, path, page._ba_task_id)
             )
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             name_item.setToolTip(path)
@@ -884,8 +890,8 @@ def _ba_refresh(ctx, page) -> None:
         page._ba_vars_count.setText(f"{len(columns)} variable(s) selected")
     finally:
         page._ba_updating = False
-    ctx._ba_paint_table(page)
-    ctx._ba_update_calc_btn(page)
+    _ba_paint_table(ctx, page)
+    _ba_update_calc_btn(ctx, page)
 
 
 def _ba_validate(ctx, page):
@@ -896,7 +902,7 @@ def _ba_validate(ctx, page):
         return False, "Select at least one variable to align."
     batches = params.get("batches") or {}
     missing = [
-        ctx._comp_file_name(path, page._ba_task_id)
+        _data_naming._comp_file_name(ctx, path, page._ba_task_id)
         for path in params["files"]
         if not (batches.get(path) or "").strip()
     ]
@@ -916,7 +922,7 @@ def _ba_validate(ctx, page):
 
 
 def _ba_calculate(ctx, page) -> None:
-    ok, message = ctx._ba_validate(page)
+    ok, message = _ba_validate(ctx, page)
     if not ok:
         QMessageBox.warning(ctx.host, "Calculate", message)
         return
@@ -931,7 +937,7 @@ def _ba_calculate(ctx, page) -> None:
             "first.",
         )
         return
-    if ctx._ba_model_current(page):
+    if _ba_model_current(ctx, page):
         reply = QMessageBox.question(
             ctx.host, "Calculate",
             "A model is already fitted for this configuration.\n"
@@ -943,17 +949,17 @@ def _ba_calculate(ctx, page) -> None:
     page._ba_running = True
     page._ba_cancel = False
     page._ba_status.setText("Calculating…")
-    ctx._ba_update_calc_btn(page)
+    _ba_update_calc_btn(ctx, page)
 
     q = queue.Queue()
     page._ba_queue = q
     page._ba_thread = threading.Thread(
-        target=ctx._ba_run, args=(page, q), daemon=True
+        target=partial(_ba_run, ctx), args=(page, q), daemon=True
     )
     page._ba_thread.start()
     timer = QTimer(ctx.host)
     timer.setInterval(150)
-    timer.timeout.connect(lambda: ctx._ba_poll(page))
+    timer.timeout.connect(lambda: _ba_poll(ctx, page))
     timer.start()
     page._ba_timer = timer
 
@@ -966,14 +972,14 @@ def _ba_run(ctx, page, q) -> None:
         q.put(("log", f"— Starting {label} —"))
         q.put(("status", "Fitting the batch model…"))
         if method == "combat":
-            arrays, meta = ctx._ba_fit_combat(page, q)
+            arrays, meta = _ba_fit_combat(ctx, page, q)
         else:
-            arrays, meta = ctx._ba_fit_cytonorm(page, q)
+            arrays, meta = _ba_fit_cytonorm(ctx, page, q)
         if getattr(page, "_ba_cancel", False):
             q.put(("error", "Calculation cancelled."))
             return
         q.put(("status", "Writing the model…"))
-        model = ctx._ba_write_model(page, arrays, meta)
+        model = _ba_write_model(ctx, page, arrays, meta)
         q.put(("done", model))
     except Exception as exc:  # noqa: BLE001
         q.put(("error", str(exc)))
@@ -982,11 +988,11 @@ def _ba_run(ctx, page, q) -> None:
 def _ba_read_matrix(ctx, page, path, columns):
     import numpy as np
 
-    values = ctx._column_data(page._ba_task_id, path, columns)
+    values = _data_columns._column_data(ctx, page._ba_task_id, path, columns)
     missing = [c for c in columns if c not in values]
     if missing:
         raise ValueError(
-            f"{ctx._comp_file_name(path, page._ba_task_id)} is missing "
+            f"{_data_naming._comp_file_name(ctx, path, page._ba_task_id)} is missing "
             f"column(s): {', '.join(missing[:4])}"
         )
     matrix = np.column_stack(
@@ -1033,9 +1039,9 @@ def _ba_fit_cytonorm(ctx, page, q):
     for index, path in enumerate(refs):
         if getattr(page, "_ba_cancel", False):
             raise ValueError("Calculation cancelled.")
-        name = ctx._comp_file_name(path, page._ba_task_id)
+        name = _data_naming._comp_file_name(ctx, path, page._ba_task_id)
         q.put(("log", f"Reading reference {index + 1}/{len(refs)}: {name}"))
-        matrix = ctx._ba_read_matrix(page, path, columns)
+        matrix = _ba_read_matrix(ctx, page, path, columns)
         if matrix.shape[0] < _BA_MIN_CELLS:
             q.put(("log", f"  {name}: too few cells, skipped"))
             continue
@@ -1185,9 +1191,9 @@ def _ba_fit_combat(ctx, page, q):
     for index, path in enumerate(files):
         if getattr(page, "_ba_cancel", False):
             raise ValueError("Calculation cancelled.")
-        name = ctx._comp_file_name(path, page._ba_task_id)
+        name = _data_naming._comp_file_name(ctx, path, page._ba_task_id)
         q.put(("log", f"Reading {index + 1}/{len(files)}: {name}"))
-        matrix = ctx._ba_read_matrix(page, path, columns)
+        matrix = _ba_read_matrix(ctx, page, path, columns)
         if matrix.shape[0] == 0:
             q.put(("log", f"  {name}: no finite rows, skipped"))
             continue
@@ -1283,16 +1289,16 @@ def _ba_write_model(ctx, page, arrays, meta):
     """Save the fitted arrays into the module folder and describe them."""
     import numpy as np
 
-    folder = ctx._module_dir(page._ba_task_id)
+    folder = _data_files._module_dir(ctx, page._ba_task_id)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / "alignment.npz"
     np.savez_compressed(path, **arrays)
     stat = path.stat()
     model_id = f"{int(stat.st_mtime_ns)}-{int(stat.st_size)}"
     model = {
-        "npz": ctx._module_rel(page._ba_task_id, "alignment.npz"),
+        "npz": _data_files._module_rel(ctx, page._ba_task_id, "alignment.npz"),
         "model_id": model_id,
-        "config_sig": ctx._ba_config_sig(page._ba_params),
+        "config_sig": _ba_config_sig(ctx, page._ba_params),
         "method": meta.get("method"),
         "columns": list(meta.get("columns") or []),
         "batches": list(meta.get("batches") or []),
@@ -1319,7 +1325,7 @@ def _ba_poll(ctx, page) -> None:
             break
         kind = msg[0]
         if kind == "log":
-            ctx._ba_log(page, msg[1])
+            _ba_log(ctx, page, msg[1])
         elif kind == "status":
             page._ba_status.setText(msg[1])
         elif kind == "done":
@@ -1331,7 +1337,7 @@ def _ba_poll(ctx, page) -> None:
                 ctx.project.save()
             page._ba_snapshot = copy.deepcopy(params)
             page._ba_dirty = False
-            ctx._ba_update_save_btn(page)
+            _ba_update_save_btn(ctx, page)
             finished = True
         elif kind == "error":
             error = msg[1]
@@ -1344,7 +1350,7 @@ def _ba_poll(ctx, page) -> None:
         timer.stop()
         page._ba_timer = None
     if error:
-        ctx._ba_log(page, f"✗ {error}")
+        _ba_log(ctx, page, f"✗ {error}")
         page._ba_status.setText("Failed")
         QMessageBox.warning(ctx.host, "Calculate", error)
     else:
@@ -1361,15 +1367,15 @@ def _ba_poll(ctx, page) -> None:
                 f"{len(page._ba_params['model'].get('batches') or [])} batch(es)."
             )
         page._ba_status.setText(summary)
-        ctx._ba_log(page, summary)
+        _ba_log(ctx, page, summary)
         ctx.statusBar().showMessage(summary)
         ctx._module_saved(page)
-    ctx._ba_update_calc_btn(page)
+    _ba_update_calc_btn(ctx, page)
 
 
 def _ba_mark_dirty(ctx, page) -> None:
     page._ba_dirty = True
-    ctx._ba_update_save_btn(page)
+    _ba_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -1385,8 +1391,8 @@ def _ba_save_now(ctx, page) -> None:
         ctx.project.save()
     page._ba_snapshot = copy.deepcopy(params)
     page._ba_dirty = False
-    ctx._ba_update_save_btn(page)
-    ctx._ba_log(page, "Settings saved")
+    _ba_update_save_btn(ctx, page)
+    _ba_log(ctx, page, "Settings saved")
     ctx.statusBar().showMessage("Batch Alignment settings saved")
     ctx._module_saved(page)
 
@@ -1419,7 +1425,7 @@ def _ba_close(ctx, page) -> None:
 
 
 def _ba_report(ctx, page) -> None:
-    if not ctx._ba_model_current(page):
+    if not _ba_model_current(ctx, page):
         QMessageBox.information(
             ctx.host, "Report", "Calculate first, then run the report."
         )
@@ -1429,17 +1435,17 @@ def _ba_report(ctx, page) -> None:
     page._ba_reporting = True
     page._ba_cancel = False
     page._ba_status.setText("Building report…")
-    ctx._ba_update_calc_btn(page)
+    _ba_update_calc_btn(ctx, page)
 
     q = queue.Queue()
     page._ba_report_queue = q
     page._ba_report_thread = threading.Thread(
-        target=ctx._ba_report_run, args=(page, q), daemon=True
+        target=partial(_ba_report_run, ctx), args=(page, q), daemon=True
     )
     page._ba_report_thread.start()
     timer = QTimer(ctx.host)
     timer.setInterval(150)
-    timer.timeout.connect(lambda: ctx._ba_report_poll(page))
+    timer.timeout.connect(lambda: _ba_report_poll(ctx, page))
     timer.start()
     page._ba_report_timer = timer
 
@@ -1449,7 +1455,7 @@ def _ba_report_run(ctx, page, q) -> None:
 
     try:
         params = page._ba_params
-        stage = ctx._ba_stage(page._ba_task_def)
+        stage = _ba_stage(ctx, page._ba_task_def)
         if stage is None:
             raise ValueError("The fitted model is no longer available")
         columns = list(stage["columns"])
@@ -1471,11 +1477,11 @@ def _ba_report_run(ctx, page, q) -> None:
             if getattr(page, "_ba_cancel", False):
                 q.put(("error", "Report cancelled."))
                 return
-            name = ctx._comp_file_name(path, page._ba_task_id)
+            name = _data_naming._comp_file_name(ctx, path, page._ba_task_id)
             q.put(("progress", index + 1, n_files, name))
             if path not in batch_of:
                 continue
-            values = ctx._column_data(page._ba_task_id, path, columns)
+            values = _data_columns._column_data(ctx, page._ba_task_id, path, columns)
             missing = [c for c in columns if c not in values]
             if missing:
                 q.put(("log", f"Skipped {name}: missing {missing[0]}"))
@@ -1565,7 +1571,7 @@ def _ba_report_poll(ctx, page) -> None:
                 f"Reading files for the report: {msg[1]}/{msg[2]} ({msg[3]})"
             )
         elif kind == "log":
-            ctx._ba_log(page, msg[1])
+            _ba_log(ctx, page, msg[1])
         elif kind == "done":
             payload = msg[1]
             finished = True
@@ -1581,24 +1587,24 @@ def _ba_report_poll(ctx, page) -> None:
     page._ba_reporting = False
     if error:
         page._ba_status.setText("Report failed")
-        ctx._ba_log(page, f"✗ {error}")
+        _ba_log(ctx, page, f"✗ {error}")
         QMessageBox.warning(ctx.host, "Report", error)
-        ctx._ba_update_calc_btn(page)
+        _ba_update_calc_btn(ctx, page)
         return
     try:
         page._ba_status.setText("Writing the report…")
         QApplication.processEvents()
-        target = ctx._ba_write_report(page, payload)
+        target = _ba_write_report(ctx, page, payload)
     except Exception as exc:  # noqa: BLE001
         page._ba_status.setText("Report failed")
-        ctx._ba_log(page, f"✗ {exc}")
+        _ba_log(ctx, page, f"✗ {exc}")
         QMessageBox.warning(ctx.host, "Report", str(exc))
-        ctx._ba_update_calc_btn(page)
+        _ba_update_calc_btn(ctx, page)
         return
     page._ba_status.setText("Report written")
-    ctx._ba_log(page, f"Report written to {target}")
+    _ba_log(ctx, page, f"Report written to {target}")
     ctx.statusBar().showMessage("Batch Alignment report written")
-    ctx._ba_update_calc_btn(page)
+    _ba_update_calc_btn(ctx, page)
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
 
@@ -1633,7 +1639,7 @@ def _ba_write_report(ctx, page, payload):
     from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib.figure import Figure
 
-    folder = ctx._module_dir(page._ba_task_id) / "report"
+    folder = _data_files._module_dir(ctx, page._ba_task_id) / "report"
     folder.mkdir(parents=True, exist_ok=True)
     columns = payload["columns"]
     batches = payload["batches"]
@@ -1756,7 +1762,7 @@ def _ba_write_report(ctx, page, payload):
                                    linewidth=0.6, linestyle=(0, (2, 2)))
                         baseline -= 0.55
                     previous_group = group
-                    centers, density = ctx._ba_density(
+                    centers, density = _ba_density(ctx,
                         entry[panel], low, high, log_axis
                     )
                     values = np.power(10.0, centers) if log_axis else centers

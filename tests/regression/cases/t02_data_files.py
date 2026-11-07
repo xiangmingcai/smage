@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
 from smage.data.files import _subset_visible_columns  # noqa: E402
+from smage.data import files as _data_files
+from smage.data import naming as _data_naming
 
 
 def _open(case_id: str, tasks=(), rows: int = 50):
@@ -52,19 +54,19 @@ def task_chain() -> None:
     try:
         ctx = window._ctx
         harness.eq(
-            [task["id"] for task in ctx._task_chain("g-1")],
+            [task["id"] for task in _data_files._task_chain(ctx, "g-1")],
             ["data-import", "s-1", "g-1"],
         )
-        harness.eq(ctx._parent_task_name("g-1"), "Scale")
-        harness.eq(ctx._parent_task_name("data-import"), None)
-        harness.eq(ctx._task_chain("missing"), [])
-        harness.eq(ctx._import_task()["id"], "data-import")
-        harness.eq(len(ctx._imported_files()), 1)
+        harness.eq(_data_files._parent_task_name(ctx, "g-1"), "Scale")
+        harness.eq(_data_files._parent_task_name(ctx, "data-import"), None)
+        harness.eq(_data_files._task_chain(ctx, "missing"), [])
+        harness.eq(_data_files._import_task(ctx)["id"], "data-import")
+        harness.eq(len(_data_files._imported_files(ctx)), 1)
         harness.eq(
-            ctx._module_display_title("g-1", "Gating"), "Scale → Gating"
+            _data_files._module_display_title(ctx, "g-1", "Gating"), "Scale → Gating"
         )
         harness.eq(
-            ctx._module_display_title("s-1", "Scale"), "Data Import → Scale"
+            _data_files._module_display_title(ctx, "s-1", "Scale"), "Data Import → Scale"
         )
     finally:
         _close(window)
@@ -76,39 +78,39 @@ def file_records() -> None:
     try:
         ctx = window._ctx
         parquet = str(project.data_dir / "case.parquet")
-        record = ctx._file_record(parquet)
+        record = _data_files._file_record(ctx, parquet)
         harness.check(record is not None, "the imported file record is found")
         harness.eq(record["name"], "case.fcs")
-        harness.eq(ctx._file_record(str(project.data_dir / "missing.parquet")), None)
+        harness.eq(_data_files._file_record(ctx, str(project.data_dir / "missing.parquet")), None)
 
-        harness.eq(ctx._rel_data_key(parquet), "case.parquet")
+        harness.eq(_data_files._rel_data_key(ctx, parquet), "case.parquet")
         harness.eq(
-            ctx._rel_data_key(r"C:\elsewhere\outside.parquet"), "outside.parquet"
+            _data_files._rel_data_key(ctx, r"C:\elsewhere\outside.parquet"), "outside.parquet"
         )
 
-        harness.eq(ctx._comp_file_name(parquet), "case.fcs")
+        harness.eq(_data_naming._comp_file_name(ctx, parquet), "case.fcs")
         harness.eq(
-            ctx._comp_file_name(str(project.data_dir / "missing.parquet")),
+            _data_naming._comp_file_name(ctx, str(project.data_dir / "missing.parquet")),
             "missing.parquet",
         )
 
-        harness.eq(ctx._module_dir("s-1"), project.path / "Module" / "s-1")
-        harness.eq(ctx._module_dir(None), None)
-        harness.eq(ctx._module_rel("s-1", "x.json"), "Module/s-1/x.json")
+        harness.eq(_data_files._module_dir(ctx, "s-1"), project.path / "Module" / "s-1")
+        harness.eq(_data_files._module_dir(ctx, None), None)
+        harness.eq(_data_files._module_rel(ctx, "s-1", "x.json"), "Module/s-1/x.json")
         ctx._draft_task_ids = {"s-1"}
         harness.eq(
-            ctx._module_dir("s-1"),
+            _data_files._module_dir(ctx, "s-1"),
             project.path / "Module" / "s-1" / "draft",
         )
         harness.eq(
-            ctx._module_rel("s-1", "x.json"), "Module/s-1/draft/x.json"
+            _data_files._module_rel(ctx, "s-1", "x.json"), "Module/s-1/draft/x.json"
         )
 
-        harness.eq(ctx._module_size_path("data-import"), project.data_dir)
+        harness.eq(_data_files._module_size_path(ctx, "data-import"), project.data_dir)
         harness.eq(
-            ctx._module_size_path("s-1"), project.path / "Module" / "s-1"
+            _data_files._module_size_path(ctx, "s-1"), project.path / "Module" / "s-1"
         )
-        harness.eq(ctx._module_size_path(None), None)
+        harness.eq(_data_files._module_size_path(ctx, None), None)
     finally:
         ctx._draft_task_ids = set()
         _close(window)
@@ -132,17 +134,17 @@ def subset_filters() -> None:
     try:
         ctx = window._ctx
         harness.eq(
-            ctx._subset_filters("g-1"),
+            _data_files._subset_filters(ctx, "g-1"),
             [({parquet_a}, {"x", "FL1-A"})],
         )
-        harness.eq(ctx._subset_visible_files("g-1"), {parquet_a})
+        harness.eq(_data_files._subset_visible_files(ctx, "g-1"), {parquet_a})
         harness.eq(_subset_visible_columns(ctx, "g-1"), {"x", "FL1-A"})
-        harness.eq(ctx._subset_filters("sub-1"), [], "a subset never hides itself")
+        harness.eq(_data_files._subset_filters(ctx, "sub-1"), [], "a subset never hides itself")
 
-        available = ctx._available_files("g-1")
+        available = _data_files._available_files(ctx, "g-1")
         harness.eq([rec["parquet"] for rec in available], [parquet_a])
 
-        harness.eq(ctx._subset_visible_files("data-import"), None)
+        harness.eq(_data_files._subset_visible_files(ctx, "data-import"), None)
         harness.eq(_subset_visible_columns(ctx, "data-import"), None)
     finally:
         _close(window)
@@ -164,17 +166,17 @@ def rename_display() -> None:
     harness.open_project(window, project)
     try:
         ctx = window._ctx
-        harness.eq(ctx._rename_file_name("g-1", parquet, "case.fcs"), "renamed.fcs")
-        harness.eq(ctx._rename_file_name("r-1", parquet, "case.fcs"), "case.fcs",
+        harness.eq(_data_naming._rename_file_name(ctx, "g-1", parquet, "case.fcs"), "renamed.fcs")
+        harness.eq(_data_naming._rename_file_name(ctx, "r-1", parquet, "case.fcs"), "case.fcs",
                    "a rename does not apply to itself")
-        harness.eq(ctx._rename_file_name("g-1", "/other.parquet", "other.fcs"),
+        harness.eq(_data_naming._rename_file_name(ctx, "g-1", "/other.parquet", "other.fcs"),
                    "other.fcs")
 
-        available = ctx._available_files("g-1")
+        available = _data_files._available_files(ctx, "g-1")
         harness.eq(available[0]["name"], "renamed.fcs")
-        harness.eq(ctx._imported_files()[0]["name"], "case.fcs",
+        harness.eq(_data_files._imported_files(ctx)[0]["name"], "case.fcs",
                    "the stored record is not mutated")
-        harness.eq(ctx._comp_file_name(parquet, "g-1"), "renamed.fcs")
+        harness.eq(_data_naming._comp_file_name(ctx, parquet, "g-1"), "renamed.fcs")
     finally:
         _close(window)
 

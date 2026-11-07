@@ -88,6 +88,14 @@ from smage.widgets.plot_axes import (
 )
 from smage.widgets.resources import _lock_pixmap
 import copy
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import sampling as _data_sampling
+from smage.data import stores as _data_stores
+from smage.widgets import colormap as _widgets_colormap
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
+from smage.widgets.plot import renderer as _widgets_plot_renderer
 
 
 OVERLAY_LAYER_COLORS = [
@@ -548,7 +556,7 @@ def _build_figure_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -567,14 +575,14 @@ def _build_figure_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._fig_cancel_btn.setToolTip("Stop drawing the queued plots")
     page._fig_cancel_btn.setVisible(False)
     page._fig_cancel_btn.clicked.connect(
-        lambda _=False: ctx._figure_cancel_rendering(page)
+        lambda _=False: _figure_cancel_rendering(ctx, page)
     )
     tl.addWidget(page._fig_cancel_btn)
     save_btn = QPushButton("Save")
     save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._figure_close(page))
+    close_btn.clicked.connect(lambda _=False: _figure_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -586,7 +594,7 @@ def _build_figure_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     cl.setSpacing(12)
 
     # Left: zoomable flow canvas (Word-like, auto-wrapping rows).
-    fig_panel = ctx._build_panel_frame()
+    fig_panel = _widgets_panels._build_panel_frame(ctx)
     fl = QVBoxLayout(fig_panel)
     fl.setContentsMargins(10, 10, 10, 10)
     fl.setSpacing(6)
@@ -614,7 +622,7 @@ def _build_figure_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     fl.addWidget(canvas_view, 1)
 
     # Right: settings panel.
-    settings_panel = ctx._build_panel_frame()
+    settings_panel = _widgets_panels._build_panel_frame(ctx)
     sl = QVBoxLayout(settings_panel)
     sl.setContentsMargins(10, 10, 10, 10)
     sl.setSpacing(6)
@@ -664,33 +672,33 @@ def _build_figure_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._fig_pan_range = None
     page._fig_save_btn = save_btn
     page._fig_dirty = False
-    save_btn.clicked.connect(lambda _=False: ctx._figure_save_now(page))
-    ctx._figure_update_save_btn(page)
+    save_btn.clicked.connect(lambda _=False: _figure_save_now(ctx, page))
+    _figure_update_save_btn(ctx, page)
     page._fig_filter_timer = QTimer(ctx.host)
     page._fig_filter_timer.setInterval(100)
     page._fig_filter_timer.timeout.connect(
-        lambda: ctx._figure_image_filter_on_timer(page)
+        lambda: _figure_image_filter_on_timer(ctx, page)
     )
     page._fig_filter_timer.start()
-    canvas_view.enter_callback = lambda: ctx._figure_toggle_break(page, page._fig_selected)
-    canvas_view.delete_callback = lambda: ctx._figure_delete_selected(page)
-    canvas_view.unfocus_callback = lambda: ctx._figure_unfocus(page)
-    canvas_view.plot_wheel_cb = lambda item, d: ctx._figure_plot_wheel(page, item, d)
-    canvas_view.plot_pan_start_cb = lambda item, sp: ctx._figure_plot_pan_start(page, item, sp)
-    canvas_view.plot_pan_move_cb = lambda sp: ctx._figure_plot_pan_move(page, sp)
-    canvas_view.plot_pan_end_cb = lambda: ctx._figure_plot_pan_end(page)
-    canvas_view.rubber_select_cb = lambda rect, ctrl: ctx._figure_box_select(page, rect, ctrl)
-    canvas_view.rubber_clear_cb = lambda: ctx._figure_clear_selection(page)
-    canvas_view.select_all_cb = lambda: ctx._figure_select_all(page)
+    canvas_view.enter_callback = lambda: _figure_toggle_break(ctx, page, page._fig_selected)
+    canvas_view.delete_callback = lambda: _figure_delete_selected(ctx, page)
+    canvas_view.unfocus_callback = lambda: _figure_unfocus(ctx, page)
+    canvas_view.plot_wheel_cb = lambda item, d: _figure_plot_wheel(ctx, page, item, d)
+    canvas_view.plot_pan_start_cb = lambda item, sp: _figure_plot_pan_start(ctx, page, item, sp)
+    canvas_view.plot_pan_move_cb = lambda sp: _figure_plot_pan_move(ctx, page, sp)
+    canvas_view.plot_pan_end_cb = lambda: _figure_plot_pan_end(ctx, page)
+    canvas_view.rubber_select_cb = lambda rect, ctrl: _figure_box_select(ctx, page, rect, ctrl)
+    canvas_view.rubber_clear_cb = lambda: _figure_clear_selection(ctx, page)
+    canvas_view.select_all_cb = lambda: _figure_select_all(ctx, page)
 
     for plot_dict in page._fig_plots:
-        ctx._figure_new_card(page, plot_dict)
+        _figure_new_card(ctx, page, plot_dict)
 
-    add_scatter.clicked.connect(lambda _=False: ctx._figure_add_plot(page, "scatter"))
-    add_overlay.clicked.connect(lambda _=False: ctx._figure_add_plot(page, "overlay"))
-    add_hist.clicked.connect(lambda _=False: ctx._figure_add_plot(page, "histogram"))
-    add_image.clicked.connect(lambda _=False: ctx._figure_add_plot(page, "image"))
-    add_nxn.clicked.connect(lambda _=False: ctx._figure_add_nxn(page))
+    add_scatter.clicked.connect(lambda _=False: _figure_add_plot(ctx, page, "scatter"))
+    add_overlay.clicked.connect(lambda _=False: _figure_add_plot(ctx, page, "overlay"))
+    add_hist.clicked.connect(lambda _=False: _figure_add_plot(ctx, page, "histogram"))
+    add_image.clicked.connect(lambda _=False: _figure_add_plot(ctx, page, "image"))
+    add_nxn.clicked.connect(lambda _=False: _figure_add_nxn(ctx, page))
 
     if locked:
         add_scatter.setEnabled(False)
@@ -699,11 +707,11 @@ def _build_figure_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
         add_image.setEnabled(False)
         add_nxn.setEnabled(False)
 
-    ctx._figure_relayout(page)
+    _figure_relayout(ctx, page)
     if page._fig_plots:
-        ctx._figure_select(page, 0)
+        _figure_select(ctx, page, 0)
     else:
-        ctx._figure_rebuild_settings(page)
+        _figure_rebuild_settings(ctx, page)
     return page
 
 
@@ -713,7 +721,7 @@ def _figure_new_card(ctx, page, plot_dict, render: bool=True) -> int:
     `render=False` leaves the card empty so callers can draw big batches
     of new plots over several event-loop turns.
     """
-    plot_widget = ctx._figure_make_plot_widget(plot_dict)
+    plot_widget = _widgets_plot_renderer._figure_make_plot_widget(ctx, plot_dict)
 
     index = len(page._fig_cards)
     size = plot_dict.get("size")
@@ -724,19 +732,19 @@ def _figure_new_card(ctx, page, plot_dict, render: bool=True) -> int:
 
     card = _FigureCard(
         plot_widget, index,
-        select_callback=lambda i: ctx._figure_select(page, i),
+        select_callback=lambda i: _figure_select(ctx, page, i),
         side_widget=(
-            ctx._figure_attach_legend(plot_widget)
+            _widgets_plot_renderer._figure_attach_legend(ctx, plot_widget)
             if plot_dict.get("type") == "image" else None
         ),
     )
     proxy = _CardProxy(
-        on_select=lambda ctrl: ctx._figure_card_clicked(page, card.index(), ctrl),
-        on_drop=lambda pos: ctx._figure_reorder(page, card.index(), pos),
-        on_drag=lambda pos: ctx._figure_drag_preview(page, card.index(), pos),
-        on_drag_end=lambda: ctx._figure_clear_drop_marker(page),
-        on_focus=lambda: ctx._figure_focus(page, card.index()),
-        on_context=lambda pos: ctx._figure_card_context_menu(
+        on_select=lambda ctrl: _figure_card_clicked(ctx, page, card.index(), ctrl),
+        on_drop=lambda pos: _figure_reorder(ctx, page, card.index(), pos),
+        on_drag=lambda pos: _figure_drag_preview(ctx, page, card.index(), pos),
+        on_drag_end=lambda: _figure_clear_drop_marker(ctx, page),
+        on_focus=lambda: _figure_focus(ctx, page, card.index()),
+        on_context=lambda pos: _figure_card_context_menu(ctx,
             page, card.index(), pos
         ),
     )
@@ -748,7 +756,7 @@ def _figure_new_card(ctx, page, plot_dict, render: bool=True) -> int:
     # Select / focus on clicks that reach the plot itself (the "A"/"F"
     # corner buttons and the legend); the card proxy handles the rest.
     click_filter = _ClickFilter(
-        lambda ctrl: ctx._figure_card_clicked(page, card.index(), ctrl)
+        lambda ctrl: _figure_card_clicked(ctx, page, card.index(), ctrl)
     )
     card.installEventFilter(click_filter)
     plot_widget.viewport().installEventFilter(click_filter)
@@ -756,7 +764,7 @@ def _figure_new_card(ctx, page, plot_dict, render: bool=True) -> int:
     page._fig_filters.append(click_filter)
 
     # Double-click focuses the plot (wheel/drag act on its data).
-    dbl_click_filter = _DoubleClickFilter(lambda: ctx._figure_focus(page, card.index()))
+    dbl_click_filter = _DoubleClickFilter(lambda: _figure_focus(ctx, page, card.index()))
     card.installEventFilter(dbl_click_filter)
     plot_widget.viewport().installEventFilter(dbl_click_filter)
     page._fig_filters.append(dbl_click_filter)
@@ -768,19 +776,19 @@ def _figure_new_card(ctx, page, plot_dict, render: bool=True) -> int:
         rt.setSingleShot(True)
         rt.setInterval(30)
         rt.timeout.connect(
-            lambda: ctx._figure_image_refresh(page, plot_dict, plot_widget)
+            lambda: _figure_image_refresh(ctx, page, plot_dict, plot_widget)
         )
         vb.sigRangeChanged.connect(lambda *_: rt.start())
         plot_widget._img_refresh_timer = rt
 
     page._fig_cards.append(card)
     if render:
-        ctx._figure_render(
+        _widgets_plot_renderer._figure_render(ctx,
             plot_dict, plot_widget,
             column_transforms=page._fig_column_transforms,
             task_id=page._fig_task_id,
         )
-    ctx._figure_relayout(page)
+    _figure_relayout(ctx, page)
     return index
 
 
@@ -791,12 +799,12 @@ def _figure_resize_card(ctx, page, index: int, w: int, h: int) -> None:
             page._fig_cards[index].proxy().resize(int(w), int(h))
         except RuntimeError:
             return  # proxy already deleted (e.g. during teardown)
-        ctx._figure_relayout(page)
+        _figure_relayout(ctx, page)
 
 
 def _figure_mark_dirty(ctx, page) -> None:
     page._fig_dirty = True
-    ctx._figure_update_save_btn(page)
+    _figure_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -805,7 +813,7 @@ def _figure_save_now(ctx, page) -> None:
         ctx.project.save()
     page._fig_snapshot = copy.deepcopy(page._fig_task_def.get("params", {}))
     page._fig_dirty = False
-    ctx._figure_update_save_btn(page)
+    _figure_update_save_btn(ctx, page)
     ctx.statusBar().showMessage("Figure saved")
     ctx._module_saved(page)
 
@@ -832,12 +840,12 @@ def _figure_update_save_btn(ctx, page) -> None:
 def _figure_reorder(ctx, page, index: int, scene_pos) -> None:
     plots = page._fig_plots
     cards = page._fig_cards
-    ctx._figure_clear_drop_marker(page)
+    _figure_clear_drop_marker(ctx, page)
     if not (0 <= index < len(plots)):
         return
-    new_index = ctx._figure_drop_index(page, index, scene_pos)
+    new_index = _figure_drop_index(ctx, page, index, scene_pos)
     if new_index == index:
-        ctx._figure_relayout(page)
+        _figure_relayout(ctx, page)
         return
     # A dragged card joins the row it is dropped into: a manual line break
     # it carried must not follow it, or it would stay on a row of its own.
@@ -848,15 +856,15 @@ def _figure_reorder(ctx, page, index: int, scene_pos) -> None:
     for i, card in enumerate(cards):
         card.set_index(i)
     page._fig_selected = [new_index]
-    ctx._figure_relayout(page)
-    ctx._figure_mark_dirty(page)
+    _figure_relayout(ctx, page)
+    _figure_mark_dirty(ctx, page)
 
 
 def _figure_drop_marker_pos(ctx, page, index: int, scene_pos):
     """Return (x, y, w, h) of the slot the dragged card would land in."""
     if not page._fig_cards:
         return None
-    new_index = ctx._figure_drop_index(page, index, scene_pos)
+    new_index = _figure_drop_index(ctx, page, index, scene_pos)
     # Simulate the drop (the dragged card loses its line break, exactly as
     # _figure_reorder does) and read back its final flow position.
     plots = [dict(p) for p in page._fig_plots]
@@ -869,7 +877,7 @@ def _figure_drop_marker_pos(ctx, page, index: int, scene_pos):
     new_index = max(0, min(new_index, len(plots)))
     plots.insert(new_index, dragged_plot)
     cards.insert(new_index, dragged_card)
-    positions = ctx._figure_flow_positions(cards, plots)
+    positions = _figure_flow_positions(ctx, cards, plots)
     if not (0 <= new_index < len(positions)):
         return None
     return positions[new_index]
@@ -878,7 +886,7 @@ def _figure_drop_marker_pos(ctx, page, index: int, scene_pos):
 def _figure_drag_preview(ctx, page, index: int, scene_pos) -> None:
     """Show the insertion slot while a card is being dragged."""
     marker = getattr(page, "_fig_drop_marker", None)
-    where = ctx._figure_drop_marker_pos(page, index, scene_pos)
+    where = _figure_drop_marker_pos(ctx, page, index, scene_pos)
     if where is None:
         return
     x, y, w, h = where
@@ -929,7 +937,7 @@ def _figure_drop_index(ctx, page, index: int, scene_pos) -> int:
     others_plots = [p for i, p in enumerate(page._fig_plots) if i != index]
     if not others_cards:
         return 0
-    pos = ctx._figure_flow_positions(others_cards, others_plots)
+    pos = _figure_flow_positions(ctx, others_cards, others_plots)
     px, py = scene_pos.x(), scene_pos.y()
     idx = 0
     for i, (x0, y0, w, h) in enumerate(pos):
@@ -955,8 +963,8 @@ def _figure_toggle_break(ctx, page, indices) -> None:
             p["break_before"] = not p.get("break_before", False)
             changed = True
     if changed:
-        ctx._figure_relayout(page)
-        ctx._figure_mark_dirty(page)
+        _figure_relayout(ctx, page)
+        _figure_mark_dirty(ctx, page)
 
 
 def _figure_card_context_menu(ctx, page, index, global_pos) -> None:
@@ -964,7 +972,7 @@ def _figure_card_context_menu(ctx, page, index, global_pos) -> None:
     if not (0 <= index < len(page._fig_cards)):
         return
     if index not in page._fig_selected:
-        ctx._figure_set_selection(page, [index])
+        _figure_set_selection(ctx, page, [index])
     selected = list(page._fig_selected)
     menu = QMenu(ctx.host)
     duplicate = menu.addAction("Duplicate")
@@ -982,11 +990,11 @@ def _figure_card_context_menu(ctx, page, index, global_pos) -> None:
     if chosen is None:
         return
     if chosen is duplicate:
-        ctx._figure_duplicate_selected(page)
+        _figure_duplicate_selected(ctx, page)
     elif chosen is delete:
-        ctx._figure_delete_selected(page)
+        _figure_delete_selected(ctx, page)
     elif chosen is permute:
-        ctx._figure_permute(page, selected[0])
+        _figure_permute(ctx, page, selected[0])
 
 
 def _figure_scroll_to(ctx, page, index) -> None:
@@ -1003,14 +1011,14 @@ def _figure_scroll_to(ctx, page, index) -> None:
 def _figure_insert_plot(ctx, page, plot_dict, target: int) -> int:
     """Create a card for `plot_dict` and place it at `target`."""
     page._fig_plots.append(plot_dict)
-    index = ctx._figure_new_card(page, plot_dict)
+    index = _figure_new_card(ctx, page, plot_dict)
     target = max(0, min(int(target), len(page._fig_plots) - 1))
     if target != index:
         page._fig_plots.insert(target, page._fig_plots.pop(index))
         page._fig_cards.insert(target, page._fig_cards.pop(index))
         for i, card in enumerate(page._fig_cards):
             card.set_index(i)
-        ctx._figure_relayout(page)
+        _figure_relayout(ctx, page)
     return target
 
 
@@ -1025,12 +1033,12 @@ def _figure_duplicate_selected(ctx, page) -> None:
             continue
         clone = copy.deepcopy(page._fig_plots[index])
         clone["break_before"] = False
-        ctx._figure_insert_plot(page, clone, target + offset)
-    ctx._figure_mark_dirty(page)
-    ctx._figure_set_selection(
+        _figure_insert_plot(ctx, page, clone, target + offset)
+    _figure_mark_dirty(ctx, page)
+    _figure_set_selection(ctx,
         page, list(range(target, target + len(indices)))
     )
-    ctx._figure_scroll_to(page, target)
+    _figure_scroll_to(ctx, page, target)
 
 
 def _figure_permute(ctx, page, index) -> None:
@@ -1038,17 +1046,17 @@ def _figure_permute(ctx, page, index) -> None:
     if not (0 <= index < len(page._fig_plots)):
         return
     plot = page._fig_plots[index]
-    records = ctx._available_files(page._fig_task_id)
+    records = _data_files._available_files(ctx, page._fig_task_id)
     files = [
         (rec.get("parquet"), rec.get("name"))
         for rec in records
         if rec.get("parquet")
     ]
-    rec = ctx._figure_record(plot.get("file"))
+    rec = _widgets_plot_renderer._figure_record(ctx, plot.get("file"))
     columns = (
-        ctx._columns_for(rec.get("parquet"), page._fig_task_id) if rec else []
+        _data_columns._columns_for(ctx, rec.get("parquet"), page._fig_task_id) if rec else []
     )
-    filters = ctx._figure_filter_options(page._fig_task_id)
+    filters = _figure_filter_options(ctx, page._fig_task_id)
     _debug_log(
         f"permute open: type={plot.get('type')} files={len(files)} "
         f"columns={len(columns)} filters={len(filters)}"
@@ -1090,16 +1098,16 @@ def _figure_permute(ctx, page, index) -> None:
             elif dimension == _FigurePermuteDialog.FILTER:
                 clone["filter"] = dict(value)
             clone["break_before"] = bool(new_row)
-            ctx._figure_insert_plot(page, clone, target + offset)
+            _figure_insert_plot(ctx, page, clone, target + offset)
     except Exception as exc:  # noqa: BLE001
         _log_exception(exc)
         QMessageBox.critical(
             ctx.host, "Permute", f"Could not create the plots:\n{exc}"
         )
         return
-    ctx._figure_mark_dirty(page)
-    ctx._figure_set_selection(page, list(range(target, target + len(values))))
-    ctx._figure_scroll_to(page, target)
+    _figure_mark_dirty(ctx, page)
+    _figure_set_selection(ctx, page, list(range(target, target + len(values))))
+    _figure_scroll_to(ctx, page, target)
     _debug_log(
         f"permute done: plots={len(page._fig_plots)} "
         f"cards={len(page._fig_cards)} selected={page._fig_selected}"
@@ -1124,21 +1132,21 @@ def _figure_delete_selected(ctx, page) -> None:
         c.set_index(i)
     if page._fig_cards:
         page._fig_selected = [min(indices[-1], len(page._fig_cards) - 1)]
-        ctx._figure_relayout(page)
-        ctx._figure_set_selection(page, page._fig_selected)
+        _figure_relayout(ctx, page)
+        _figure_set_selection(ctx, page, page._fig_selected)
     else:
         page._fig_selected = []
-        ctx._figure_relayout(page)
-        ctx._figure_rebuild_settings(page)
-    ctx._figure_mark_dirty(page)
+        _figure_relayout(ctx, page)
+        _figure_rebuild_settings(ctx, page)
+    _figure_mark_dirty(ctx, page)
 
 
 def _figure_relayout(ctx, page) -> None:
     """Flow-layout the cards (Word-like): one row, wrapped by line breaks."""
-    positions = ctx._figure_flow_positions(page._fig_cards, page._fig_plots)
+    positions = _figure_flow_positions(ctx, page._fig_cards, page._fig_plots)
     for (x, y, w, h), card in zip(positions, page._fig_cards):
         card.proxy().setPos(x, y)
-    ctx._figure_update_scene_rect(page)
+    _figure_update_scene_rect(ctx, page)
 
 
 def _figure_update_scene_rect(ctx, page) -> None:
@@ -1151,9 +1159,9 @@ def _figure_update_scene_rect(ctx, page) -> None:
 
 def _figure_add_plot(ctx, page, ptype: str) -> None:
     """Append a new plot (scatter or histogram) and select it."""
-    records = ctx._available_files(page._fig_task_id)
+    records = _data_files._available_files(ctx, page._fig_task_id)
     rec = records[0] if records else None
-    columns = ctx._columns_for(
+    columns = _data_columns._columns_for(ctx,
         rec.get("parquet"), page._fig_task_id
     ) if rec else []
     x = columns[0] if columns else None
@@ -1206,16 +1214,16 @@ def _figure_add_plot(ctx, page, ptype: str) -> None:
         "size": _figure_default_size(ptype),
     }
     page._fig_plots.append(plot_dict)
-    index = ctx._figure_new_card(page, plot_dict)
-    ctx._figure_mark_dirty(page)
-    ctx._figure_select(page, index)
-    ctx._figure_scroll_to(page, index)
+    index = _figure_new_card(ctx, page, plot_dict)
+    _figure_mark_dirty(ctx, page)
+    _figure_select(ctx, page, index)
+    _figure_scroll_to(ctx, page, index)
 
 
 def _figure_add_nxn(ctx, page) -> None:
     """Add a lower-triangle scatter matrix for a set of variables."""
     records = [
-        rec for rec in ctx._available_files(page._fig_task_id)
+        rec for rec in _data_files._available_files(ctx, page._fig_task_id)
         if rec.get("parquet")
     ]
     if not records:
@@ -1228,7 +1236,7 @@ def _figure_add_nxn(ctx, page) -> None:
     file_columns = {}
     columns = []
     for rec in records:
-        cols = ctx._columns_for(rec.get("parquet"), page._fig_task_id)
+        cols = _data_columns._columns_for(ctx, rec.get("parquet"), page._fig_task_id)
         file_columns[rec.get("parquet")] = cols
         for name in cols:
             if name not in columns:
@@ -1245,7 +1253,7 @@ def _figure_add_nxn(ctx, page) -> None:
             return "Select at least 2 variables"
         return f"{count} variables → {count * (count - 1) // 2} plots"
 
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Add N×N Plot", columns, [], "Filter variables…",
         reorder=True, summary=summary,
     )
@@ -1262,7 +1270,7 @@ def _figure_add_nxn(ctx, page) -> None:
     if page._fig_selected:
         index = page._fig_selected[0]
         if 0 <= index < len(page._fig_plots):
-            candidate = ctx._figure_record(
+            candidate = _widgets_plot_renderer._figure_record(ctx,
                 page._fig_plots[index].get("file")
             )
             path = candidate.get("parquet") if candidate else None
@@ -1330,7 +1338,7 @@ def _figure_add_nxn(ctx, page) -> None:
                 # Matrix plots are one of many: keep fewer points.
                 "max_points": limit,
             })
-    ctx._figure_add_batch(page, plots)
+    _figure_add_batch(ctx, page, plots)
 
 
 def _figure_add_batch(ctx, page, plots) -> None:
@@ -1340,14 +1348,14 @@ def _figure_add_batch(ctx, page, plots) -> None:
     first = len(page._fig_cards)
     for plot in plots:
         page._fig_plots.append(plot)
-        ctx._figure_new_card(page, plot, render=False)
-    ctx._figure_relayout(page)
-    ctx._figure_mark_dirty(page)
-    ctx._figure_set_selection(
+        _figure_new_card(ctx, page, plot, render=False)
+    _figure_relayout(ctx, page)
+    _figure_mark_dirty(ctx, page)
+    _figure_set_selection(ctx,
         page, list(range(first, first + len(plots)))
     )
-    ctx._figure_scroll_to(page, first)
-    ctx._figure_render_queue(
+    _figure_scroll_to(ctx, page, first)
+    _figure_render_queue(ctx,
         page, list(range(first, first + len(plots)))
     )
     _debug_log(f"nxn added: plots={len(page._fig_plots)} batch={len(plots)}")
@@ -1373,7 +1381,7 @@ def _figure_render_queue(ctx, page, indices) -> None:
             if not (0 <= i < len(page._fig_plots) and i < len(page._fig_cards)):
                 continue
             try:
-                ctx._figure_render(
+                _widgets_plot_renderer._figure_render(ctx,
                     page._fig_plots[i],
                     page._fig_cards[i].plot_widget(),
                     column_transforms=page._fig_column_transforms,
@@ -1387,13 +1395,13 @@ def _figure_render_queue(ctx, page, indices) -> None:
         if view is not None:
             view.viewport().repaint()
         done = state["total"] - len(queue)
-        ctx._figure_update_progress(page, done, state["total"])
+        _figure_update_progress(ctx, page, done, state["total"])
         ctx.statusBar().showMessage(
             f"Building plots: {done} / {state['total']}"
         )
         if not queue:
             timer.stop()
-            ctx._figure_update_progress(page, 0, 0)
+            _figure_update_progress(ctx, page, 0, 0)
             ctx.statusBar().showMessage("Plots ready", 3000)
 
     timer = QTimer(page)
@@ -1428,7 +1436,7 @@ def _figure_cancel_rendering(ctx, page) -> None:
                     "Cancelled", color="#6b7785", size="10pt"
                 )
         state["queue"].clear()
-    ctx._figure_update_progress(page, 0, 0)
+    _figure_update_progress(ctx, page, 0, 0)
     ctx.statusBar().showMessage("Plot rendering cancelled", 3000)
 
 
@@ -1447,7 +1455,7 @@ def _figure_render_histogram_when_ready(ctx, plot_dict, plot_widget, transforms,
     ) != token:
         # The page switched plot type / file while the pool was loading.
         return
-    ctx._figure_render_histogram(
+    _widgets_plot_renderer._figure_render_histogram(ctx,
         plot_dict, plot_widget, transforms, mask, task_id, stages
     )
 
@@ -1460,7 +1468,7 @@ def _figure_render_when_ready(ctx, plot_dict, plot_widget, transforms, mask, tas
     ) != token:
         # The page switched plot type / file while the pool was loading.
         return
-    ctx._figure_render_scatter(
+    _widgets_plot_renderer._figure_render_scatter(ctx,
         plot_dict, plot_widget, transforms, mask, task_id, stages
     )
 
@@ -1469,13 +1477,13 @@ def _figure_filter_options(ctx, figure_task_id):
     """Return [(display_name, {"task_id":..,"gate_id":..}), ...] for gates
     in gating modules strictly upstream of the figure module."""
     options = []
-    for task in ctx._task_chain(figure_task_id):
+    for task in _data_files._task_chain(ctx, figure_task_id):
         if task.get("id") == figure_task_id:
             continue
         if task.get("type") != "gating":
             continue
         module_name = task.get("name", "Gating")
-        for gate in ctx._gating_gates_for(task):
+        for gate in _data_stores._gating_gates_for(ctx, task):
             options.append((
                 f"{module_name} → {gate.get('name', gate.get('id'))}",
                 {"task_id": task.get("id"), "gate_id": gate.get("id")},
@@ -1498,10 +1506,10 @@ def _figure_filter_mask(ctx, plot_dict, row_task_id=None):
     gating_task = ctx._find_task_by_id(f.get("task_id"))
     if gating_task is None:
         return None, "Filter module not found"
-    rec = ctx._figure_record(plot_dict.get("file"))
+    rec = _widgets_plot_renderer._figure_record(ctx, plot_dict.get("file"))
     if rec is None:
         return None, "No data file"
-    gates = ctx._gating_gates_for(gating_task, rec["parquet"])
+    gates = _data_stores._gating_gates_for(ctx, gating_task, rec["parquet"])
     by_id = {g["id"]: g for g in gates}
     chain = []
     cur = by_id.get(f.get("gate_id"))
@@ -1514,7 +1522,7 @@ def _figure_filter_mask(ctx, plot_dict, row_task_id=None):
     for g in chain:
         needed |= _gate_needed_columns(g, by_id)
     filter_task = f.get("task_id")
-    values = ctx._column_data(
+    values = _data_columns._column_data(ctx,
         filter_task, rec["parquet"], list(needed)
     )
     missing = needed - set(values)
@@ -1532,8 +1540,8 @@ def _figure_filter_mask(ctx, plot_dict, row_task_id=None):
     if mask is None:
         return None, "Filter could not be applied"
     if row_task_id:
-        index = ctx._subsample_row_index(row_task_id, rec["parquet"])
-        if index is not None and len(mask) == ctx._data_row_count(rec["parquet"]):
+        index = _data_sampling._subsample_row_index(ctx, row_task_id, rec["parquet"])
+        if index is not None and len(mask) == _data_columns._data_row_count(ctx, rec["parquet"]):
             mask = np.asarray(mask)[index]
     return mask, None
 
@@ -1543,7 +1551,7 @@ def _figure_image_filter_error(ctx, f, parquet_path):
     gating_task = ctx._find_task_by_id(f.get("task_id"))
     if gating_task is None:
         return "Filter module not found"
-    gates = ctx._gating_gates_for(gating_task, parquet_path)
+    gates = _data_stores._gating_gates_for(ctx, gating_task, parquet_path)
     by_id = {g["id"]: g for g in gates}
     chain = []
     cur = by_id.get(f.get("gate_id"))
@@ -1555,7 +1563,7 @@ def _figure_image_filter_error(ctx, f, parquet_path):
     needed = set()
     for g in chain:
         needed |= _gate_needed_columns(g, by_id)
-    values = ctx._column_data(f.get("task_id"), parquet_path, list(needed))
+    values = _data_columns._column_data(ctx, f.get("task_id"), parquet_path, list(needed))
     missing = needed - set(values)
     if missing:
         return "Filter parameter not in this file: " + ", ".join(
@@ -1577,7 +1585,7 @@ def _figure_update_image_legend(ctx, plot_widget, layers, show=True) -> None:
 
 
 def _figure_image_refresh(ctx, page, plot_dict, plot_widget) -> None:
-    ctx._figure_render_image(
+    _widgets_plot_renderer._figure_render_image(ctx,
         plot_dict, plot_widget,
         column_transforms=page._fig_column_transforms,
         task_id=page._fig_task_id,
@@ -1599,14 +1607,14 @@ def _figure_image_filter_on_timer(ctx, page) -> None:
     for i, p in enumerate(page._fig_plots):
         if p.get("type") != "image" or i >= len(page._fig_cards):
             continue
-        rec = ctx._figure_record(p.get("file"))
+        rec = _widgets_plot_renderer._figure_record(ctx, p.get("file"))
         path = rec.get("parquet") if rec else None
         f = p.get("filter")
         if not f or not path:
             continue
         key = (path, (f.get("task_id"), f.get("gate_id")))
         if key in completed:
-            ctx._figure_render_image(
+            _widgets_plot_renderer._figure_render_image(ctx,
                 p, page._fig_cards[i].plot_widget(),
                 column_transforms=page._fig_column_transforms,
                 task_id=page._fig_task_id,
@@ -1671,7 +1679,7 @@ def _figure_original_tick_state(ctx, plot_widget) -> dict:
     timer.setSingleShot(True)
     timer.setInterval(40)
     timer.timeout.connect(
-        lambda: ctx._figure_refresh_original_ticks(plot_widget)
+        lambda: _figure_refresh_original_ticks(ctx, plot_widget)
     )
     state["timer"] = timer
     # Zooming / panning re-picks the ticks for the visible range.
@@ -1688,9 +1696,9 @@ def _figure_set_original_ticks(ctx, plot_widget, orientation, configs, values=No
     numbers (arcsinh / log10 axes, like FlowJo) and is recomputed for the
     visible range whenever the view is zoomed or panned.
     """
-    state = ctx._figure_original_tick_state(plot_widget)
+    state = _figure_original_tick_state(ctx, plot_widget)
     state[orientation] = list(configs) if configs else None
-    ctx._figure_update_original_axis(plot_widget, orientation)
+    _figure_update_original_axis(ctx, plot_widget, orientation)
     # The view range may still settle after this render: refresh shortly.
     timer = state.get("timer")
     if timer is not None:
@@ -1701,8 +1709,8 @@ def _figure_refresh_original_ticks(ctx, plot_widget) -> None:
     state = getattr(plot_widget, "_orig_ticks", None)
     if not state:
         return
-    ctx._figure_update_original_axis(plot_widget, "bottom")
-    ctx._figure_update_original_axis(plot_widget, "left")
+    _figure_update_original_axis(ctx, plot_widget, "bottom")
+    _figure_update_original_axis(ctx, plot_widget, "left")
 
 
 def _figure_update_original_axis(ctx, plot_widget, orientation) -> None:
@@ -1800,12 +1808,12 @@ def _figure_update_original_axis(ctx, plot_widget, orientation) -> None:
 def _figure_apply_change(ctx, page, index: int, plot_dict: dict) -> None:
     """Re-render a plot after a settings change (marks the page dirty)."""
     if 0 <= index < len(page._fig_cards):
-        ctx._figure_render(
+        _widgets_plot_renderer._figure_render(ctx,
             plot_dict, page._fig_cards[index].plot_widget(),
             column_transforms=page._fig_column_transforms,
             task_id=page._fig_task_id,
         )
-    ctx._figure_mark_dirty(page)
+    _figure_mark_dirty(ctx, page)
 
 
 def _figure_apply_display(ctx, page, index: int, plot_dict: dict) -> None:
@@ -1815,32 +1823,32 @@ def _figure_apply_display(ctx, page, index: int, plot_dict: dict) -> None:
     skipping the full render keeps them instant.
     """
     if 0 <= index < len(page._fig_cards):
-        ctx._figure_apply_display_options(
+        _widgets_plot_renderer._figure_apply_display_options(ctx,
             plot_dict, page._fig_cards[index].plot_widget()
         )
-    ctx._figure_mark_dirty(page)
+    _figure_mark_dirty(ctx, page)
 
 
 def _figure_apply_display_all(ctx, page) -> None:
     """Re-apply only the labels/ticks/title of every selected plot."""
     for i in page._fig_selected:
         if 0 <= i < len(page._fig_cards):
-            ctx._figure_apply_display_options(
+            _widgets_plot_renderer._figure_apply_display_options(ctx,
                 page._fig_plots[i], page._fig_cards[i].plot_widget()
             )
-    ctx._figure_mark_dirty(page)
+    _figure_mark_dirty(ctx, page)
 
 
 def _figure_apply_change_multi(ctx, page) -> None:
     """Re-render every selected plot after a batch edit (marks the page dirty)."""
     for i in page._fig_selected:
         if 0 <= i < len(page._fig_cards):
-            ctx._figure_render(
+            _widgets_plot_renderer._figure_render(ctx,
                 page._fig_plots[i], page._fig_cards[i].plot_widget(),
                 column_transforms=page._fig_column_transforms,
                 task_id=page._fig_task_id,
             )
-    ctx._figure_mark_dirty(page)
+    _figure_mark_dirty(ctx, page)
 
 
 def _figure_refresh_all(ctx, page) -> None:
@@ -1854,7 +1862,7 @@ def _figure_refresh_all(ctx, page) -> None:
             plot_widget = card.plot_widget()
             vb = plot_widget.getPlotItem().getViewBox()
             xr, yr = vb.viewRange()
-            ctx._figure_render(
+            _widgets_plot_renderer._figure_render(ctx,
                 page._fig_plots[i], plot_widget,
                 column_transforms=page._fig_column_transforms,
                 task_id=page._fig_task_id,
@@ -1871,15 +1879,15 @@ def _figure_set_selection(ctx, page, indices) -> None:
     sel = set(indices)
     for i, card in enumerate(page._fig_cards):
         card.set_selected(i in sel)
-    ctx._figure_rebuild_settings(page)
+    _figure_rebuild_settings(ctx, page)
     page._fig_view.setFocus()
 
 
 def _figure_select(ctx, page, index: int) -> None:
     """Select a single plot (clicking a card with no modifier)."""
-    ctx._figure_set_selection(page, [index])
+    _figure_set_selection(ctx, page, [index])
     if page._fig_focused != index:
-        ctx._figure_unfocus(page)
+        _figure_unfocus(ctx, page)
 
 
 def _figure_card_clicked(ctx, page, index: int, ctrl: bool) -> None:
@@ -1890,10 +1898,10 @@ def _figure_card_clicked(ctx, page, index: int, ctrl: bool) -> None:
             sel.remove(index)
         else:
             sel.append(index)
-        ctx._figure_unfocus(page)
-        ctx._figure_set_selection(page, sel)
+        _figure_unfocus(ctx, page)
+        _figure_set_selection(ctx, page, sel)
     else:
-        ctx._figure_select(page, index)
+        _figure_select(ctx, page, index)
 
 
 def _figure_box_select(ctx, page, scene_rect, ctrl: bool) -> None:
@@ -1906,22 +1914,22 @@ def _figure_box_select(ctx, page, scene_rect, ctrl: bool) -> None:
         sel = set(page._fig_selected)
         sel.update(hits)
         hits = sorted(sel)
-    ctx._figure_unfocus(page)
-    ctx._figure_set_selection(page, hits)
+    _figure_unfocus(ctx, page)
+    _figure_set_selection(ctx, page, hits)
 
 
 def _figure_select_all(ctx, page) -> None:
     """Select every plot (Ctrl+A on the canvas)."""
     if not page._fig_cards:
         return
-    ctx._figure_unfocus(page)
-    ctx._figure_set_selection(page, list(range(len(page._fig_cards))))
+    _figure_unfocus(ctx, page)
+    _figure_set_selection(ctx, page, list(range(len(page._fig_cards))))
 
 
 def _figure_clear_selection(ctx, page) -> None:
     """Deselect every plot (a plain click on empty canvas)."""
-    ctx._figure_unfocus(page)
-    ctx._figure_set_selection(page, [])
+    _figure_unfocus(ctx, page)
+    _figure_set_selection(ctx, page, [])
 
 
 def _figure_focus(ctx, page, index: int) -> None:
@@ -1933,8 +1941,8 @@ def _figure_focus(ctx, page, index: int) -> None:
     for i, card in enumerate(page._fig_cards):
         card.set_selected(i == index)
         card.set_focused(i == index)
-    ctx._figure_rebuild_settings(page)
-    ctx._figure_update_plot_mouse(page)
+    _figure_rebuild_settings(ctx, page)
+    _figure_update_plot_mouse(ctx, page)
     page._fig_view.setFocus()
 
 
@@ -1943,7 +1951,7 @@ def _figure_unfocus(ctx, page) -> None:
     page._fig_focused = None
     for card in page._fig_cards:
         card.set_focused(False)
-    ctx._figure_update_plot_mouse(page)
+    _figure_update_plot_mouse(ctx, page)
 
 
 def _figure_update_plot_mouse(ctx, page) -> None:
@@ -1975,10 +1983,10 @@ def _figure_plot_pan_start(ctx, page, item, scene_pos) -> bool:
     # Corner buttons (bottom-left): "A" resets to settings range, "F" fits all.
     if local.y() >= card.height() - 40:
         if local.x() <= 21:
-            ctx._figure_apply_ranges(page._fig_plots[focused], card.plot_widget())
+            _widgets_plot_renderer._figure_apply_ranges(ctx, page._fig_plots[focused], card.plot_widget())
             return True
         if local.x() <= 40:
-            ctx._figure_fit_all(page._fig_plots[focused], card.plot_widget())
+            _widgets_plot_renderer._figure_fit_all(ctx, page._fig_plots[focused], card.plot_widget())
             return True
     page._fig_pan_scene = scene_pos
     page._fig_pan_range = card.plot_widget().getPlotItem().getViewBox().viewRange()
@@ -2020,15 +2028,15 @@ def _figure_plot_pan_end(ctx, page) -> bool:
 def _figure_rebuild_settings(ctx, page) -> None:
     """Rebuild the right-hand settings panel for the current selection."""
     if len(page._fig_selected) > 1:
-        ctx._figure_rebuild_settings_multi(page)
+        _figure_rebuild_settings_multi(ctx, page)
     else:
-        ctx._figure_rebuild_settings_single(page)
+        _figure_rebuild_settings_single(ctx, page)
 
 
 def _figure_rebuild_settings_single(ctx, page) -> None:
     """Rebuild the right-hand settings panel for a single selected plot."""
     layout = page._fig_settings_layout
-    ctx._clear_settings_layout(layout)
+    _widgets_panels._clear_settings_layout(ctx, layout)
     index = page._fig_selected[0] if page._fig_selected else -1
     if index < 0 or index >= len(page._fig_plots):
         hint = QLabel("Add a plot to see its settings.")
@@ -2048,9 +2056,9 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         note.setWordWrap(True)
         layout.addWidget(note)
 
-    records = ctx._available_files(page._fig_task_id)
-    rec = ctx._figure_record(plot_dict.get("file"))
-    columns = ctx._columns_for(
+    records = _data_files._available_files(ctx, page._fig_task_id)
+    rec = _widgets_plot_renderer._figure_record(ctx, plot_dict.get("file"))
+    columns = _data_columns._columns_for(ctx,
         rec.get("parquet"), page._fig_task_id
     ) if rec else []
 
@@ -2064,21 +2072,21 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         if idx >= 0:
             file_combo.setCurrentIndex(idx)
     file_combo.setEnabled(enabled)
-    layout.addWidget(ctx._file_nav_row(file_combo, enabled))
+    layout.addWidget(_widgets_panels._file_nav_row(ctx, file_combo, enabled))
 
     # X parameter (image plots have no x parameter: their axes are the
     # image's own spatial coordinates, fixed by the image itself).
     x_combo = None
     if plot_dict.get("type") != "image":
         layout.addWidget(QLabel("X parameter"))
-        x_combo = ctx._figure_param_combo(columns, plot_dict.get("x"), enabled)
+        x_combo = _widgets_plot_renderer._figure_param_combo(ctx, columns, plot_dict.get("x"), enabled)
         layout.addWidget(x_combo)
 
     # Filter: apply an upstream gate (gate + ancestors) to the data.
     layout.addWidget(QLabel("Filter"))
     filter_combo = _NoWheelComboBox()
     filter_combo.addItem("None", None)
-    filter_options = ctx._figure_filter_options(page._fig_task_id)
+    filter_options = _figure_filter_options(ctx, page._fig_task_id)
     selected_idx = 0
     current_filter = plot_dict.get("filter")
     filter_found = False
@@ -2108,24 +2116,24 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         # table built below.
         if plot_dict.get("type") != "image":
             layout.addWidget(QLabel("Y parameter"))
-            y_combo = ctx._figure_param_combo(columns, plot_dict.get("y"), enabled)
+            y_combo = _widgets_plot_renderer._figure_param_combo(ctx, columns, plot_dict.get("y"), enabled)
             layout.addWidget(y_combo)
 
         if plot_dict.get("type") == "overlay":
-            ctx._figure_overlay_settings(
+            _figure_overlay_settings(ctx,
                 layout, plot_dict, plot_widget, enabled,
-                on_change=lambda: ctx._figure_apply_change(
+                on_change=lambda: _figure_apply_change(ctx,
                     page, index, plot_dict
                 ),
                 page=page, index=index,
             )
         else:
-            ctx._figure_scatter_color_settings(
+            _widgets_plot_renderer._figure_scatter_color_settings(ctx,
                 layout, plot_dict, plot_widget, columns, enabled,
-                on_change=lambda: ctx._figure_apply_change(page, index, plot_dict),
+                on_change=lambda: _figure_apply_change(ctx, page, index, plot_dict),
                 on_rebuild=lambda: (
-                    ctx._figure_rebuild_settings(page),
-                    ctx._figure_apply_change(page, index, plot_dict),
+                    _figure_rebuild_settings(ctx, page),
+                    _figure_apply_change(ctx, page, index, plot_dict),
                 ),
                 task_id=page._fig_task_id,
             )
@@ -2173,7 +2181,7 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
                         f"background-color: rgb({chosen.red()},{chosen.green()},{chosen.blue()}); "
                         "border: 1px solid #555;"
                     )
-                    ctx._figure_apply_change(page, index, plot_dict)
+                    _figure_apply_change(ctx, page, index, plot_dict)
 
             btn.clicked.connect(on_pick)
             return btn
@@ -2188,14 +2196,14 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
     ptype = plot_dict.get("type")
     file_path = plot_dict.get("file")
     x_configs = (
-        ctx._figure_axis_scale_configs(
+        _widgets_plot_renderer._figure_axis_scale_configs(ctx,
             page._fig_task_id, file_path, plot_dict.get("x"),
             page._fig_column_transforms,
         ) if ptype in ("scatter", "histogram", "overlay") else []
     )
     # Histograms show counts and images show pixel coordinates.
     y_configs = (
-        ctx._figure_axis_scale_configs(
+        _widgets_plot_renderer._figure_axis_scale_configs(ctx,
             page._fig_task_id, file_path, plot_dict.get("y"),
             page._fig_column_transforms,
         ) if ptype in ("scatter", "overlay") else []
@@ -2203,16 +2211,16 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
 
     # X range.
     layout.addWidget(QLabel("X range"))
-    layout.addWidget(ctx._figure_range_row(
+    layout.addWidget(_widgets_plot_renderer._figure_range_row(ctx,
         plot_dict, "x", plot_widget, enabled,
-        lambda: ctx._figure_mark_dirty(page), configs=x_configs,
+        lambda: _figure_mark_dirty(ctx, page), configs=x_configs,
     ))
 
     # Y range (scatter/histogram/image: histograms show the Count axis).
     layout.addWidget(QLabel("Y range"))
-    layout.addWidget(ctx._figure_range_row(
+    layout.addWidget(_widgets_plot_renderer._figure_range_row(ctx,
         plot_dict, "y", plot_widget, enabled,
-        lambda: ctx._figure_mark_dirty(page), configs=y_configs,
+        lambda: _figure_mark_dirty(ctx, page), configs=y_configs,
     ))
 
     # Size (width/height in canvas units).
@@ -2262,9 +2270,9 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
     layout.addWidget(res_row)
 
     # Display options: labels/ticks only, so no data re-read per keystroke.
-    ctx._figure_display_toggles(
+    _widgets_plot_renderer._figure_display_toggles(ctx,
         layout, plot_dict, enabled,
-        on_change=lambda: ctx._figure_apply_display(page, index, plot_dict),
+        on_change=lambda: _figure_apply_display(ctx, page, index, plot_dict),
     )
 
     layout.addStretch()
@@ -2273,8 +2281,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
     def on_file_changed():
         plot_dict["file"] = file_combo.currentData()
         plot_dict["file_name"] = file_combo.currentText()
-        new_rec = ctx._figure_record(plot_dict["file"])
-        new_cols = ctx._columns_for(
+        new_rec = _widgets_plot_renderer._figure_record(ctx, plot_dict["file"])
+        new_cols = _data_columns._columns_for(ctx,
             new_rec.get("parquet"), page._fig_task_id
         ) if new_rec else []
         # Keep the last-used x/y; blank them if this file lacks them.
@@ -2290,8 +2298,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
                 if plot_dict.get("last_color_param") in new_cols
                 else None
             )
-        ctx._figure_rebuild_settings(page)
-        ctx._figure_apply_change(page, index, plot_dict)
+        _figure_rebuild_settings(ctx, page)
+        _figure_apply_change(ctx, page, index, plot_dict)
 
     file_combo.currentIndexChanged.connect(lambda _=0: on_file_changed())
 
@@ -2300,7 +2308,7 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         # Keep the current view range; only the data subset changes.
         vb = plot_widget.getPlotItem().getViewBox()
         xr, yr = vb.viewRange()
-        ctx._figure_apply_change(page, index, plot_dict)
+        _figure_apply_change(ctx, page, index, plot_dict)
         vb.disableAutoRange()
         vb.setRange(xRange=(xr[0], xr[1]), yRange=(yr[0], yr[1]), padding=0)
 
@@ -2320,8 +2328,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
             elif attr == "y":
                 plot_dict["ymin"] = None
                 plot_dict["ymax"] = None
-            ctx._figure_apply_change(page, index, plot_dict)
-            ctx._figure_rebuild_settings(page)
+            _figure_apply_change(ctx, page, index, plot_dict)
+            _figure_rebuild_settings(ctx, page)
         return handler
 
     if x_combo is not None:
@@ -2332,13 +2340,13 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
     if bins_spin is not None:
         def on_bins(v):
             plot_dict["bins"] = int(v)
-            ctx._figure_apply_change(page, index, plot_dict)
+            _figure_apply_change(ctx, page, index, plot_dict)
         bins_spin.valueChanged.connect(on_bins)
 
     if hist_mode_combo is not None:
         def on_hist_mode(_=0):
             plot_dict["hist_mode"] = hist_mode_combo.currentData()
-            ctx._figure_apply_change(page, index, plot_dict)
+            _figure_apply_change(ctx, page, index, plot_dict)
         hist_mode_combo.currentIndexChanged.connect(on_hist_mode)
 
     def on_width_changed():
@@ -2349,8 +2357,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         h = h if h is not None else w
         plot_dict["size"] = [int(w), int(h)]
         resolution_field.set_value(int(round(w / 10.0)))
-        ctx._figure_resize_card(page, index, w, h)
-        ctx._figure_mark_dirty(page)
+        _figure_resize_card(ctx, page, index, w, h)
+        _figure_mark_dirty(ctx, page)
 
     def on_height_changed():
         w = width_field.value()
@@ -2358,8 +2366,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         if w is None or h is None:
             return
         plot_dict["size"] = [int(w), int(h)]
-        ctx._figure_resize_card(page, index, w, h)
-        ctx._figure_mark_dirty(page)
+        _figure_resize_card(ctx, page, index, w, h)
+        _figure_mark_dirty(ctx, page)
 
     def on_resolution_changed():
         r = resolution_field.value()
@@ -2375,8 +2383,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         plot_dict["size"] = [int(w_new), int(h_new)]
         width_field.set_value(w_new)
         height_field.set_value(h_new)
-        ctx._figure_resize_card(page, index, w_new, h_new)
-        ctx._figure_mark_dirty(page)
+        _figure_resize_card(ctx, page, index, w_new, h_new)
+        _figure_mark_dirty(ctx, page)
 
     def _legend_extra():
         # Extra card width consumed by the side legend (and its spacing).
@@ -2400,8 +2408,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         plot_dict["size"] = [w_new, int(h)]
         width_field.set_value(w_new)
         resolution_field.set_value(int(round(w_new / 10.0)))
-        ctx._figure_resize_card(page, index, w_new, h)
-        ctx._figure_mark_dirty(page)
+        _figure_resize_card(ctx, page, index, w_new, h)
+        _figure_mark_dirty(ctx, page)
 
     def on_square():
         h = height_field.value()
@@ -2411,8 +2419,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         plot_dict["size"] = [w_new, int(h)]
         width_field.set_value(w_new)
         resolution_field.set_value(int(round(w_new / 10.0)))
-        ctx._figure_resize_card(page, index, w_new, h)
-        ctx._figure_mark_dirty(page)
+        _figure_resize_card(ctx, page, index, w_new, h)
+        _figure_mark_dirty(ctx, page)
 
 
 def _figure_rebuild_settings_multi(ctx, page) -> None:
@@ -2422,11 +2430,11 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
     when they differ; setting a field applies it to every selected plot.
     """
     layout = page._fig_settings_layout
-    ctx._clear_settings_layout(layout)
+    _widgets_panels._clear_settings_layout(ctx, layout)
     indices = page._fig_selected
     plots = [page._fig_plots[i] for i in indices if 0 <= i < len(page._fig_plots)]
     if not plots:
-        ctx._figure_rebuild_settings_single(page)
+        _figure_rebuild_settings_single(ctx, page)
         return
     locked = page._fig_locked
     enabled = not locked
@@ -2501,7 +2509,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                     f"background-color: rgb({rgb[0]},{rgb[1]},{rgb[2]}); "
                     "border: 1px solid #555;"
                 )
-                ctx._figure_apply_change_multi(page)
+                _figure_apply_change_multi(ctx, page)
 
         btn.clicked.connect(on_pick)
         return btn
@@ -2545,7 +2553,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                     apply(ps, max_key, mx)
             min_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
             max_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
-            ctx._figure_apply_change_multi(page)
+            _figure_apply_change_multi(ctx, page)
 
         auto.stateChanged.connect(lambda _=0: commit())
         min_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
@@ -2559,15 +2567,15 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
         h.addStretch()
         return row
 
-    records = ctx._available_files(page._fig_task_id)
+    records = _data_files._available_files(ctx, page._fig_task_id)
 
     # Union of columns across every selected plot's file.
     col_set = []
     seen = set()
     for p in plots:
-        rec = ctx._figure_record(p.get("file"))
+        rec = _widgets_plot_renderer._figure_record(ctx, p.get("file"))
         for c in (
-            ctx._columns_for(rec.get("parquet"), page._fig_task_id)
+            _data_columns._columns_for(ctx, rec.get("parquet"), page._fig_task_id)
             if rec else []
         ):
             if c not in seen:
@@ -2589,8 +2597,8 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
         for p in plots:
             p["file"] = f
             p["file_name"] = file_combo.currentText()
-            rec = ctx._figure_record(f)
-            cols = ctx._columns_for(
+            rec = _widgets_plot_renderer._figure_record(ctx, f)
+            cols = _data_columns._columns_for(ctx,
                 rec.get("parquet"), page._fig_task_id
             ) if rec else []
             p["x"] = p.get("last_x") if p.get("last_x") in cols else None
@@ -2601,8 +2609,8 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                     if p.get("last_color_param") in cols
                     else None
                 )
-        ctx._figure_apply_change_multi(page)
-        ctx._figure_rebuild_settings_multi(page)
+        _figure_apply_change_multi(ctx, page)
+        _figure_rebuild_settings_multi(ctx, page)
 
     file_combo.currentIndexChanged.connect(on_file_changed)
 
@@ -2612,7 +2620,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
     if any(p.get("type") != "image" for p in plots):
         layout.addWidget(QLabel("X parameter"))
         xv = common(plots, "x")
-        x_combo = ctx._figure_param_combo(col_set, None if xv is _MIXED else xv, enabled)
+        x_combo = _widgets_plot_renderer._figure_param_combo(ctx, col_set, None if xv is _MIXED else xv, enabled)
         layout.addWidget(x_combo)
 
     def on_x(v):
@@ -2622,8 +2630,8 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
             p["last_x"] = v
             p["xmin"] = None
             p["xmax"] = None
-        ctx._figure_apply_change_multi(page)
-        ctx._figure_rebuild_settings_multi(page)
+        _figure_apply_change_multi(ctx, page)
+        _figure_rebuild_settings_multi(ctx, page)
 
     if x_combo is not None:
         x_combo.currentTextChanged.connect(on_x)
@@ -2633,7 +2641,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
     filter_combo = _NoWheelComboBox()
     filter_combo.addItem("", _MIXED)
     filter_combo.addItem("None", None)
-    filter_options = ctx._figure_filter_options(page._fig_task_id)
+    filter_options = _figure_filter_options(ctx, page._fig_task_id)
     for label, val in filter_options:
         filter_combo.addItem(label, val)
     fv = common(plots, "filter")
@@ -2664,14 +2672,14 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
             if 0 <= i < len(page._fig_cards):
                 vb = page._fig_cards[i].plot_widget().getPlotItem().getViewBox()
                 xr, yr = vb.viewRange()
-                ctx._figure_render(
+                _widgets_plot_renderer._figure_render(ctx,
                     page._fig_plots[i], page._fig_cards[i].plot_widget(),
                     column_transforms=page._fig_column_transforms,
                     task_id=page._fig_task_id,
                 )
                 vb.disableAutoRange()
                 vb.setRange(xRange=(xr[0], xr[1]), yRange=(yr[0], yr[1]), padding=0)
-        ctx._figure_mark_dirty(page)
+        _figure_mark_dirty(ctx, page)
 
     filter_combo.currentIndexChanged.connect(on_filter_changed)
 
@@ -2680,7 +2688,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
     if scatter_plots:
         layout.addWidget(QLabel("Y parameter"))
         yv = common(scatter_plots, "y")
-        y_combo = ctx._figure_param_combo(col_set, None if yv is _MIXED else yv, enabled)
+        y_combo = _widgets_plot_renderer._figure_param_combo(ctx, col_set, None if yv is _MIXED else yv, enabled)
         layout.addWidget(y_combo)
 
         def on_y(v):
@@ -2690,8 +2698,8 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                 p["last_y"] = v
                 p["ymin"] = None
                 p["ymax"] = None
-            ctx._figure_apply_change_multi(page)
-            ctx._figure_rebuild_settings_multi(page)
+            _figure_apply_change_multi(ctx, page)
+            _figure_rebuild_settings_multi(ctx, page)
 
         y_combo.currentTextChanged.connect(on_y)
 
@@ -2708,8 +2716,8 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
             if data is _MIXED:
                 return
             apply(scatter_plots, "color_mode", data)
-            ctx._figure_apply_change_multi(page)
-            ctx._figure_rebuild_settings_multi(page)
+            _figure_apply_change_multi(ctx, page)
+            _figure_rebuild_settings_multi(ctx, page)
 
         mode_combo.currentIndexChanged.connect(on_mode_changed)
 
@@ -2718,7 +2726,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
             if mode_val == "parameter":
                 layout.addWidget(QLabel("Color parameter"))
                 cpv = common(scatter_plots, "color_param")
-                cp_combo = ctx._figure_param_combo(
+                cp_combo = _widgets_plot_renderer._figure_param_combo(ctx,
                     col_set, None if cpv is _MIXED else cpv, enabled
                 )
                 layout.addWidget(cp_combo)
@@ -2726,7 +2734,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                 def on_cp(v):
                     apply(scatter_plots, "color_param", v or None)
                     apply(scatter_plots, "last_color_param", v or None)
-                    ctx._figure_apply_change_multi(page)
+                    _figure_apply_change_multi(ctx, page)
 
                 cp_combo.currentTextChanged.connect(on_cp)
             elif mode_val == "solid":
@@ -2740,7 +2748,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                     [(p, p) for p in _palette_names()],
                     common(scatter_plots, "palette", _default_palette()),
                 )
-                ctx._add_more_colormaps(palette_combo)
+                _widgets_colormap._add_more_colormaps(ctx, palette_combo)
                 layout.addWidget(palette_combo)
 
                 def on_palette(_=0):
@@ -2748,7 +2756,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                     if data is _MIXED:
                         return
                     apply(scatter_plots, "palette", data)
-                    ctx._figure_apply_change_multi(page)
+                    _figure_apply_change_multi(ctx, page)
 
                 palette_combo.currentIndexChanged.connect(on_palette)
 
@@ -2771,7 +2779,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
 
         def on_point_size(v):
             apply(scatter_plots, "point_size", float(v))
-            ctx._figure_apply_change_multi(page)
+            _figure_apply_change_multi(ctx, page)
 
         point_spin = _LogStepSpinBox(None if ps_val is _MIXED else ps_val, on_point_size)
         point_spin.set_enabled(enabled and point_fixed.isChecked())
@@ -2782,7 +2790,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                 return
             apply(scatter_plots, "fixed_point_size", st == Qt.CheckState.Checked)
             point_spin.set_enabled(enabled and st == Qt.CheckState.Checked)
-            ctx._figure_apply_change_multi(page)
+            _figure_apply_change_multi(ctx, page)
 
         point_fixed.stateChanged.connect(on_point_fixed)
 
@@ -2798,7 +2806,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
 
         def on_bins(v):
             apply(hist_plots, "bins", int(float(v)))
-            ctx._figure_apply_change_multi(page)
+            _figure_apply_change_multi(ctx, page)
 
         bins_spin = _LogStepSpinBox(None if bv is _MIXED else bv, on_bins)
         bins_spin.set_enabled(enabled)
@@ -2815,7 +2823,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
             if data is _MIXED:
                 return
             apply(hist_plots, "hist_mode", data)
-            ctx._figure_apply_change_multi(page)
+            _figure_apply_change_multi(ctx, page)
 
         hist_mode_combo.currentIndexChanged.connect(on_hist_mode)
 
@@ -2850,8 +2858,8 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
         if w is None or h is None:
             return
         for i in indices:
-            ctx._figure_resize_card(page, i, int(w), int(h))
-        ctx._figure_mark_dirty(page)
+            _figure_resize_card(ctx, page, i, int(w), int(h))
+        _figure_mark_dirty(ctx, page)
 
     width_field = _SizeField(None if w_val is _MIXED else w_val, on_size_changed)
     height_field = _SizeField(None if h_val is _MIXED else h_val, on_size_changed)
@@ -2887,7 +2895,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                 if st == Qt.CheckState.PartiallyChecked:
                     return
                 apply(plots, k, st == Qt.CheckState.Checked)
-                ctx._figure_apply_display_all(page)
+                _figure_apply_display_all(ctx, page)
 
             return h
 
@@ -2917,7 +2925,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
 
         def on_font_size(v, k=key):
             apply(plots, k, int(v))
-            ctx._figure_apply_display_all(page)
+            _figure_apply_display_all(ctx, page)
 
         spin.valueChanged.connect(on_font_size)
 
@@ -2969,12 +2977,12 @@ def _figure_overlay_gate_options(ctx, page, plot_dict) -> list:
     if not path:
         return []
     options = []
-    for task in ctx._task_chain(page._fig_task_id):
+    for task in _data_files._task_chain(ctx, page._fig_task_id):
         if task.get("id") == page._fig_task_id:
             continue
         if task.get("type") != "gating":
             continue
-        for gate in ctx._gating_gates_for(task, path):
+        for gate in _data_stores._gating_gates_for(ctx, task, path):
             options.append({
                 "task_id": task.get("id"),
                 "gate_id": gate.get("id"),
@@ -2994,7 +3002,7 @@ def _figure_overlay_gate_options(ctx, page, plot_dict) -> list:
 
 def _figure_overlay_pick(ctx, page, index, plot_dict, on_change) -> None:
     """Choose the layers of an overlay scatter (gates, in order)."""
-    options = ctx._figure_overlay_gate_options(page, plot_dict)
+    options = _figure_overlay_gate_options(ctx, page, plot_dict)
     if not options:
         QMessageBox.information(
             ctx.host, "Select gates",
@@ -3012,7 +3020,7 @@ def _figure_overlay_pick(ctx, page, index, plot_dict, on_change) -> None:
     ]
     # The picker only chooses which gates are layers (its list keeps the
     # gating order); the layer order is controlled by dragging the table.
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select gates", [opt["label"] for opt in options], current,
         "Filter gates...",
     )
@@ -3046,7 +3054,7 @@ def _figure_overlay_pick(ctx, page, index, plot_dict, on_change) -> None:
         })
     plot_dict["layers"] = new_layers
     if page is not None:
-        ctx._figure_rebuild_settings(page)
+        _figure_rebuild_settings(ctx, page)
     on_change()
 
 
@@ -3066,7 +3074,7 @@ def _figure_overlay_settings(ctx, layout, plot_dict, plot_widget, enabled, on_ch
     pick_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     pick_btn.setEnabled(enabled)
     pick_btn.clicked.connect(
-        lambda _=False: ctx._figure_overlay_pick(
+        lambda _=False: _figure_overlay_pick(ctx,
             page, index, plot_dict, on_change
         )
     )
@@ -3106,7 +3114,7 @@ def _figure_overlay_settings(ctx, layout, plot_dict, plot_widget, enabled, on_ch
     # Current gate names (a gate may have been renamed upstream).
     names = {}
     if page is not None:
-        for opt in ctx._figure_overlay_gate_options(page, plot_dict):
+        for opt in _figure_overlay_gate_options(ctx, page, plot_dict):
             names[(opt["task_id"], opt["gate_id"])] = opt["name"]
 
     syncing = {"value": False}
@@ -3189,7 +3197,7 @@ def _figure_overlay_settings(ctx, layout, plot_dict, plot_widget, enabled, on_ch
         layers.insert(target, layer)
         if page is not None:
             QTimer.singleShot(
-                0, lambda: ctx._figure_rebuild_settings(page)
+                0, lambda: _figure_rebuild_settings(ctx, page)
             )
         on_change()
 
@@ -3200,7 +3208,7 @@ def _figure_overlay_settings(ctx, layout, plot_dict, plot_widget, enabled, on_ch
         empty.setStyleSheet("color: #8a94a6;")
         layout.addWidget(empty)
 
-    ctx._figure_point_size_settings(
+    _figure_point_size_settings(ctx,
         layout, plot_dict, plot_widget, enabled, on_change
     )
 
@@ -3220,12 +3228,12 @@ def _figure_overlay_masks(ctx, plot_dict, task_id, parquet_path) -> dict:
     groups = {}
     for layer in layers:
         groups.setdefault(layer["task_id"], []).append(layer)
-    full_rows = int(ctx._data_row_count(parquet_path) or 0)
+    full_rows = int(_data_columns._data_row_count(ctx, parquet_path) or 0)
     for gate_task_id, group in groups.items():
         gating_task = ctx._find_task_by_id(gate_task_id)
         if gating_task is None:
             continue
-        gates = ctx._gating_gates_for(gating_task, parquet_path)
+        gates = _data_stores._gating_gates_for(ctx, gating_task, parquet_path)
         if not gates:
             continue
         by_id = {g["id"]: g for g in gates}
@@ -3241,14 +3249,14 @@ def _figure_overlay_masks(ctx, plot_dict, task_id, parquet_path) -> dict:
         if not needed:
             continue
         try:
-            values = ctx._column_data(
+            values = _data_columns._column_data(ctx,
                 gate_task_id, parquet_path, list(needed)
             )
         except Exception:  # noqa: BLE001
             continue
         if not values:
             continue
-        index = ctx._subsample_row_index(task_id, parquet_path)
+        index = _data_sampling._subsample_row_index(ctx, task_id, parquet_path)
         for gate_id in gate_ids:
             try:
                 mask = _compute_gate_filter_mask(
@@ -3272,7 +3280,7 @@ def _figure_overlay_point_colors(ctx, plot_dict, task_id, parquet_path, n_points
 
     colors = np.empty((n_points, 3), dtype=np.uint8)
     colors[:, :] = OVERLAY_OTHER_COLOR
-    masks = ctx._figure_overlay_masks(plot_dict, task_id, parquet_path)
+    masks = _figure_overlay_masks(ctx, plot_dict, task_id, parquet_path)
     keep = np.asarray(keep, dtype=bool)
     layers = [
         layer for layer in plot_dict.get("layers") or []
@@ -3313,7 +3321,7 @@ def _figure_channel_values(ctx, task_id, parquet_path, channel, max_points: int 
     """Finite values of one image channel (sampled unless max_points=None)."""
     import numpy as np
 
-    values = ctx._column_data(
+    values = _data_columns._column_data(ctx,
         task_id, parquet_path, [channel], extra_stages=extra_stages
     ).get(channel)
     if values is None:

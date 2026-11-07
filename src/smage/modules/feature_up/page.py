@@ -31,6 +31,14 @@ from smage.data.image_index import _build_image_index_files
 from smage.widgets.controls import _NoWheelComboBox
 from smage.widgets.resources import _lock_pixmap
 import copy
+from smage.data import columns as _data_columns
+from smage.data import feature_outputs as _data_feature_outputs
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import sampling as _data_sampling
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 def _fup_matched_from(ctx, params, to_path):
@@ -54,7 +62,7 @@ def _build_feature_up_page(ctx, name: str, task_def: dict, locked: bool) -> QWid
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -70,7 +78,7 @@ def _build_feature_up_page(ctx, name: str, task_def: dict, locked: bool) -> QWid
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._fup_close(page))
+    close_btn.clicked.connect(lambda _=False: _fup_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -104,25 +112,25 @@ def _build_feature_up_page(ctx, name: str, task_def: dict, locked: bool) -> QWid
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._fup_files_panel(page))
-    splitter.addWidget(ctx._fup_match_panel(page))
-    splitter.addWidget(ctx._fup_features_panel(page))
+    splitter.addWidget(_fup_files_panel(ctx, page))
+    splitter.addWidget(_fup_match_panel(ctx, page))
+    splitter.addWidget(_fup_features_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 2)
     splitter.setStretchFactor(2, 2)
     splitter.setSizes([240, 480, 480])
     row.addWidget(splitter, 1)
 
-    row.addWidget(ctx._fup_log_panel(page))
+    row.addWidget(_fup_log_panel(ctx, page))
     layout.addWidget(content, 1)
 
-    ctx._fup_refresh_files(page)
-    ctx._fup_update_save_btn(page)
+    _fup_refresh_files(ctx, page)
+    _fup_update_save_btn(ctx, page)
     return page
 
 
 def _fup_log_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -163,7 +171,7 @@ def _fup_log(ctx, page, text) -> None:
 
 
 def _fup_files_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -229,16 +237,16 @@ def _fup_files_panel(ctx, page) -> QWidget:
 
     lay.addStretch()
 
-    from_btn.clicked.connect(lambda _=False: ctx._fup_select_files(page, "from"))
-    to_btn.clicked.connect(lambda _=False: ctx._fup_select_files(page, "to"))
-    match_btn.clicked.connect(lambda _=False: ctx._fup_match(page))
-    key_from.currentIndexChanged.connect(lambda _=0: ctx._fup_on_key(page, "from"))
-    key_to.currentIndexChanged.connect(lambda _=0: ctx._fup_on_key(page, "to"))
+    from_btn.clicked.connect(lambda _=False: _fup_select_files(ctx, page, "from"))
+    to_btn.clicked.connect(lambda _=False: _fup_select_files(ctx, page, "to"))
+    match_btn.clicked.connect(lambda _=False: _fup_match(ctx, page))
+    key_from.currentIndexChanged.connect(lambda _=0: _fup_on_key(ctx, page, "from"))
+    key_to.currentIndexChanged.connect(lambda _=0: _fup_on_key(ctx, page, "to"))
     return panel
 
 
 def _fup_match_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -270,7 +278,7 @@ def _fup_match_panel(ctx, page) -> QWidget:
 
 
 def _fup_features_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -313,9 +321,9 @@ def _fup_features_panel(ctx, page) -> QWidget:
     page._fup_calc_btn = calc_btn
     page._fup_calc_status = status
 
-    select_btn.clicked.connect(lambda _=False: ctx._fup_select_features(page))
-    del_btn.clicked.connect(lambda _=False: ctx._fup_delete_feature(page))
-    calc_btn.clicked.connect(lambda _=False: ctx._fup_calculate(page))
+    select_btn.clicked.connect(lambda _=False: _fup_select_features(ctx, page))
+    del_btn.clicked.connect(lambda _=False: _fup_delete_feature(ctx, page))
+    calc_btn.clicked.connect(lambda _=False: _fup_calculate(ctx, page))
     return panel
 
 
@@ -327,17 +335,17 @@ def _fup_refresh_files(ctx, page) -> None:
         from_box.blockSignals(True)
         from_box.clear()
         for p in params.get("from_files") or []:
-            from_box.addItem(ctx._comp_file_name(p, page._fup_task_id))
+            from_box.addItem(_data_naming._comp_file_name(ctx, p, page._fup_task_id))
         from_box.blockSignals(False)
     if to_box is not None:
         to_box.blockSignals(True)
         to_box.clear()
         for p in params.get("to_files") or []:
-            to_box.addItem(ctx._comp_file_name(p, page._fup_task_id))
+            to_box.addItem(_data_naming._comp_file_name(ctx, p, page._fup_task_id))
         to_box.blockSignals(False)
-    ctx._fup_refresh_key_combos(page)
-    ctx._fup_rebuild_matches(page)
-    ctx._fup_rebuild_features(page)
+    _fup_refresh_key_combos(ctx, page)
+    _fup_rebuild_matches(ctx, page)
+    _fup_rebuild_features(ctx, page)
 
 
 def _fup_common_columns(ctx, page, files_key) -> list:
@@ -345,9 +353,9 @@ def _fup_common_columns(ctx, page, files_key) -> list:
     paths = list(page._fup_params.get(files_key) or [])
     if not paths:
         return []
-    common = set(ctx._columns_for(paths[0], page._fup_task_id))
+    common = set(_data_columns._columns_for(ctx, paths[0], page._fup_task_id))
     for p in paths[1:]:
-        common &= set(ctx._columns_for(p, page._fup_task_id))
+        common &= set(_data_columns._columns_for(ctx, p, page._fup_task_id))
     return sorted(common)
 
 
@@ -360,7 +368,7 @@ def _fup_refresh_key_combos(ctx, page) -> None:
         combo = getattr(page, combo_attr, None)
         if combo is None:
             continue
-        cols = ctx._fup_common_columns(page, files_key)
+        cols = _fup_common_columns(ctx, page, files_key)
         cur = params.get(key_attr)
         combo.blockSignals(True)
         combo.clear()
@@ -378,34 +386,34 @@ def _fup_on_key(ctx, page, which) -> None:
     if combo is None:
         return
     params[f"key_{which}"] = combo.currentData()
-    ctx._fup_mark_dirty(page)
-    ctx._fup_rebuild_matches(page)
+    _fup_mark_dirty(ctx, page)
+    _fup_rebuild_matches(ctx, page)
 
 
 def _fup_select_files(ctx, page, which) -> None:
-    records = ctx._available_files(page._fup_task_id)
+    records = _data_files._available_files(ctx, page._fup_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     key = "from_files" if which == "from" else "to_files"
-    current = [ctx._comp_file_name(p, page._fup_task_id) for p in page._fup_params.get(key) or []]
+    current = [_data_naming._comp_file_name(ctx, p, page._fup_task_id) for p in page._fup_params.get(key) or []]
     title = "Select From files" if which == "from" else "Select To files"
-    chosen = ctx._pick_items_dialog(title, names, current, "Filter files...")
+    chosen = _widgets_picker._pick_items_dialog(ctx, title, names, current, "Filter files...")
     if chosen is None:
         return
     page._fup_params[key] = [by_name[n] for n in chosen if n in by_name]
-    ctx._fup_refresh_files(page)
-    ctx._fup_mark_dirty(page)
+    _fup_refresh_files(ctx, page)
+    _fup_mark_dirty(ctx, page)
 
 
 def _fup_select_features(ctx, page) -> None:
-    from_cols = ctx._fup_common_columns(page, "from_files")
+    from_cols = _fup_common_columns(ctx, page, "from_files")
     if not from_cols:
         QMessageBox.information(ctx.host, "Features", "Select From files first.")
         return
     key_from = page._fup_params.get("key_from")
     options = [c for c in from_cols if c != key_from]
     existing = [f.get("source") for f in page._fup_params.get("features") or []]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select features", options, existing, "Filter columns..."
     )
     if chosen is None:
@@ -421,8 +429,8 @@ def _fup_select_features(ctx, page) -> None:
         else:
             features.append({"source": source, "name": source})
     page._fup_params["features"] = features
-    ctx._fup_rebuild_features(page)
-    ctx._fup_mark_dirty(page)
+    _fup_rebuild_features(ctx, page)
+    _fup_mark_dirty(ctx, page)
 
 
 def _fup_delete_feature(ctx, page) -> None:
@@ -431,8 +439,8 @@ def _fup_delete_feature(ctx, page) -> None:
     features = page._fup_params.get("features") or []
     if 0 <= row < len(features):
         del features[row]
-        ctx._fup_rebuild_features(page)
-        ctx._fup_mark_dirty(page)
+        _fup_rebuild_features(ctx, page)
+        _fup_mark_dirty(ctx, page)
 
 
 def _fup_rebuild_features(ctx, page) -> None:
@@ -441,7 +449,7 @@ def _fup_rebuild_features(ctx, page) -> None:
         return
     features = page._fup_params.get("features") or []
     enabled = not page._fup_locked
-    dup = ctx._fup_duplicate_names(page)
+    dup = _fup_duplicate_names(ctx, page)
     table.blockSignals(True)
     table.setRowCount(0)
     table.setRowCount(len(features))
@@ -463,9 +471,9 @@ def _fup_rebuild_features(ctx, page) -> None:
         def on_name(text, f=feat, warn_label=warn):
             f["name"] = text.strip()
             warn_label.setVisible(
-                (f.get("name") or "").strip() in ctx._fup_duplicate_names(page)
+                (f.get("name") or "").strip() in _fup_duplicate_names(ctx, page)
             )
-            ctx._fup_mark_dirty(page)
+            _fup_mark_dirty(ctx, page)
 
         name_edit.textEdited.connect(lambda t, cb=on_name: cb(t))
         nh.addWidget(name_edit, 1)
@@ -478,12 +486,12 @@ def _fup_rebuild_features(ctx, page) -> None:
 def _fup_existing_columns(ctx, page) -> set:
     cols = set()
     for path in page._fup_params.get("to_files") or []:
-        cols |= set(ctx._columns_for(path, page._fup_task_id))
+        cols |= set(_data_columns._columns_for(ctx, path, page._fup_task_id))
     return cols
 
 
 def _fup_duplicate_names(ctx, page) -> set:
-    existing = ctx._fup_existing_columns(page)
+    existing = _fup_existing_columns(ctx, page)
     dup = set()
     seen = set()
     for feat in page._fup_params.get("features") or []:
@@ -533,13 +541,13 @@ def _fup_match(ctx, page) -> None:
             return
     matches = {}
     for from_path in params.get("from_files") or []:
-        to_path = ctx._fup_default_to(page, from_path)
+        to_path = _fup_default_to(ctx, page, from_path)
         if to_path is not None:
             matches[from_path] = to_path
     params["matches"] = matches
-    ctx._fup_rebuild_matches(page)
-    ctx._fup_mark_dirty(page)
-    ctx._fup_log(page, "Matched files.")
+    _fup_rebuild_matches(ctx, page)
+    _fup_mark_dirty(ctx, page)
+    _fup_log(ctx, page, "Matched files.")
 
 
 def _fup_key_values(ctx, task_id, parquet_path, key):
@@ -551,7 +559,7 @@ def _fup_key_values(ctx, task_id, parquet_path, key):
     if not parquet_path or not key:
         return None
     try:
-        values = ctx._column_data(task_id, parquet_path, [key], numeric=False)
+        values = _data_columns._column_data(ctx, task_id, parquet_path, [key], numeric=False)
         if values.get(key) is not None:
             return values[key]
     except Exception as exc:  # noqa: BLE001
@@ -605,11 +613,11 @@ def _fup_fill_match_stats(ctx, page, row, from_path, to_path) -> None:
             return
 
     try:
-        fv = ctx._fup_key_values(page._fup_task_id, from_path, key_from)
+        fv = _fup_key_values(ctx, page._fup_task_id, from_path, key_from)
         if fv is None:
             unavailable("From", key_from)
             return
-        tv = ctx._fup_key_values(page._fup_task_id, to_path, key_to)
+        tv = _fup_key_values(ctx, page._fup_task_id, to_path, key_to)
         if tv is None:
             unavailable("To", key_to)
             return
@@ -647,7 +655,7 @@ def _fup_rebuild_match_row(ctx, page, row) -> None:
     from_path = from_files[row] if row < len(from_files) else None
     combo = table.cellWidget(row, 1)
     to_path = combo.currentData() if combo is not None else None
-    ctx._fup_fill_match_stats(page, row, from_path, to_path)
+    _fup_fill_match_stats(ctx, page, row, from_path, to_path)
 
 
 def _fup_rebuild_matches(ctx, page) -> None:
@@ -663,7 +671,7 @@ def _fup_rebuild_matches(ctx, page) -> None:
     table.setRowCount(len(from_files))
     for i, from_path in enumerate(from_files):
         from_missing = not Path(str(from_path)).is_file()
-        text = ctx._comp_file_name(from_path, page._fup_task_id)
+        text = _data_naming._comp_file_name(ctx, from_path, page._fup_task_id)
         if from_missing:
             text += "  (missing)"
         item = QTableWidgetItem(text)
@@ -679,7 +687,7 @@ def _fup_rebuild_matches(ctx, page) -> None:
         combo = _NoWheelComboBox()
         combo.addItem("", None)
         for to_path in to_files:
-            label = ctx._comp_file_name(to_path, page._fup_task_id)
+            label = _data_naming._comp_file_name(ctx, to_path, page._fup_task_id)
             if not Path(str(to_path)).is_file():
                 label += "  (missing)"
             combo.addItem(label, to_path)
@@ -694,14 +702,14 @@ def _fup_rebuild_matches(ctx, page) -> None:
                 matches[f] = value
             else:
                 matches.pop(f, None)
-            ctx._fup_rebuild_match_row(page, ri)
-            ctx._fup_mark_dirty(page)
+            _fup_rebuild_match_row(ctx, page, ri)
+            _fup_mark_dirty(ctx, page)
 
         combo.currentIndexChanged.connect(
             lambda _=0, c=combo, cb=on_to: cb(c.currentData())
         )
         table.setCellWidget(i, 1, combo)
-        ctx._fup_fill_match_stats(page, i, from_path, cur)
+        _fup_fill_match_stats(ctx, page, i, from_path, cur)
     table.blockSignals(False)
 
 
@@ -716,8 +724,8 @@ def _fup_validate(ctx, page):
     features = params.get("features") or []
     if not features:
         return False, "Select at least one feature to map."
-    from_common = set(ctx._fup_common_columns(page, "from_files"))
-    to_common = set(ctx._fup_common_columns(page, "to_files"))
+    from_common = set(_fup_common_columns(ctx, page, "from_files"))
+    to_common = set(_fup_common_columns(ctx, page, "to_files"))
     if params.get("key_from") not in from_common:
         return False, f"Key '{params['key_from']}' is not in every From file."
     if params.get("key_to") not in to_common:
@@ -730,14 +738,14 @@ def _fup_validate(ctx, page):
         return False, "Give every mapped feature a new column name."
     if len(names) != len(set(names)):
         return False, "New column names must be unique."
-    existing = ctx._fup_existing_columns(page)
+    existing = _fup_existing_columns(ctx, page)
     if any(n in existing for n in names):
         return False, "A new column name collides with an existing To-file column."
     return True, ""
 
 
 def _fup_calculate(ctx, page) -> None:
-    ok, message = ctx._fup_validate(page)
+    ok, message = _fup_validate(ctx, page)
     if not ok:
         QMessageBox.warning(ctx.host, "Calculate", message)
         return
@@ -746,7 +754,7 @@ def _fup_calculate(ctx, page) -> None:
     from_files = params.get("from_files") or []
     unmatched = [f for f in from_files if not matches.get(f)]
     if unmatched:
-        names = ", ".join(ctx._comp_file_name(f, page._fup_task_id) for f in unmatched)
+        names = ", ".join(_data_naming._comp_file_name(ctx, f, page._fup_task_id) for f in unmatched)
         reply = QMessageBox.question(
             ctx.host, "Calculate",
             f"{len(unmatched)} From file(s) have no matched To file and "
@@ -780,28 +788,28 @@ def _fup_calculate(ctx, page) -> None:
     try:
         for to_path in to_targets:
             if getattr(page, "_fup_cancel", False):
-                ctx._fup_log(page, "Calculation cancelled.")
+                _fup_log(ctx, page, "Calculation cancelled.")
                 break
-            name = ctx._comp_file_name(to_path, page._fup_task_id)
+            name = _data_naming._comp_file_name(ctx, to_path, page._fup_task_id)
             if status is not None:
                 status.setText(f"Calculating… {name}")
             QApplication.processEvents()
             try:
-                rel, columns, kind = ctx._fup_compute_file(page, to_path)
+                rel, columns, kind = _fup_compute_file(ctx, page, to_path)
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{name}: {exc}")
-                ctx._fup_log(page, f"✗ {name}: {exc}")
+                _fup_log(ctx, page, f"✗ {name}: {exc}")
                 continue
             outputs[to_path] = {
                 "path": rel,
                 "columns": columns,
                 "kind": kind,
-                "signature": ctx._feature_up_signature(
+                "signature": _data_feature_outputs._feature_up_signature(ctx,
                     params, to_path, page._fup_task_id
                 ),
             }
             done += 1
-            ctx._fup_log(
+            _fup_log(ctx,
                 page, f"✓ {name} → {Path(rel).name} ({len(columns)} column(s))"
             )
     finally:
@@ -818,8 +826,8 @@ def _fup_calculate(ctx, page) -> None:
         ctx.project.save()
     page._fup_snapshot = copy.deepcopy(params)
     page._fup_dirty = False
-    ctx._fup_update_save_btn(page)
-    ctx._fup_rebuild_matches(page)
+    _fup_update_save_btn(ctx, page)
+    _fup_rebuild_matches(ctx, page)
 
     summary = f"Calculated {done} file(s)."
     if skipped:
@@ -828,7 +836,7 @@ def _fup_calculate(ctx, page) -> None:
         summary += f" {len(failed)} failed — see the log."
     if status is not None:
         status.setText(summary)
-    ctx._fup_log(page, summary)
+    _fup_log(ctx, page, summary)
     ctx.statusBar().showMessage(summary)
     ctx._module_saved(page)
 
@@ -839,7 +847,7 @@ def _fup_compute_file(ctx, page, to_path):
     import pandas as pd
 
     params = page._fup_params
-    from_path = ctx._fup_matched_from(params, to_path)
+    from_path = _fup_matched_from(ctx, params, to_path)
     if not from_path:
         raise ValueError("no matched From file")
     key_from = params["key_from"]
@@ -851,10 +859,10 @@ def _fup_compute_file(ctx, page, to_path):
     # Build the From lookup table (key -> feature values); the first row
     # wins when a key value repeats. Keys are read as stored (text keys
     # must not be coerced to NaN); feature values are numeric.
-    from_keys = ctx._fup_key_values(page._fup_task_id, from_path, key_from)
+    from_keys = _fup_key_values(ctx, page._fup_task_id, from_path, key_from)
     if from_keys is None:
         raise ValueError(f"'{key_from}' is missing from the From file")
-    fv = ctx._column_data(page._fup_task_id, from_path, sources)
+    fv = _data_columns._column_data(ctx, page._fup_task_id, from_path, sources)
     from_keys = pd.Series(from_keys).astype("object")
     tmp = [f"__fup_src_{j}" for j in range(len(sources))]
     lf = pd.DataFrame({
@@ -864,14 +872,14 @@ def _fup_compute_file(ctx, page, to_path):
     lf = lf[lf["__fup_key"].notna()]
     dup = int(len(lf) - lf.drop_duplicates(subset="__fup_key", keep="first").shape[0])
     if dup:
-        ctx._fup_log(
+        _fup_log(ctx,
             page,
-            f"{ctx._comp_file_name(from_path, page._fup_task_id)}: {dup} duplicate key value(s) "
+            f"{_data_naming._comp_file_name(ctx, from_path, page._fup_task_id)}: {dup} duplicate key value(s) "
             f"— kept the first row.",
         )
     lf = lf.drop_duplicates(subset="__fup_key", keep="first")
 
-    tv = ctx._fup_key_values(page._fup_task_id, to_path, key_to)
+    tv = _fup_key_values(ctx, page._fup_task_id, to_path, key_to)
     if tv is None:
         raise ValueError(f"'{key_to}' is missing from the To file")
     merged = pd.DataFrame({"__fup_key": pd.Series(tv).astype("object")}).merge(
@@ -887,8 +895,8 @@ def _fup_compute_file(ctx, page, to_path):
     # to the whole file (downstream readers expect that), so the sampled
     # rows are scattered back and the rest stays empty — those rows are
     # never read below the Subsample module.
-    n_full = ctx._data_row_count(to_path)
-    index = ctx._subsample_row_index(page._fup_task_id, to_path)
+    n_full = _data_columns._data_row_count(ctx, to_path)
+    index = _data_sampling._subsample_row_index(ctx, page._fup_task_id, to_path)
     if index is not None and row_vals:
         for name in list(row_vals):
             values = row_vals[name]
@@ -897,10 +905,10 @@ def _fup_compute_file(ctx, page, to_path):
                 full[index] = values[: len(index)]
                 row_vals[name] = full
 
-    ent = ctx._ensure_image_index(to_path)
+    ent = _data_image_index._ensure_image_index(ctx, to_path)
     is_image = ent is not None and ent.get("manifest") is not None
     stem = Path(str(to_path)).stem
-    rel = ctx._module_rel(page._fup_task_id, f"{stem}_mapped.parquet")
+    rel = _data_files._module_rel(ctx, page._fup_task_id, f"{stem}_mapped.parquet")
     path = ctx.project.path / rel
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -933,7 +941,7 @@ def _fup_compute_file(ctx, page, to_path):
 
 def _fup_mark_dirty(ctx, page) -> None:
     page._fup_dirty = True
-    ctx._fup_update_save_btn(page)
+    _fup_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -950,8 +958,8 @@ def _fup_save_now(ctx, page) -> None:
         ctx.project.save()
     page._fup_snapshot = copy.deepcopy(params)
     page._fup_dirty = False
-    ctx._fup_update_save_btn(page)
-    ctx._fup_log(page, "Settings saved")
+    _fup_update_save_btn(ctx, page)
+    _fup_log(ctx, page, "Settings saved")
     ctx.statusBar().showMessage("Feature Up settings saved")
     ctx._module_saved(page)
 
@@ -966,7 +974,7 @@ def _fup_close(ctx, page) -> None:
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._fup_cancel = True
-        ctx._fup_log(page, "Stopping after the current file…")
+        _fup_log(ctx, page, "Stopping after the current file…")
         return
     if getattr(page, "_fup_dirty", False):
         reply = QMessageBox.question(

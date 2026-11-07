@@ -9,6 +9,11 @@ from PySide6.QtWidgets import (
 
 from smage.core.constants import MODULE_STATE_MODIFIED
 from smage.widgets.resources import _lock_pixmap
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import naming as _data_naming
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 def _build_subset_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
@@ -23,7 +28,7 @@ def _build_subset_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -39,7 +44,7 @@ def _build_subset_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._subset_close(page))
+    close_btn.clicked.connect(lambda _=False: _subset_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -57,7 +62,7 @@ def _build_subset_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     # only when the user commits it (the document's "Save to take effect").
     page._subset_draft_files = list(params.get("files") or [])
     page._subset_draft_columns = list(params.get("columns") or [])
-    save_btn.clicked.connect(lambda _=False: ctx._subset_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _subset_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -72,20 +77,20 @@ def _build_subset_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._subset_files_panel(page))
-    splitter.addWidget(ctx._subset_columns_panel(page))
+    splitter.addWidget(_subset_files_panel(ctx, page))
+    splitter.addWidget(_subset_columns_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
     splitter.setSizes([440, 440])
     row.addWidget(splitter, 1)
     layout.addWidget(content, 1)
 
-    ctx._subset_refresh(page)
+    _subset_refresh(ctx, page)
     return page
 
 
 def _subset_files_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -107,12 +112,12 @@ def _subset_files_panel(ctx, page) -> QWidget:
     )
     lay.addWidget(box, 1)
     page._subset_files_box = box
-    btn.clicked.connect(lambda _=False: ctx._subset_select_files(page))
+    btn.clicked.connect(lambda _=False: _subset_select_files(ctx, page))
     return panel
 
 
 def _subset_columns_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -135,7 +140,7 @@ def _subset_columns_panel(ctx, page) -> QWidget:
     )
     lay.addWidget(box, 1)
     page._subset_columns_box = box
-    btn.clicked.connect(lambda _=False: ctx._subset_select_columns(page))
+    btn.clicked.connect(lambda _=False: _subset_select_columns(ctx, page))
     return panel
 
 
@@ -146,22 +151,22 @@ def _subset_column_options(ctx, page) -> list:
         # No file filter yet, so every visible file counts as kept.
         paths = [
             rec.get("parquet")
-            for rec in ctx._available_files(page._subset_task_id)
+            for rec in _data_files._available_files(ctx, page._subset_task_id)
         ]
     columns = []
     for path in paths:
-        for name in ctx._columns_for(path, page._subset_task_id):
+        for name in _data_columns._columns_for(ctx, path, page._subset_task_id):
             if name not in columns:
                 columns.append(name)
     return columns
 
 
 def _subset_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._subset_task_id)
+    records = _data_files._available_files(ctx, page._subset_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
-    current = [ctx._comp_file_name(p, page._subset_task_id) for p in page._subset_draft_files]
-    chosen = ctx._pick_items_dialog(
+    current = [_data_naming._comp_file_name(ctx, p, page._subset_task_id) for p in page._subset_draft_files]
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -169,29 +174,29 @@ def _subset_select_files(ctx, page) -> None:
     page._subset_draft_files = [by_name[n] for n in chosen if n in by_name]
     # The column list follows the kept files, so drop selections that are
     # no longer offered by any of them.
-    options = set(ctx._subset_column_options(page))
+    options = set(_subset_column_options(ctx, page))
     page._subset_draft_columns = [
         c for c in page._subset_draft_columns if c in options
     ]
-    ctx._subset_refresh(page)
-    ctx._subset_mark_dirty(page)
+    _subset_refresh(ctx, page)
+    _subset_mark_dirty(ctx, page)
 
 
 def _subset_select_columns(ctx, page) -> None:
-    options = ctx._subset_column_options(page)
+    options = _subset_column_options(ctx, page)
     if not options:
         QMessageBox.information(
             ctx.host, "Select columns", "There are no columns to choose from."
         )
         return
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select columns", options, page._subset_draft_columns, "Filter columns..."
     )
     if chosen is None:
         return
     page._subset_draft_columns = list(chosen)
-    ctx._subset_refresh(page)
-    ctx._subset_mark_dirty(page)
+    _subset_refresh(ctx, page)
+    _subset_mark_dirty(ctx, page)
 
 
 def _subset_refresh(ctx, page) -> None:
@@ -202,7 +207,7 @@ def _subset_refresh(ctx, page) -> None:
     if files_box is not None:
         files_box.clear()
         for path in files:
-            files_box.addItem(ctx._comp_file_name(path, page._subset_task_id))
+            files_box.addItem(_data_naming._comp_file_name(ctx, path, page._subset_task_id))
     if cols_box is not None:
         cols_box.clear()
         for name in columns:
@@ -217,12 +222,12 @@ def _subset_refresh(ctx, page) -> None:
             if columns else "All columns visible"
         )
         summary.setText(f"{file_text} · {col_text}")
-    ctx._subset_update_save_btn(page)
+    _subset_update_save_btn(ctx, page)
 
 
 def _subset_mark_dirty(ctx, page) -> None:
     page._subset_dirty = True
-    ctx._subset_update_save_btn(page)
+    _subset_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -240,7 +245,7 @@ def _subset_save_now(ctx, page) -> None:
     if ctx.project is not None:
         ctx.project.save()
     page._subset_dirty = False
-    ctx._subset_update_save_btn(page)
+    _subset_update_save_btn(ctx, page)
     ctx.statusBar().showMessage("Subset settings saved")
     ctx._module_saved(page)
 

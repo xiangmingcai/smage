@@ -11,6 +11,8 @@ import harness  # noqa: E402
 import _e2e_helpers as e2e  # noqa: E402
 
 from smage.modules.figure.page import _FigurePermuteDialog  # noqa: E402
+from smage.modules.figure import page as _figure_page
+from smage.widgets import picker as _widgets_picker  # noqa: E402
 
 
 def _open(case_id: str):
@@ -33,7 +35,7 @@ def add_plots() -> None:
     try:
         ctx = window._ctx
         harness.eq(page._fig_plots, [])
-        ctx._figure_add_plot(page, "scatter")
+        _figure_page._figure_add_plot(ctx, page, "scatter")
         harness.pump(300)
         harness.eq(len(page._fig_plots), 1)
         harness.eq(len(page._fig_cards), 1)
@@ -43,7 +45,7 @@ def add_plots() -> None:
         harness.check(bool(plot["x"]) and bool(plot["y"]))
         harness.eq(page._fig_selected, [0])
 
-        ctx._figure_add_plot(page, "histogram")
+        _figure_page._figure_add_plot(ctx, page, "histogram")
         harness.pump(250)
         harness.eq(len(page._fig_plots), 2)
         harness.eq(page._fig_plots[1]["type"], "histogram")
@@ -57,16 +59,16 @@ def duplicate_delete() -> None:
     window, _project, page = _open("figure_dup")
     try:
         ctx = window._ctx
-        ctx._figure_add_plot(page, "scatter")
+        _figure_page._figure_add_plot(ctx, page, "scatter")
         harness.pump(250)
-        ctx._figure_duplicate_selected(page)
+        _figure_page._figure_duplicate_selected(ctx, page)
         harness.pump(250)
         harness.eq(len(page._fig_plots), 2)
         harness.eq(len(page._fig_cards), 2)
         harness.eq(page._fig_plots[0]["type"], page._fig_plots[1]["type"])
 
         page._fig_selected = [0]
-        ctx._figure_delete_selected(page)
+        _figure_page._figure_delete_selected(ctx, page)
         harness.pump(250)
         harness.eq(len(page._fig_plots), 1)
         harness.eq(len(page._fig_cards), 1)
@@ -79,14 +81,14 @@ def break_and_save() -> None:
     window, _project, page = _open("figure_save")
     try:
         ctx = window._ctx
-        ctx._figure_add_plot(page, "scatter")
+        _figure_page._figure_add_plot(ctx, page, "scatter")
         harness.pump(250)
         plot = page._fig_plots[0]
         harness.check(not plot.get("break_before"))
-        ctx._figure_toggle_break(page, [0])
+        _figure_page._figure_toggle_break(ctx, page, [0])
         harness.check(page._fig_plots[0].get("break_before"))
 
-        ctx._figure_save_now(page)
+        _figure_page._figure_save_now(ctx, page)
         task = window.project.workflow["tasks"][0]["children"][0]
         harness.eq(len(task["params"]["plots"]), 1)
         harness.check(task["params"]["plots"][0]["break_before"])
@@ -105,8 +107,8 @@ def nxn() -> None:
     window, _project, page = _open("figure_nxn")
     try:
         ctx = window._ctx
-        window._pick_items_dialog = lambda *a, **k: ["x", "y", "FL1-A"]
-        ctx._figure_add_nxn(page)
+        _widgets_picker._pick_items_dialog = lambda *a, **k: ["x", "y", "FL1-A"]
+        _figure_page._figure_add_nxn(ctx, page)
         harness.pump(600)
         harness.eq(len(page._fig_plots), 3, "three variables give three pairs")
         harness.eq(len(page._fig_cards), 3)
@@ -121,7 +123,7 @@ def permute() -> None:
     window, _project, page = _open("figure_permute")
     try:
         ctx = window._ctx
-        ctx._figure_add_plot(page, "scatter")
+        _figure_page._figure_add_plot(ctx, page, "scatter")
         harness.pump(250)
 
         class FakeDialog:
@@ -138,7 +140,7 @@ def permute() -> None:
                 return False
 
         window._figure_permute_dialog = lambda *a, **k: FakeDialog()
-        ctx._figure_permute(page, 0)
+        _figure_page._figure_permute(ctx, page, 0)
         harness.pump(500)
         harness.eq(len(page._fig_plots), 3)
         harness.eq(
@@ -157,7 +159,7 @@ def image_overlay() -> None:
     try:
         page = e2e.open_page(window, "fig-img", "figure", "Figure")
         ctx = window._ctx
-        ctx._figure_add_plot(page, "image")
+        _figure_page._figure_add_plot(ctx, page, "image")
         harness.pump(500)
         harness.eq(page._fig_plots[0]["type"], "image")
         harness.check(bool(page._fig_plots[0].get("layers")),
@@ -168,7 +170,7 @@ def image_overlay() -> None:
             "the image card has a side legend widget",
         )
 
-        ctx._figure_add_plot(page, "overlay")
+        _figure_page._figure_add_plot(ctx, page, "overlay")
         harness.pump(400)
         harness.eq(page._fig_plots[1]["type"], "overlay")
         harness.eq(page._fig_plots[1]["color_mode"], "overlay")
@@ -182,17 +184,17 @@ def box_select() -> None:
     window, _project, page = _open("figure_box")
     try:
         ctx = window._ctx
-        ctx._figure_add_plot(page, "scatter")
+        _figure_page._figure_add_plot(ctx, page, "scatter")
         harness.pump(250)
-        ctx._figure_set_selection(page, [1])
-        ctx._figure_add_plot(page, "histogram")
+        _figure_page._figure_set_selection(ctx, page, [1])
+        _figure_page._figure_add_plot(ctx, page, "histogram")
         harness.pump(250)
 
         bounds = page._fig_scene.itemsBoundingRect().adjusted(-20, -20, 20, 20)
-        ctx._figure_box_select(page, bounds, False)
+        _figure_page._figure_box_select(ctx, page, bounds, False)
         harness.eq(sorted(page._fig_selected), [0, 1])
 
-        positions = ctx._figure_flow_positions(page._fig_cards, page._fig_plots)
+        positions = _figure_page._figure_flow_positions(ctx, page._fig_cards, page._fig_plots)
         harness.eq(len(positions), 2)
     finally:
         _close(window)

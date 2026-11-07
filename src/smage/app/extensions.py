@@ -32,6 +32,9 @@ from smage.extensions_registry import (
 import json
 import queue
 import threading
+from smage.modules.batch_align import page as _batch_align_page
+from smage.modules.cluster import page as _cluster_page
+from smage.widgets import panels as _widgets_panels
 
 
 def _nvidia_cuda_version():
@@ -284,7 +287,7 @@ class ExtensionsMixin:
 
         def show(index):
             stop_timer()
-            self._clear_layout(host.layout())
+            _widgets_panels._clear_layout(self._ctx, host.layout())
             if index < 0:
                 return
             self._ext_detail_panel(host, EXTENSION_DEFS[index])
@@ -311,9 +314,9 @@ class ExtensionsMixin:
         for index in range(1, self.tabs.count()):
             page = self.tabs.widget(index)
             if hasattr(page, "_ba_flowsom_status"):
-                self._ba_update_flowsom_ext(page)
+                _batch_align_page._ba_update_flowsom_ext(self._ctx, page)
             if hasattr(page, "_cluster_ext_hint"):
-                self._cluster_update_ext_state(page)
+                _cluster_page._cluster_update_ext_state(self._ctx, page)
 
     def _ext_detail_panel(self, host, entry) -> None:
         """Build the detail panel for one extension in the manager."""

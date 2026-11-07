@@ -23,6 +23,8 @@ import harness  # noqa: E402
 from smage.modules.gating import page as gating_page  # noqa: E402
 from smage.widgets.gate_editor.canvas import _GatePolygonROI  # noqa: E402
 from smage.widgets.plot_axes import _gate_roi_pens  # noqa: E402
+from smage.data import naming as _data_naming
+from smage.modules.gating import page as gating_page
 
 
 def _open(case_id: str):
@@ -45,7 +47,7 @@ def add_range_gate() -> None:
     try:
         ctx = window._ctx
         harness.eq(page._gating_gates, [])
-        ctx._gating_add_gate(page, "range", (2.0, 8.0))
+        gating_page._gating_add_gate(ctx, page, "range", (2.0, 8.0))
         harness.eq(len(page._gating_gates), 1)
         gate = page._gating_gates[0]
         harness.eq(gate["type"], "range")
@@ -61,7 +63,7 @@ def gate_groups() -> None:
     window, _project, page = _open("gating_groups")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "quadrant", (5.0, 5.0))
+        gating_page._gating_add_gate(ctx, page, "quadrant", (5.0, 5.0))
         harness.eq(len(page._gating_gates), 4)
         quadrants = {gate.get("quadrant") for gate in page._gating_gates}
         harness.eq(quadrants, {1, 2, 3, 4})
@@ -69,7 +71,7 @@ def gate_groups() -> None:
         harness.eq(len(crosshairs), 1)
         harness.check(None not in crosshairs)
 
-        ctx._gating_add_gate(page, "split", (5.0, 0.0))
+        gating_page._gating_add_gate(ctx, page, "split", (5.0, 0.0))
         harness.eq(len(page._gating_gates), 6)
         split_gates = page._gating_gates[4:]
         harness.eq({gate["side"] for gate in split_gates}, {"left", "right"})
@@ -83,9 +85,9 @@ def not_gate() -> None:
     window, _project, page = _open("gating_not")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "range", (2.0, 8.0))
+        gating_page._gating_add_gate(ctx, page, "range", (2.0, 8.0))
         source = page._gating_gates[0]
-        ctx._gating_add_not_gate(page, 0)
+        gating_page._gating_add_not_gate(ctx, page, 0)
         harness.eq(len(page._gating_gates), 2)
         not_gate = page._gating_gates[1]
         harness.eq(not_gate["type"], "not")
@@ -100,12 +102,12 @@ def delete_group() -> None:
     window, _project, page = _open("gating_delete")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "quadrant", (5.0, 5.0))
+        gating_page._gating_add_gate(ctx, page, "quadrant", (5.0, 5.0))
         harness.eq(len(page._gating_gates), 4)
         with harness.patch_dialogs(
             gating_page, question=QMessageBox.StandardButton.Yes
         ):
-            ctx._gating_delete_gate(page, 0, cascade=True)
+            gating_page._gating_delete_gate(ctx, page, 0, cascade=True)
         harness.eq(page._gating_gates, [], "deleting one quadrant deletes the group")
         harness.eq(page._gating_rois, [])
     finally:
@@ -117,9 +119,9 @@ def save_gates() -> None:
     window, project, page = _open("gating_save")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "range", (1.0, 9.0))
-        ctx._gating_add_not_gate(page, 0)
-        ctx._gating_save_now(page)
+        gating_page._gating_add_gate(ctx, page, "range", (1.0, 9.0))
+        gating_page._gating_add_not_gate(ctx, page, 0)
+        gating_page._gating_save_now(ctx, page)
 
         harness.check(not page._gating_dirty)
         path = project.path / "Module" / "g-1" / "gates.json"
@@ -150,19 +152,19 @@ def close_prompt() -> None:
     window, _project, page = _open("gating_close")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "range", (1.0, 9.0))
+        gating_page._gating_add_gate(ctx, page, "range", (1.0, 9.0))
         harness.check(page._gating_dirty)
 
         with harness.patch_dialogs(
             gating_page, question=QMessageBox.StandardButton.No
         ):
-            ctx._gating_close(page)
+            gating_page._gating_close(ctx, page)
         harness.eq(window.tabs.count(), 2, "No keeps the page open")
 
         with harness.patch_dialogs(
             gating_page, question=QMessageBox.StandardButton.Yes
         ):
-            ctx._gating_close(page)
+            gating_page._gating_close(ctx, page)
         harness.eq(window.tabs.count(), 1, "Yes closes without saving")
     finally:
         _close(window)
@@ -176,18 +178,18 @@ def shapes() -> None:
         pens = _gate_roi_pens("#000000")
 
         rect = pg.RectROI((2, 2), (8, 8), **pens)
-        ctx._gating_add_gate(page, "rect", rect)
+        gating_page._gating_add_gate(ctx, page, "rect", rect)
         harness.eq(page._gating_gates[-1]["type"], "rect")
         harness.eq(page._gating_gates[-1]["pos"], [2.0, 2.0])
         harness.eq(page._gating_gates[-1]["size"], [8.0, 8.0])
 
         ellipse = pg.EllipseROI((10, 10), (4, 6), **pens)
-        ctx._gating_add_gate(page, "ellipse", ellipse)
+        gating_page._gating_add_gate(ctx, page, "ellipse", ellipse)
         harness.eq(page._gating_gates[-1]["type"], "ellipse")
         harness.eq(page._gating_gates[-1]["size"], [4.0, 6.0])
 
         polygon = _GatePolygonROI([(0, 0), (5, 0), (5, 5), (0, 5)], **pens)
-        ctx._gating_add_gate(page, "polygon", polygon)
+        gating_page._gating_add_gate(ctx, page, "polygon", polygon)
         harness.eq(page._gating_gates[-1]["type"], "polygon")
         harness.check(len(page._gating_gates[-1]["points"]) >= 3)
         harness.eq(len(page._gating_gates), 3)
@@ -200,9 +202,9 @@ def stats() -> None:
     window, _project, page = _open("gating_stats")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "range", (0.0, 1e12))
+        gating_page._gating_add_gate(ctx, page, "range", (0.0, 1e12))
         gate_id = page._gating_gates[0]["id"]
-        ctx._gating_request_stats(page)
+        gating_page._gating_request_stats(ctx, page)
         harness.wait_for(
             lambda: gate_id in getattr(page, "_gating_last_stats", {}),
             timeout=30,
@@ -220,18 +222,18 @@ def copy_paste() -> None:
     window, _project, page = _open("gating_copy")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "range", (0.0, 5.0))
+        gating_page._gating_add_gate(ctx, page, "range", (0.0, 5.0))
         first = page._gating_gates[0]
-        ctx._gating_copy_gate(page, 0)
-        ctx._gating_paste_gate(page, None)
+        gating_page._gating_copy_gate(ctx, page, 0)
+        gating_page._gating_paste_gate(ctx, page, None)
         harness.eq(len(page._gating_gates), 2)
         copied = page._gating_gates[1]
         harness.check(copied["id"] != first["id"])
         harness.eq(copied["type"], "range")
 
         page._gating_gates[1]["parent"] = first["id"]
-        ctx._gating_copy_branch(page, 0)
-        ctx._gating_paste_branch(page, None)
+        gating_page._gating_copy_branch(ctx, page, 0)
+        gating_page._gating_paste_branch(ctx, page, None)
         harness.eq(len(page._gating_gates), 4)
         new_root = page._gating_gates[2]
         new_child = page._gating_gates[3]
@@ -248,25 +250,25 @@ def per_file() -> None:
         ctx = window._ctx
         parquet = str(project.data_dir / "case.parquet")
         page._gating_files = [parquet]
-        ctx._gating_add_gate(page, "range", (0.0, 5.0))
+        gating_page._gating_add_gate(ctx, page, "range", (0.0, 5.0))
         gate = page._gating_gates[0]
         from smage.core.gates import _gate_group_id
 
         group = _gate_group_id(gate)
-        ctx._gating_toggle_per_file(page, 0)
+        gating_page._gating_toggle_per_file(ctx, page, 0)
         harness.check(group in page._gating_per_file)
 
-        ctx._gating_apply_geometry(page, gate, {"x1": 1.0, "x2": 2.0})
+        gating_page._gating_apply_geometry(ctx, page, gate, {"x1": 1.0, "x2": 2.0})
         harness.eq(page._gating_per_file[group][parquet],
                    {"x1": 1.0, "x2": 2.0})
         harness.eq((gate["x1"], gate["x2"]), (0.0, 5.0),
                    "the shared geometry is unchanged")
 
-        name = ctx._comp_file_name(parquet, page._gating_task_id)
+        name = _data_naming._comp_file_name(ctx, parquet, page._gating_task_id)
         with harness.patch_dialogs(
             gating_page, item=name, item_ok=True
         ):
-            ctx._gating_unify_gate(page, 0)
+            gating_page._gating_unify_gate(ctx, page, 0)
         harness.check(group not in page._gating_per_file,
                       "unify drops the per-file overrides")
         harness.eq((gate["x1"], gate["x2"]), (1.0, 2.0))
@@ -296,11 +298,11 @@ def col2gate() -> None:
     try:
         ctx = window._ctx
         page._gating_files = [str(parquet)]
-        counts = ctx._gating_col2gate_counts(page, "group")
+        counts = gating_page._gating_col2gate_counts(ctx, page, "group")
         harness.eq([value for value, _count in counts], [1, 2, 3])
         harness.eq(sum(count for _value, count in counts), 60)
 
-        ctx._gating_col2gate_generate(page, "group", "Group ", counts)
+        gating_page._gating_col2gate_generate(ctx, page, "group", "Group ", counts)
         harness.eq(len(page._gating_gates), 3)
         harness.eq(
             [gate["name"] for gate in page._gating_gates],
@@ -320,8 +322,8 @@ def and_gate() -> None:
     window, _project, page = _open("gating_and")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "range", (0.0, 5.0))
-        ctx._gating_add_gate(page, "range", (2.0, 8.0))
+        gating_page._gating_add_gate(ctx, page, "range", (0.0, 5.0))
+        gating_page._gating_add_gate(ctx, page, "range", (2.0, 8.0))
 
         def accept() -> None:
             for widget in QApplication.topLevelWidgets():
@@ -337,7 +339,7 @@ def and_gate() -> None:
                 return
 
         QTimer.singleShot(0, accept)
-        ctx._gating_add_boolean_gate(page, 0, "and")
+        gating_page._gating_add_boolean_gate(ctx, page, 0, "and")
         harness.eq(len(page._gating_gates), 3)
         boolean = page._gating_gates[-1]
         harness.eq(boolean["type"], "and")
@@ -352,15 +354,15 @@ def subset_view() -> None:
     window, _project, page = _open("gating_subset")
     try:
         ctx = window._ctx
-        ctx._gating_add_gate(page, "range", (0.0, 5.0))
+        gating_page._gating_add_gate(ctx, page, "range", (0.0, 5.0))
         gate = page._gating_gates[0]
-        ctx._gating_open_gate_subset(page, gate["id"])
+        gating_page._gating_open_gate_subset(ctx, page, gate["id"])
         harness.eq(page._gating_parent_id, gate["id"])
         harness.eq(page._gating_active_gate_id, gate["id"])
         harness.check(page._gating_tree.selectedItems(),
                       "the gate is selected in the tree")
 
-        ctx._gating_open_gate_subset(page, "missing")
+        gating_page._gating_open_gate_subset(ctx, page, "missing")
         harness.eq(page._gating_parent_id, None)
         harness.eq(page._gating_active_gate_id, None)
     finally:

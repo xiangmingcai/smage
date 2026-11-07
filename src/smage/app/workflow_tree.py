@@ -41,6 +41,10 @@ from smage.widgets.resources import (
 )
 from uuid import uuid4
 import copy
+from smage.data import files as _data_files
+from smage.data import stores as _data_stores
+from smage.modules.import_ import page as _import__page
+from smage.modules.rename import page as _rename_page
 
 
 class _ModuleChip(QFrame):
@@ -661,7 +665,7 @@ class WorkflowTreeMixin:
         menu.addSeparator()
 
         rename_action = QAction("Rename", self)
-        rename_action.triggered.connect(lambda: self._rename_task(task_def))
+        rename_action.triggered.connect(lambda: _rename_page._rename_task(self._ctx, task_def))
         menu.addAction(rename_action)
 
         # Manual lock: a locked module opens as a temporary draft and can only
@@ -693,7 +697,7 @@ class WorkflowTreeMixin:
         copied = copy.deepcopy(task_def)
         if not with_branch:
             copied["children"] = []
-        self._attach_gating_stores(copied)
+        _data_stores._attach_gating_stores(self._ctx, copied)
         self._clipboard = copied
 
     def _reset_pasted_outputs(self, task: dict) -> None:
@@ -778,14 +782,14 @@ class WorkflowTreeMixin:
             if node.get("type") != "gate2col":
                 continue
             rules = (node.get("params") or {}).get("rules") or []
-            chain = self._task_chain(node.get("id"))
+            chain = _data_files._task_chain(self._ctx, node.get("id"))
             gating_tasks = [
                 t for t in chain[:-1] if t.get("type") == "gating"
             ]
             known = {t.get("id") for t in gating_tasks}
             gate_owner = {}
             for owner in reversed(gating_tasks):  # nearest ancestor first
-                for gate in self._gating_gates_for(owner):
+                for gate in _data_stores._gating_gates_for(self._ctx, owner):
                     gate_owner.setdefault(gate.get("id"), owner.get("id"))
             for rule in rules:
                 current = rule.get("gate_task")
@@ -811,7 +815,7 @@ class WorkflowTreeMixin:
         self._remap_pasted_paths(new_task, mapping)
         task_def.setdefault("children", []).append(new_task)
         self._remap_pasted_refs(new_task, mapping)
-        self._restore_gating_stores(new_task, mapping)
+        _data_stores._restore_gating_stores(self._ctx, new_task, mapping)
         if self.project is not None:
             self.project.save()
         self._refresh_workflow_tree()
@@ -911,7 +915,7 @@ class WorkflowTreeMixin:
         makes a released lock (e.g. after deleting a Segmentation module)
         take effect immediately.
         """
-        task = self._import_task()
+        task = _data_files._import_task(self._ctx)
         if task is None or self.project is None:
             return
         task_id = task.get("id")
@@ -919,9 +923,9 @@ class WorkflowTreeMixin:
             page = self.tabs.widget(index)
             if page.property("task_id") != task_id:
                 continue
-            if getattr(page, "_import_locked_state", None) == self._import_locked():
+            if getattr(page, "_import_locked_state", None) == _import__page._import_locked(self._ctx):
                 return
-            fresh = self._build_data_import_page()
+            fresh = _import__page._build_data_import_page(self._ctx)
             fresh.setProperty("task_id", task_id)
             title = self.tabs.tabText(index)
             self.tabs.removeTab(index)
@@ -1070,7 +1074,7 @@ class WorkflowTreeMixin:
         force = {str(new_task["id"])}
         parent_id = parent_task_def.get("id")
         if parent_id:
-            force |= {str(t.get("id")) for t in self._task_chain(parent_id)}
+            force |= {str(t.get("id")) for t in _data_files._task_chain(self._ctx, parent_id)}
         self._tree_force_expand = force
         if self.project is not None:
             self.project.save()

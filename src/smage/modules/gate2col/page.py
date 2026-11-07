@@ -38,6 +38,15 @@ from smage.data.image_index import _build_image_index_files
 from smage.widgets.controls import _NoWheelComboBox
 from smage.widgets.resources import _lock_pixmap
 import copy
+from smage.data import columns as _data_columns
+from smage.data import feature_outputs as _data_feature_outputs
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import sampling as _data_sampling
+from smage.data import stores as _data_stores
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 def _build_gate2col_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
@@ -52,7 +61,7 @@ def _build_gate2col_page(ctx, name: str, task_def: dict, locked: bool) -> QWidge
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -68,7 +77,7 @@ def _build_gate2col_page(ctx, name: str, task_def: dict, locked: bool) -> QWidge
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._g2c_close(page))
+    close_btn.clicked.connect(lambda _=False: _g2c_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -88,7 +97,7 @@ def _build_gate2col_page(ctx, name: str, task_def: dict, locked: bool) -> QWidge
     page._g2c_log_lines = list(params.get("log") or [])
     page._g2c_running = False
     page._g2c_cancel = False
-    save_btn.clicked.connect(lambda _=False: ctx._g2c_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _g2c_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -98,23 +107,23 @@ def _build_gate2col_page(ctx, name: str, task_def: dict, locked: bool) -> QWidge
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._g2c_files_panel(page))
-    splitter.addWidget(ctx._g2c_rules_panel(page))
+    splitter.addWidget(_g2c_files_panel(ctx, page))
+    splitter.addWidget(_g2c_rules_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 2)
     splitter.setSizes([300, 620])
     row.addWidget(splitter, 1)
 
-    row.addWidget(ctx._g2c_log_panel(page))
+    row.addWidget(_g2c_log_panel(ctx, page))
     layout.addWidget(content, 1)
 
-    ctx._g2c_refresh_files(page)
-    ctx._g2c_update_save_btn(page)
+    _g2c_refresh_files(ctx, page)
+    _g2c_update_save_btn(ctx, page)
     return page
 
 
 def _g2c_log_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -158,12 +167,12 @@ def _g2c_gate_options(ctx, page):
     """Enumerate every gate of every upstream Gating module."""
     opts = []
     gating_tasks = [
-        t for t in ctx._task_chain(page._g2c_task_id)
+        t for t in _data_files._task_chain(ctx, page._g2c_task_id)
         if t.get("id") != page._g2c_task_id and t.get("type") == "gating"
     ]
     multi = len(gating_tasks) > 1
     for task in gating_tasks:
-        gates = ctx._gating_gates_for(task)
+        gates = _data_stores._gating_gates_for(ctx, task)
         by_id = {g["id"]: g for g in gates}
         for gate in gates:
             chain = _gate_chain(gates, gate["id"])
@@ -196,7 +205,7 @@ def _g2c_gate_mask(ctx, gate_task_id, gates, gate_id, parquet_path):
         needed |= _gate_needed_columns(g, by_id)
     if not needed:
         return None
-    values = ctx._column_data(gate_task_id, parquet_path, list(needed))
+    values = _data_columns._column_data(ctx, gate_task_id, parquet_path, list(needed))
     if not values:
         return None
     try:
@@ -212,7 +221,7 @@ def _g2c_gate_mask(ctx, gate_task_id, gates, gate_id, parquet_path):
 
 
 def _g2c_files_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -240,16 +249,16 @@ def _g2c_files_panel(ctx, page) -> QWidget:
     lay.addWidget(table, 1)
     page._g2c_files_table = table
     page._g2c_count_label = count
-    select_btn.clicked.connect(lambda _=False: ctx._g2c_select_files(page))
+    select_btn.clicked.connect(lambda _=False: _g2c_select_files(ctx, page))
     return panel
 
 
 def _g2c_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._g2c_task_id)
+    records = _data_files._available_files(ctx, page._g2c_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
-    current = [ctx._comp_file_name(p, page._g2c_task_id) for p in page._g2c_params.get("files") or []]
-    chosen = ctx._pick_items_dialog(
+    current = [_data_naming._comp_file_name(ctx, p, page._g2c_task_id) for p in page._g2c_params.get("files") or []]
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -257,7 +266,7 @@ def _g2c_select_files(ctx, page) -> None:
     # Reject a file that lacks the columns needed by an already-selected gate.
     rules = page._g2c_params.get("rules") or []
     selected_opts = [
-        o for o in ctx._g2c_gate_options(page)
+        o for o in _g2c_gate_options(ctx, page)
         if any(r.get("gate_task") == o["gate_task"] and r.get("gate_id") == o["gate_id"]
                for r in rules)
     ]
@@ -267,7 +276,7 @@ def _g2c_select_files(ctx, page) -> None:
         path = by_name.get(name)
         if path is None:
             continue
-        cols = set(ctx._columns_for(path, page._g2c_task_id))
+        cols = set(_data_columns._columns_for(ctx, path, page._g2c_task_id))
         missing = [
             o["label"] for o in selected_opts if not (o["needed"] <= cols)
         ]
@@ -282,8 +291,8 @@ def _g2c_select_files(ctx, page) -> None:
             "needed by the selected gates:\n" + "\n".join(rejected),
         )
     page._g2c_params["files"] = accepted
-    ctx._g2c_refresh_files(page)
-    ctx._g2c_mark_dirty(page)
+    _g2c_refresh_files(ctx, page)
+    _g2c_mark_dirty(ctx, page)
 
 
 def _g2c_file_status(ctx, page, parquet_path) -> str:
@@ -295,7 +304,7 @@ def _g2c_file_status(ctx, page, parquet_path) -> str:
         return "Not converted"
     if not (ctx.project.path / rec["path"]).is_file():
         return "Not converted"
-    if rec.get("signature") != ctx._gate2col_signature(
+    if rec.get("signature") != _data_feature_outputs._gate2col_signature(ctx,
         params, parquet_path, page._g2c_task_id
     ):
         return "Not converted"
@@ -310,7 +319,7 @@ def _g2c_refresh_files(ctx, page) -> None:
         table.setRowCount(len(files))
         for i, path in enumerate(files):
             missing = not Path(str(path)).is_file()
-            label = ctx._comp_file_name(path, page._g2c_task_id)
+            label = _data_naming._comp_file_name(ctx, path, page._g2c_task_id)
             if missing:
                 label += "  (missing)"
             item = QTableWidgetItem(label)
@@ -322,7 +331,7 @@ def _g2c_refresh_files(ctx, page) -> None:
                     "created it, or select files again."
                 )
             table.setItem(i, 0, item)
-            status = "File missing" if missing else ctx._g2c_file_status(page, path)
+            status = "File missing" if missing else _g2c_file_status(ctx, page, path)
             sitem = QTableWidgetItem(status)
             sitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
             if missing:
@@ -336,11 +345,11 @@ def _g2c_refresh_files(ctx, page) -> None:
     count = getattr(page, "_g2c_count_label", None)
     if count is not None:
         count.setText(f"{len(files)} file(s) selected")
-    ctx._g2c_rebuild_rules(page)
+    _g2c_rebuild_rules(ctx, page)
 
 
 def _g2c_rules_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -381,16 +390,16 @@ def _g2c_rules_panel(ctx, page) -> QWidget:
     page._g2c_calc_btn = calc_btn
     page._g2c_calc_status = status
 
-    add_btn.clicked.connect(lambda _=False: ctx._g2c_add_rule(page))
-    del_btn.clicked.connect(lambda _=False: ctx._g2c_delete_rule(page))
-    calc_btn.clicked.connect(lambda _=False: ctx._g2c_calculate(page))
+    add_btn.clicked.connect(lambda _=False: _g2c_add_rule(ctx, page))
+    del_btn.clicked.connect(lambda _=False: _g2c_delete_rule(ctx, page))
+    calc_btn.clicked.connect(lambda _=False: _g2c_calculate(ctx, page))
     return panel
 
 
 def _g2c_add_rule(ctx, page) -> None:
     page._g2c_params["rules"].append({"gate_task": None, "gate_id": None, "name": ""})
-    ctx._g2c_refresh_rules(page)
-    ctx._g2c_mark_dirty(page)
+    _g2c_refresh_rules(ctx, page)
+    _g2c_mark_dirty(ctx, page)
 
 
 def _g2c_delete_rule(ctx, page) -> None:
@@ -399,20 +408,20 @@ def _g2c_delete_rule(ctx, page) -> None:
     rules = page._g2c_params["rules"]
     if 0 <= row < len(rules):
         del rules[row]
-        ctx._g2c_refresh_rules(page)
-        ctx._g2c_mark_dirty(page)
+        _g2c_refresh_rules(ctx, page)
+        _g2c_mark_dirty(ctx, page)
 
 
 def _g2c_existing_columns(ctx, page) -> set:
     cols = set()
     for path in page._g2c_params.get("files") or []:
-        cols |= set(ctx._columns_for(path, page._g2c_task_id))
+        cols |= set(_data_columns._columns_for(ctx, path, page._g2c_task_id))
     return cols
 
 
 def _g2c_duplicate_names(ctx, page) -> set:
     """Set of new-column names that are duplicated or clash with a file column."""
-    existing = ctx._g2c_existing_columns(page)
+    existing = _g2c_existing_columns(ctx, page)
     dup = set()
     seen = set()
     for rule in page._g2c_params.get("rules") or []:
@@ -431,20 +440,20 @@ def _g2c_rebuild_rules(ctx, page) -> None:
         return
     params = page._g2c_params
     rules = params.get("rules") or []
-    opts = ctx._g2c_gate_options(page)
+    opts = _g2c_gate_options(ctx, page)
     enabled = not page._g2c_locked
-    dup_names = ctx._g2c_duplicate_names(page)
+    dup_names = _g2c_duplicate_names(ctx, page)
 
     table.blockSignals(True)
     table.setRowCount(0)
     table.setRowCount(len(rules))
 
     def mark():
-        ctx._g2c_mark_dirty(page)
-        ctx._g2c_refresh_statuses(page)
+        _g2c_mark_dirty(ctx, page)
+        _g2c_refresh_statuses(ctx, page)
 
     def rebuild_soon():
-        QTimer.singleShot(0, lambda: ctx._g2c_rebuild_rules(page))
+        QTimer.singleShot(0, lambda: _g2c_rebuild_rules(ctx, page))
 
     for i, rule in enumerate(rules):
         combo = _NoWheelComboBox()
@@ -492,7 +501,7 @@ def _g2c_rebuild_rules(ctx, page) -> None:
             r["name"] = text.strip()
             mark()
             warn_label.setVisible(
-                (r.get("name") or "").strip() in ctx._g2c_duplicate_names(page)
+                (r.get("name") or "").strip() in _g2c_duplicate_names(ctx, page)
             )
 
         name_edit.textEdited.connect(lambda t, cb=on_name: cb(t))
@@ -505,7 +514,7 @@ def _g2c_rebuild_rules(ctx, page) -> None:
 
 
 def _g2c_refresh_rules(ctx, page) -> None:
-    ctx._g2c_rebuild_rules(page)
+    _g2c_rebuild_rules(ctx, page)
 
 
 def _g2c_refresh_statuses(ctx, page) -> None:
@@ -516,7 +525,7 @@ def _g2c_refresh_statuses(ctx, page) -> None:
     for i, path in enumerate(files):
         if i >= table.rowCount():
             break
-        status = ctx._g2c_file_status(page, path)
+        status = _g2c_file_status(ctx, page, path)
         item = table.item(i, 1)
         if item is None:
             item = QTableWidgetItem()
@@ -530,7 +539,7 @@ def _g2c_refresh_statuses(ctx, page) -> None:
 
 def _g2c_mark_dirty(ctx, page) -> None:
     page._g2c_dirty = True
-    ctx._g2c_update_save_btn(page)
+    _g2c_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -547,8 +556,8 @@ def _g2c_save_now(ctx, page) -> None:
         ctx.project.save()
     page._g2c_snapshot = copy.deepcopy(params)
     page._g2c_dirty = False
-    ctx._g2c_update_save_btn(page)
-    ctx._g2c_log(page, "Settings saved")
+    _g2c_update_save_btn(ctx, page)
+    _g2c_log(ctx, page, "Settings saved")
     ctx.statusBar().showMessage("Gate2Col settings saved")
     ctx._module_saved(page)
 
@@ -560,7 +569,7 @@ def _g2c_validate(ctx, page):
     rules = params.get("rules") or []
     if not rules:
         return False, "Add at least one gate to convert."
-    existing = ctx._g2c_existing_columns(page)
+    existing = _g2c_existing_columns(ctx, page)
     names = []
     for i, rule in enumerate(rules):
         if not rule.get("gate_task") or not rule.get("gate_id"):
@@ -577,7 +586,7 @@ def _g2c_validate(ctx, page):
 
 
 def _g2c_calculate(ctx, page) -> None:
-    ok, message = ctx._g2c_validate(page)
+    ok, message = _g2c_validate(ctx, page)
     if not ok:
         QMessageBox.warning(ctx.host, "Convert", message)
         return
@@ -606,33 +615,33 @@ def _g2c_calculate(ctx, page) -> None:
     try:
         for path in selected:
             if getattr(page, "_g2c_cancel", False):
-                ctx._g2c_log(page, "Conversion cancelled.")
+                _g2c_log(ctx, page, "Conversion cancelled.")
                 break
-            name = ctx._comp_file_name(path, page._g2c_task_id)
+            name = _data_naming._comp_file_name(ctx, path, page._g2c_task_id)
             if status is not None:
                 status.setText(f"Converting… {name}")
             QApplication.processEvents()
             if not Path(str(path)).is_file():
                 outputs.pop(path, None)
                 failed.append(f"{name}: file not found")
-                ctx._g2c_log(page, f"✗ {name}: file not found — skipped")
+                _g2c_log(ctx, page, f"✗ {name}: file not found — skipped")
                 continue
             try:
-                rel, columns, kind = ctx._g2c_compute_file(page, path)
+                rel, columns, kind = _g2c_compute_file(ctx, page, path)
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{name}: {exc}")
-                ctx._g2c_log(page, f"✗ {name}: {exc}")
+                _g2c_log(ctx, page, f"✗ {name}: {exc}")
                 continue
             outputs[path] = {
                 "path": rel,
                 "columns": columns,
                 "kind": kind,
-                "signature": ctx._gate2col_signature(
+                "signature": _data_feature_outputs._gate2col_signature(ctx,
                     params, path, page._g2c_task_id
                 ),
             }
             done += 1
-            ctx._g2c_log(
+            _g2c_log(ctx,
                 page, f"✓ {name} → {Path(rel).name} ({len(columns)} column(s))"
             )
     finally:
@@ -649,21 +658,21 @@ def _g2c_calculate(ctx, page) -> None:
         ctx.project.save()
     page._g2c_snapshot = copy.deepcopy(params)
     page._g2c_dirty = False
-    ctx._g2c_update_save_btn(page)
-    ctx._g2c_refresh_files(page)
+    _g2c_update_save_btn(ctx, page)
+    _g2c_refresh_files(ctx, page)
 
     summary = f"Converted {done} file(s)."
     if failed:
         summary += f" {len(failed)} failed — see the log."
     if status is not None:
         status.setText(summary)
-    ctx._g2c_log(page, summary)
+    _g2c_log(ctx, page, summary)
     ctx.statusBar().showMessage(summary)
     ctx._module_saved(page)
 
 
 def _g2c_row_count(ctx, parquet_path) -> int:
-    return ctx._data_row_count(parquet_path)
+    return _data_columns._data_row_count(ctx, parquet_path)
 
 
 def _g2c_compute_file(ctx, page, parquet_path):
@@ -673,15 +682,15 @@ def _g2c_compute_file(ctx, page, parquet_path):
 
     params = page._g2c_params
     rules = params.get("rules") or []
-    opts = ctx._g2c_gate_options(page)
+    opts = _g2c_gate_options(ctx, page)
     by_key = {(o["gate_task"], o["gate_id"]): o for o in opts}
 
     # A gate is evaluated row by row, so restricting the work to the rows a
     # Subsample module keeps gives the same values. The output file stays
     # row-aligned to the whole source; rows hidden by sampling hold 0 and
     # are never read below the Subsample module.
-    n_full = ctx._data_row_count(parquet_path)
-    index = ctx._subsample_row_index(page._g2c_task_id, parquet_path)
+    n_full = _data_columns._data_row_count(ctx, parquet_path)
+    index = _data_sampling._subsample_row_index(ctx, page._g2c_task_id, parquet_path)
     cols = []
     for rule in rules:
         opt = by_key.get((rule.get("gate_task"), rule.get("gate_id")))
@@ -689,10 +698,10 @@ def _g2c_compute_file(ctx, page, parquet_path):
             raise ValueError(f"gate not found for '{rule.get('name')}'")
         gating_task = ctx._find_task_by_id(opt["gate_task"])
         gates = (
-            ctx._gating_gates_for(gating_task, parquet_path)
+            _data_stores._gating_gates_for(ctx, gating_task, parquet_path)
             if gating_task is not None else opt["gates"]
         )
-        mask = ctx._g2c_gate_mask(
+        mask = _g2c_gate_mask(ctx,
             opt["gate_task"], gates, opt["gate_id"], parquet_path
         )
         if mask is None:
@@ -706,10 +715,10 @@ def _g2c_compute_file(ctx, page, parquet_path):
             mask = full
         cols.append((rule["name"], mask))
 
-    ent = ctx._ensure_image_index(parquet_path)
+    ent = _data_image_index._ensure_image_index(ctx, parquet_path)
     is_image = ent is not None and ent.get("manifest") is not None
     stem = Path(str(parquet_path)).stem
-    rel = ctx._module_rel(page._g2c_task_id, f"{stem}_gates.parquet")
+    rel = _data_files._module_rel(ctx, page._g2c_task_id, f"{stem}_gates.parquet")
     path = ctx.project.path / rel
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -752,7 +761,7 @@ def _g2c_close(ctx, page) -> None:
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._g2c_cancel = True
-        ctx._g2c_log(page, "Stopping after the current file…")
+        _g2c_log(ctx, page, "Stopping after the current file…")
         return
     if getattr(page, "_g2c_dirty", False):
         reply = QMessageBox.question(

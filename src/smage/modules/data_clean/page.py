@@ -36,6 +36,15 @@ import json
 import math
 import queue
 import threading
+from functools import partial
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import outputs as _data_outputs
+from smage.data import sampling as _data_sampling
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 _DC_MODES = [
@@ -64,9 +73,9 @@ def _dc_signature(ctx, params, parquet_path, task_id=None) -> str:
         "name": params.get("name"),
         "source": str(parquet_path),
         "stat": stat,
-        "stages": ctx._map_stage_token(task_id),
+        "stages": _data_columns._map_stage_token(ctx, task_id),
     }
-    sample = ctx._subsample_sig(task_id, parquet_path)
+    sample = _data_sampling._subsample_sig(ctx, task_id, parquet_path)
     if sample:
         payload["sample"] = sample
     return hashlib.sha1(
@@ -87,7 +96,7 @@ def _dc_params_for(ctx, task_def) -> dict:
 
 def _dc_column_values(ctx, parquet_path, rec, name):
     """Row-aligned float64 values of one Data Clean column."""
-    return ctx._cluster_column_values(parquet_path, rec, name)
+    return _data_outputs._cluster_column_values(ctx, parquet_path, rec, name)
 
 
 def _build_dc_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
@@ -102,7 +111,7 @@ def _build_dc_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -118,7 +127,7 @@ def _build_dc_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._dc_close(page))
+    close_btn.clicked.connect(lambda _=False: _dc_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -149,7 +158,7 @@ def _build_dc_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._dc_running = False
     page._dc_cancel = False
     page._dc_updating = False
-    save_btn.clicked.connect(lambda _=False: ctx._dc_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _dc_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -159,24 +168,24 @@ def _build_dc_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._dc_left_panel(page))
-    splitter.addWidget(ctx._dc_center_panel(page))
-    splitter.addWidget(ctx._dc_right_panel(page))
+    splitter.addWidget(_dc_left_panel(ctx, page))
+    splitter.addWidget(_dc_center_panel(ctx, page))
+    splitter.addWidget(_dc_right_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
     splitter.setStretchFactor(2, 1)
     splitter.setSizes([320, 320, 400])
     row.addWidget(splitter, 1)
 
-    row.addWidget(ctx._dc_log_panel(page))
+    row.addWidget(_dc_log_panel(ctx, page))
     layout.addWidget(content, 1)
 
-    ctx._dc_refresh(page)
+    _dc_refresh(ctx, page)
     return page
 
 
 def _dc_log_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -213,7 +222,7 @@ def _dc_log(ctx, page, text) -> None:
 
 
 def _dc_left_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -248,12 +257,12 @@ def _dc_left_panel(ctx, page) -> QWidget:
     lay.addWidget(files_count)
     page._dc_files_count = files_count
 
-    files_btn.clicked.connect(lambda _=False: ctx._dc_select_files(page))
+    files_btn.clicked.connect(lambda _=False: _dc_select_files(ctx, page))
     return panel
 
 
 def _dc_center_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -304,15 +313,15 @@ def _dc_center_panel(ctx, page) -> QWidget:
     lay.addWidget(vars_count)
     page._dc_vars_count = vars_count
 
-    vars_btn.clicked.connect(lambda _=False: ctx._dc_select_vars(page))
+    vars_btn.clicked.connect(lambda _=False: _dc_select_vars(ctx, page))
     time_combo.currentIndexChanged.connect(
-        lambda _=0: ctx._dc_on_time(page)
+        lambda _=0: _dc_on_time(ctx, page)
     )
     return panel
 
 
 def _dc_right_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -324,7 +333,7 @@ def _dc_right_panel(ctx, page) -> QWidget:
         mode.addItem(label, value)
     mode.setEnabled(not page._dc_locked)
     lay.addWidget(mode)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "All runs both checks and keeps the union of their flags; each "
         "single mode uses only that check."
     ))
@@ -344,7 +353,7 @@ def _dc_right_panel(ctx, page) -> QWidget:
     mad.setValue(6.0)
     grid.addWidget(mad, row, 1)
     row += 1
-    grid.addWidget(ctx._param_hint(
+    grid.addWidget(_widgets_panels._param_hint(ctx,
         "How many MADs a bin may deviate before it is removed. Lower = "
         "stricter."
     ), row, 0, 1, 2)
@@ -357,7 +366,7 @@ def _dc_right_panel(ctx, page) -> QWidget:
     it_limit.setValue(0.6)
     grid.addWidget(it_limit, row, 1)
     row += 1
-    grid.addWidget(ctx._param_hint(
+    grid.addWidget(_widgets_panels._param_hint(ctx,
         "Isolation Tree gain limit. Lower = stricter; skipped when there "
         "are too few bins."
     ), row, 0, 1, 2)
@@ -368,7 +377,7 @@ def _dc_right_panel(ctx, page) -> QWidget:
     consecutive.setValue(5)
     grid.addWidget(consecutive, row, 1)
     row += 1
-    grid.addWidget(ctx._param_hint(
+    grid.addWidget(_widgets_panels._param_hint(ctx,
         "Also drop runs of up to this many consecutive bad bins."
     ), row, 0, 1, 2)
     row += 1
@@ -378,7 +387,7 @@ def _dc_right_panel(ctx, page) -> QWidget:
     min_cells.setValue(150)
     grid.addWidget(min_cells, row, 1)
     row += 1
-    grid.addWidget(ctx._param_hint(
+    grid.addWidget(_widgets_panels._param_hint(ctx,
         "Smallest bin the statistics are computed on; larger = more stable "
         "but fewer bins."
     ), row, 0, 1, 2)
@@ -391,7 +400,7 @@ def _dc_right_panel(ctx, page) -> QWidget:
     remove_zeros = QCheckBox("Remove zeros before peak detection")
     remove_zeros.setEnabled(not page._dc_locked)
     lay.addWidget(remove_zeros)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Ignore zero values when locating the peaks (useful for "
         "sparse/low-background channels)."
     ))
@@ -428,14 +437,14 @@ def _dc_right_panel(ctx, page) -> QWidget:
         widget.setEnabled(not page._dc_locked)
     name_edit.setEnabled(not page._dc_locked)
 
-    mode.currentIndexChanged.connect(lambda _=0: ctx._dc_on_mode(page))
-    mad.valueChanged.connect(lambda _=0.0: ctx._dc_on_param(page))
-    it_limit.valueChanged.connect(lambda _=0.0: ctx._dc_on_param(page))
-    consecutive.valueChanged.connect(lambda _=0: ctx._dc_on_param(page))
-    min_cells.valueChanged.connect(lambda _=0: ctx._dc_on_param(page))
-    remove_zeros.toggled.connect(lambda _=0: ctx._dc_on_param(page))
-    name_edit.textEdited.connect(lambda _=0: ctx._dc_on_name(page))
-    calc_btn.clicked.connect(lambda _=False: ctx._dc_calculate(page))
+    mode.currentIndexChanged.connect(lambda _=0: _dc_on_mode(ctx, page))
+    mad.valueChanged.connect(lambda _=0.0: _dc_on_param(ctx, page))
+    it_limit.valueChanged.connect(lambda _=0.0: _dc_on_param(ctx, page))
+    consecutive.valueChanged.connect(lambda _=0: _dc_on_param(ctx, page))
+    min_cells.valueChanged.connect(lambda _=0: _dc_on_param(ctx, page))
+    remove_zeros.toggled.connect(lambda _=0: _dc_on_param(ctx, page))
+    name_edit.textEdited.connect(lambda _=0: _dc_on_name(ctx, page))
+    calc_btn.clicked.connect(lambda _=False: _dc_calculate(ctx, page))
     return panel
 
 
@@ -443,27 +452,27 @@ def _dc_common_columns(ctx, page) -> list:
     files = page._dc_params.get("files") or []
     if not files:
         return []
-    common = set(ctx._columns_for(files[0], page._dc_task_id))
+    common = set(_data_columns._columns_for(ctx, files[0], page._dc_task_id))
     for path in files[1:]:
-        common &= set(ctx._columns_for(path, page._dc_task_id))
+        common &= set(_data_columns._columns_for(ctx, path, page._dc_task_id))
     return sorted(common)
 
 
 def _dc_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._dc_task_id)
+    records = _data_files._available_files(ctx, page._dc_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     current = [
-        ctx._comp_file_name(p, page._dc_task_id)
+        _data_naming._comp_file_name(ctx, p, page._dc_task_id)
         for p in page._dc_params.get("files") or []
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
         return
     page._dc_params["files"] = [by_name[n] for n in chosen if n in by_name]
-    common = set(ctx._dc_common_columns(page))
+    common = set(_dc_common_columns(ctx, page))
     time_col = page._dc_params.get("time") or ""
     if time_col not in common:
         time_col = next((c for c in common if c.lower() == "time"), "")
@@ -472,13 +481,13 @@ def _dc_select_files(ctx, page) -> None:
         c for c in page._dc_params.get("columns") or []
         if c in common and c != time_col
     ]
-    ctx._dc_refresh(page)
-    ctx._dc_mark_dirty(page)
+    _dc_refresh(ctx, page)
+    _dc_mark_dirty(ctx, page)
 
 
 def _dc_select_vars(ctx, page) -> None:
     options = [
-        c for c in ctx._dc_common_columns(page)
+        c for c in _dc_common_columns(ctx, page)
         if c != (page._dc_params.get("time") or "")
     ]
     if not options:
@@ -487,15 +496,15 @@ def _dc_select_vars(ctx, page) -> None:
             "Select data files with common columns first."
         )
         return
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select variables", options,
         page._dc_params.get("columns") or [], "Filter variables...",
     )
     if chosen is None:
         return
     page._dc_params["columns"] = list(chosen)
-    ctx._dc_refresh(page)
-    ctx._dc_mark_dirty(page)
+    _dc_refresh(ctx, page)
+    _dc_mark_dirty(ctx, page)
 
 
 def _dc_on_time(ctx, page) -> None:
@@ -507,15 +516,15 @@ def _dc_on_time(ctx, page) -> None:
         page._dc_params["columns"] = [
             c for c in page._dc_params["columns"] if c != value
         ]
-        ctx._dc_refresh(page)
-    ctx._dc_mark_dirty(page)
+        _dc_refresh(ctx, page)
+    _dc_mark_dirty(ctx, page)
 
 
 def _dc_on_mode(ctx, page) -> None:
     if getattr(page, "_dc_updating", False):
         return
     page._dc_params["mode"] = page._dc_mode.currentData() or "all"
-    ctx._dc_mark_dirty(page)
+    _dc_mark_dirty(ctx, page)
 
 
 def _dc_on_param(ctx, page) -> None:
@@ -526,21 +535,21 @@ def _dc_on_param(ctx, page) -> None:
     page._dc_params["consecutive_bins"] = int(page._dc_consecutive.value())
     page._dc_params["min_cells"] = int(page._dc_min_cells.value())
     page._dc_params["remove_zeros"] = bool(page._dc_remove_zeros.isChecked())
-    ctx._dc_mark_dirty(page)
+    _dc_mark_dirty(ctx, page)
 
 
 def _dc_on_name(ctx, page) -> None:
     if getattr(page, "_dc_updating", False):
         return
     page._dc_params["name"] = page._dc_name.text().strip()
-    ctx._dc_mark_dirty(page)
-    ctx._dc_update_name(page)
+    _dc_mark_dirty(ctx, page)
+    _dc_update_name(ctx, page)
 
 
 def _dc_existing_columns(ctx, page) -> set:
     cols = set()
     for path in page._dc_params.get("files") or []:
-        cols |= set(ctx._columns_for(path, page._dc_task_id))
+        cols |= set(_data_columns._columns_for(ctx, path, page._dc_task_id))
     return cols
 
 
@@ -548,12 +557,12 @@ def _dc_name_conflict(ctx, page) -> bool:
     name = (page._dc_params.get("name") or "").strip()
     if not name:
         return False
-    return name in ctx._dc_existing_columns(page)
+    return name in _dc_existing_columns(ctx, page)
 
 
 def _dc_update_name(ctx, page) -> None:
-    page._dc_warn.setVisible(ctx._dc_name_conflict(page))
-    ctx._dc_update_calc_btn(page)
+    page._dc_warn.setVisible(_dc_name_conflict(ctx, page))
+    _dc_update_calc_btn(ctx, page)
 
 
 def _dc_update_calc_btn(ctx, page) -> None:
@@ -564,7 +573,7 @@ def _dc_update_calc_btn(ctx, page) -> None:
         and params.get("time")
         and params.get("columns")
         and name
-        and not ctx._dc_name_conflict(page)
+        and not _dc_name_conflict(ctx, page)
     )
     page._dc_calc_btn.setEnabled(ok and not page._dc_locked)
     if not params.get("files"):
@@ -605,11 +614,11 @@ def _dc_refresh(ctx, page) -> None:
         page._dc_files_box.clear()
         for path in files:
             page._dc_files_box.addItem(
-                ctx._comp_file_name(path, page._dc_task_id)
+                _data_naming._comp_file_name(ctx, path, page._dc_task_id)
             )
         page._dc_files_count.setText(f"{len(files)} file(s) selected")
 
-        common = ctx._dc_common_columns(page)
+        common = _dc_common_columns(ctx, page)
         time_col = params.get("time") or ""
         page._dc_time.blockSignals(True)
         page._dc_time.clear()
@@ -628,7 +637,7 @@ def _dc_refresh(ctx, page) -> None:
         page._dc_vars_count.setText(f"{len(columns)} variable(s) selected")
     finally:
         page._dc_updating = False
-    ctx._dc_update_name(page)
+    _dc_update_name(ctx, page)
 
 
 def _dc_validate(ctx, page):
@@ -649,7 +658,7 @@ def _dc_validate(ctx, page):
     name = (params.get("name") or "").strip()
     if not name:
         return False, "Enter a name for the new column."
-    if ctx._dc_name_conflict(page):
+    if _dc_name_conflict(ctx, page):
         return False, f"The column name '{name}' is already used."
     return True, ""
 
@@ -664,10 +673,10 @@ def _dc_analyze_file(ctx, page, path, q, index, total):
     task_id = page._dc_task_id
     time_col = params.get("time") or ""
     columns = list(params.get("columns") or [])
-    name = ctx._comp_file_name(path, task_id)
+    name = _data_naming._comp_file_name(ctx, path, task_id)
     q.put(("log", f"Reading {index}/{total}: {name}"))
     q.put(("status", f"Cleaning {index}/{total} — reading"))
-    values = ctx._column_data(task_id, path, [time_col] + columns)
+    values = _data_columns._column_data(ctx, task_id, path, [time_col] + columns)
     missing = [c for c in [time_col] + columns if c not in values]
     if missing:
         raise ValueError("column(s) not available: " + ", ".join(missing))
@@ -678,7 +687,7 @@ def _dc_analyze_file(ctx, page, path, q, index, total):
     n_rows = len(matrix)
     if n_rows == 0:
         raise ValueError("the file has no rows")
-    up_index = ctx._subsample_row_index(task_id, path)
+    up_index = _data_sampling._subsample_row_index(ctx, task_id, path)
     row_index = (
         np.asarray(up_index, dtype=np.int64)
         if up_index is not None else np.arange(n_rows, dtype=np.int64)
@@ -748,13 +757,13 @@ def _dc_write_file(ctx, page, path, flags, row_indices=None):
     params = page._dc_params
     name = (params.get("name") or "PeacoQC_pass").strip()
     stem = Path(str(path)).stem
-    rel = ctx._module_rel(page._dc_task_id, f"{stem}_dataclean.parquet")
+    rel = _data_files._module_rel(ctx, page._dc_task_id, f"{stem}_dataclean.parquet")
     out_path = ctx.project.path / rel
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ent = ctx._ensure_image_index(path)
+    ent = _data_image_index._ensure_image_index(ctx, path)
     is_image = ent is not None and ent.get("manifest") is not None
-    n_full = ctx._data_row_count(path)
+    n_full = _data_columns._data_row_count(ctx, path)
     sel = (
         np.asarray(row_indices) if row_indices is not None
         else np.arange(len(flags))
@@ -816,12 +825,12 @@ def _dc_run(ctx, page, q):
             if getattr(page, "_dc_cancel", False):
                 q.put(("log", "Calculation cancelled."))
                 break
-            name = ctx._comp_file_name(path, page._dc_task_id)
+            name = _data_naming._comp_file_name(ctx, path, page._dc_task_id)
             try:
-                flags, row_index, detail = ctx._dc_analyze_file(
+                flags, row_index, detail = _dc_analyze_file(ctx,
                     page, path, q, i + 1, n_files
                 )
-                rel, cols, kind = ctx._dc_write_file(
+                rel, cols, kind = _dc_write_file(ctx,
                     page, path, flags, row_index
                 )
             except Exception as exc:  # noqa: BLE001
@@ -832,7 +841,7 @@ def _dc_run(ctx, page, q):
                 "path": rel,
                 "columns": cols,
                 "kind": kind,
-                "signature": ctx._dc_signature(
+                "signature": _dc_signature(ctx,
                     params, path, page._dc_task_id
                 ),
             }
@@ -850,7 +859,7 @@ def _dc_run(ctx, page, q):
 
 
 def _dc_calculate(ctx, page) -> None:
-    ok, message = ctx._dc_validate(page)
+    ok, message = _dc_validate(ctx, page)
     if not ok:
         QMessageBox.warning(ctx.host, "Calculate", message)
         return
@@ -876,13 +885,13 @@ def _dc_calculate(ctx, page) -> None:
     q = queue.Queue()
     page._dc_queue = q
     page._dc_thread = threading.Thread(
-        target=ctx._dc_run, args=(page, q), daemon=True
+        target=partial(_dc_run, ctx), args=(page, q), daemon=True
     )
     page._dc_thread.start()
 
     timer = QTimer(ctx.host)
     timer.setInterval(120)
-    timer.timeout.connect(lambda: ctx._dc_poll(page))
+    timer.timeout.connect(lambda: _dc_poll(ctx, page))
     timer.start()
     page._dc_timer = timer
 
@@ -900,7 +909,7 @@ def _dc_poll(ctx, page) -> None:
             break
         kind = msg[0]
         if kind == "log":
-            ctx._dc_log(page, msg[1])
+            _dc_log(ctx, page, msg[1])
         elif kind == "status":
             page._dc_status.setText(msg[1])
         elif kind == "done":
@@ -913,7 +922,7 @@ def _dc_poll(ctx, page) -> None:
                 ctx.project.save()
             page._dc_snapshot = copy.deepcopy(params)
             page._dc_dirty = False
-            ctx._dc_update_save_btn(page)
+            _dc_update_save_btn(ctx, page)
             page._dc_done = done
             page._dc_failed = failed
             finished = True
@@ -927,9 +936,9 @@ def _dc_poll(ctx, page) -> None:
     if timer is not None:
         timer.stop()
         page._dc_timer = None
-    ctx._dc_update_calc_btn(page)
+    _dc_update_calc_btn(ctx, page)
     if error:
-        ctx._dc_log(page, f"✗ {error}")
+        _dc_log(ctx, page, f"✗ {error}")
         QMessageBox.warning(ctx.host, "Calculate", error)
         page._dc_status.setText("Failed")
     else:
@@ -937,14 +946,14 @@ def _dc_poll(ctx, page) -> None:
         if getattr(page, "_dc_failed", 0):
             summary += f" {page._dc_failed} failed — see the log."
         page._dc_status.setText(summary)
-        ctx._dc_log(page, summary)
+        _dc_log(ctx, page, summary)
         ctx.statusBar().showMessage(summary)
         ctx._module_saved(page)
 
 
 def _dc_mark_dirty(ctx, page) -> None:
     page._dc_dirty = True
-    ctx._dc_update_save_btn(page)
+    _dc_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -960,8 +969,8 @@ def _dc_save_now(ctx, page) -> None:
         ctx.project.save()
     page._dc_snapshot = copy.deepcopy(params)
     page._dc_dirty = False
-    ctx._dc_update_save_btn(page)
-    ctx._dc_log(page, "Settings saved")
+    _dc_update_save_btn(ctx, page)
+    _dc_log(ctx, page, "Settings saved")
     ctx.statusBar().showMessage("Data Clean settings saved")
     ctx._module_saved(page)
 
@@ -977,7 +986,7 @@ def _dc_close(ctx, page) -> None:
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._dc_cancel = True
-        ctx._dc_log(page, "Stopping after the current file…")
+        _dc_log(ctx, page, "Stopping after the current file…")
         return
     if getattr(page, "_dc_dirty", False):
         reply = QMessageBox.question(

@@ -38,6 +38,14 @@ import hashlib
 import json
 import queue
 import threading
+from functools import partial
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import sampling as _data_sampling
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 _CLUSTER_SEED = 42
@@ -82,7 +90,7 @@ def _cluster_signature(ctx, params, parquet_path, task_id=None) -> str:
         payload["extension_version"] = (
             ctx._ext_entry(method).get("version") or ""
         )
-    sample = ctx._subsample_sig(task_id, parquet_path)
+    sample = _data_sampling._subsample_sig(ctx, task_id, parquet_path)
     if sample:
         payload["sample"] = sample
     payload = json.dumps(payload, sort_keys=True)
@@ -112,7 +120,7 @@ def _build_cluster_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -128,7 +136,7 @@ def _build_cluster_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._cluster_close(page))
+    close_btn.clicked.connect(lambda _=False: _cluster_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -160,7 +168,7 @@ def _build_cluster_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     page._cluster_running = False
     page._cluster_cancel = False
     page._cluster_updating = False
-    save_btn.clicked.connect(lambda _=False: ctx._cluster_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _cluster_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -170,24 +178,24 @@ def _build_cluster_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._cluster_left_panel(page))
-    splitter.addWidget(ctx._cluster_center_panel(page))
-    splitter.addWidget(ctx._cluster_right_panel(page))
+    splitter.addWidget(_cluster_left_panel(ctx, page))
+    splitter.addWidget(_cluster_center_panel(ctx, page))
+    splitter.addWidget(_cluster_right_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
     splitter.setStretchFactor(2, 1)
     splitter.setSizes([320, 320, 420])
     row.addWidget(splitter, 1)
 
-    row.addWidget(ctx._cluster_log_panel(page))
+    row.addWidget(_cluster_log_panel(ctx, page))
     layout.addWidget(content, 1)
 
-    ctx._cluster_refresh(page)
+    _cluster_refresh(ctx, page)
     return page
 
 
 def _cluster_log_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -228,7 +236,7 @@ def _cluster_log(ctx, page, text) -> None:
 
 
 def _cluster_left_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -267,13 +275,13 @@ def _cluster_left_panel(ctx, page) -> QWidget:
     lay.addWidget(files_count)
     page._cluster_files_count = files_count
 
-    method.currentIndexChanged.connect(lambda _=0: ctx._cluster_on_method(page))
-    files_btn.clicked.connect(lambda _=False: ctx._cluster_select_files(page))
+    method.currentIndexChanged.connect(lambda _=0: _cluster_on_method(ctx, page))
+    files_btn.clicked.connect(lambda _=False: _cluster_select_files(ctx, page))
     return panel
 
 
 def _cluster_center_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -300,12 +308,12 @@ def _cluster_center_panel(ctx, page) -> QWidget:
     lay.addWidget(vars_count)
     page._cluster_vars_count = vars_count
 
-    vars_btn.clicked.connect(lambda _=False: ctx._cluster_select_vars(page))
+    vars_btn.clicked.connect(lambda _=False: _cluster_select_vars(ctx, page))
     return panel
 
 
 def _cluster_right_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -317,7 +325,7 @@ def _cluster_right_panel(ctx, page) -> QWidget:
     max_events.setValue(5000)
     max_events.setEnabled(not page._cluster_locked)
     lay.addWidget(max_events)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Randomly cap the points each table (flow) file contributes "
         "(0 = use everything). Image files are always clustered in full — "
         "use an upstream Subsample module to thin a huge image. Fixed seed."
@@ -335,7 +343,7 @@ def _cluster_right_panel(ctx, page) -> QWidget:
             grid.addWidget(QLabel(label), row, 0)
             grid.addWidget(widget, row, 1)
             row += 1
-            grid.addWidget(ctx._param_hint(hint), row, 0, 1, 2)
+            grid.addWidget(_widgets_panels._param_hint(ctx, hint), row, 0, 1, 2)
             row += 1
         return host
 
@@ -456,7 +464,7 @@ def _cluster_right_panel(ctx, page) -> QWidget:
     normalize.setChecked(True)
     normalize.setEnabled(not page._cluster_locked)
     lay.addWidget(normalize)
-    lay.addWidget(ctx._param_hint(
+    lay.addWidget(_widgets_panels._param_hint(ctx,
         "Z-score the variables first, so no channel dominates the distance."
     ))
     page._cluster_normalize = normalize
@@ -504,21 +512,21 @@ def _cluster_right_panel(ctx, page) -> QWidget:
         w.setEnabled(not page._cluster_locked)
     name_edit.setEnabled(not page._cluster_locked)
 
-    max_events.valueChanged.connect(lambda _=0: ctx._cluster_on_max_events(page))
-    kmeans_k.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "kmeans", "k", kmeans_k.value()))
-    flowsom_nodes.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "flowsom", "nodes", flowsom_nodes.value()))
-    flowsom_k.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "flowsom", "k", flowsom_k.value()))
-    phenograph_k.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "phenograph", "k", phenograph_k.value()))
-    leiden_k.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "leiden", "k", leiden_k.value()))
-    leiden_res.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "leiden", "resolution", leiden_res.value()))
-    dbscan_eps.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "dbscan", "eps", dbscan_eps.value()))
-    dbscan_ms.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "dbscan", "min_samples", dbscan_ms.value()))
-    hier_k.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "hierarchical", "k", hier_k.value()))
-    parc_knn.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "parc", "knn", parc_knn.value()))
-    parc_res.valueChanged.connect(lambda _=0: ctx._cluster_on_param(page, "parc", "resolution", parc_res.value()))
-    normalize.toggled.connect(lambda _=0: ctx._cluster_on_normalize(page))
-    name_edit.textEdited.connect(lambda _=0: ctx._cluster_on_name(page))
-    calc_btn.clicked.connect(lambda _=False: ctx._cluster_calculate(page))
+    max_events.valueChanged.connect(lambda _=0: _cluster_on_max_events(ctx, page))
+    kmeans_k.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "kmeans", "k", kmeans_k.value()))
+    flowsom_nodes.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "flowsom", "nodes", flowsom_nodes.value()))
+    flowsom_k.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "flowsom", "k", flowsom_k.value()))
+    phenograph_k.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "phenograph", "k", phenograph_k.value()))
+    leiden_k.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "leiden", "k", leiden_k.value()))
+    leiden_res.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "leiden", "resolution", leiden_res.value()))
+    dbscan_eps.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "dbscan", "eps", dbscan_eps.value()))
+    dbscan_ms.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "dbscan", "min_samples", dbscan_ms.value()))
+    hier_k.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "hierarchical", "k", hier_k.value()))
+    parc_knn.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "parc", "knn", parc_knn.value()))
+    parc_res.valueChanged.connect(lambda _=0: _cluster_on_param(ctx, page, "parc", "resolution", parc_res.value()))
+    normalize.toggled.connect(lambda _=0: _cluster_on_normalize(ctx, page))
+    name_edit.textEdited.connect(lambda _=0: _cluster_on_name(ctx, page))
+    calc_btn.clicked.connect(lambda _=False: _cluster_calculate(ctx, page))
     return panel
 
 
@@ -526,15 +534,15 @@ def _cluster_on_method(ctx, page) -> None:
     if getattr(page, "_cluster_updating", False):
         return
     page._cluster_params["method"] = page._cluster_method.currentData() or "kmeans"
-    ctx._cluster_refresh(page)
-    ctx._cluster_mark_dirty(page)
+    _cluster_refresh(ctx, page)
+    _cluster_mark_dirty(ctx, page)
 
 
 def _cluster_on_param(ctx, page, group, key, value) -> None:
     if getattr(page, "_cluster_updating", False):
         return
     page._cluster_params.setdefault(group, {})[key] = value
-    ctx._cluster_mark_dirty(page)
+    _cluster_mark_dirty(ctx, page)
 
 
 def _cluster_update_ext_state(ctx, page) -> None:
@@ -558,71 +566,71 @@ def _cluster_update_ext_state(ctx, page) -> None:
                 "Extension → Manage Extensions before calculating."
             )
         hint.setVisible(bool(missing))
-    ctx._cluster_update_calc_btn(page)
+    _cluster_update_calc_btn(ctx, page)
 
 
 def _cluster_on_normalize(ctx, page) -> None:
     if getattr(page, "_cluster_updating", False):
         return
     page._cluster_params["normalize"] = page._cluster_normalize.isChecked()
-    ctx._cluster_mark_dirty(page)
+    _cluster_mark_dirty(ctx, page)
 
 
 def _cluster_on_max_events(ctx, page) -> None:
     if getattr(page, "_cluster_updating", False):
         return
     page._cluster_params["max_events"] = int(page._cluster_max_events.value())
-    ctx._cluster_mark_dirty(page)
+    _cluster_mark_dirty(ctx, page)
 
 
 def _cluster_on_name(ctx, page) -> None:
     if getattr(page, "_cluster_updating", False):
         return
     page._cluster_params["name"] = page._cluster_name.text().strip()
-    ctx._cluster_mark_dirty(page)
-    ctx._cluster_update_name(page)
+    _cluster_mark_dirty(ctx, page)
+    _cluster_update_name(ctx, page)
 
 
 def _cluster_common_columns(ctx, page) -> list:
     files = page._cluster_params.get("files") or []
     if not files:
         return []
-    common = set(ctx._columns_for(files[0], page._cluster_task_id))
+    common = set(_data_columns._columns_for(ctx, files[0], page._cluster_task_id))
     for p in files[1:]:
-        common &= set(ctx._columns_for(p, page._cluster_task_id))
+        common &= set(_data_columns._columns_for(ctx, p, page._cluster_task_id))
     return sorted(common)
 
 
 def _cluster_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._cluster_task_id)
+    records = _data_files._available_files(ctx, page._cluster_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     current = [
-        ctx._comp_file_name(p, page._cluster_task_id)
+        _data_naming._comp_file_name(ctx, p, page._cluster_task_id)
         for p in page._cluster_params.get("files") or []
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
         return
     page._cluster_params["files"] = [by_name[n] for n in chosen if n in by_name]
-    common = set(ctx._cluster_common_columns(page))
+    common = set(_cluster_common_columns(ctx, page))
     page._cluster_params["columns"] = [
         c for c in page._cluster_params.get("columns") or [] if c in common
     ]
-    ctx._cluster_refresh(page)
-    ctx._cluster_mark_dirty(page)
+    _cluster_refresh(ctx, page)
+    _cluster_mark_dirty(ctx, page)
 
 
 def _cluster_select_vars(ctx, page) -> None:
-    options = ctx._cluster_common_columns(page)
+    options = _cluster_common_columns(ctx, page)
     if not options:
         QMessageBox.information(
             ctx.host, "Select variables", "Select data files first."
         )
         return
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select variables",
         options,
         page._cluster_params.get("columns") or [],
@@ -631,14 +639,14 @@ def _cluster_select_vars(ctx, page) -> None:
     if chosen is None:
         return
     page._cluster_params["columns"] = list(chosen)
-    ctx._cluster_refresh(page)
-    ctx._cluster_mark_dirty(page)
+    _cluster_refresh(ctx, page)
+    _cluster_mark_dirty(ctx, page)
 
 
 def _cluster_existing_columns(ctx, page) -> set:
     cols = set()
     for path in page._cluster_params.get("files") or []:
-        cols |= set(ctx._columns_for(path, page._cluster_task_id))
+        cols |= set(_data_columns._columns_for(ctx, path, page._cluster_task_id))
     return cols
 
 
@@ -646,12 +654,12 @@ def _cluster_name_conflict(ctx, page) -> bool:
     name = (page._cluster_params.get("name") or "").strip()
     if not name:
         return False
-    return name in ctx._cluster_existing_columns(page)
+    return name in _cluster_existing_columns(ctx, page)
 
 
 def _cluster_update_name(ctx, page) -> None:
-    page._cluster_warn.setVisible(ctx._cluster_name_conflict(page))
-    ctx._cluster_update_calc_btn(page)
+    page._cluster_warn.setVisible(_cluster_name_conflict(ctx, page))
+    _cluster_update_calc_btn(ctx, page)
 
 
 def _cluster_update_calc_btn(ctx, page) -> None:
@@ -661,7 +669,7 @@ def _cluster_update_calc_btn(ctx, page) -> None:
         params.get("files")
         and params.get("columns")
         and name
-        and not ctx._cluster_name_conflict(page)
+        and not _cluster_name_conflict(ctx, page)
     )
     method = str(params.get("method") or "")
     missing = None
@@ -735,7 +743,7 @@ def _cluster_refresh(ctx, page) -> None:
         method = params.get("method")
         page._cluster_kmeans_host.setVisible(method == "kmeans")
         page._cluster_flowsom_host.setVisible(method == "flowsom")
-        ctx._cluster_update_ext_state(page)
+        _cluster_update_ext_state(ctx, page)
         page._cluster_phenograph_host.setVisible(method == "phenograph")
         page._cluster_leiden_host.setVisible(method == "leiden")
         page._cluster_dbscan_host.setVisible(method == "dbscan")
@@ -759,7 +767,7 @@ def _cluster_refresh(ctx, page) -> None:
         page._cluster_files_box.clear()
         for path in files:
             page._cluster_files_box.addItem(
-                ctx._comp_file_name(path, page._cluster_task_id)
+                _data_naming._comp_file_name(ctx, path, page._cluster_task_id)
             )
         page._cluster_files_count.setText(f"{len(files)} file(s) selected")
 
@@ -770,7 +778,7 @@ def _cluster_refresh(ctx, page) -> None:
         page._cluster_vars_count.setText(f"{len(columns)} variable(s) selected")
     finally:
         page._cluster_updating = False
-    ctx._cluster_update_name(page)
+    _cluster_update_name(ctx, page)
 
 
 def _cluster_validate(ctx, page):
@@ -782,7 +790,7 @@ def _cluster_validate(ctx, page):
     name = (params.get("name") or "").strip()
     if not name:
         return False, "Set the new column name."
-    if ctx._cluster_name_conflict(page):
+    if _cluster_name_conflict(ctx, page):
         return False, "The new column name collides with an existing column."
     return True, ""
 
@@ -895,13 +903,13 @@ def _cluster_write_file(ctx, page, path, labels, row_indices=None):
     params = page._cluster_params
     name = (params.get("name") or "cluster").strip()
     stem = Path(str(path)).stem
-    rel = ctx._module_rel(page._cluster_task_id, f"{stem}_cluster.parquet")
+    rel = _data_files._module_rel(ctx, page._cluster_task_id, f"{stem}_cluster.parquet")
     out_path = ctx.project.path / rel
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ent = ctx._ensure_image_index(path)
+    ent = _data_image_index._ensure_image_index(ctx, path)
     is_image = ent is not None and ent.get("manifest") is not None
-    n_full = ctx._data_row_count(path)
+    n_full = _data_columns._data_row_count(ctx, path)
     sel = np.asarray(row_indices) if row_indices is not None else np.arange(len(labels))
     sel = sel.astype(np.int64)
 
@@ -960,16 +968,16 @@ def _cluster_run(ctx, page, q):
         total_before = 0
         total_after = 0
         for i, path in enumerate(files):
-            name = ctx._comp_file_name(path, page._cluster_task_id)
+            name = _data_naming._comp_file_name(ctx, path, page._cluster_task_id)
             q.put(("log", f"Reading {i + 1}/{n_files}: {name}"))
             q.put(("status", f"Reading {i + 1}/{n_files} ({25 * (i + 1) // n_files}%)"))
-            values = ctx._column_data(page._cluster_task_id, path, columns)
+            values = _data_columns._column_data(ctx, page._cluster_task_id, path, columns)
             if any(c not in values for c in columns):
                 raise ValueError(f"{name} is missing a column")
             X = np.column_stack([values[c] for c in columns]).astype("float64")
             n_vis = len(X)
             total_before += n_vis
-            up_idx = ctx._subsample_row_index(page._cluster_task_id, path)
+            up_idx = _data_sampling._subsample_row_index(ctx, page._cluster_task_id, path)
             full_rows = (
                 np.asarray(up_idx, dtype=np.int64)
                 if up_idx is not None else np.arange(n_vis, dtype=np.int64)
@@ -977,9 +985,9 @@ def _cluster_run(ctx, page, q):
             # Pixel-level (image) files are clustered in full: downsampling
             # would leave holes that render black. max_events only applies
             # to table (flow) data.
-            is_image = ctx._ensure_image_index(path) is not None
+            is_image = _data_image_index._ensure_image_index(ctx, path) is not None
             if max_events > 0 and not is_image and n_vis > max_events:
-                seed = ctx._cluster_sample_seed(page, path)
+                seed = _cluster_sample_seed(ctx, page, path)
                 keep = np.sort(
                     np.random.default_rng(seed).permutation(n_vis)[:max_events]
                 )
@@ -999,7 +1007,7 @@ def _cluster_run(ctx, page, q):
 
         q.put(("log", "Normalizing (z-score)…" if params.get("normalize")
                else "Normalization skipped"))
-        X = ctx._cluster_prepare(X, bool(params.get("normalize")))
+        X = _cluster_prepare(ctx, X, bool(params.get("normalize")))
 
         method = params.get("method", "kmeans")
         # Each method keeps its own parameter group; FlowSOM runs in the
@@ -1010,15 +1018,15 @@ def _cluster_run(ctx, page, q):
         q.put(("status", "Clustering… (25%)"))
         t0 = time.time()
         if method == "flowsom":
-            labels = ctx._cluster_fit_flowsom(
+            labels = _cluster_fit_flowsom(ctx,
                 page, q, cfg, X, _CLUSTER_SEED
             )
         elif method == "parc":
-            labels = ctx._cluster_fit_parc(
+            labels = _cluster_fit_parc(ctx,
                 page, q, cfg, X, _CLUSTER_SEED
             )
         else:
-            labels = ctx._cluster_fit(method, cfg, X, _CLUSTER_SEED)
+            labels = _cluster_fit(ctx, method, cfg, X, _CLUSTER_SEED)
         fit_seconds = time.time() - t0
         q.put(("log", f"Clustering finished in {fit_seconds:.1f}s"))
 
@@ -1028,12 +1036,12 @@ def _cluster_run(ctx, page, q):
             if getattr(page, "_cluster_cancel", False):
                 q.put(("log", "Calculation cancelled."))
                 break
-            name = ctx._comp_file_name(path, page._cluster_task_id)
+            name = _data_naming._comp_file_name(ctx, path, page._cluster_task_id)
             seg = labels[offset:offset + n]
             offset += n
             q.put(("status", f"Writing {i + 1}/{n_files} ({90 + 10 * (i + 1) // n_files}%)"))
             try:
-                rel, cols, kind = ctx._cluster_write_file(
+                rel, cols, kind = _cluster_write_file(ctx,
                     page, path, seg, row_indices[i]
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1044,7 +1052,7 @@ def _cluster_run(ctx, page, q):
                 "path": rel,
                 "columns": cols,
                 "kind": kind,
-                "signature": ctx._cluster_signature(
+                "signature": _cluster_signature(ctx,
                     params, path, page._cluster_task_id
                 ),
             }
@@ -1055,7 +1063,7 @@ def _cluster_run(ctx, page, q):
 
 
 def _cluster_calculate(ctx, page) -> None:
-    ok, message = ctx._cluster_validate(page)
+    ok, message = _cluster_validate(ctx, page)
     if not ok:
         QMessageBox.warning(ctx.host, "Calculate", message)
         return
@@ -1090,13 +1098,13 @@ def _cluster_calculate(ctx, page) -> None:
     q = queue.Queue()
     page._cluster_queue = q
     page._cluster_thread = threading.Thread(
-        target=ctx._cluster_run, args=(page, q), daemon=True
+        target=partial(_cluster_run, ctx), args=(page, q), daemon=True
     )
     page._cluster_thread.start()
 
     timer = QTimer(ctx.host)
     timer.setInterval(100)
-    timer.timeout.connect(lambda: ctx._cluster_poll(page))
+    timer.timeout.connect(lambda: _cluster_poll(ctx, page))
     timer.start()
     page._cluster_timer = timer
 
@@ -1114,7 +1122,7 @@ def _cluster_poll(ctx, page) -> None:
             break
         kind = msg[0]
         if kind == "log":
-            ctx._cluster_log(page, msg[1])
+            _cluster_log(ctx, page, msg[1])
         elif kind == "status":
             page._cluster_status.setText(msg[1])
         elif kind == "done":
@@ -1127,7 +1135,7 @@ def _cluster_poll(ctx, page) -> None:
                 ctx.project.save()
             page._cluster_snapshot = copy.deepcopy(params)
             page._cluster_dirty = False
-            ctx._cluster_update_save_btn(page)
+            _cluster_update_save_btn(ctx, page)
             page._cluster_done = done
             page._cluster_failed = failed
             finished = True
@@ -1141,9 +1149,9 @@ def _cluster_poll(ctx, page) -> None:
     if timer is not None:
         timer.stop()
         page._cluster_timer = None
-    ctx._cluster_update_calc_btn(page)
+    _cluster_update_calc_btn(ctx, page)
     if error:
-        ctx._cluster_log(page, f"✗ {error}")
+        _cluster_log(ctx, page, f"✗ {error}")
         QMessageBox.warning(ctx.host, "Calculate", error)
         page._cluster_status.setText("Failed")
     else:
@@ -1151,14 +1159,14 @@ def _cluster_poll(ctx, page) -> None:
         if getattr(page, "_cluster_failed", 0):
             summary += f" {page._cluster_failed} failed — see the log."
         page._cluster_status.setText(summary)
-        ctx._cluster_log(page, summary)
+        _cluster_log(ctx, page, summary)
         ctx.statusBar().showMessage(summary)
         ctx._module_saved(page)
 
 
 def _cluster_mark_dirty(ctx, page) -> None:
     page._cluster_dirty = True
-    ctx._cluster_update_save_btn(page)
+    _cluster_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -1175,8 +1183,8 @@ def _cluster_save_now(ctx, page) -> None:
         ctx.project.save()
     page._cluster_snapshot = copy.deepcopy(params)
     page._cluster_dirty = False
-    ctx._cluster_update_save_btn(page)
-    ctx._cluster_log(page, "Settings saved")
+    _cluster_update_save_btn(ctx, page)
+    _cluster_log(ctx, page, "Settings saved")
     ctx.statusBar().showMessage("Cluster settings saved")
     ctx._module_saved(page)
 
@@ -1192,7 +1200,7 @@ def _cluster_close(ctx, page) -> None:
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._cluster_cancel = True
-        ctx._cluster_log(page, "Stopping after the current file…")
+        _cluster_log(ctx, page, "Stopping after the current file…")
         return
     if getattr(page, "_cluster_dirty", False):
         reply = QMessageBox.question(

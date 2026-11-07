@@ -10,8 +10,10 @@ import pandas as pd
 import tifffile
 
 import harness
+from smage.data import feature_outputs as _data_feature_outputs
 from smage.data.image_index import _build_image_index_files
 from smage.importer import import_file
+from smage.modules.export import page as _export_page
 
 
 def open_window(project):
@@ -123,7 +125,7 @@ def export_table(window, task_id: str, files, columns, out_dir,
     """Run one table export through the real Export page; return queue messages."""
     page = open_page(window, task_id, "export", "Export")
     q = queue.Queue()
-    window._ctx._export_job_table(page, q, {
+    _export_page._export_job_table(window._ctx, page, q, {
         "files": list(files),
         "columns": list(columns),
         "format": fmt,
@@ -139,7 +141,7 @@ def export_table(window, task_id: str, files, columns, out_dir,
 
 def feature_record(window, parquet: str, task_id: str) -> dict:
     """The Feature output record visible at a downstream task."""
-    records = window._ctx._feature_outputs(task_id)
+    records = _data_feature_outputs._feature_outputs(window._ctx, task_id)
     for record in records:
         if record.get("source") == parquet:
             return record

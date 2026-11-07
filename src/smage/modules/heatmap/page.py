@@ -73,6 +73,15 @@ import hashlib
 import json
 import queue
 import threading
+from functools import partial
+from smage.data import columns as _data_columns
+from smage.data import files as _data_files
+from smage.data import naming as _data_naming
+from smage.data import sampling as _data_sampling
+from smage.data import stores as _data_stores
+from smage.widgets import colormap as _widgets_colormap
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 _HEATMAP_STORE_NAME = "heatmap.json"
@@ -501,14 +510,14 @@ class _HeatmapCanvas(QWidget):
 
 
 def _heatmap_store_path(ctx, task_id) -> Path | None:
-    folder = ctx._module_dir(task_id)
+    folder = _data_files._module_dir(ctx, task_id)
     if folder is None:
         return None
     return folder / _HEATMAP_STORE_NAME
 
 
 def _heatmap_store_load(ctx, task_id) -> dict | None:
-    path = ctx._heatmap_store_path(task_id)
+    path = _heatmap_store_path(ctx, task_id)
     if path is None or not path.is_file():
         return None
     try:
@@ -520,7 +529,7 @@ def _heatmap_store_load(ctx, task_id) -> dict | None:
 
 
 def _heatmap_store_save(ctx, task_id, payload: dict) -> None:
-    path = ctx._heatmap_store_path(task_id)
+    path = _heatmap_store_path(ctx, task_id)
     if path is None:
         return
     try:
@@ -542,14 +551,14 @@ def _heatmap_signature(ctx, page) -> str:
             entry = [str(path), int(st.st_size), int(st.st_mtime_ns)]
         except OSError:
             entry = [str(path), 0, 0]
-        sig = ctx._subsample_sig(task_id, path)
+        sig = _data_sampling._subsample_sig(ctx, task_id, path)
         if sig:
             entry.append(sig)
         files.append(entry)
     try:
         stages = [
             [kind, stage]
-            for kind, stage in ctx._map_stages(task_id)
+            for kind, stage in _data_columns._map_stages(ctx, task_id)
         ]
         stages_text = json.dumps(stages, sort_keys=True, default=str)
     except Exception:  # noqa: BLE001
@@ -576,7 +585,7 @@ def _heatmap_gate_options(ctx, page) -> list:
         return []
     task_id = page._heatmap_task_id
     gating_tasks = [
-        task for task in ctx._task_chain(task_id)
+        task for task in _data_files._task_chain(ctx, task_id)
         if task.get("id") != task_id and task.get("type") == "gating"
     ]
     multi = len(gating_tasks) > 1
@@ -584,7 +593,7 @@ def _heatmap_gate_options(ctx, page) -> list:
     used_labels = set()
     for task in gating_tasks:
         per_file = [
-            {g["id"]: g for g in ctx._gating_gates_for(task, path)}
+            {g["id"]: g for g in _data_stores._gating_gates_for(ctx, task, path)}
             for path in files
         ]
         if not per_file or any(not ids for ids in per_file):
@@ -594,7 +603,7 @@ def _heatmap_gate_options(ctx, page) -> list:
             common &= set(ids)
         if not common:
             continue
-        gates = ctx._gating_gates_for(task)
+        gates = _data_stores._gating_gates_for(ctx, task)
         for gate in gates:
             if gate["id"] not in common:
                 continue
@@ -619,7 +628,7 @@ def _heatmap_common_columns(ctx, page) -> list:
     if not files:
         return []
     lists = [
-        ctx._columns_for(path, page._heatmap_task_id) for path in files
+        _data_columns._columns_for(ctx, path, page._heatmap_task_id) for path in files
     ]
     if not lists:
         return []
@@ -633,10 +642,10 @@ def _heatmap_file_sizes(ctx, page) -> dict:
     sizes = {}
     for path in page._heatmap_params.get("files") or []:
         try:
-            index = ctx._subsample_row_index(page._heatmap_task_id, path)
+            index = _data_sampling._subsample_row_index(ctx, page._heatmap_task_id, path)
             sizes[path] = (
                 int(len(index)) if index is not None
-                else int(ctx._data_row_count(path) or 0)
+                else int(_data_columns._data_row_count(ctx, path) or 0)
             )
         except Exception:  # noqa: BLE001
             sizes[path] = 0
@@ -652,7 +661,7 @@ def _heatmap_sampled_counts(ctx, page) -> dict:
     except (TypeError, ValueError):
         value = 0
     return _heatmap_sample_counts(
-        ctx._heatmap_file_sizes(page),
+        _heatmap_file_sizes(ctx, page),
         sampling.get("mode") or "full", method, value,
     )
 
@@ -669,7 +678,7 @@ def _build_heatmap_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
     tl.addWidget(QLabel(
-        f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"
+        f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"
     ))
     if locked:
         draft = QLabel("Draft (locked)")
@@ -681,7 +690,7 @@ def _build_heatmap_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._heatmap_close(page))
+    close_btn.clicked.connect(lambda _=False: _heatmap_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -717,7 +726,7 @@ def _build_heatmap_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     if not params["files"]:
         params["files"] = [
             rec.get("parquet")
-            for rec in ctx._available_files(task_def.get("id"))
+            for rec in _data_files._available_files(ctx, task_def.get("id"))
         ]
 
     page._heatmap_task_def = task_def
@@ -733,10 +742,10 @@ def _build_heatmap_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     page._heatmap_queue = None
     page._heatmap_timer = None
     page._heatmap_thread = None
-    page._heatmap_result = ctx._heatmap_store_load(task_def.get("id"))
+    page._heatmap_result = _heatmap_store_load(ctx, task_def.get("id"))
     page._heatmap_dendro_cache = {}
     page._heatmap_syncing = False
-    save_btn.clicked.connect(lambda _=False: ctx._heatmap_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _heatmap_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -746,9 +755,9 @@ def _build_heatmap_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._heatmap_left_panel(page))
-    splitter.addWidget(ctx._heatmap_middle_panel(page))
-    splitter.addWidget(ctx._heatmap_right_panel(page))
+    splitter.addWidget(_heatmap_left_panel(ctx, page))
+    splitter.addWidget(_heatmap_middle_panel(ctx, page))
+    splitter.addWidget(_heatmap_right_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
     splitter.setStretchFactor(2, 3)
@@ -759,14 +768,14 @@ def _build_heatmap_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     # Apply the requested proportions once the page has a real size.
     QTimer.singleShot(0, lambda sp=splitter: sp.setSizes([280, 280, 840]))
 
-    ctx._heatmap_refresh(page)
-    ctx._heatmap_refresh_plot(page)
-    ctx._heatmap_update_save_btn(page)
+    _heatmap_refresh(ctx, page)
+    _heatmap_refresh_plot(ctx, page)
+    _heatmap_update_save_btn(ctx, page)
     return page
 
 
 def _heatmap_left_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -774,8 +783,8 @@ def _heatmap_left_panel(ctx, page) -> QWidget:
     # Data files and Sampling share the column height 1:1.
     split = QSplitter(Qt.Orientation.Vertical)
     split.setChildrenCollapsible(False)
-    split.addWidget(ctx._heatmap_files_section(page))
-    split.addWidget(ctx._heatmap_sampling_section(page))
+    split.addWidget(_heatmap_files_section(ctx, page))
+    split.addWidget(_heatmap_sampling_section(ctx, page))
     split.setStretchFactor(0, 1)
     split.setStretchFactor(1, 1)
 
@@ -799,7 +808,7 @@ def _heatmap_files_section(ctx, page) -> QWidget:
     files_btn = QPushButton("Select files…")
     files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     files_btn.setEnabled(not page._heatmap_locked)
-    files_btn.clicked.connect(lambda _=False: ctx._heatmap_select_files(page))
+    files_btn.clicked.connect(lambda _=False: _heatmap_select_files(ctx, page))
     lay.addWidget(files_btn)
     files_box = QListWidget()
     files_box.setStyleSheet(
@@ -868,13 +877,13 @@ def _heatmap_sampling_section(ctx, page) -> QWidget:
     page._heatmap_sampling_summary = summary
 
     sampling.currentIndexChanged.connect(
-        lambda _=0: ctx._heatmap_on_sampling(page)
+        lambda _=0: _heatmap_on_sampling(ctx, page)
     )
     method.currentIndexChanged.connect(
-        lambda _=0: ctx._heatmap_on_sampling(page)
+        lambda _=0: _heatmap_on_sampling(ctx, page)
     )
     value_spin.valueChanged.connect(
-        lambda _v: ctx._heatmap_on_sampling_value(page)
+        lambda _v: _heatmap_on_sampling_value(ctx, page)
     )
     return section
 
@@ -895,7 +904,7 @@ def _heatmap_gates_panel(ctx, page) -> QWidget:
     gates_btn = QPushButton("Select gates…")
     gates_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     gates_btn.setEnabled(not page._heatmap_locked)
-    gates_btn.clicked.connect(lambda _=False: ctx._heatmap_select_gates(page))
+    gates_btn.clicked.connect(lambda _=False: _heatmap_select_gates(ctx, page))
     lay.addWidget(gates_btn)
     box = QListWidget()
     box.setStyleSheet(
@@ -906,7 +915,7 @@ def _heatmap_gates_panel(ctx, page) -> QWidget:
     box.setDragEnabled(not page._heatmap_locked)
     box.setToolTip("Drag rows to change their order")
     box.model().rowsMoved.connect(
-        lambda *a: ctx._heatmap_on_order(page, "gates", box)
+        lambda *a: _heatmap_on_order(ctx, page, "gates", box)
     )
     lay.addWidget(box, 1)
     count = QLabel("")
@@ -935,7 +944,7 @@ def _heatmap_variables_panel(ctx, page) -> QWidget:
     vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     vars_btn.setEnabled(not page._heatmap_locked)
     vars_btn.clicked.connect(
-        lambda _=False: ctx._heatmap_select_variables(page)
+        lambda _=False: _heatmap_select_variables(ctx, page)
     )
     lay.addWidget(vars_btn)
     box = QListWidget()
@@ -947,7 +956,7 @@ def _heatmap_variables_panel(ctx, page) -> QWidget:
     box.setDragEnabled(not page._heatmap_locked)
     box.setToolTip("Drag columns to change their order")
     box.model().rowsMoved.connect(
-        lambda *a: ctx._heatmap_on_order(page, "variables", box)
+        lambda *a: _heatmap_on_order(ctx, page, "variables", box)
     )
     lay.addWidget(box, 1)
     count = QLabel("")
@@ -960,26 +969,26 @@ def _heatmap_variables_panel(ctx, page) -> QWidget:
 
 
 def _heatmap_middle_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(8)
 
     split = QSplitter(Qt.Orientation.Vertical)
     split.setChildrenCollapsible(False)
-    split.addWidget(ctx._heatmap_gates_panel(page))
-    split.addWidget(ctx._heatmap_variables_panel(page))
+    split.addWidget(_heatmap_gates_panel(ctx, page))
+    split.addWidget(_heatmap_variables_panel(ctx, page))
     split.setSizes([280, 280])
     lay.addWidget(split, 1)
 
     row = QHBoxLayout()
     calc_btn = QPushButton("Calculate")
     calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    calc_btn.clicked.connect(lambda _=False: ctx._heatmap_calculate(page))
+    calc_btn.clicked.connect(lambda _=False: _heatmap_calculate(ctx, page))
     cancel_btn = QPushButton("Cancel")
     cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     cancel_btn.setVisible(False)
-    cancel_btn.clicked.connect(lambda _=False: ctx._heatmap_cancel(page))
+    cancel_btn.clicked.connect(lambda _=False: _heatmap_cancel(ctx, page))
     row.addWidget(calc_btn, 1)
     row.addWidget(cancel_btn)
     lay.addLayout(row)
@@ -1004,11 +1013,11 @@ def _heatmap_middle_panel(ctx, page) -> QWidget:
 def _heatmap_right_panel(ctx, page) -> QWidget:
     split = QSplitter(Qt.Orientation.Vertical)
     split.setChildrenCollapsible(False)
-    split.addWidget(ctx._heatmap_plot_panel(page))
+    split.addWidget(_heatmap_plot_panel(ctx, page))
     bottom = QSplitter(Qt.Orientation.Horizontal)
     bottom.setChildrenCollapsible(False)
-    bottom.addWidget(ctx._heatmap_log_panel(page))
-    bottom.addWidget(ctx._heatmap_params_panel(page))
+    bottom.addWidget(_heatmap_log_panel(ctx, page))
+    bottom.addWidget(_heatmap_params_panel(ctx, page))
     # Log : plot settings = 2 : 3.
     bottom.setStretchFactor(0, 2)
     bottom.setStretchFactor(1, 3)
@@ -1042,7 +1051,7 @@ def _heatmap_right_panel(ctx, page) -> QWidget:
 
 
 def _heatmap_plot_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -1067,7 +1076,7 @@ def _heatmap_plot_panel(ctx, page) -> QWidget:
 
 
 def _heatmap_log_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -1087,7 +1096,7 @@ def _heatmap_log_panel(ctx, page) -> QWidget:
 
 
 def _heatmap_params_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -1104,12 +1113,12 @@ def _heatmap_params_panel(ctx, page) -> QWidget:
     scroll.setWidget(host)
     lay.addWidget(scroll, 1)
     page._heatmap_params_form = form
-    ctx._heatmap_fill_params(page, form)
+    _heatmap_fill_params(ctx, page, form)
     return panel
 
 
 def _heatmap_fill_params(ctx, page, form) -> None:
-    ctx._clear_settings_layout(form)
+    _widgets_panels._clear_settings_layout(ctx, form)
     cfg = page._heatmap_params.setdefault("plot", {})
     editable = not page._heatmap_locked
 
@@ -1131,7 +1140,7 @@ def _heatmap_fill_params(ctx, page, form) -> None:
 
     grid.addWidget(QLabel("Colormap"), 1, 0)
     cmap_combo = _NoWheelComboBox()
-    ctx._populate_palette_combo(
+    _widgets_colormap._populate_palette_combo(ctx,
         cmap_combo, cfg.get("colormap") or _default_palette()
     )
     cmap_combo.setEnabled(editable)
@@ -1237,7 +1246,7 @@ def _heatmap_fill_params(ctx, page, form) -> None:
     copy_btn = QPushButton("Copy matrix")
     copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     copy_btn.setToolTip("Copy the displayed matrix to the clipboard (TSV)")
-    copy_btn.clicked.connect(lambda _=False: ctx._heatmap_copy_matrix(page))
+    copy_btn.clicked.connect(lambda _=False: _heatmap_copy_matrix(ctx, page))
     grid.addWidget(copy_btn, 10, 0, 1, 4)
     form.addLayout(grid)
 
@@ -1251,8 +1260,8 @@ def _heatmap_fill_params(ctx, page, form) -> None:
         )
 
     def changed():
-        ctx._heatmap_mark_dirty(page)
-        ctx._heatmap_refresh_plot(page)
+        _heatmap_mark_dirty(ctx, page)
+        _heatmap_refresh_plot(ctx, page)
 
     def on_width(value):
         cfg["cell_width"] = int(value)
@@ -1349,14 +1358,14 @@ def _heatmap_fill_params(ctx, page, form) -> None:
 
 
 def _heatmap_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._heatmap_task_id)
+    records = _data_files._available_files(ctx, page._heatmap_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
     current = [
-        ctx._comp_file_name(path, page._heatmap_task_id)
+        _data_naming._comp_file_name(ctx, path, page._heatmap_task_id)
         for path in page._heatmap_params.get("files") or []
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files...",
         reorder=True,
     )
@@ -1365,12 +1374,12 @@ def _heatmap_select_files(ctx, page) -> None:
     page._heatmap_params["files"] = [
         by_name[name] for name in chosen if name in by_name
     ]
-    ctx._heatmap_mark_dirty(page)
-    ctx._heatmap_refresh(page)
+    _heatmap_mark_dirty(ctx, page)
+    _heatmap_refresh(ctx, page)
 
 
 def _heatmap_select_gates(ctx, page) -> None:
-    options = ctx._heatmap_gate_options(page)
+    options = _heatmap_gate_options(ctx, page)
     if not options:
         QMessageBox.information(
             ctx.host, "Select gates",
@@ -1384,7 +1393,7 @@ def _heatmap_select_gates(ctx, page) -> None:
         for gate in page._heatmap_params.get("gates") or []
         if gate.get("label") in by_label
     ]
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select gates", labels, current, "Filter gates...", reorder=True,
     )
     if chosen is None:
@@ -1398,19 +1407,19 @@ def _heatmap_select_gates(ctx, page) -> None:
             "task": opt["task"], "id": opt["id"], "label": label,
         })
     page._heatmap_params["gates"] = selected
-    ctx._heatmap_mark_dirty(page)
-    ctx._heatmap_refresh(page)
+    _heatmap_mark_dirty(ctx, page)
+    _heatmap_refresh(ctx, page)
 
 
 def _heatmap_select_variables(ctx, page) -> None:
-    columns = ctx._heatmap_common_columns(page)
+    columns = _heatmap_common_columns(ctx, page)
     if not columns:
         QMessageBox.information(
             ctx.host, "Select variables",
             "Select data files with common columns first.",
         )
         return
-    chosen = ctx._pick_items_dialog(
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select variables", columns,
         page._heatmap_params.get("variables") or [],
         "Filter variables...", reorder=True,
@@ -1418,8 +1427,8 @@ def _heatmap_select_variables(ctx, page) -> None:
     if chosen is None:
         return
     page._heatmap_params["variables"] = list(chosen)
-    ctx._heatmap_mark_dirty(page)
-    ctx._heatmap_refresh(page)
+    _heatmap_mark_dirty(ctx, page)
+    _heatmap_refresh(ctx, page)
 
 
 def _heatmap_on_order(ctx, page, key, box) -> None:
@@ -1441,9 +1450,9 @@ def _heatmap_on_order(ctx, page, key, box) -> None:
         page._heatmap_params["variables"] = [
             value for value in values if value
         ]
-    ctx._heatmap_mark_dirty(page)
-    ctx._heatmap_update_buttons(page)
-    ctx._heatmap_refresh_stale(page)
+    _heatmap_mark_dirty(ctx, page)
+    _heatmap_update_buttons(ctx, page)
+    _heatmap_refresh_stale(ctx, page)
 
 
 def _heatmap_fill_list(ctx, box, entries) -> None:
@@ -1463,7 +1472,7 @@ def _heatmap_fill_list(ctx, box, entries) -> None:
 
 def _heatmap_refresh(ctx, page) -> None:
     params = page._heatmap_params
-    records = ctx._available_files(page._heatmap_task_id)
+    records = _data_files._available_files(ctx, page._heatmap_task_id)
     by_path = {rec.get("parquet"): rec for rec in records}
     params["files"] = [
         path for path in params.get("files") or [] if path in by_path
@@ -1472,7 +1481,7 @@ def _heatmap_refresh(ctx, page) -> None:
     page._heatmap_files_box.clear()
     for path in params["files"]:
         page._heatmap_files_box.addItem(
-            ctx._comp_file_name(path, page._heatmap_task_id)
+            _data_naming._comp_file_name(ctx, path, page._heatmap_task_id)
         )
     page._heatmap_files_box.blockSignals(False)
     page._heatmap_files_count.setText(
@@ -1480,7 +1489,7 @@ def _heatmap_refresh(ctx, page) -> None:
     )
 
     # Keep only gates/variables that still exist for the selection.
-    options = ctx._heatmap_gate_options(page)
+    options = _heatmap_gate_options(ctx, page)
     by_gate = {
         f"{opt['task']}|{opt['id']}": opt for opt in options
     }
@@ -1496,25 +1505,25 @@ def _heatmap_refresh(ctx, page) -> None:
         })
     if gates != (params.get("gates") or []):
         params["gates"] = gates
-        ctx._heatmap_mark_dirty(page)
-    common = set(ctx._heatmap_common_columns(page))
+        _heatmap_mark_dirty(ctx, page)
+    common = set(_heatmap_common_columns(ctx, page))
     variables = [
         name for name in params.get("variables") or [] if name in common
     ]
     if variables != (params.get("variables") or []):
         params["variables"] = variables
-        ctx._heatmap_mark_dirty(page)
+        _heatmap_mark_dirty(ctx, page)
 
     page._heatmap_syncing = True
     try:
-        ctx._heatmap_fill_list(
+        _heatmap_fill_list(ctx,
             page._heatmap_gates_box,
             [
                 (f"{g['task']}|{g['id']}", g["label"])
                 for g in params["gates"]
             ],
         )
-        ctx._heatmap_fill_list(
+        _heatmap_fill_list(ctx,
             page._heatmap_vars_box,
             [(name, name) for name in params["variables"]],
         )
@@ -1527,10 +1536,10 @@ def _heatmap_refresh(ctx, page) -> None:
         f"{len(params['variables'])} variable(s)"
     )
 
-    ctx._heatmap_sync_sampling_controls(page)
-    ctx._heatmap_refresh_sampling(page)
-    ctx._heatmap_update_buttons(page)
-    ctx._heatmap_refresh_stale(page)
+    _heatmap_sync_sampling_controls(ctx, page)
+    _heatmap_refresh_sampling(ctx, page)
+    _heatmap_update_buttons(ctx, page)
+    _heatmap_refresh_stale(ctx, page)
 
 
 def _heatmap_sync_sampling_controls(ctx, page) -> None:
@@ -1570,20 +1579,20 @@ def _heatmap_on_sampling(ctx, page) -> None:
     )
     method = sampling["method"]
     sampling[method] = int(page._heatmap_sampling_value.value())
-    ctx._heatmap_sync_sampling_controls(page)
-    ctx._heatmap_refresh_sampling(page)
-    ctx._heatmap_mark_dirty(page)
-    ctx._heatmap_update_buttons(page)
-    ctx._heatmap_refresh_stale(page)
+    _heatmap_sync_sampling_controls(ctx, page)
+    _heatmap_refresh_sampling(ctx, page)
+    _heatmap_mark_dirty(ctx, page)
+    _heatmap_update_buttons(ctx, page)
+    _heatmap_refresh_stale(ctx, page)
 
 
 def _heatmap_on_sampling_value(ctx, page) -> None:
     sampling = page._heatmap_params.setdefault("sampling", {})
     method = sampling.get("method") or "uniform"
     sampling[method] = int(page._heatmap_sampling_value.value())
-    ctx._heatmap_refresh_sampling(page)
-    ctx._heatmap_mark_dirty(page)
-    ctx._heatmap_refresh_stale(page)
+    _heatmap_refresh_sampling(ctx, page)
+    _heatmap_mark_dirty(ctx, page)
+    _heatmap_refresh_stale(ctx, page)
 
 
 def _heatmap_refresh_sampling(ctx, page) -> None:
@@ -1592,7 +1601,7 @@ def _heatmap_refresh_sampling(ctx, page) -> None:
     if not files:
         page._heatmap_sampling_summary.setText("Select data files first.")
         return
-    sizes = ctx._heatmap_file_sizes(page)
+    sizes = _heatmap_file_sizes(ctx, page)
     sampling = params.get("sampling") or {}
     method = sampling.get("method") or "uniform"
     try:
@@ -1604,7 +1613,7 @@ def _heatmap_refresh_sampling(ctx, page) -> None:
     )
     lines = []
     for path in files:
-        name = ctx._comp_file_name(path, page._heatmap_task_id)
+        name = _data_naming._comp_file_name(ctx, path, page._heatmap_task_id)
         used = counts.get(path, sizes.get(path, 0))
         lines.append(f"{name}: {sizes.get(path, 0):,} → {used:,}")
     page._heatmap_sampling_summary.setText("\n".join(lines))
@@ -1639,7 +1648,7 @@ def _heatmap_refresh_stale(ctx, page) -> None:
     if not result:
         page._heatmap_stale_label.setText("")
         return
-    stale = result.get("signature") != ctx._heatmap_signature(page)
+    stale = result.get("signature") != _heatmap_signature(ctx, page)
     page._heatmap_stale_label.setText(
         "Outdated — press Calculate" if stale else ""
     )
@@ -1653,7 +1662,7 @@ def _heatmap_update_save_btn(ctx, page) -> None:
 
 def _heatmap_mark_dirty(ctx, page) -> None:
     page._heatmap_dirty = True
-    ctx._heatmap_update_save_btn(page)
+    _heatmap_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -1706,7 +1715,7 @@ def _heatmap_calculate(ctx, page) -> None:
     page._heatmap_status.setText("Calculating…")
     page._heatmap_progress.setRange(0, max(1, len(params["files"])))
     page._heatmap_progress.setValue(0)
-    ctx._heatmap_update_buttons(page)
+    _heatmap_update_buttons(ctx, page)
 
     runlog.action(
         "heatmap.calculate", module=str(page._heatmap_task_id),
@@ -1717,12 +1726,12 @@ def _heatmap_calculate(ctx, page) -> None:
     q = queue.Queue()
     page._heatmap_queue = q
     page._heatmap_thread = threading.Thread(
-        target=ctx._heatmap_run, args=(page, q), daemon=True
+        target=partial(_heatmap_run, ctx), args=(page, q), daemon=True
     )
     page._heatmap_thread.start()
     timer = QTimer(ctx.host)
     timer.setInterval(100)
-    timer.timeout.connect(lambda: ctx._heatmap_poll(page))
+    timer.timeout.connect(lambda: _heatmap_poll(ctx, page))
     timer.start()
     page._heatmap_timer = timer
 
@@ -1751,10 +1760,10 @@ def _heatmap_run(ctx, page, q) -> None:
         q.put(("log", "— Starting heatmap calculation —"))
         sizes = {}
         for path in files:
-            index = ctx._subsample_row_index(task_id, path)
+            index = _data_sampling._subsample_row_index(ctx, task_id, path)
             sizes[path] = (
                 int(len(index)) if index is not None
-                else int(ctx._data_row_count(path) or 0)
+                else int(_data_columns._data_row_count(ctx, path) or 0)
             )
         method = sampling.get("method") or "uniform"
         try:
@@ -1784,7 +1793,7 @@ def _heatmap_run(ctx, page, q) -> None:
             if page._heatmap_cancel:
                 q.put(("cancelled",))
                 return
-            name = ctx._comp_file_name(path, task_id)
+            name = _data_naming._comp_file_name(ctx, path, task_id)
             q.put(("status", f"Reading {i + 1}/{total}"))
             q.put(("log", f"Reading {i + 1}/{total}: {name} "
                           f"({sizes.get(path, 0):,} rows)"))
@@ -1797,13 +1806,13 @@ def _heatmap_run(ctx, page, q) -> None:
                     continue
                 gates = gates_cache.get(ref["task"])
                 if gates is None:
-                    gates = ctx._gating_gates_for(task, path)
+                    gates = _data_stores._gating_gates_for(ctx, task, path)
                     gates_cache[ref["task"]] = gates
                 by_id = {g["id"]: g for g in gates}
                 for gate in _gate_chain(gates, ref.get("id")):
                     needed |= _gate_needed_columns(gate, by_id)
             names = sorted(needed)
-            arrays = ctx._column_data(
+            arrays = _data_columns._column_data(ctx,
                 task_id, path, names, row_filter=False
             )
             missing = [name_ for name_ in variables if name_ not in arrays]
@@ -1811,7 +1820,7 @@ def _heatmap_run(ctx, page, q) -> None:
                 raise ValueError(
                     f"{name} is missing: {', '.join(missing)}"
                 )
-            index = ctx._subsample_row_index(task_id, path)
+            index = _data_sampling._subsample_row_index(ctx, task_id, path)
             if index is not None:
                 arrays = {key: value[index] for key, value in arrays.items()}
             if not arrays:
@@ -1947,11 +1956,11 @@ def _heatmap_run(ctx, page, q) -> None:
 
         payload = {
             "version": 1,
-            "signature": ctx._heatmap_signature(page),
+            "signature": _heatmap_signature(ctx, page),
             "computed_at": datetime.now().isoformat(timespec="seconds"),
             "files": files,
             "file_names": {
-                path: ctx._comp_file_name(path, task_id)
+                path: _data_naming._comp_file_name(ctx, path, task_id)
                 for path in files
             },
             "gates": gate_refs,
@@ -1983,7 +1992,7 @@ def _heatmap_poll(ctx, page) -> None:
             break
         kind = msg[0]
         if kind == "log":
-            ctx._heatmap_log(page, msg[1])
+            _heatmap_log(ctx, page, msg[1])
         elif kind == "status":
             page._heatmap_status.setText(msg[1])
         elif kind == "progress":
@@ -1994,7 +2003,7 @@ def _heatmap_poll(ctx, page) -> None:
             finished = True
         elif kind == "done":
             payload = msg[1]
-            ctx._heatmap_apply_result(page, payload)
+            _heatmap_apply_result(ctx, page, payload)
             finished = True
         elif kind == "error":
             error = msg[1]
@@ -2007,13 +2016,13 @@ def _heatmap_poll(ctx, page) -> None:
         timer.stop()
         page._heatmap_timer = None
     page._heatmap_queue = None
-    ctx._heatmap_update_buttons(page)
+    _heatmap_update_buttons(ctx, page)
     if cancelled:
-        ctx._heatmap_log(page, "Cancelled.")
+        _heatmap_log(ctx, page, "Cancelled.")
         page._heatmap_status.setText("Cancelled")
         return
     if error:
-        ctx._heatmap_log(page, f"✗ {error}")
+        _heatmap_log(ctx, page, f"✗ {error}")
         page._heatmap_status.setText("Failed — see the log")
         QMessageBox.warning(ctx.host, "Calculate", error)
         return
@@ -2024,23 +2033,23 @@ def _heatmap_poll(ctx, page) -> None:
 def _heatmap_apply_result(ctx, page, payload) -> None:
     page._heatmap_result = payload
     page._heatmap_dendro_cache = {}
-    ctx._heatmap_store_save(page._heatmap_task_id, payload)
-    ctx._heatmap_refresh_plot(page)
-    ctx._heatmap_refresh_stale(page)
+    _heatmap_store_save(ctx, page._heatmap_task_id, payload)
+    _heatmap_refresh_plot(ctx, page)
+    _heatmap_refresh_stale(ctx, page)
     if ctx.project is not None:
         ctx.project.save()
     page._heatmap_snapshot = copy.deepcopy(page._heatmap_params)
     page._heatmap_dirty = False
-    ctx._heatmap_update_save_btn(page)
+    _heatmap_update_save_btn(ctx, page)
     gates = len(payload.get("gates") or [])
     variables = len(payload.get("variables") or [])
     files = len(payload.get("files") or [])
-    ctx._heatmap_log(
+    _heatmap_log(ctx,
         page,
         f"✓ {gates} gates × {variables} variables "
         f"({files} files, {payload.get('seconds', 0):.2f} s)",
     )
-    ctx._heatmap_log(page, "Matrix saved to the module folder.")
+    _heatmap_log(ctx, page, "Matrix saved to the module folder.")
     ctx.statusBar().showMessage("Heatmap calculated")
     ctx._module_saved(page)
     runlog.action(
@@ -2069,12 +2078,12 @@ def _heatmap_display(ctx, page):
     col_order = list(range(len(col_labels)))
     row_dendro = col_dendro = None
     if cfg.get("cluster_rows"):
-        info = ctx._heatmap_dendro(page, "row")
+        info = _heatmap_dendro(ctx, page, "row")
         if info and len(info.get("order") or []) == len(row_labels):
             row_order = list(info["order"])
             row_dendro = info
     if cfg.get("cluster_cols"):
-        info = ctx._heatmap_dendro(page, "col")
+        info = _heatmap_dendro(ctx, page, "col")
         if info and len(info.get("order") or []) == len(col_labels):
             col_order = list(info["order"])
             col_dendro = info
@@ -2118,7 +2127,7 @@ def _heatmap_dendro(ctx, page, axis: str):
 
 
 def _heatmap_refresh_plot(ctx, page) -> None:
-    display = ctx._heatmap_display(page)
+    display = _heatmap_display(ctx, page)
     canvas = getattr(page, "_heatmap_canvas", None)
     if canvas is None:
         return
@@ -2139,7 +2148,7 @@ def _heatmap_refresh_plot(ctx, page) -> None:
 
 
 def _heatmap_copy_matrix(ctx, page) -> None:
-    display = ctx._heatmap_display(page)
+    display = _heatmap_display(ctx, page)
     if display is None:
         return
     rows, cols, matrix, _row, _col = display
@@ -2157,14 +2166,14 @@ def _heatmap_save_now(ctx, page) -> None:
         merged.update(page._heatmap_dendro_cache)
         if merged:
             page._heatmap_result["clustering"] = merged
-        ctx._heatmap_store_save(
+        _heatmap_store_save(ctx,
             page._heatmap_task_id, page._heatmap_result
         )
     if ctx.project is not None:
         ctx.project.save()
     page._heatmap_snapshot = copy.deepcopy(page._heatmap_params)
     page._heatmap_dirty = False
-    ctx._heatmap_update_save_btn(page)
+    _heatmap_update_save_btn(ctx, page)
     ctx.statusBar().showMessage("Heatmap saved")
     ctx._module_saved(page)
 
@@ -2182,7 +2191,7 @@ def _heatmap_close(ctx, page) -> None:
         page._heatmap_task_def["params"] = copy.deepcopy(
             page._heatmap_snapshot
         )
-    ctx._heatmap_cleanup(page)
+    _heatmap_cleanup(ctx, page)
     ctx._close_module_page(page)
 
 

@@ -19,7 +19,6 @@ from PySide6.QtCore import (QTimer, Qt)
 from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMessageBox, QPushButton)
 
 from smage.extensions_registry import EXTENSION_DEFS, _extension_def
-from smage.app.delegates import ModuleDelegatesMixin
 from smage.app.logging_setup import _install_excepthook, _install_qt_message_handler
 from smage.runlog import runlog
 from smage.app.module_sizes import ModuleSizesMixin
@@ -57,6 +56,9 @@ from smage.core.formatting import _format_sci
 from smage.core.image_ops import _pool_mask
 from smage.core.pipeline import _evaluate_stages
 from smage.core.sampling import _subsample_allocate
+from functools import partial
+from smage.data import pool as _data_pool
+from smage.widgets import settings as _widgets_settings
 
 
 # Light-blue "tech" theme, loosely inspired by Positron's blue accents.
@@ -175,12 +177,14 @@ from smage.core.sampling import _subsample_allocate
 # to unmodified).
 
 
-class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin, ExtensionsMixin, ProjectIOMixin, ModuleSizesMixin,
-                  ModuleDelegatesMixin):
+class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin, ExtensionsMixin, ProjectIOMixin, ModuleSizesMixin):
     """Main window: File/Help menu bar and a single tabbed workspace."""
 
     def __init__(self) -> None:
         super().__init__()
+        # The context is a thin proxy over this window; create it before any
+        # timer or menu wiring captures it.
+        self._ctx = AppContext(self)
         self.project = None
         self._clipboard = None
         self._import_files = []
@@ -212,7 +216,7 @@ class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin, ExtensionsMixi
         self._pool_worker = None
         self._pool_timer = QTimer(self)
         self._pool_timer.setInterval(40)
-        self._pool_timer.timeout.connect(self._pool_poll)
+        self._pool_timer.timeout.connect(partial(_data_pool._pool_poll, self._ctx))
         # Storage / memory readouts (tab corner + workflow cards).
         self._module_sizes = {}     # task id -> (bytes, file count)
         self._size_labels = {}      # task id -> the label on its card
@@ -236,13 +240,12 @@ class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin, ExtensionsMixi
         self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
         self._stage_cache = {}
-        self._ctx = AppContext(self)
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 800)
         self._build_menu_bar()
         self._build_main_area()
         self._restore_window_geometry()
-        self._apply_appearance_settings()
+        _widgets_settings._apply_appearance_settings(self._ctx)
         # Session log: record user actions (see runlog.py). Installed after the
         # UI exists so menu actions are known.
         self._action_logger = _UIActionLogger(self)

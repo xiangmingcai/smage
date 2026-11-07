@@ -9,6 +9,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
+from smage.modules.data_clean import page as _data_clean_page
 
 
 def _open(case_id: str):
@@ -47,26 +48,26 @@ def validate() -> None:
     window, _project, page, parquet = _open("dc_validate")
     try:
         ctx = window._ctx
-        ok, message = ctx._dc_validate(page)
+        ok, message = _data_clean_page._dc_validate(ctx, page)
         harness.check(not ok)
         harness.check("Select at least one data file" in message, message)
 
         page._dc_params["files"] = [str(parquet)]
-        ok, message = ctx._dc_validate(page)
+        ok, message = _data_clean_page._dc_validate(ctx, page)
         harness.check("acquisition time" in message, message)
 
         page._dc_params["time"] = "Time"
         page._dc_params["columns"] = ["FL1-A"]
         page._dc_params["name"] = ""
-        ok, message = ctx._dc_validate(page)
+        ok, message = _data_clean_page._dc_validate(ctx, page)
         harness.check("name for the new column" in message, message)
 
         page._dc_params["name"] = "x"
-        ok, message = ctx._dc_validate(page)
+        ok, message = _data_clean_page._dc_validate(ctx, page)
         harness.check("already used" in message, message)
 
         page._dc_params["name"] = "clean_pass"
-        ok, message = ctx._dc_validate(page)
+        ok, message = _data_clean_page._dc_validate(ctx, page)
         harness.check(ok, message)
     finally:
         _close(window)
@@ -84,7 +85,7 @@ def write_output() -> None:
 
         flags = np.zeros(40, dtype="float64")
         flags[::2] = 1.0
-        rel, columns, kind = ctx._dc_write_file(page, str(parquet), flags)
+        rel, columns, kind = _data_clean_page._dc_write_file(ctx, page, str(parquet), flags)
         harness.eq(columns, ["clean_pass"])
         harness.eq(kind, "table")
         output = project.path / rel
@@ -104,10 +105,10 @@ def signature() -> None:
                   "mode": "all", "mad": 6, "it_limit": 0.6,
                   "consecutive_bins": 5, "min_cells": 150,
                   "remove_zeros": False, "name": "clean_pass"}
-        first = ctx._dc_signature(params, str(parquet), "dc-1")
-        harness.eq(ctx._dc_signature(params, str(parquet), "dc-1"), first)
+        first = _data_clean_page._dc_signature(ctx, params, str(parquet), "dc-1")
+        harness.eq(_data_clean_page._dc_signature(ctx, params, str(parquet), "dc-1"), first)
         params = dict(params, mad=7)
-        harness.check(ctx._dc_signature(params, str(parquet), "dc-1") != first)
+        harness.check(_data_clean_page._dc_signature(ctx, params, str(parquet), "dc-1") != first)
     finally:
         _close(window)
 
@@ -145,7 +146,7 @@ def calculate() -> None:
             "min_cells": 50,
             "consecutive_bins": 3,
         })
-        ctx._dc_calculate(page)
+        _data_clean_page._dc_calculate(ctx, page)
         harness.check(page._dc_running)
         harness.wait_for(lambda: not page._dc_running, timeout=120,
                          message="PeacoQC")

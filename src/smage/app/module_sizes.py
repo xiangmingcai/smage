@@ -8,6 +8,7 @@ from smage.widgets.resources import (
     _process_memory_bytes,
     _system_memory_bytes,
 )
+from smage.data import files as _data_files
 
 
 class ModuleSizesMixin:
@@ -21,7 +22,7 @@ class ModuleSizesMixin:
 
     def _schedule_module_size(self, task_id) -> None:
         """Measure a module folder in the background (cached until it saves)."""
-        path = self._module_size_path(task_id)
+        path = _data_files._module_size_path(self._ctx, task_id)
         if path is None or not Path(path).is_dir():
             self._forget_module_size(task_id)
             return
@@ -131,7 +132,7 @@ class ModuleSizesMixin:
         text = _format_bytes(size)
         label.setText(text)
         detail = f"{text} · {count:,} file(s)"
-        path = self._module_size_path(task_id)
+        path = _data_files._module_size_path(self._ctx, task_id)
         if path is not None:
             detail += f"\n{path}"
         label.setToolTip(detail)

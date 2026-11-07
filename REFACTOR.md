@@ -109,7 +109,6 @@ src/smage/
     project_io.py                     menus, project open/save, window shell
     module_sizes.py                   storage-usage worker/labels
     logging_setup.py                  Qt message handler + excepthook
-    delegates.py                      1,013 one-line module delegates
   core/                       ~1,380   Qt-free, no window state
     formatting.py
     scale_math.py
@@ -132,6 +131,7 @@ src/smage/
     outputs.py
     feature_outputs.py
     workers.py                        background threads (Qt-free)
+    registry.py                       lazy resolver for cross-layer calls
   widgets/                    ~6,150   Qt, ctx passed explicitly
     resources.py
     panels.py
@@ -525,25 +525,32 @@ passes with `SHUTDOWN OK`).
       window geometry, tabs, resource indicator); `app/module_sizes.py` —
       `ModuleSizesMixin`
 - [x] `app/logging_setup.py` — Qt message handler + excepthook
-- [x] `app/delegates.py` — `ModuleDelegatesMixin`: all 1,013 one-line
-      delegates from the earlier batches, kept so call sites stay unchanged
+- [x] `app/delegates.py` — removed.  Module pages now call their own
+      functions directly, and `data/` / `widgets/` use `data/registry.py`
+      for the few calls that would otherwise form an import cycle.
 - [x] 6.5 `main.py` = docstring + imports + `MainWindow` + `main()`
 
 Result: `main.py` **348 lines**. `MainWindow` is now:
 
 ```python
 class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin,
-                  ExtensionsMixin, ProjectIOMixin, ModuleSizesMixin,
-                  ModuleDelegatesMixin):
+                  ExtensionsMixin, ProjectIOMixin, ModuleSizesMixin):
     def __init__(self): ...
     def _figure_permute_dialog(self, *args, **kwargs): ...
 ```
 
 The app shell uses **mixins** (not `ctx`-taking functions) because these
 methods are inherently window code; moving them verbatim kept every `self`
-reference working. The 1,013 module delegates live in one generated mixin
-and are the remaining cleanup target: once call sites use the layer/module
-functions directly, `app/delegates.py` can disappear.
+reference working.
+
+The one-line delegate mixin was removed afterwards (2026-11): all 21 module
+pages call their own layer functions directly, and `MainWindow` no longer
+carries a thousand forwarding methods.  The remaining cross-layer calls
+(`data` → module pages, `widgets` → module pages) would create import cycles,
+so they resolve lazily through `data/registry.py` (`AppContext.__getattr__`
+looks a name up there before falling back to the host).  That table holds
+only the names actually called across layers; add an entry when a new
+cross-layer call is introduced.
 
 Final verification: `test_all_pages_smoke` opens and closes all 21 module
 pages; `test_module_lock`, `test_draft_locked`, `test_import_unlock`,

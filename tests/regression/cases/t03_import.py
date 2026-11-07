@@ -19,6 +19,7 @@ import harness  # noqa: E402
 
 from smage.dimensions import parameter_names, read_dimensions  # noqa: E402
 from smage.importer import _select_and_rename, import_file  # noqa: E402
+from smage.modules.import_ import page as _import__page
 
 FIXTURES = harness.FIXTURES_DIR
 FCS = FIXTURES / "fcs" / "synthetic_8ch.fcs"
@@ -151,7 +152,7 @@ def _import_page(case_id: str):
     project.save()
     window = harness.new_window()
     harness.open_project(window, project)
-    window._load_import_files()
+    _import__page._load_import_files(window._ctx)
     window._open_module("data-import", "import", "Data Import")
     harness.pump(300)
     return window, project
@@ -169,7 +170,7 @@ def _set_files(window, paths, sampling="full", percent=10) -> None:
         }
         for path in paths
     ]
-    window._refresh_import_list()
+    _import__page._refresh_import_list(window._ctx)
 
 
 def _close(window) -> None:
@@ -186,7 +187,7 @@ def page_peek() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
+            _import__page._peek_files(window._ctx)
 
         entry = window._import_files[0]
         harness.eq(entry["status"], "peeked")
@@ -211,7 +212,7 @@ def page_peek_error() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
+            _import__page._peek_files(window._ctx)
 
         entry = window._import_files[0]
         harness.eq(entry["status"], "error")
@@ -231,8 +232,8 @@ def page_run() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
-            window._run_import()
+            _import__page._peek_files(window._ctx)
+            _import__page._run_import(window._ctx)
         harness.check(getattr(window, "_import_running", False), "import started")
         harness.wait_for(
             lambda: not getattr(window, "_import_running", False),
@@ -264,7 +265,7 @@ def page_not_peeked() -> None:
             question=QMessageBox.StandardButton.Yes,
             warning=QMessageBox.StandardButton.Ok,
         ):
-            window._run_import()
+            _import__page._run_import(window._ctx)
 
         harness.check(
             not getattr(window, "_import_running", False),
@@ -285,8 +286,8 @@ def page_sampling() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
-            window._run_import()
+            _import__page._peek_files(window._ctx)
+            _import__page._run_import(window._ctx)
         harness.wait_for(
             lambda: not getattr(window, "_import_running", False),
             timeout=30,
@@ -307,11 +308,11 @@ def page_rename() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
+            _import__page._peek_files(window._ctx)
             params = window._import_files[0]["parameters"]
             params[0]["extract"] = False
             params[1]["rename"] = "Renamed"
-            window._run_import()
+            _import__page._run_import(window._ctx)
         harness.wait_for(
             lambda: not getattr(window, "_import_running", False),
             timeout=30,
@@ -336,8 +337,8 @@ def page_image() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
-            window._run_import()
+            _import__page._peek_files(window._ctx)
+            _import__page._run_import(window._ctx)
         harness.wait_for(
             lambda: not getattr(window, "_import_running", False),
             timeout=30,
@@ -365,8 +366,8 @@ def page_delete() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
-            window._run_import()
+            _import__page._peek_files(window._ctx)
+            _import__page._run_import(window._ctx)
         harness.wait_for(
             lambda: not getattr(window, "_import_running", False),
             timeout=30,
@@ -378,7 +379,7 @@ def page_delete() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._delete_selected_files()
+            _import__page._delete_selected_files(window._ctx)
 
         harness.eq(window._import_files, [])
         harness.eq(window._processed_files, [])
@@ -398,7 +399,7 @@ def page_apply_to() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
+            _import__page._peek_files(window._ctx)
         first, second = window._import_files
         first["parameters"][0]["extract"] = False
         first["parameters"][1]["rename"] = "Applied"
@@ -428,7 +429,7 @@ def page_apply_to() -> None:
                 warning=QMessageBox.StandardButton.Ok,
                 question=QMessageBox.StandardButton.Yes,
             ):
-                window._apply_to_files()
+                _import__page._apply_to_files(window._ctx)
         finally:
             timer.stop()
 
@@ -451,7 +452,7 @@ def page_cancel() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._peek_files()
+            _import__page._peek_files(window._ctx)
 
         def slow_import(*args, **kwargs):
             _time.sleep(0.3)
@@ -461,9 +462,9 @@ def page_cancel() -> None:
         with harness.patch_dialogs(
             import_page, question=QMessageBox.StandardButton.Yes
         ):
-            window._run_import()
+            _import__page._run_import(window._ctx)
         harness.pump(60)
-        window._cancel_import()
+        _import__page._cancel_import(window._ctx)
         harness.wait_for(
             lambda: not getattr(window, "_import_running", False),
             timeout=30,

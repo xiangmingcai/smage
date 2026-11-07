@@ -47,17 +47,20 @@ from smage.widgets.resources import _dot_pixmap
 from uuid import uuid4
 import queue
 import threading
+from functools import partial
+from smage.data import files as _data_files
+from smage.widgets import panels as _widgets_panels
 
 
 def _import_locked(ctx) -> bool:
     """True if Data Import is currently locked (session unlocks apply)."""
-    task = ctx._import_task()
+    task = _data_files._import_task(ctx)
     return task is not None and ctx._task_locked(task)
 
 
 def _load_import_files(ctx) -> None:
     """Load the Data Import file list and processed results from the project."""
-    task = ctx._import_task()
+    task = _data_files._import_task(ctx)
     if task is None:
         ctx._import_files = []
         ctx._processed_files = []
@@ -89,7 +92,7 @@ def _build_data_import_page(ctx) -> QWidget:
     layout = QVBoxLayout(page)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(0)
-    locked = ctx._import_locked()
+    locked = _import_locked(ctx)
     page._import_locked_state = locked
     layout.addWidget(ctx._build_module_toolbar(
         "Data Import", page, include_save=False, locked=locked,
@@ -101,20 +104,20 @@ def _build_data_import_page(ctx) -> QWidget:
     cl = QHBoxLayout(content)
     cl.setContentsMargins(12, 12, 12, 12)
     cl.setSpacing(12)
-    middle_panel = ctx._build_middle_panel()
-    input_panel = ctx._build_input_panel()
-    processed_panel = ctx._build_processed_panel()
+    middle_panel = _widgets_panels._build_middle_panel(ctx)
+    input_panel = _build_input_panel(ctx)
+    processed_panel = _build_processed_panel(ctx)
     cl.addWidget(input_panel, 1)
     cl.addWidget(middle_panel, 1)
     cl.addWidget(processed_panel, 1)
     layout.addWidget(content, 1)
     if locked:
-        ctx._set_import_controls_enabled(False)
+        _set_import_controls_enabled(ctx, False)
     return page
 
 
 def _build_sample_panel(ctx) -> QFrame:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -144,19 +147,19 @@ def _build_sample_panel(ctx) -> QFrame:
 
     ctx.sample_apply_btn = QPushButton("Apply to")
     ctx.sample_apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    ctx.sample_apply_btn.clicked.connect(ctx._apply_sampling_to_files)
+    ctx.sample_apply_btn.clicked.connect(partial(_apply_sampling_to_files, ctx))
     row.addWidget(ctx.sample_apply_btn)
     lay.addLayout(row)
 
     lay.addStretch()
 
-    ctx.sample_combo.currentIndexChanged.connect(ctx._on_sampling_changed)
-    ctx.sample_percent_spin.valueChanged.connect(ctx._on_sampling_changed)
+    ctx.sample_combo.currentIndexChanged.connect(partial(_on_sampling_changed, ctx))
+    ctx.sample_percent_spin.valueChanged.connect(partial(_on_sampling_changed, ctx))
     return panel
 
 
 def _build_processed_panel(ctx) -> QFrame:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -164,7 +167,7 @@ def _build_processed_panel(ctx) -> QFrame:
     ctx.processed_list = QListWidget()
     ctx.processed_list.setFrameShape(QFrame.Shape.NoFrame)
     lay.addWidget(ctx.processed_list)
-    ctx._refresh_processed_panel()
+    _refresh_processed_panel(ctx)
     return panel
 
 
@@ -192,7 +195,7 @@ def _set_import_controls_enabled(ctx, enabled: bool) -> None:
 
 
 def _build_input_panel(ctx) -> QFrame:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
 
@@ -201,7 +204,7 @@ def _build_input_panel(ctx) -> QFrame:
     header.addStretch()
     ctx.select_btn = QPushButton("Select Files…")
     ctx.select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    ctx.select_btn.clicked.connect(ctx._select_import_files)
+    ctx.select_btn.clicked.connect(partial(_select_import_files, ctx))
     header.addWidget(ctx.select_btn)
     lay.addLayout(header)
 
@@ -218,17 +221,17 @@ def _build_input_panel(ctx) -> QFrame:
     ctx.peek_btn = QPushButton("Peek")
     ctx.peek_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     ctx.peek_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    ctx.peek_btn.clicked.connect(ctx._peek_files)
+    ctx.peek_btn.clicked.connect(partial(_peek_files, ctx))
     btn_row.addWidget(ctx.peek_btn, 1)
     ctx.import_btn = QPushButton("Import")
     ctx.import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     ctx.import_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    ctx.import_btn.clicked.connect(ctx._run_import)
+    ctx.import_btn.clicked.connect(partial(_run_import, ctx))
     btn_row.addWidget(ctx.import_btn, 1)
     ctx.delete_btn = QPushButton("Delete")
     ctx.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     ctx.delete_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    ctx.delete_btn.clicked.connect(ctx._delete_selected_files)
+    ctx.delete_btn.clicked.connect(partial(_delete_selected_files, ctx))
     btn_row.addWidget(ctx.delete_btn, 1)
     lay.addLayout(btn_row)
 
@@ -237,11 +240,11 @@ def _build_input_panel(ctx) -> QFrame:
     for entry in ctx._import_files:
         entry["checked"] = False
 
-    ctx._refresh_import_list()
+    _refresh_import_list(ctx)
 
-    ctx.select_all_box.stateChanged.connect(ctx._on_select_all_state_changed)
-    ctx.import_list.itemChanged.connect(ctx._on_item_check_changed)
-    ctx.import_list.itemSelectionChanged.connect(ctx._on_import_selection_changed)
+    ctx.select_all_box.stateChanged.connect(partial(_on_select_all_state_changed, ctx))
+    ctx.import_list.itemChanged.connect(partial(_on_item_check_changed, ctx))
+    ctx.import_list.itemSelectionChanged.connect(partial(_on_import_selection_changed, ctx))
     return panel
 
 
@@ -266,8 +269,8 @@ def _select_import_files(ctx) -> None:
                 "sampling_percent": 10,
             }
         )
-    ctx._persist_import_files()
-    ctx._refresh_import_list()
+    _persist_import_files(ctx)
+    _refresh_import_list(ctx)
 
 
 def _refresh_import_list(ctx) -> None:
@@ -284,7 +287,7 @@ def _refresh_import_list(ctx) -> None:
             text = base
 
         item = QListWidgetItem(text)
-        item.setToolTip(ctx._status_tooltip(entry))
+        item.setToolTip(_status_tooltip(ctx, entry))
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(
             Qt.CheckState.Checked
@@ -295,7 +298,7 @@ def _refresh_import_list(ctx) -> None:
         item.setIcon(QIcon(_dot_pixmap(color)))
         ctx.import_list.addItem(item)
     ctx._updating_checks = False
-    ctx._update_select_all_state()
+    _update_select_all_state(ctx)
 
 
 def _peek_files(ctx) -> None:
@@ -344,8 +347,8 @@ def _peek_files(ctx) -> None:
         progress.setValue(step + 1)
         QApplication.processEvents()
 
-    ctx._persist_import_files()
-    ctx._refresh_import_list()
+    _persist_import_files(ctx)
+    _refresh_import_list(ctx)
     progress.close()
 
 
@@ -429,19 +432,19 @@ def _run_import(ctx) -> None:
     progress.setAutoClose(False)
     progress.setAutoReset(False)
     progress.setValue(0)
-    progress.canceled.connect(ctx._cancel_import)
+    progress.canceled.connect(partial(_cancel_import, ctx))
     ctx._import_progress = progress
 
     q = queue.Queue()
     ctx._import_queue = q
     ctx._import_thread = threading.Thread(
-        target=ctx._import_worker, args=(jobs, q), daemon=True
+        target=partial(_import_worker, ctx), args=(jobs, q), daemon=True
     )
     ctx._import_thread.start()
 
     timer = QTimer(ctx.host)
     timer.setInterval(100)
-    timer.timeout.connect(ctx._import_poll)
+    timer.timeout.connect(partial(_import_poll, ctx))
     timer.start()
     ctx._import_timer = timer
 
@@ -519,7 +522,7 @@ def _import_poll(ctx) -> None:
             entry["status"] = "processed"
             entry["error"] = None
             entry["imported"] = {"parquet": out_path, "rows": result["rows"]}
-            ctx._column_index[ctx._rel_data_key(out_path)] = result["columns"]
+            ctx._column_index[_data_files._rel_data_key(ctx, out_path)] = result["columns"]
             ctx.project.save_columns(ctx._column_index)
             ctx._processed_files[:] = [
                 r for r in ctx._processed_files if r.get("source") != entry["path"]
@@ -545,7 +548,7 @@ def _import_poll(ctx) -> None:
             finished = True
     if not finished:
         return
-    ctx._import_finish()
+    _import_finish(ctx)
 
 
 def _import_finish(ctx) -> None:
@@ -577,9 +580,9 @@ def _import_finish(ctx) -> None:
         ctx._import_progress = None
     ctx.peek_btn.setEnabled(True)
     ctx.import_btn.setEnabled(True)
-    ctx._persist_import_files()
-    ctx._refresh_import_list()
-    ctx._refresh_processed_panel()
+    _persist_import_files(ctx)
+    _refresh_import_list(ctx)
+    _refresh_processed_panel(ctx)
 
 
 IMPORT_STATUS_COLORS = {
@@ -591,7 +594,7 @@ IMPORT_STATUS_COLORS = {
 
 
 def _build_parameter_panel(ctx) -> QFrame:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -609,9 +612,9 @@ def _build_parameter_panel(ctx) -> QFrame:
     ctx.apply_params_btn = QPushButton("Apply to")
     for b in (ctx.copy_params_btn, ctx.paste_params_btn, ctx.apply_params_btn):
         b.setCursor(Qt.CursorShape.PointingHandCursor)
-    ctx.copy_params_btn.clicked.connect(ctx._copy_parameters)
-    ctx.paste_params_btn.clicked.connect(ctx._paste_parameters)
-    ctx.apply_params_btn.clicked.connect(ctx._apply_to_files)
+    ctx.copy_params_btn.clicked.connect(partial(_copy_parameters, ctx))
+    ctx.paste_params_btn.clicked.connect(partial(_paste_parameters, ctx))
+    ctx.apply_params_btn.clicked.connect(partial(_apply_to_files, ctx))
     button_row.addWidget(ctx.copy_params_btn)
     button_row.addWidget(ctx.paste_params_btn)
     button_row.addWidget(ctx.apply_params_btn)
@@ -662,16 +665,16 @@ def _delete_selected_files(ctx) -> None:
                         Path(parquet).unlink(missing_ok=True)
                     except OSError:
                         pass
-                    ctx._column_index.pop(ctx._rel_data_key(parquet), None)
+                    ctx._column_index.pop(_data_files._rel_data_key(ctx, parquet), None)
         ctx._processed_files[:] = [
             r for r in ctx._processed_files if r.get("source") != source
         ]
         del ctx._import_files[i]
 
     ctx.project.save_columns(ctx._column_index)
-    ctx._persist_import_files()
-    ctx._refresh_import_list()
-    ctx._refresh_processed_panel()
+    _persist_import_files(ctx)
+    _refresh_import_list(ctx)
+    _refresh_processed_panel(ctx)
     ctx.statusBar().showMessage(f"Deleted {len(checked)} file(s)")
 
 
@@ -710,8 +713,8 @@ def _on_item_check_changed(ctx, item) -> None:
         checked = item.checkState() == Qt.CheckState.Checked
         if ctx._import_files[index].get("checked", True) != checked:
             ctx._import_files[index]["checked"] = checked
-            ctx._persist_import_files()
-    ctx._update_select_all_state()
+            _persist_import_files(ctx)
+    _update_select_all_state(ctx)
 
 
 def _update_select_all_state(ctx) -> None:
@@ -735,19 +738,19 @@ def _update_select_all_state(ctx) -> None:
 def _on_import_selection_changed(ctx) -> None:
     item = ctx.import_list.currentItem()
     if item is None:
-        ctx._show_file_parameters(None)
+        _show_file_parameters(ctx, None)
         return
     index = ctx.import_list.row(item)
     if 0 <= index < len(ctx._import_files):
-        ctx._show_file_parameters(ctx._import_files[index])
+        _show_file_parameters(ctx, ctx._import_files[index])
     else:
-        ctx._show_file_parameters(None)
+        _show_file_parameters(ctx, None)
 
 
 def _show_file_parameters(ctx, entry) -> None:
     ctx._current_entry = entry
-    ctx._show_file_sampling(entry)
-    ctx._clear_parameter_rows()
+    _show_file_sampling(ctx, entry)
+    _clear_parameter_rows(ctx)
     if entry is None:
         ctx.parameter_summary.setText("Select a file to see its parameters.")
         ctx.parameter_rows_layout.addStretch()
@@ -790,7 +793,7 @@ def _show_file_parameters(ctx, entry) -> None:
             for n in parameter_names(dims)
         ]
         entry["parameters"] = params
-        ctx._persist_import_files()
+        _persist_import_files(ctx)
 
     # Column headers
     header = QWidget()
@@ -810,7 +813,7 @@ def _show_file_parameters(ctx, entry) -> None:
     hh.addWidget(h_new, 1)
     ctx.parameter_rows_layout.addWidget(header)
 
-    locked = ctx._import_locked()
+    locked = _import_locked(ctx)
     for param in params:
         row = QWidget()
         h = QHBoxLayout(row)
@@ -836,10 +839,10 @@ def _show_file_parameters(ctx, entry) -> None:
 
         check.toggled.connect(
             lambda checked, pp=param, ll=line_edit:
-                ctx._on_param_extract_toggled(pp, ll, checked)
+                _on_param_extract_toggled(ctx, pp, ll, checked)
         )
         line_edit.editingFinished.connect(
-            lambda pp=param, ll=line_edit: ctx._on_param_renamed(pp, ll)
+            lambda pp=param, ll=line_edit: _on_param_renamed(ctx, pp, ll)
         )
 
         ctx.parameter_rows_layout.addWidget(row)
@@ -860,16 +863,16 @@ def _clear_parameter_rows(ctx) -> None:
 def _on_param_extract_toggled(ctx, param, line_edit, checked) -> None:
     param["extract"] = checked
     line_edit.setEnabled(checked)
-    ctx._persist_import_files()
+    _persist_import_files(ctx)
 
 
 def _on_param_renamed(ctx, param, line_edit) -> None:
     param["rename"] = line_edit.text().strip() or param.get("name", "")
-    ctx._persist_import_files()
+    _persist_import_files(ctx)
 
 
 def _copy_parameters(ctx) -> None:
-    ctx._flash_button(ctx.copy_params_btn)
+    _flash_button(ctx, ctx.copy_params_btn)
     entry = ctx._current_entry
     if entry is None or not entry.get("parameters"):
         QMessageBox.information(ctx, "Copy", "No parameters to copy. Peek a file first.")
@@ -883,7 +886,7 @@ def _copy_parameters(ctx) -> None:
 
 
 def _paste_parameters(ctx) -> None:
-    ctx._flash_button(ctx.paste_params_btn)
+    _flash_button(ctx, ctx.paste_params_btn)
     entry = ctx._current_entry
     if entry is None or not entry.get("parameters"):
         QMessageBox.information(ctx, "Paste", "No parameters to paste into. Peek a file first.")
@@ -953,8 +956,8 @@ def _paste_parameters(ctx) -> None:
         p["extract"] = extract_text.lower() in ("true", "1", "yes", "y", "t")
         p["rename"] = rename or name
 
-    ctx._persist_import_files()
-    ctx._show_file_parameters(entry)
+    _persist_import_files(ctx)
+    _show_file_parameters(ctx, entry)
     ctx.statusBar().showMessage("Parameters pasted")
 
 
@@ -969,25 +972,25 @@ def _flash_button(ctx, button) -> None:
 
 
 def _apply_to_files(ctx) -> None:
-    ctx._flash_button(ctx.apply_params_btn)
+    _flash_button(ctx, ctx.apply_params_btn)
     entry = ctx._current_entry
     if entry is None or not entry.get("parameters"):
         QMessageBox.information(ctx, "Apply to", "No parameters to apply. Peek a file first.")
         return
 
-    candidates = ctx._find_same_parameter_files(entry)
+    candidates = _find_same_parameter_files(ctx, entry)
     if not candidates:
         QMessageBox.information(
             ctx.host, "Apply to", "No other files have the same parameter names."
         )
         return
 
-    selected = ctx._show_apply_dialog(candidates)
+    selected = _show_apply_dialog(ctx, candidates)
     if not selected:
         return
 
-    ctx._apply_parameter_settings(entry, selected)
-    ctx._persist_import_files()
+    _apply_parameter_settings(ctx, entry, selected)
+    _persist_import_files(ctx)
     ctx.statusBar().showMessage(f"Applied to {len(selected)} file(s)")
 
 
@@ -1085,11 +1088,11 @@ def _on_sampling_changed(ctx) -> None:
     entry["sampling"] = sampling
     entry["sampling_percent"] = ctx.sample_percent_spin.value()
     ctx.sample_percent_spin.setVisible(sampling == "partial")
-    ctx._persist_import_files()
+    _persist_import_files(ctx)
 
 
 def _apply_sampling_to_files(ctx) -> None:
-    ctx._flash_button(ctx.sample_apply_btn)
+    _flash_button(ctx, ctx.sample_apply_btn)
     entry = ctx._current_entry
     if entry is None:
         QMessageBox.information(ctx, "Apply to", "No file selected.")
@@ -1103,7 +1106,7 @@ def _apply_sampling_to_files(ctx) -> None:
         QMessageBox.information(ctx, "Apply to", "No other files to apply to.")
         return
 
-    selected = ctx._show_apply_dialog(candidates)
+    selected = _show_apply_dialog(ctx, candidates)
     if not selected:
         return
 
@@ -1111,7 +1114,7 @@ def _apply_sampling_to_files(ctx) -> None:
         ctx._import_files[idx]["sampling"] = sampling
         ctx._import_files[idx]["sampling_percent"] = percent
 
-    ctx._persist_import_files()
+    _persist_import_files(ctx)
     ctx.statusBar().showMessage(f"Applied sampling to {len(selected)} file(s)")
 
 

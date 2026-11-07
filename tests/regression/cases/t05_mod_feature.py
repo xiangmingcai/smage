@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
 from smage.modules.feature import page as feature_page  # noqa: E402
+from smage.modules.feature import page as feature_page
 
 
 def _open(case_id: str, ignore=None):
@@ -57,7 +58,7 @@ def calculate() -> None:
     window, project, page, parquet = _open("feature_calc", ignore=[])
     try:
         ctx = window._ctx
-        ctx._feat_calculate(page)
+        feature_page._feat_calculate(ctx, page)
         outputs = page._feat_params.get("outputs") or {}
         harness.check(parquet in outputs, f"outputs: {outputs}")
         record = outputs[parquet]
@@ -86,7 +87,7 @@ def ignore_background() -> None:
         ctx = window._ctx
         with harness.patch_dialogs(feature_page,
                                    question=QMessageBox.StandardButton.Yes):
-            ctx._feat_calculate(page)
+            feature_page._feat_calculate(ctx, page)
         output = project.path / page._feat_params["outputs"][parquet]["path"]
         frame = pd.read_parquet(output)
         harness.eq(sorted(frame["group"].tolist()), [1, 2],
@@ -103,14 +104,14 @@ def validation() -> None:
         page._feat_params["feature"] = ""
         with harness.patch_dialogs(feature_page,
                                    warning=QMessageBox.StandardButton.Ok):
-            ctx._feat_calculate(page)
+            feature_page._feat_calculate(ctx, page)
         harness.check(not page._feat_params.get("outputs"))
 
         page._feat_params["feature"] = "group"
         page._feat_params["rules"] = [{"source": "v", "method": "mean"}]
         with harness.patch_dialogs(feature_page,
                                    warning=QMessageBox.StandardButton.Ok):
-            ctx._feat_calculate(page)
+            feature_page._feat_calculate(ctx, page)
         harness.check(not page._feat_params.get("outputs"),
                       "Count must be the first rule")
     finally:

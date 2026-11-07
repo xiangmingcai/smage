@@ -34,6 +34,12 @@ from smage.project import Project
 from smage.runlog import runlog
 import copy
 import shutil
+from functools import partial
+from smage.data import pool as _data_pool
+from smage.data import stores as _data_stores
+from smage.modules.import_ import page as _import__page
+from smage.modules.segmentation import page as _segmentation_page
+from smage.widgets import settings as _widgets_settings
 
 
 class ProjectIOMixin:
@@ -92,9 +98,9 @@ class ProjectIOMixin:
                 event.ignore()
                 return
         # Mask-edge images are temporary: drop this module's cache on exit.
-        self._seg_clear_edge_cache()
+        _segmentation_page._seg_clear_edge_cache(self._ctx)
         self._save_window_geometry()
-        self._discard_draft_folders()
+        _data_stores._discard_draft_folders(self._ctx)
         runlog.info("window.close")
         runlog.stop("window closed")
         event.accept()
@@ -123,7 +129,7 @@ class ProjectIOMixin:
 
         settings_menu = bar.addMenu("&Settings")
         settings_action = QAction("Global Settings…", self)
-        settings_action.triggered.connect(self._open_settings)
+        settings_action.triggered.connect(partial(_widgets_settings._open_settings, self._ctx))
         settings_menu.addAction(settings_action)
 
         help_menu = bar.addMenu("&Help")
@@ -162,7 +168,7 @@ class ProjectIOMixin:
         if not ok or not name:
             return
 
-        self._discard_draft_folders()
+        _data_stores._discard_draft_folders(self._ctx)
         try:
             self.project = Project.create(Path(parent_dir), name)
         except OSError as error:
@@ -172,7 +178,7 @@ class ProjectIOMixin:
         runlog.info("project.new", path=str(self.project.path), name=self.project.name)
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
-        self._pool_clear()
+        _data_pool._pool_clear(self._ctx)
         self._channel_range_cache = {}
         self._size_labels.clear()
         self._size_pending.clear()
@@ -180,7 +186,7 @@ class ProjectIOMixin:
         self._refresh_storage_usage()
         self._column_index = self.project.load_columns()
         self._reset_module_tabs()
-        self._load_import_files()
+        _import__page._load_import_files(self._ctx)
         self._refresh_workflow_tree()
         self.statusBar().showMessage(f"Project created: {self.project.path}")
 
@@ -189,7 +195,7 @@ class ProjectIOMixin:
         folder = QFileDialog.getExistingDirectory(self, "Open Project")
         if not folder:
             return
-        self._discard_draft_folders()
+        _data_stores._discard_draft_folders(self._ctx)
         try:
             self.project = Project.load(Path(folder))
         except (OSError, ValueError, KeyError) as error:
@@ -205,7 +211,7 @@ class ProjectIOMixin:
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
         self._column_index = self.project.load_columns()
         self._reset_module_tabs()
-        self._load_import_files()
+        _import__page._load_import_files(self._ctx)
         self._refresh_workflow_tree()
         self.statusBar().showMessage(f"Opened: {self.project.path}")
 
@@ -225,7 +231,7 @@ class ProjectIOMixin:
         if not ok or not name:
             return
 
-        self._discard_draft_folders()
+        _data_stores._discard_draft_folders(self._ctx)
         try:
             new_project = Project.create(Path(parent_dir), name)
             new_project.samples = copy.deepcopy(self.project.samples)
@@ -258,7 +264,7 @@ class ProjectIOMixin:
         self._stage_cache = {}
         self._seg_value_cache = {}
         self._seg_mask_cache = {}
-        self._seg_clear_edge_cache()
+        _segmentation_page._seg_clear_edge_cache(self._ctx)
 
     def _build_main_area(self) -> None:
         self.tabs = QTabWidget()

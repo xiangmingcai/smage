@@ -18,6 +18,12 @@ from smage.widgets.controls import (
     _NoWheelComboBox, _NoWheelDoubleSpinBox,
 )
 from smage.widgets.resources import _lock_pixmap
+from smage.data import files as _data_files
+from smage.data import image_index as _data_image_index
+from smage.data import naming as _data_naming
+from smage.data import sampling as _data_sampling
+from smage.widgets import panels as _widgets_panels
+from smage.widgets import picker as _widgets_picker
 
 
 _SUBS_DEFAULT_COUNT = 10000
@@ -28,14 +34,14 @@ def _subsample_saved_mask(ctx, task, parquet_path, manifest):
     """Load a module's saved coverage mask, or None when absent/stale."""
     import numpy as np
 
-    npy, meta_path = ctx._subsample_coverage_paths(task, parquet_path)
+    npy, meta_path = _data_sampling._subsample_coverage_paths(ctx, task, parquet_path)
     if npy is None or not npy.is_file() or not meta_path.is_file():
         return None
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if meta != ctx._subsample_mask_meta(task, parquet_path, manifest):
+    if meta != _data_sampling._subsample_mask_meta(ctx, task, parquet_path, manifest):
         return None
     try:
         mask = np.load(npy)
@@ -53,18 +59,18 @@ def _subsample_write_masks(ctx, page) -> int:
     import numpy as np
 
     task = page._subs_task_def
-    folder = ctx._subsample_coverage_dir(task.get("id"))
+    folder = _data_sampling._subsample_coverage_dir(ctx, task.get("id"))
     if folder is None:
         return 0
     wanted = set()
     written = 0
     for path in page._subs_params.get("files") or []:
-        ent = ctx._ensure_image_index(path)
+        ent = _data_image_index._ensure_image_index(ctx, path)
         if ent is None or ent.get("manifest") is None:
             continue  # table data needs no raster coverage mask
         manifest = ent["manifest"]
-        mask = ctx._subsample_own_mask(task, path, manifest)
-        npy, meta_path = ctx._subsample_coverage_paths(task, path)
+        mask = _data_sampling._subsample_own_mask(ctx, task, path, manifest)
+        npy, meta_path = _data_sampling._subsample_coverage_paths(ctx, task, path)
         if npy is None:
             continue
         wanted.add(npy.name)
@@ -81,7 +87,7 @@ def _subsample_write_masks(ctx, page) -> int:
             folder.mkdir(parents=True, exist_ok=True)
             np.save(npy, mask)
             meta_path.write_text(
-                json.dumps(ctx._subsample_mask_meta(task, path, manifest)),
+                json.dumps(_data_sampling._subsample_mask_meta(ctx, task, path, manifest)),
                 encoding="utf-8",
             )
             written += 1
@@ -105,12 +111,12 @@ def _subsample_module_mask(ctx, task, parquet_path, manifest):
         cache = {}
         ctx._subsample_mask_cache = cache
     key = (task.get("id"), str(parquet_path),
-           ctx._subsample_sig(task.get("id"), parquet_path))
+           _data_sampling._subsample_sig(ctx, task.get("id"), parquet_path))
     if key in cache:
         return cache[key]
-    mask = ctx._subsample_saved_mask(task, parquet_path, manifest)
+    mask = _subsample_saved_mask(ctx, task, parquet_path, manifest)
     if mask is None:
-        mask = ctx._subsample_own_mask(task, parquet_path, manifest)
+        mask = _data_sampling._subsample_own_mask(ctx, task, parquet_path, manifest)
     if len(cache) > 8:
         cache.clear()
     cache[key] = mask
@@ -126,8 +132,8 @@ def _subsample_pixel_mask(ctx, task_id, parquet_path, manifest):
     import numpy as np
 
     masks = []
-    for task in ctx._subsample_tasks(task_id):
-        mask = ctx._subsample_module_mask(task, parquet_path, manifest)
+    for task in _data_sampling._subsample_tasks(ctx, task_id):
+        mask = _subsample_module_mask(ctx, task, parquet_path, manifest)
         if mask is not None:
             masks.append(mask)
     if not masks:
@@ -147,7 +153,7 @@ def _subsample_cover_ent(ctx, task_id, parquet_path, manifest):
     crop it with `_image_mask_crop`; the renderer keeps a block opaque
     only when that fraction is above one half.
     """
-    mask = ctx._subsample_pixel_mask(task_id, parquet_path, manifest)
+    mask = _subsample_pixel_mask(ctx, task_id, parquet_path, manifest)
     if mask is None:
         return None
     blocks = [info["block"] for info in manifest.get("levels", [])]
@@ -171,7 +177,7 @@ def _build_subsample_page(ctx, name: str, task_def: dict, locked: bool) -> QWidg
     tl = QHBoxLayout(bar)
     tl.setContentsMargins(12, 6, 12, 6)
     tl.setSpacing(4)
-    tl.addWidget(QLabel(f"<b>{ctx._module_display_title(task_def.get('id'), name)}</b>"))
+    tl.addWidget(QLabel(f"<b>{_data_files._module_display_title(ctx, task_def.get('id'), name)}</b>"))
     if locked:
         lock_icon = QLabel()
         lock_icon.setPixmap(_lock_pixmap())
@@ -187,7 +193,7 @@ def _build_subsample_page(ctx, name: str, task_def: dict, locked: bool) -> QWidg
     save_btn.setEnabled(not locked)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    close_btn.clicked.connect(lambda _=False: ctx._subs_close(page))
+    close_btn.clicked.connect(lambda _=False: _subs_close(ctx, page))
     tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
@@ -208,7 +214,7 @@ def _build_subsample_page(ctx, name: str, task_def: dict, locked: bool) -> QWidg
     page._subs_dirty = False
     page._subs_snapshot = copy.deepcopy(params)
     page._subs_updating = False
-    save_btn.clicked.connect(lambda _=False: ctx._subs_save_now(page))
+    save_btn.clicked.connect(lambda _=False: _subs_save_now(ctx, page))
 
     content = QWidget()
     content.setStyleSheet("background: #f5f8fb;")
@@ -218,20 +224,20 @@ def _build_subsample_page(ctx, name: str, task_def: dict, locked: bool) -> QWidg
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(ctx._subs_settings_panel(page))
-    splitter.addWidget(ctx._subs_table_panel(page))
+    splitter.addWidget(_subs_settings_panel(ctx, page))
+    splitter.addWidget(_subs_table_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
     splitter.setSizes([400, 520])
     row.addWidget(splitter, 1)
     layout.addWidget(content, 1)
 
-    ctx._subs_refresh(page)
+    _subs_refresh(ctx, page)
     return page
 
 
 def _subs_settings_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -300,16 +306,16 @@ def _subs_settings_panel(ctx, page) -> QWidget:
 
     lay.addStretch()
 
-    files_btn.clicked.connect(lambda _=False: ctx._subs_select_files(page))
-    basis.currentIndexChanged.connect(lambda _=0: ctx._subs_on_basis(page))
-    unit.currentIndexChanged.connect(lambda _=0: ctx._subs_on_unit(page))
-    count_box.valueChanged.connect(lambda _=0: ctx._subs_on_value(page))
-    alloc.currentIndexChanged.connect(lambda _=0: ctx._subs_on_alloc(page))
+    files_btn.clicked.connect(lambda _=False: _subs_select_files(ctx, page))
+    basis.currentIndexChanged.connect(lambda _=0: _subs_on_basis(ctx, page))
+    unit.currentIndexChanged.connect(lambda _=0: _subs_on_unit(ctx, page))
+    count_box.valueChanged.connect(lambda _=0: _subs_on_value(ctx, page))
+    alloc.currentIndexChanged.connect(lambda _=0: _subs_on_alloc(ctx, page))
     return panel
 
 
 def _subs_table_panel(ctx, page) -> QWidget:
-    panel = ctx._build_panel_frame()
+    panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
@@ -338,13 +344,13 @@ def _subs_table_panel(ctx, page) -> QWidget:
     override_hint.setVisible(False)
     lay.addWidget(override_hint)
     page._subs_override_hint = override_hint
-    table.itemChanged.connect(lambda item: ctx._subs_on_cell(page, item))
+    table.itemChanged.connect(lambda item: _subs_on_cell(ctx, page, item))
     return panel
 
 
 def _subs_visible_sizes(ctx, page) -> dict:
     return {
-        path: ctx._subsample_visible_count(page._subs_task_id, path)
+        path: _data_sampling._subsample_visible_count(ctx, page._subs_task_id, path)
         for path in (page._subs_params.get("files") or [])
     }
 
@@ -357,11 +363,11 @@ def _subs_computed(ctx, page, sizes) -> dict:
 
 
 def _subs_select_files(ctx, page) -> None:
-    records = ctx._available_files(page._subs_task_id)
+    records = _data_files._available_files(ctx, page._subs_task_id)
     names = [rec.get("name", "") for rec in records]
     by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
-    current = [ctx._comp_file_name(p, page._subs_task_id) for p in page._subs_params.get("files") or []]
-    chosen = ctx._pick_items_dialog(
+    current = [_data_naming._comp_file_name(ctx, p, page._subs_task_id) for p in page._subs_params.get("files") or []]
+    chosen = _widgets_picker._pick_items_dialog(ctx,
         "Select data files", names, current, "Filter files..."
     )
     if chosen is None:
@@ -373,8 +379,8 @@ def _subs_select_files(ctx, page) -> None:
         p: k for p, k in (page._subs_params.get("overrides") or {}).items()
         if p in files
     }
-    ctx._subs_refresh(page)
-    ctx._subs_mark_dirty(page)
+    _subs_refresh(ctx, page)
+    _subs_mark_dirty(ctx, page)
 
 
 def _subs_param_changed(ctx, page) -> None:
@@ -390,8 +396,8 @@ def _subs_param_changed(ctx, page) -> None:
         )
         if reply == QMessageBox.StandardButton.Yes:
             page._subs_params["overrides"] = {}
-    ctx._subs_refresh(page)
-    ctx._subs_mark_dirty(page)
+    _subs_refresh(ctx, page)
+    _subs_mark_dirty(ctx, page)
 
 
 def _subs_percent_mode(ctx, params) -> bool:
@@ -411,14 +417,14 @@ def _subs_on_basis(ctx, page) -> None:
     params["basis"] = value or ""
     if value:
         # First basis choice: seed the value the right field needs.
-        if ctx._subs_percent_mode(params) and params.get("percent") is None:
+        if _subs_percent_mode(ctx, params) and params.get("percent") is None:
             params["percent"] = _SUBS_DEFAULT_PERCENT
         elif params.get("count") is None:
             params["count"] = int(page._subs_count.value()) or _SUBS_DEFAULT_COUNT
     if changed:
-        ctx._subs_param_changed(page)
+        _subs_param_changed(ctx, page)
     else:
-        ctx._subs_refresh(page)
+        _subs_refresh(ctx, page)
 
 
 def _subs_on_unit(ctx, page) -> None:
@@ -429,11 +435,11 @@ def _subs_on_unit(ctx, page) -> None:
     if value == (params.get("unit") or "points"):
         return
     params["unit"] = value
-    if ctx._subs_percent_mode(params) and params.get("percent") is None:
+    if _subs_percent_mode(ctx, params) and params.get("percent") is None:
         params["percent"] = _SUBS_DEFAULT_PERCENT
     elif params.get("count") is None:
         params["count"] = _SUBS_DEFAULT_COUNT
-    ctx._subs_param_changed(page)
+    _subs_param_changed(ctx, page)
 
 
 def _subs_on_value(ctx, page) -> None:
@@ -441,11 +447,11 @@ def _subs_on_value(ctx, page) -> None:
         return
     params = page._subs_params
     value = float(page._subs_count.value())
-    if ctx._subs_percent_mode(params):
+    if _subs_percent_mode(ctx, params):
         params["percent"] = value
     else:
         params["count"] = int(round(value))
-    ctx._subs_param_changed(page)
+    _subs_param_changed(ctx, page)
 
 
 def _subs_on_alloc(ctx, page) -> None:
@@ -455,7 +461,7 @@ def _subs_on_alloc(ctx, page) -> None:
     if value == (page._subs_params.get("allocation") or "uniform"):
         return
     page._subs_params["allocation"] = value
-    ctx._subs_param_changed(page)
+    _subs_param_changed(ctx, page)
 
 
 def _subs_on_cell(ctx, page, item) -> None:
@@ -466,7 +472,7 @@ def _subs_on_cell(ctx, page, item) -> None:
     path = item.data(Qt.ItemDataRole.UserRole)
     if not path:
         return
-    sizes = ctx._subs_visible_sizes(page)
+    sizes = _subs_visible_sizes(ctx, page)
     if path not in sizes:
         return
     text = (item.text() or "").strip()
@@ -475,23 +481,23 @@ def _subs_on_cell(ctx, page, item) -> None:
     try:
         value = int(float(text))
     except ValueError:
-        ctx._subs_refresh(page)
+        _subs_refresh(ctx, page)
         return
     # A manual value never exceeds the file's own point count.
     value = max(0, min(value, sizes[path]))
-    computed = ctx._subs_computed(page, sizes).get(path)
+    computed = _subs_computed(ctx, page, sizes).get(path)
     if computed is not None and value == computed:
         page._subs_params.get("overrides", {}).pop(path, None)
     else:
         page._subs_params.setdefault("overrides", {})[path] = value
-    ctx._subs_refresh(page)
-    ctx._subs_mark_dirty(page)
+    _subs_refresh(ctx, page)
+    _subs_mark_dirty(ctx, page)
 
 
 def _subs_refresh(ctx, page) -> None:
     params = page._subs_params
     files = list(params.get("files") or [])
-    sizes = ctx._subs_visible_sizes(page)
+    sizes = _subs_visible_sizes(ctx, page)
     counts = _subsample_allocate(params, sizes)
 
     page._subs_updating = True
@@ -503,7 +509,7 @@ def _subs_refresh(ctx, page) -> None:
         has_basis = bool(params.get("basis"))
         total = params.get("basis") == "total"
         per_file = params.get("basis") == "per_file"
-        percent_mode = ctx._subs_percent_mode(params)
+        percent_mode = _subs_percent_mode(ctx, params)
 
         page._subs_unit.blockSignals(True)
         page._subs_unit.setCurrentIndex(
@@ -544,13 +550,13 @@ def _subs_refresh(ctx, page) -> None:
 
         page._subs_files_box.clear()
         for path in files:
-            page._subs_files_box.addItem(ctx._comp_file_name(path, page._subs_task_id))
+            page._subs_files_box.addItem(_data_naming._comp_file_name(ctx, path, page._subs_task_id))
 
         table = page._subs_table
         table.blockSignals(True)
         table.setRowCount(len(files))
         for i, path in enumerate(files):
-            name_item = QTableWidgetItem(ctx._comp_file_name(path, page._subs_task_id))
+            name_item = QTableWidgetItem(_data_naming._comp_file_name(ctx, path, page._subs_task_id))
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             table.setItem(i, 0, name_item)
             orig_item = QTableWidgetItem(str(sizes.get(path, 0)))
@@ -572,12 +578,12 @@ def _subs_refresh(ctx, page) -> None:
     page._subs_override_hint.setVisible(
         bool(page._subs_params.get("overrides"))
     )
-    ctx._subs_update_save_btn(page)
+    _subs_update_save_btn(ctx, page)
 
 
 def _subs_mark_dirty(ctx, page) -> None:
     page._subs_dirty = True
-    ctx._subs_update_save_btn(page)
+    _subs_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
 
@@ -601,12 +607,12 @@ def _subs_save_now(ctx, page) -> None:
     try:
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
-        count = ctx._subsample_write_masks(page)
+        count = _subsample_write_masks(ctx, page)
     finally:
         QApplication.restoreOverrideCursor()
     ctx._subsample_cache = {}
     ctx._subsample_mask_cache = {}
-    ctx._subs_update_save_btn(page)
+    _subs_update_save_btn(ctx, page)
     message = "Subsample settings saved"
     if count:
         message += f" ({count} image mask(s))"
