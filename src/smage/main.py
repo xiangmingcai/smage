@@ -13,7 +13,10 @@ from datetime import datetime
 from pathlib import Path
 
 # Make the `smage` package importable when this file is run directly.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# A PyInstaller bundle provides the package itself, so the source path must
+# not be inserted there.
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import (QTimer, Qt)
 from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMessageBox, QPushButton)
@@ -338,8 +341,77 @@ class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin, ExtensionsMixi
     # -- save / close ------------------------------------------------------
 
 
+def _run_script(path: str) -> int:
+    """Execute a regression case script inside this (possibly frozen) app."""
+    import os
+    import runpy
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    script = Path(path).resolve()
+    # ``runpy`` does not put the script's directory on sys.path the way a
+    # normal ``python script.py`` does; case helpers live next to the script.
+    sys.path.insert(0, str(script.parent.parent))
+    sys.path.insert(0, str(script.parent))
+    try:
+        runpy.run_path(str(script), run_name="__main__")
+    except SystemExit as exc:
+        code = exc.code
+        if isinstance(code, int):
+            return code
+        return 0 if code is None else 1
+    return 0
+
+
+def _run_tests_options(argv: list[str]) -> tuple[tuple[str, ...], str | None, str | None]:
+    tags: list[str] = []
+    case = None
+    root = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        value = argv[i + 1] if i + 1 < len(argv) else None
+        if arg == "--tag" and value:
+            tags.append(value)
+            i += 2
+        elif arg == "--case" and value:
+            case = value
+            i += 2
+        elif arg == "--root" and value:
+            root = value
+            i += 2
+        else:
+            i += 1
+    return tuple(tags), case, root
+
+
+def _run_self_test() -> int:
+    """Import every dependency and check bundled files; used by frozen builds."""
+    from smage.selfcheck import run_self_check, write_report
+
+    problems = run_self_check()
+    report = write_report(problems)
+    for problem in problems:
+        print(f"FAIL: {problem}")
+    print("SELF-CHECK OK" if not problems else f"SELF-CHECK: {len(problems)} problem(s)")
+    print(f"report: {report}")
+    return 0 if not problems else 1
+
+
 def main() -> int:
     """Run the application."""
+    if "--self-test" in sys.argv:
+        return _run_self_test()
+    if "--run-tests" in sys.argv:
+        from smage.testrun import run_tests
+
+        tags, case, root = _run_tests_options(sys.argv)
+        return run_tests(tags, case, root)
+    if "--run-script" in sys.argv:
+        index = sys.argv.index("--run-script")
+        if index + 1 >= len(sys.argv):
+            print("--run-script needs a path")
+            return 2
+        return _run_script(sys.argv[index + 1])
     _install_excepthook()
     _install_qt_message_handler()
     app = QApplication(sys.argv)

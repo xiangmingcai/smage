@@ -6,6 +6,8 @@ from pathlib import Path
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 
+from smage.frozen import bundle_root, package_root
+
 
 _MODULE_ICON_CACHE: dict = {}
 _MODULE_ICON_DIR = None
@@ -31,10 +33,10 @@ def _module_icon_dir():
         return _MODULE_ICON_DIR
     from pathlib import Path as _Path
 
-    package = _Path(__file__).resolve().parent.parent
+    package = package_root()
     candidates = [
-        package / "icons",                        # packaged next to the package
-        package.parents[1] / "data" / "icon",     # source checkout
+        package / "icons",                          # bundled with the package
+        bundle_root().parent / "data" / "icon",     # source checkout
         _Path.cwd() / "data" / "icon",
     ]
     for folder in candidates:

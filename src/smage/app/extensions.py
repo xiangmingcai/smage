@@ -31,7 +31,9 @@ from smage.extensions_registry import (
 )
 import json
 import queue
+import sys
 import threading
+from smage.frozen import is_frozen, package_root
 from smage.modules.batch_align import page as _batch_align_page
 from smage.modules.cluster import page as _cluster_page
 from smage.widgets import panels as _widgets_panels
@@ -164,7 +166,7 @@ class ExtensionsMixin:
 
     def _ext_runner_path(self, ext_id: str) -> Path:
         entry = _extension_def(ext_id)
-        return Path(__file__).parent / "runners" / entry["runner"]
+        return package_root() / "runners" / entry["runner"]
 
     def _detect_python_interpreters(self) -> list:
         """Scan the system for Python interpreters (Windows).
@@ -187,6 +189,9 @@ class ExtensionsMixin:
             # The WindowsApps python.exe/python3.exe are Store stubs, not real
             # interpreters; skip them so users don't pick a non-working Python.
             if "\\WindowsApps\\" in path or "/WindowsApps/" in path:
+                return
+            # In a frozen build sys.executable is Smage.exe, not a Python.
+            if is_frozen() and os.path.normcase(path) == os.path.normcase(sys.executable):
                 return
             if path not in found and Path(path).is_file():
                 found[path] = name

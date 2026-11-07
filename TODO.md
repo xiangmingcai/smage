@@ -65,7 +65,18 @@
 
 ## 发布准备
 
-- [ ] 打包为 Windows 可执行程序（PyInstaller 等）并验证 `pythonw` 启动方式；把 `data/icon/*.svg` 复制到 `src/smage/icons/` 一并打包（`_module_icon_dir()` 会优先读包内目录）。
+- [ ] 打包为 Windows 可执行程序（PyInstaller 等）并验证 `pythonw` 启动方式。
+  - [x] 路径已改为经 `smage/frozen.py` 的 `bundle_root()` / `package_root()` 解析（图标、runner 脚本、`sys.path`）。
+  - [ ] `--add-data` 打入 `src/smage/icons` → `smage/icons` 和 `src/smage/runners` → `smage/runners`。
+  - [ ] 在没装 Python 的干净 Windows 上，从任意目录双击 exe，跑通导入 → 门控 → 导出。
+  - [ ] 扩展管理器不应把 `Smage.exe` 当成 Python 解释器（已在 `_detect_python_interpreters` 中过滤 frozen 的 `sys.executable`）。
+  - [x] 动态导入已覆盖：`packaging/smage.spec` 对 `smage`、numba、llvmlite、umap、scanpy 做 `collect_submodules`；`smage/selfcheck.py` + `Smage.exe --self-test` 会在冻结包里逐个导入验证。
+  - [x] 业务流程验证：回归套件已打进包，`Smage.exe --run-tests [--tag e2e]` 在冻结环境中运行（结果写到 `%TEMP%\SmageTests\frozen-latest.md`）。
+  - [ ] 每次改依赖后跑一次 `packaging/build_win.py`，确认冻结版 `--self-test` 退出码为 0。
+- [ ] **锁定依赖版本**：`requirements.txt` 目前只锁了 `PySide6==6.8.3`，其余都是浮动版本。
+  - [ ] 从干净环境安装后生成 `requirements-lock.txt`（`pip freeze`），构建时改为 `pip install -r requirements-lock.txt`，保证每次打包的依赖、体积和行为一致。
+  - [ ] 把构建期依赖（PyInstaller 等）拆到 `requirements-build.txt`，不混进运行期清单。
+  - [ ] 升级任何依赖时重新生成锁文件，并在 `--full` 回归套件上验证后再发布。
 - [ ] **确定以 GPL-3.0 发布**：
   - [ ] 根目录添加 `LICENSE`（GPL-3.0 全文），README 写明 "Smage is free software under GPL-3.0"。
   - [ ] 发布安装包时必须向用户提供完整对应源码（公开 GitHub 仓库，或随包提供源码包/下载链接）。

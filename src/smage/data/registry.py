@@ -185,6 +185,11 @@ _TARGETS = {
 }
 
 
+def target_modules() -> list[str]:
+    """Module paths referenced by the table (used by the frozen self-check)."""
+    return sorted({module for module, _attr in _TARGETS.values()})
+
+
 def resolve(ctx, name):
     """Return *name* bound to *ctx*, or None when it is not a known helper."""
     target = _TARGETS.get(name)

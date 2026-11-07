@@ -29,9 +29,12 @@ SRC_DIR = REPO_ROOT / "src"
 CASES_DIR = REGRESSION_DIR / "cases"
 BASELINE_DIR = REGRESSION_DIR / "baseline"
 
-WORKSPACE = Path(
-    os.environ.get("SMAGE_TEST_ROOT") or r"E:\smage_test\samge_batch_test"
-).resolve()
+_DEFAULT_WORKSPACE = (
+    Path(os.environ.get("TEMP") or Path.home()) / "SmageTests"
+    if getattr(sys, "frozen", False)
+    else Path(r"E:\smage_test\samge_batch_test")
+)
+WORKSPACE = Path(os.environ.get("SMAGE_TEST_ROOT") or _DEFAULT_WORKSPACE).resolve()
 RUN_ID = os.environ.get("SMAGE_RUN_ID") or time.strftime("%Y%m%d-%H%M%S")
 RUN_DIR = WORKSPACE / "runs" / RUN_ID
 # Each script gets its own APPDATA when the runner provides one (parallel runs).
@@ -44,7 +47,9 @@ FIXTURES_DIR = WORKSPACE / "_fixtures"
 if os.environ.get("SMAGE_SHOW") != "1":
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["APPDATA"] = str(APP_DATA)
-if str(SRC_DIR) not in sys.path:
+# In a frozen build ``smage`` comes from the bundle; adding the source tree
+# would silently test the wrong code.
+if not getattr(sys, "frozen", False) and str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 _FORBIDDEN = [
@@ -584,7 +589,7 @@ def _result_record(item: Case, status: str, message: str, duration_ms: int,
         "log_errors": list(log_errors),
         "artifacts": list(_CURRENT_ARTIFACTS),
         "traceback": trace,
-        "script": Path(sys.argv[0]).stem,
+        "script": os.environ.get("SMAGE_PART_NAME") or Path(sys.argv[0]).stem,
         "repro": f"python tests/regression/run_all.py --case {item.id}",
     }
 
@@ -594,10 +599,11 @@ def run_cases() -> int:
     global _CURRENT_NOTES, _CURRENT_ARTIFACTS, _CURRENT_CASE
     ensure_work_dir()
 
+    stem = os.environ.get("SMAGE_PART_NAME") or Path(sys.argv[0]).stem
     selected = _selected_cases()
     if not selected:
         print("NO CASES SELECTED")
-        (PARTS_DIR / f"{Path(sys.argv[0]).stem}.json").write_text("[]", encoding="utf-8")
+        (PARTS_DIR / f"{stem}.json").write_text("[]", encoding="utf-8")
         return 0
 
     results: list[dict] = []
@@ -639,7 +645,7 @@ def run_cases() -> int:
         suffix = f" - {message}" if message else ""
         print(f"[{marker}] {item.id} ({duration_ms} ms){suffix}")
 
-    part = PARTS_DIR / f"{Path(sys.argv[0]).stem}.json"
+    part = PARTS_DIR / f"{stem}.json"
     part.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
 
     passed = sum(1 for item in results if item["status"] == "pass")

@@ -326,6 +326,24 @@ def settings_and_extension_dialogs() -> None:
         _close(window)
 
 
+@harness.case("shell.extension_runners", "L5", "extensions", tags=("fast",))
+def extension_runners() -> None:
+    """Every extension's runner script resolves inside the package."""
+    from smage.extensions_registry import EXTENSION_DEFS
+
+    window = harness.new_window()
+    try:
+        missing = [
+            entry["id"]
+            for entry in EXTENSION_DEFS
+            if entry.get("runner")
+            and not window._ext_runner_path(entry["id"]).is_file()
+        ]
+        harness.eq(missing, [], "runner scripts are missing")
+    finally:
+        harness.close_window(window)
+
+
 @harness.case("shell.resource_indicator", "L5", "shell", tags=("fast",))
 def resource_indicator() -> None:
     window, _project = _open("shell_resources")

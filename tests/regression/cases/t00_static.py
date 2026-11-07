@@ -112,6 +112,49 @@ def check_runners() -> None:
     harness.check(not errors, "; ".join(errors))
 
 
+@harness.case("static.frozen", "L0", "infra", tags=("smoke",))
+def check_frozen_helpers() -> None:
+    """bundle_root/package_root switch from the source tree to _MEIPASS."""
+    import sys as _sys
+
+    from smage import frozen
+
+    harness.eq(frozen.is_frozen(), False)
+    harness.eq(frozen.bundle_root(), harness.SRC_DIR)
+    harness.check(
+        (frozen.package_root() / "runners" / "cellpose_runner.py").is_file(),
+        "runner scripts resolve under package_root()",
+    )
+
+    had_frozen = hasattr(_sys, "frozen")
+    had_meipass = hasattr(_sys, "_MEIPASS")
+    old_frozen = getattr(_sys, "frozen", None)
+    old_meipass = getattr(_sys, "_MEIPASS", None)
+    try:
+        _sys.frozen = True
+        _sys._MEIPASS = str(harness.RUN_DIR)
+        harness.check(frozen.is_frozen())
+        harness.eq(frozen.bundle_root(), harness.RUN_DIR)
+        harness.eq(frozen.package_root(), harness.RUN_DIR / "smage")
+    finally:
+        if had_frozen:
+            _sys.frozen = old_frozen
+        else:
+            del _sys.frozen
+        if had_meipass:
+            _sys._MEIPASS = old_meipass
+        else:
+            del _sys._MEIPASS
+
+
+@harness.case("static.selfcheck", "L0", "infra", tags=("fast",))
+def check_self_check() -> None:
+    """Every module imported at runtime (incl. lazy ones) resolves here."""
+    from smage.selfcheck import run_self_check
+
+    harness.eq(run_self_check(), [], "self-check reported problems")
+
+
 @harness.case("static.case_ids", "L0", "infra", tags=("smoke",))
 def check_case_ids() -> None:
     ids = []
