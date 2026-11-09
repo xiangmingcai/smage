@@ -13,7 +13,7 @@ import harness  # noqa: E402
 
 from smage.modules.scale import page as scale_page  # noqa: E402
 from smage.data import columns as _data_columns
-from smage.modules.scale import page as scale_page
+from smage.widgets.plot import renderer as _widgets_plot_renderer
 
 
 def _open(case_id: str):
@@ -27,6 +27,37 @@ def _open(case_id: str):
     window._open_module("s-1", "scale", "Scale")
     harness.pump(400)
     return window, project, window.tabs.currentWidget()
+
+
+def _open_two_files(case_id: str):
+    """Open Scale on a project with two imported files sharing columns."""
+    task = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        children=[harness.task_def("gating", task_id="g-1", name="Gating")],
+    )
+    project = harness.new_project(case_id, rows=80, tasks=[task])
+    first = project.data_dir / "case.parquet"
+    second = project.data_dir / "second.parquet"
+    frame = pd.read_parquet(first)
+    frame.to_parquet(second, index=False)
+    import_task = project.workflow["tasks"][0]
+    import_task["params"]["processed"].append(
+        {
+            "name": "second.fcs",
+            "source": str(harness.FIXTURES_DIR / "fcs" / "synthetic_8ch.fcs"),
+            "parquet": str(second),
+            "rows": int(len(frame)),
+        }
+    )
+    columns = project.load_columns()
+    columns[second.name] = list(frame.columns)
+    project.save_columns(columns)
+    project.save()
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("s-1", "scale", "Scale")
+    harness.pump(400)
+    return window, project, window.tabs.currentWidget(), first, second
 
 
 def _close(window) -> None:
@@ -67,9 +98,14 @@ def apply_method() -> None:
         raw = pd.read_parquet(parquet)["FL1-A"].to_numpy(dtype="float64")
         values = _data_columns._column_data(ctx, "g-1", parquet, ["FL1-A"])
         harness.check(
-            np.allclose(values["FL1-A"], np.log10(raw)),
-            "downstream reads the transformed values",
+            np.allclose(values["FL1-A"], raw),
+            "Scale is display-only: downstream data is unchanged",
         )
+        configs = _widgets_plot_renderer._figure_axis_scale_configs(
+            ctx, "g-1", parquet, "FL1-A"
+        )
+        harness.eq([c.get("method") for c in configs], ["log10"],
+                   "the plot applies the log10 display transform")
     finally:
         _close(window)
 
@@ -96,7 +132,44 @@ def apply_arcsinh() -> None:
         scale_page._scaling_save_now(ctx, page)
         raw = pd.read_parquet(parquet)["FL2-A"].to_numpy(dtype="float64")
         values = _data_columns._column_data(ctx, "g-1", parquet, ["FL2-A"])
-        harness.check(np.allclose(values["FL2-A"], np.arcsinh(raw / 5.0)))
+        harness.check(
+            np.allclose(values["FL2-A"], raw),
+            "Scale is display-only: downstream data is unchanged",
+        )
+        configs = _widgets_plot_renderer._figure_axis_scale_configs(
+            ctx, "g-1", parquet, "FL2-A"
+        )
+        harness.eq([c.get("method") for c in configs], ["arcsinh"],
+                   "the plot applies the arcsinh display transform")
+    finally:
+        _close(window)
+
+
+@harness.case("mod.scale.preview_keeps_axes", "L4", "scale", tags=("fast",))
+def preview_keeps_axes() -> None:
+    """Switching the preview file must not reset X/Y or the image channel."""
+    window, _project, page, first, second = _open_two_files("scale_preview_axes")
+    try:
+        ctx = window._ctx
+        # Settings (and the preview file combo) are built once files are
+        # selected; without a selection there are no visible columns.
+        page._scaling_files = [str(first), str(second)]
+        scale_page._scaling_rebuild_visible(ctx, page)
+        preview = page._scaling_preview
+        preview.update(
+            {"x": "FL2-A", "y": "FL3-A", "image_channel": "FL4-A"}
+        )
+        combo = page._scaling_file_combo
+        index = combo.findData(str(second))
+        harness.check(index >= 0, "the second file is listed")
+        combo.setCurrentIndex(index)
+        harness.pump(200)
+
+        harness.eq(preview["file"], str(second))
+        harness.eq(preview["x"], "FL2-A", "X parameter survives the file switch")
+        harness.eq(preview["y"], "FL3-A", "Y parameter survives the file switch")
+        harness.eq(preview["image_channel"], "FL4-A",
+                   "image channel survives the file switch")
     finally:
         _close(window)
 

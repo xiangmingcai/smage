@@ -115,6 +115,65 @@ def _columns_for(ctx, parquet_path, task_id=None) -> list:
     return columns
 
 
+def _stage_cached_values(ctx, stages, parquet_path, names, expected_rows) -> dict:
+    """Values whose final form is already in ``ctx._stage_cache``.
+
+    Compensation and Unmix store their complete output columns there.  When
+    the *last* stage that touches a requested column is one of them, the
+    cached array is the final value for this file and the parquet does not
+    need to be read again.  Arrays whose length does not match the rows this
+    caller expects (a different Subsample scope) are ignored.
+    """
+    cache = getattr(ctx, "_stage_cache", None)
+    if not cache:
+        return {}
+    last = {}
+    for index, (kind, stage) in enumerate(stages):
+        if kind == "compensation":
+            for name in stage.get("names") or ():
+                last[name] = index
+        elif kind == "unmix":
+            for name in stage.get("names") or ():
+                last[name] = index
+        elif kind == "scale":
+            for name in (stage.get("columns") or ()):
+                last[name] = index
+        elif kind == "illumination":
+            for sub in stage.get("submodules") or ():
+                channel = sub.get("channel")
+                if channel:
+                    last[channel] = index
+        elif kind == "batch_align":
+            for name in stage.get("columns") or ():
+                last[name] = index
+        elif kind == "rename":
+            for old, new in (stage.get("map") or {}).items():
+                last[old] = index
+                last[new] = index
+
+    found = {}
+    for name in names:
+        index = last.get(name)
+        if index is None:
+            continue
+        kind, stage = stages[index]
+        if kind == "compensation":
+            entry = cache.get(
+                ("comp", stage.get("id"), parquet_path, expected_rows)
+            )
+        elif kind == "unmix":
+            entry = cache.get(
+                ("unmix", stage.get("task_id"), parquet_path, expected_rows)
+            )
+        else:
+            continue
+        array = (entry or {}).get(name)
+        if array is None or len(array) != expected_rows:
+            continue
+        found[name] = array
+    return found
+
+
 def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filter=True, numeric=True) -> dict:
     """Column values as seen at `task_id`, with upstream map stages applied.
 
@@ -130,7 +189,9 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
     if not parquet_path or not names:
         return {}
     names = list(names)
-    stages = ctx._map_stages(task_id) if task_id else []
+    stages = (
+        ctx._map_stages(task_id, parquet_path=parquet_path) if task_id else []
+    )
     feature_output = ctx._feature_output(parquet_path)
     if feature_output is not None:
         # A Feature output already contains every transform applied above
@@ -138,7 +199,8 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
         # (e.g. a Scale placed after Feature) still apply, plus renames,
         # which are a name change rather than a value change.
         post = ctx._map_stages(
-            task_id, after=feature_output.get("feature_task")
+            task_id, after=feature_output.get("feature_task"),
+            parquet_path=parquet_path,
         ) if task_id else []
         renames = [
             (kind, stage) for kind, stage in stages
@@ -149,6 +211,24 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
         stages = stages + list(extra_stages)
     if not numeric:
         stages = [(kind, stage) for kind, stage in stages if kind == "rename"]
+    if (
+        numeric
+        and extra_stages is None
+        and any(kind in ("compensation", "unmix") for kind, _ in stages)
+    ):
+        # After an upstream save the pool is rebuilt; the compensation/unmix
+        # outputs are already cached, so avoid re-reading the parquet for
+        # every requested column.
+        expected_rows = ctx._data_row_count(parquet_path)
+        if row_filter and task_id:
+            sampled = ctx._subsample_row_index(task_id, parquet_path)
+            if sampled is not None:
+                expected_rows = len(sampled)
+        cached = _stage_cached_values(
+            ctx, stages, parquet_path, names, expected_rows
+        )
+        if all(name in cached for name in names):
+            return {name: cached[name] for name in names}
     if feature_output is not None:
         # Generated files are not in the import column index; their columns
         # were recorded when the module generated them.
@@ -271,19 +351,54 @@ def _data_row_count(ctx, parquet_path) -> int:
         return 0
 
 
-def _map_stages(ctx, task_id, after=None) -> list:
-    """Ordered Scale / Compensation / Unmix stages upstream of a task.
+def _bump_stages_revision(ctx) -> None:
+    """Invalidate every cached map-stage list.
+
+    Stages embed a built Unmix matrix and other per-module data, so a saved
+    module (or a deleted task) must drop the memoized lists.
+    """
+    ctx._stages_revision = getattr(ctx, "_stages_revision", 0) + 1
+
+
+def _map_stages(ctx, task_id, after=None, include_scale=False, parquet_path=None) -> list:
+    """Ordered data stages upstream of a task.
 
     Each module only declares its own input→output rule; this list is the
-    workflow order the data flows through. With `after`, only the stages of
+    workflow order the data flows through.  Scale is a *display* transform:
+    it is excluded by default and only added when ``include_scale`` is set
+    (the plot renderer asks for it).  With `after`, only the stages of
     modules *below* that ancestor are returned (used for files produced by
     a generate module, whose values already include what came before).
+    With `parquet_path`, stages that do not apply to that file are skipped
+    before they are built — building an Unmix matrix is expensive, and it
+    is wasted work for Feature outputs and other generated files.
+
+    The result is memoized per context and invalidated by
+    ``_bump_stages_revision`` (called when a module is saved or a task is
+    deleted).  Gate editing asks for the same stages many times per drag;
+    rebuilding an Unmix matrix each time made label/statistics updates take
+    seconds.
     """
     import numpy as np
 
     stages = []
     if not task_id:
         return stages
+    cache_key = (
+        task_id, after, bool(include_scale),
+        None if parquet_path is None else str(parquet_path),
+    )
+    revision = getattr(ctx, "_stages_revision", 0)
+    cache = getattr(ctx, "_map_stages_cache", None)
+    if cache is None:
+        cache = {}
+        ctx._map_stages_cache = cache
+    elif getattr(ctx, "_map_stages_cache_revision", None) != revision:
+        cache.clear()
+    ctx._map_stages_cache_revision = revision
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return list(cached)
     started = after is None
     for task in ctx._task_chain(task_id):
         if not started:
@@ -295,6 +410,8 @@ def _map_stages(ctx, task_id, after=None) -> list:
         task_type = task.get("type")
         params = task.get("params") or {}
         if task_type == "scale":
+            if not include_scale:
+                continue
             columns = {
                 c["name"]: c
                 for c in params.get("columns", [])
@@ -319,6 +436,13 @@ def _map_stages(ctx, task_id, after=None) -> list:
                     "matrix": np.asarray(matrix, dtype="float64") / 100.0,
                 }))
         elif task_type == "unmix":
+            if (
+                parquet_path is not None
+                and parquet_path not in (params.get("samples") or [])
+            ):
+                # The unmix stage never applies to this file; building its
+                # matrix (gate statistics over the source image) is costly.
+                continue
             config = ctx._unmix_flow_config(task)
             if config is not None:
                 stages.append(("unmix", config))
@@ -335,6 +459,10 @@ def _map_stages(ctx, task_id, after=None) -> list:
                     "submodules": submodules,
                 }))
         elif task_type == "batch_align":
+            if parquet_path is not None and parquet_path not in (
+                params.get("files") or {}
+            ):
+                continue
             stage = ctx._ba_stage(task)
             if stage is not None:
                 stages.append(("batch_align", stage))
@@ -345,7 +473,8 @@ def _map_stages(ctx, task_id, after=None) -> list:
             stage = _rename_stage(params)
             if stage is not None:
                 stages.append(("rename", stage))
-    return stages
+    cache[cache_key] = stages
+    return list(stages)
 
 
 def _map_stage_token(ctx, task_id) -> str:
@@ -362,12 +491,7 @@ def _map_stage_token(ctx, task_id) -> str:
     stages = ctx._map_stages(task_id) if task_id else []
     parts = []
     for kind, stage in stages:
-        if kind == "scale":
-            parts.append([
-                "scale",
-                {k: dict(v) for k, v in (stage.get("columns") or {}).items()},
-            ])
-        elif kind == "compensation":
+        if kind == "compensation":
             parts.append([
                 "comp", stage.get("id"), sorted(stage.get("files") or []),
                 list(stage.get("names") or []),

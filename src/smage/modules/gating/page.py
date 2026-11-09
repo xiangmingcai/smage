@@ -1,7 +1,7 @@
 """Gating module: gate tree, canvas ROIs and per-file statistics."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -37,6 +37,10 @@ from smage.core.gates import (
     _gate_source_ids,
     _resolve_gates_for_file,
 )
+from smage.core.scale_math import (
+    _forward_scale_value,
+    _inverse_scale_value,
+)
 from smage.core.settings import (
     _log_exception,
     _plot_background,
@@ -63,6 +67,8 @@ from smage.widgets.resources import _lock_pixmap
 from uuid import uuid4
 import copy
 import json
+from pathlib import Path
+
 import pyqtgraph as pg
 from smage.data import columns as _data_columns
 from smage.data import feature_outputs as _data_feature_outputs
@@ -146,6 +152,110 @@ def _gate_label_position(gate):
         d = max(dx, dy) * 1.5
         return (cx + bx / lb2 * d, cy + by / lb2 * d)
     return ((xr[0] + xr[1]) / 2.0, (yr[0] + yr[1]) / 2.0)
+
+
+def _gating_scale_axes(ctx, page, gate) -> tuple:
+    """(x_configs, y_configs) that map the gate's axes to plot units.
+
+    Image plots use pixel coordinates directly and are never scaled.
+    """
+    if gate.get("plot_type", "scatter") == "image":
+        return [], []
+    parquet = page._gating_preview.get("file")
+    task_id = page._gating_task_id
+    xcfg = (
+        _widgets_plot_renderer._figure_axis_scale_configs(
+            ctx, task_id, parquet, gate.get("x")
+        ) if gate.get("x") else []
+    )
+    ycfg = (
+        _widgets_plot_renderer._figure_axis_scale_configs(
+            ctx, task_id, parquet, gate.get("y")
+        ) if gate.get("y") else []
+    )
+    return xcfg, ycfg
+
+
+def _gating_preview_axes(ctx, page) -> tuple:
+    """Display configs for the currently visible scatter axes."""
+    preview = page._gating_preview
+    return _gating_scale_axes(ctx, page, {
+        "plot_type": preview.get("type", "scatter"),
+        "x": preview.get("x"),
+        "y": preview.get("y"),
+    })
+
+
+def _gating_convert_geometry(gate, geometry, xmap, ymap) -> dict:
+    """Map a gate geometry dict through the per-axis coordinate maps."""
+    t = gate.get("type")
+    out = dict(geometry)
+    if t in ("rect", "ellipse"):
+        if "pos" in geometry and "size" in geometry:
+            x, y = geometry["pos"]
+            w, h = geometry["size"]
+            out["pos"] = [xmap(x), ymap(y)]
+            out["size"] = [xmap(x + w) - xmap(x), ymap(y + h) - ymap(y)]
+    elif t == "polygon":
+        if "points" in geometry:
+            out["points"] = [
+                [xmap(p[0]), ymap(p[1])] for p in geometry["points"]
+            ]
+    elif t in ("quadrant", "split"):
+        if "vx" in geometry:
+            out["vx"] = xmap(geometry["vx"])
+        if "hy" in geometry:
+            out["hy"] = ymap(geometry["hy"])
+    elif t == "range":
+        if "x1" in geometry:
+            out["x1"] = xmap(geometry["x1"])
+        if "x2" in geometry:
+            out["x2"] = xmap(geometry["x2"])
+    elif t == "skewed_quadrant":
+        if "center" in geometry:
+            out["center"] = [
+                xmap(geometry["center"][0]), ymap(geometry["center"][1])
+            ]
+        for key in ("p_right", "p_up", "p_left", "p_down"):
+            if key in geometry:
+                out[key] = [xmap(geometry[key][0]), ymap(geometry[key][1])]
+    return out
+
+
+def _gating_geometry_to_display(ctx, page, gate, geometry) -> dict:
+    """Stored (real) gate geometry → plot coordinates."""
+    xcfg, ycfg = _gating_scale_axes(ctx, page, gate)
+    if not xcfg and not ycfg:
+        return geometry
+    return _gating_convert_geometry(
+        gate, geometry,
+        (lambda v: _forward_scale_value(v, xcfg)) if xcfg else (lambda v: v),
+        (lambda v: _forward_scale_value(v, ycfg)) if ycfg else (lambda v: v),
+    )
+
+
+def _gating_geometry_to_real(ctx, page, gate, geometry) -> dict:
+    """Plot coordinates → stored (real) gate geometry."""
+    xcfg, ycfg = _gating_scale_axes(ctx, page, gate)
+    if not xcfg and not ycfg:
+        return geometry
+    return _gating_convert_geometry(
+        gate, geometry,
+        (lambda v: _inverse_scale_value(v, xcfg)) if xcfg else (lambda v: v),
+        (lambda v: _inverse_scale_value(v, ycfg)) if ycfg else (lambda v: v),
+    )
+
+
+def _gating_preview_geometry_to_real(ctx, page, gate_type, geometry) -> dict:
+    """Convert a preview-space geometry dict to real units."""
+    xcfg, ycfg = _gating_preview_axes(ctx, page)
+    if not xcfg and not ycfg:
+        return geometry
+    return _gating_convert_geometry(
+        {"type": gate_type}, geometry,
+        (lambda v: _inverse_scale_value(v, xcfg)) if xcfg else (lambda v: v),
+        (lambda v: _inverse_scale_value(v, ycfg)) if ycfg else (lambda v: v),
+    )
 
 
 def _gating_store_path(ctx, task_def) -> Path | None:
@@ -372,6 +482,10 @@ def _gating_make_plot(ctx, page):
         lambda _=None: _widgets_plot_renderer._figure_apply_ranges(ctx, page._gating_preview, plot_widget)
     )
     plot_item._on_fit = lambda: _widgets_plot_renderer._figure_fit_all(ctx, page._gating_preview, plot_widget)
+    # Gate editing moves ROI items on top of the data.  The data items are
+    # cached as device-coordinate pixmaps so those moves blit the cached
+    # scatter/image instead of re-running the per-point paint.
+    plot_widget._gate_cache_data = True
     return plot_widget, viewbox
 
 
@@ -575,15 +689,42 @@ def _gating_apply_group_geometry(ctx, page, group_id, geometry) -> None:
 
 def _gating_on_roi_drag(ctx, page, gate, roi) -> None:
     geometry = _gating_sync_gate(ctx, gate, roi)
+    geometry = _gating_geometry_to_real(ctx, page, gate, geometry)
     _gating_apply_geometry(ctx, page, gate, geometry)
     runlog.action(
         "gating.gate_moved", module=str(page._gating_task_id),
         gate=str(gate.get("id") or ""), type=str(gate.get("type") or ""),
         pos=geometry.get("pos"), size=geometry.get("size"),
     )
-    _gating_refresh_tree_stats(ctx, page, affected={gate["id"]})
-    _gating_update_labels(ctx, page)
+    _gating_schedule_adjust(ctx, page, {gate["id"]})
     _gating_mark_dirty(ctx, page)
+
+
+def _gating_move_label(page, gate, display_geometry) -> None:
+    """Move one gate's label to follow an in-progress geometry change.
+
+    The geometry is already in plot units (it comes straight from a ROI or
+    a movable line), so no scale conversion is needed here.
+    """
+    if gate.get("type") in ("not", "and", "or"):
+        return
+    labels = getattr(page, "_gating_labels", None)
+    gates = getattr(page, "_gating_gates", None)
+    if not labels or gates is None or len(labels) != len(gates):
+        return
+    idx = next((i for i, g in enumerate(gates) if g is gate), -1)
+    if idx < 0:
+        return
+    px, py = _gate_label_position({**gate, **display_geometry})
+    ox, oy = gate.get("label_offset") or [0.0, 0.0]
+    labels[idx].setPos(px + ox, py + oy)
+
+
+def _gating_on_roi_move(ctx, page, gate, roi) -> None:
+    """Move the label with the ROI while dragging; statistics wait for release."""
+    if roi is None:
+        return
+    _gating_move_label(page, gate, _gating_sync_gate(ctx, gate, roi))
 
 
 def _gating_quadrant_sync(ctx, page, crosshair_id, key, line) -> None:
@@ -592,13 +733,18 @@ def _gating_quadrant_sync(ctx, page, crosshair_id, key, line) -> None:
     if entry is not None and len(entry["lines"]) == 2:
         vline, hline = entry["lines"]
         geometry = {"vx": vline.value(), "hy": hline.value()}
+        gate = next(
+            (g for g in page._gating_gates
+             if g.get("crosshair_id") == crosshair_id), None
+        )
+        if gate is not None:
+            geometry = _gating_geometry_to_real(ctx, page, gate, geometry)
     affected = {
         g["id"] for g in page._gating_gates
         if g.get("crosshair_id") == crosshair_id
     }
     _gating_apply_group_geometry(ctx, page, crosshair_id, geometry)
-    _gating_refresh_tree_stats(ctx, page, affected=affected)
-    _gating_update_labels(ctx, page)
+    _gating_schedule_adjust(ctx, page, affected)
     _gating_mark_dirty(ctx, page)
 
 
@@ -607,9 +753,14 @@ def _gating_split_sync(ctx, page, split_id, line) -> None:
         g["id"] for g in page._gating_gates
         if g.get("split_id") == split_id
     }
-    _gating_apply_group_geometry(ctx, page, split_id, {"vx": line.value()})
-    _gating_refresh_tree_stats(ctx, page, affected=affected)
-    _gating_update_labels(ctx, page)
+    geometry = {"vx": line.value()}
+    gate = next(
+        (g for g in page._gating_gates if g.get("split_id") == split_id), None
+    )
+    if gate is not None:
+        geometry = _gating_geometry_to_real(ctx, page, gate, geometry)
+    _gating_apply_group_geometry(ctx, page, split_id, geometry)
+    _gating_schedule_adjust(ctx, page, affected)
     _gating_mark_dirty(ctx, page)
 
 
@@ -623,11 +774,17 @@ def _gating_range_sync(ctx, page, gate, key, line) -> None:
         items = page._gating_rois[idx]
         geometry = {"x1": items[0].value(), "x2": items[1].value()}
     if geometry is None:
+        # The stored geometry is already in real units; only the dragged
+        # line value comes from the plot.
         geometry = _gate_geometry(gate)
-        geometry[key] = line.value()
+        converted = _gating_geometry_to_real(
+            ctx, page, gate, {key: line.value()}
+        )
+        geometry[key] = converted.get(key, line.value())
+    else:
+        geometry = _gating_geometry_to_real(ctx, page, gate, geometry)
     _gating_apply_geometry(ctx, page, gate, geometry)
-    _gating_refresh_tree_stats(ctx, page, affected={gate["id"]})
-    _gating_update_labels(ctx, page)
+    _gating_schedule_adjust(ctx, page, {gate["id"]})
     _gating_mark_dirty(ctx, page)
 
 
@@ -649,10 +806,78 @@ def _gating_skewed_sync(ctx, page, skewed_id) -> None:
         g["id"] for g in page._gating_gates
         if g.get("skewed_id") == skewed_id
     }
+    gate = next(
+        (g for g in page._gating_gates if g.get("skewed_id") == skewed_id),
+        None,
+    )
+    if gate is not None:
+        geometry = _gating_geometry_to_real(ctx, page, gate, geometry)
     _gating_apply_group_geometry(ctx, page, skewed_id, geometry)
-    _gating_refresh_tree_stats(ctx, page, affected=affected)
-    _gating_update_labels(ctx, page)
+    _gating_schedule_adjust(ctx, page, affected)
     _gating_mark_dirty(ctx, page)
+
+
+def _gating_group_move(page, group_key, display) -> None:
+    """Move a grouped gate's labels while dragging (no statistics yet)."""
+    affected = {
+        g["id"] for g in page._gating_gates if g.get(group_key[0]) == group_key[1]
+    }
+    for g in page._gating_gates:
+        if g.get("id") in affected:
+            _gating_move_label(page, g, display)
+
+
+def _gating_quadrant_move(ctx, page, crosshair_id, key, line) -> None:
+    entry = page._gating_crosshairs.get(crosshair_id)
+    if entry is None or len(entry["lines"]) != 2:
+        return
+    gate = next(
+        (g for g in page._gating_gates
+         if g.get("crosshair_id") == crosshair_id), None
+    )
+    if gate is None:
+        return
+    vline, hline = entry["lines"]
+    display = {"vx": vline.value(), "hy": hline.value()}
+    _gating_group_move(page, ("crosshair_id", crosshair_id), display)
+
+
+def _gating_split_move(ctx, page, split_id, line) -> None:
+    gate = next(
+        (g for g in page._gating_gates if g.get("split_id") == split_id), None
+    )
+    if gate is None:
+        return
+    _gating_group_move(page, ("split_id", split_id), {"vx": line.value()})
+
+
+def _gating_range_move(ctx, page, gate, key, line) -> None:
+    idx = next(
+        (i for i, g in enumerate(page._gating_gates) if g["id"] == gate["id"]),
+        -1,
+    )
+    if not (0 <= idx < len(page._gating_rois) and len(page._gating_rois[idx]) == 2):
+        return
+    items = page._gating_rois[idx]
+    _gating_move_label(page, gate, {"x1": items[0].value(), "x2": items[1].value()})
+
+
+def _gating_skewed_move(ctx, page, skewed_id) -> None:
+    entry = page._gating_skewed_lines.get(skewed_id)
+    if entry is None:
+        return
+    pts = [h.pos() for h in entry["roi"].getHandles()]
+    if len(pts) < 5:
+        return
+    gate = next(
+        (g for g in page._gating_gates if g.get("skewed_id") == skewed_id), None
+    )
+    if gate is None:
+        return
+    display = {"center": [pts[0].x(), pts[0].y()]}
+    for i, key in enumerate(("p_right", "p_up", "p_left", "p_down")):
+        display[key] = [pts[i + 1].x(), pts[i + 1].y()]
+    _gating_group_move(page, ("skewed_id", skewed_id), display)
 
 
 def _gating_default_name(ctx, page, tool: str) -> str:
@@ -850,6 +1075,20 @@ def _gating_col2gate_generate(ctx, page, column, prefix, counts) -> None:
     )
 
 
+def _gating_discard_items(page, *items) -> None:
+    """Remove transient gate items from the plot (the overlay draws them)."""
+    viewbox = getattr(page, "_gating_viewbox", None)
+    if viewbox is None:
+        return
+    for item in items:
+        try:
+            if item is not None and item.scene() is not None:
+                _detach_gate_item(item)
+                viewbox.removeItem(item)
+        except (RuntimeError, AttributeError):
+            pass
+
+
 def _gating_add_gate(ctx, page, tool, arg) -> None:
     """Create a gate and record the action in the session log."""
     before = len(page._gating_gates)
@@ -899,14 +1138,17 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
             "x": preview.get("x"),
             "y": preview.get("y"),
         }
+        real = _gating_preview_geometry_to_real(
+            ctx, page, "quadrant", {"vx": x0, "hy": y0}
+        )
         for qnum in (1, 2, 3, 4):
             gate = {
                 "id": uuid4().hex[:8],
                 "name": f"Q{qnum}",
                 "type": "quadrant",
                 "quadrant": qnum,
-                "vx": x0,
-                "hy": y0,
+                "vx": real["vx"],
+                "hy": real["hy"],
                 "crosshair_id": crosshair_id,
                 "x": preview.get("x"),
                 "y": preview.get("y"),
@@ -924,6 +1166,12 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
         hline.sigPositionChangeFinished.connect(
             lambda l=hline, cid=crosshair_id: _gating_quadrant_sync(ctx, page, cid, "hy", l)
         )
+        vline.sigPositionChanged.connect(
+            lambda l=vline, cid=crosshair_id: _gating_quadrant_move(ctx, page, cid, "vx", l)
+        )
+        hline.sigPositionChanged.connect(
+            lambda l=hline, cid=crosshair_id: _gating_quadrant_move(ctx, page, cid, "hy", l)
+        )
         page._gating_context_gate_id = page._gating_gates[-1]["id"]
         _gating_update_roi_visibility(ctx, page)
         _gating_rebuild_tree(ctx, page)
@@ -933,14 +1181,17 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
 
     if tool == "range":
         x1, x2 = arg
+        real = _gating_preview_geometry_to_real(
+            ctx, page, "range", {"x1": x1, "x2": x2}
+        )
         gate = {
             "id": uuid4().hex[:8],
             "name": _gating_default_name(ctx, page, "range"),
             "type": "range",
             "x": preview.get("x"),
             "y": preview.get("y"),
-            "x1": x1,
-            "x2": x2,
+            "x1": real["x1"],
+            "x2": real["x2"],
             "parent": page._gating_parent_id,
             "plot_type": preview.get("type", "scatter"),
             "display": _gating_display_snapshot(preview),
@@ -960,6 +1211,12 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
         )
         vline2.sigPositionChangeFinished.connect(
             lambda l=vline2, g=gate: _gating_range_sync(ctx, page, g, "x2", l)
+        )
+        vline1.sigPositionChanged.connect(
+            lambda l=vline1, g=gate: _gating_range_move(ctx, page, g, "x1", l)
+        )
+        vline2.sigPositionChanged.connect(
+            lambda l=vline2, g=gate: _gating_range_move(ctx, page, g, "x2", l)
         )
         page._gating_gates.append(gate)
         page._gating_rois.append([vline1, vline2])
@@ -983,13 +1240,16 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
             "x": preview.get("x"),
             "y": preview.get("y"),
         }
+        real = _gating_preview_geometry_to_real(
+            ctx, page, "split", {"vx": x0}
+        )
         for side, name in (("left", "Left"), ("right", "Right")):
             gate = {
                 "id": uuid4().hex[:8],
                 "name": name,
                 "type": "split",
                 "side": side,
-                "vx": x0,
+                "vx": real["vx"],
                 "split_id": split_id,
                 "x": preview.get("x"),
                 "y": preview.get("y"),
@@ -1003,6 +1263,9 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
             page._gating_rois.append([])
         vline.sigPositionChangeFinished.connect(
             lambda l=vline, cid=split_id: _gating_split_sync(ctx, page, cid, l)
+        )
+        vline.sigPositionChanged.connect(
+            lambda l=vline, cid=split_id: _gating_split_move(ctx, page, cid, l)
         )
         page._gating_context_gate_id = page._gating_gates[-1]["id"]
         _gating_update_roi_visibility(ctx, page)
@@ -1028,17 +1291,26 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
             "x": preview.get("x"),
             "y": preview.get("y"),
         }
+        real = _gating_preview_geometry_to_real(
+            ctx, page, "skewed_quadrant", {
+                "center": [cx, cy],
+                "p_right": list(p_right),
+                "p_up": list(p_up),
+                "p_left": list(p_left),
+                "p_down": list(p_down),
+            },
+        )
         for qnum in (1, 2, 3, 4):
             gate = {
                 "id": uuid4().hex[:8],
                 "name": f"Q{qnum}",
                 "type": "skewed_quadrant",
                 "quadrant": qnum,
-                "center": [cx, cy],
-                "p_right": list(p_right),
-                "p_up": list(p_up),
-                "p_left": list(p_left),
-                "p_down": list(p_down),
+                "center": real["center"],
+                "p_right": real["p_right"],
+                "p_up": real["p_up"],
+                "p_left": real["p_left"],
+                "p_down": real["p_down"],
                 "skewed_id": skewed_id,
                 "x": preview.get("x"),
                 "y": preview.get("y"),
@@ -1052,6 +1324,9 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
             page._gating_rois.append([])
         roi.sigRegionChangeFinished.connect(
             lambda: _gating_skewed_sync(ctx, page, skewed_id)
+        )
+        roi.sigRegionChanged.connect(
+            lambda r=roi, s=skewed_id: _gating_skewed_move(ctx, page, s)
         )
         roi.sigClicked.connect(
             lambda *a: _gating_select_gate_by_id(ctx,
@@ -1081,6 +1356,7 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
     runlog.action("gating.create", module=str(page._gating_task_id),
                   tool=str(tool), id=str(gate["id"]))
     geometry = _gating_sync_gate(ctx, gate, arg)
+    geometry = _gating_geometry_to_real(ctx, page, gate, geometry)
     for key, value in geometry.items():
         gate[key] = copy.deepcopy(value)
     runlog.action("gating.create.geometry", id=str(gate["id"]))
@@ -1091,6 +1367,9 @@ def _gating_add_gate_impl(ctx, page, tool, arg) -> None:
     arg.setCursor(Qt.CursorShape.CrossCursor)
     arg.sigRegionChangeFinished.connect(
         lambda r=arg, g=gate: _gating_on_roi_drag(ctx, page, g, r)
+    )
+    arg.sigRegionChanged.connect(
+        lambda r=arg, g=gate: _gating_on_roi_move(ctx, page, g, r)
     )
     arg.sigClicked.connect(
         lambda roi, ev, g=gate: _gating_gate_clicked(ctx, page, g["id"], ev)
@@ -1167,8 +1446,18 @@ def _gating_select_gate_by_id(ctx, page, gate_id) -> None:
             break
     if idx < 0:
         return
-    _gating_apply_selection(ctx, page, idx)
     tree = page._gating_tree
+    if page._gating_context_gate_id == gate_id:
+        # Already selected: sync the tree highlight only. A re-render and a
+        # settings rebuild here made every fine adjustment feel slow.
+        tree.blockSignals(True)
+        item = _gating_tree_item_for_index(ctx, page, idx)
+        if item is not None:
+            item.setSelected(True)
+            tree.setCurrentItem(item)
+        tree.blockSignals(False)
+        return
+    _gating_apply_selection(ctx, page, idx)
     tree.blockSignals(True)
     tree.clearSelection()
     item = _gating_tree_item_for_index(ctx, page, idx)
@@ -1227,20 +1516,46 @@ def _gating_gate_clicked(ctx, page, gate_id, ev) -> None:
         _gating_select_gate_by_id(ctx, page, gate_id)
 
 
-def _gating_descendant_ids(ctx, page, gate_id) -> set:
-    """Return the set of a gate's descendant ids (not including itself)."""
+def _gating_affected_ids(ctx, page, gate_ids) -> set:
+    """Every gate whose count/percent changes when `gate_ids` change.
+
+    That covers the gates themselves, their tree descendants (a child's
+    percentage divides by its parent's count) and any boolean gate that
+    references one of them as a source — plus that boolean gate's own
+    descendants, transitively (``NOT (A OR B)`` must follow a moved A).
+    """
+    gates = page._gating_gates
     by_parent = {}
-    for g in page._gating_gates:
+    for g in gates:
         by_parent.setdefault(g.get("parent"), []).append(g)
-    result = set()
-    stack = [gate_id]
-    while stack:
-        pid = stack.pop()
-        for child in by_parent.get(pid, []):
-            if child["id"] not in result:
-                result.add(child["id"])
-                stack.append(child["id"])
-    return result
+    affected = set(gate_ids)
+
+    def add_descendants(gid) -> None:
+        stack = [gid]
+        while stack:
+            pid = stack.pop()
+            for child in by_parent.get(pid, []):
+                cid = child.get("id")
+                if cid and cid not in affected:
+                    affected.add(cid)
+                    stack.append(cid)
+
+    for gid in tuple(affected):
+        add_descendants(gid)
+    sources = {
+        g["id"]: set(_gate_source_ids(g))
+        for g in gates
+        if g.get("type") in ("not", "and", "or") and g.get("id")
+    }
+    changed = True
+    while changed:
+        changed = False
+        for gid, refs in sources.items():
+            if gid not in affected and refs & affected:
+                affected.add(gid)
+                add_descendants(gid)
+                changed = True
+    return affected
 
 
 def _gating_visible_ids(ctx, page):
@@ -1264,6 +1579,10 @@ def _gating_visible_ids(ctx, page):
 def _gating_update_roi_visibility(ctx, page) -> None:
     """Show gates bound to the current (x, y) axes and gating-tree context."""
     from shiboken6 import isValid
+
+    overlay = getattr(page, "_gating_gate_overlay", None)
+    if overlay is not None:
+        overlay.update()
 
     def set_visible(item, visible):
         if isValid(item):
@@ -1356,14 +1675,21 @@ def _gating_on_label_dragged(ctx, page, label) -> None:
     if i >= len(page._gating_gates):
         return
     gate = page._gating_gates[i]
-    dx, dy = _gate_label_position(gate)
+    dx, dy = _gate_label_position(
+        _gating_geometry_to_display(ctx, page, gate, gate)
+    )
     pos = label.pos()
     gate["label_offset"] = [pos.x() - dx, pos.y() - dy]
     _gating_mark_dirty(ctx, page)
 
 
-def _gating_update_labels(ctx, page) -> None:
-    """Reconcile and refresh the per-gate name labels on the scatter."""
+def _gating_update_labels(ctx, page, only=None) -> None:
+    """Reconcile and refresh the per-gate name labels on the scatter.
+
+    ``only`` restricts the refresh to a set of gate ids (the gates touched
+    by a drag); computing every label's display geometry added up during
+    rapid adjustments.
+    """
     labels = page._gating_labels
     gates = page._gating_gates
     if len(labels) != len(gates):
@@ -1388,6 +1714,8 @@ def _gating_update_labels(ctx, page) -> None:
     )
     for i, gate in enumerate(gates):
         label = labels[i]
+        if only is not None and gate.get("id") not in only:
+            continue
         if gate.get("type") in ("not", "and", "or"):
             # Boolean gates have no scatter label.
             label.setVisible(False)
@@ -1399,7 +1727,9 @@ def _gating_update_labels(ctx, page) -> None:
             label.setText(f"{name}\n{pct:.2f}%")
         else:
             label.setText(name)
-        px, py = _gate_label_position(resolved[i])
+        px, py = _gate_label_position(
+            _gating_geometry_to_display(ctx, page, gate, resolved[i])
+        )
         ox, oy = gate.get("label_offset") or [0.0, 0.0]
         label.setPos(px + ox, py + oy)
         xy_ok = gate.get("x") == x and gate.get("y") == y
@@ -1425,6 +1755,8 @@ def _gating_load_rois(ctx, page) -> None:
         if gate.get("plot_type", "scatter") != plot_type:
             page._gating_rois.append(items)
             continue
+        # Gates are stored in real data units; the ROIs live in plot units.
+        rgate = _gating_geometry_to_display(ctx, page, gate, rgate)
         t = gate.get("type")
         try:
             if t == "rect":
@@ -1442,6 +1774,9 @@ def _gating_load_rois(ctx, page) -> None:
                 roi.setCursor(Qt.CursorShape.CrossCursor)
                 roi.sigRegionChangeFinished.connect(
                     lambda r=roi, g=gate: _gating_on_roi_drag(ctx, page, g, r)
+                )
+                roi.sigRegionChanged.connect(
+                    lambda r=roi, g=gate: _gating_on_roi_move(ctx, page, g, r)
                 )
                 roi.sigClicked.connect(
                     lambda roi, ev, g=gate: _gating_gate_clicked(ctx, page, g["id"], ev)
@@ -1463,6 +1798,9 @@ def _gating_load_rois(ctx, page) -> None:
                 roi.sigRegionChangeFinished.connect(
                     lambda r=roi, g=gate: _gating_on_roi_drag(ctx, page, g, r)
                 )
+                roi.sigRegionChanged.connect(
+                    lambda r=roi, g=gate: _gating_on_roi_move(ctx, page, g, r)
+                )
                 roi.sigClicked.connect(
                     lambda roi, ev, g=gate: _gating_gate_clicked(ctx, page, g["id"], ev)
                 )
@@ -1478,6 +1816,9 @@ def _gating_load_rois(ctx, page) -> None:
                 roi.setCursor(Qt.CursorShape.CrossCursor)
                 roi.sigRegionChangeFinished.connect(
                     lambda r=roi, g=gate: _gating_on_roi_drag(ctx, page, g, r)
+                )
+                roi.sigRegionChanged.connect(
+                    lambda r=roi, g=gate: _gating_on_roi_move(ctx, page, g, r)
                 )
                 roi.sigClicked.connect(
                     lambda roi, ev, g=gate: _gating_gate_clicked(ctx, page, g["id"], ev)
@@ -1503,6 +1844,12 @@ def _gating_load_rois(ctx, page) -> None:
                     hline.sigPositionChangeFinished.connect(
                         lambda l=hline, c=cid: _gating_quadrant_sync(ctx, page, c, "hy", l)
                     )
+                    vline.sigPositionChanged.connect(
+                        lambda l=vline, c=cid: _gating_quadrant_move(ctx, page, c, "vx", l)
+                    )
+                    hline.sigPositionChanged.connect(
+                        lambda l=hline, c=cid: _gating_quadrant_move(ctx, page, c, "hy", l)
+                    )
                 items = []
             elif t == "range":
                 pen = pg.mkPen(gate_color, width=2)
@@ -1519,6 +1866,12 @@ def _gating_load_rois(ctx, page) -> None:
                 vline2.sigPositionChangeFinished.connect(
                     lambda l=vline2, g=gate: _gating_range_sync(ctx, page, g, "x2", l)
                 )
+                vline1.sigPositionChanged.connect(
+                    lambda l=vline1, g=gate: _gating_range_move(ctx, page, g, "x1", l)
+                )
+                vline2.sigPositionChanged.connect(
+                    lambda l=vline2, g=gate: _gating_range_move(ctx, page, g, "x2", l)
+                )
                 items = [vline1, vline2]
             elif t == "split":
                 sid = gate.get("split_id")
@@ -1534,6 +1887,9 @@ def _gating_load_rois(ctx, page) -> None:
                     }
                     vline.sigPositionChangeFinished.connect(
                         lambda l=vline, c=sid: _gating_split_sync(ctx, page, c, l)
+                    )
+                    vline.sigPositionChanged.connect(
+                        lambda l=vline, c=sid: _gating_split_move(ctx, page, c, l)
                     )
                 items = []
             elif t == "skewed_quadrant":
@@ -1560,6 +1916,9 @@ def _gating_load_rois(ctx, page) -> None:
                     }
                     roi.sigRegionChangeFinished.connect(
                         lambda c=sid: _gating_skewed_sync(ctx, page, c)
+                    )
+                    roi.sigRegionChanged.connect(
+                        lambda r=roi, c=sid: _gating_skewed_move(ctx, page, c)
                     )
                     roi.sigClicked.connect(
                         lambda *a: _gating_select_gate_by_id(ctx, page, gate["id"])
@@ -2165,6 +2524,15 @@ def _gating_on_tree_selection(ctx, page, item, column) -> None:
     """Single-click: open the gate's drawing context (axes + range + parent points)."""
     idx = item.data(0, Qt.ItemDataRole.UserRole) if item else -1
     idx = idx if isinstance(idx, int) and idx >= 0 else -1
+    current = page._gating_context_gate_id
+    target = (
+        page._gating_gates[idx]["id"]
+        if 0 <= idx < len(page._gating_gates) else None
+    )
+    if target == current:
+        # Selecting the gate that is already active must not rebuild the
+        # plot/settings; keeping this cheap makes rapid gate edits usable.
+        return
     _gating_apply_selection(ctx, page, idx)
     # Render immediately (no double-click deferral, which felt sluggish).
     _gating_render_and_settings(ctx, page)
@@ -2293,8 +2661,69 @@ def _gating_add_boolean_gate(ctx, page, idx, op) -> None:
     _gating_mark_dirty(ctx, page)
 
 
-def _gating_request_stats(ctx, page, affected=None) -> None:
-    """Submit a background statistics recomputation (incremental if affected)."""
+def _gating_stage_signature(stages) -> str:
+    """Digest of the data pipeline (so gate edits reuse its cached output)."""
+    import hashlib
+    import json
+
+    import numpy as np
+
+    def array_token(value):
+        try:
+            arr = np.ascontiguousarray(np.asarray(value, dtype="float64"))
+            return hashlib.sha1(arr.tobytes()).hexdigest()[:10]
+        except Exception:  # noqa: BLE001
+            return str(value)[:64]
+
+    payload = []
+    for kind, stage in stages:
+        if kind == "compensation":
+            payload.append([
+                kind, stage.get("id"), sorted(stage.get("files") or []),
+                list(stage.get("names") or []),
+                array_token(stage.get("matrix")),
+            ])
+        elif kind == "unmix":
+            payload.append([
+                kind, stage.get("task_id"),
+                sorted(stage.get("samples") or []),
+                list(stage.get("names") or []),
+                array_token(stage.get("matrix")),
+            ])
+        elif kind == "illumination":
+            payload.append([
+                kind, stage.get("task_id"),
+                [
+                    [sub.get("channel"), sorted(sub.get("files") or []),
+                     sub.get("T"), array_token(sub.get("mask"))]
+                    for sub in stage.get("submodules") or []
+                ],
+            ])
+        elif kind == "batch_align":
+            payload.append([
+                kind, stage.get("id"), stage.get("model_id"),
+                sorted((stage.get("files") or {}).items()),
+                array_token(stage.get("codes")),
+            ])
+        elif kind == "rename":
+            payload.append([
+                kind, sorted((stage.get("map") or {}).items()),
+                sorted(stage.get("files") or []),
+            ])
+        else:
+            payload.append([kind, repr(stage)[:500]])
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _gating_request_stats(ctx, page, affected=None, full=False) -> None:
+    """Submit a background statistics recomputation (incremental if affected).
+
+    By default the counts come from the displayed sample (the same rows the
+    plot draws), which keeps gate editing fast.  ``full=True`` computes on
+    every event and is only used by the explicit "full data" button.
+    """
     worker = getattr(page, "_gating_stats_worker", None)
     if worker is None:
         return
@@ -2307,7 +2736,9 @@ def _gating_request_stats(ctx, page, affected=None) -> None:
     gates = _resolve_gates_for_file(
         page._gating_gates, page._gating_per_file, str(parquet_path)
     )
-    stages = _data_columns._map_stages(ctx, page._gating_task_id)
+    stages = _data_columns._map_stages(
+        ctx, page._gating_task_id, parquet_path=parquet_path
+    )
     # A Feature output is not in the import column index and already holds
     # the transforms applied above its Feature module; only the stages
     # below it still apply (renames remain a name change). Without this a
@@ -2315,8 +2746,9 @@ def _gating_request_stats(ctx, page, affected=None) -> None:
     # gate ever received a count/percent.
     feature = _data_feature_outputs._feature_output(ctx, parquet_path)
     if feature is not None:
-        post = _data_columns._map_stages(ctx,
-            page._gating_task_id, after=feature.get("feature_task")
+        post = _data_columns._map_stages(
+            ctx, page._gating_task_id, after=feature.get("feature_task"),
+            parquet_path=parquet_path,
         )
         renames = [
             (kind, stage) for kind, stage in stages
@@ -2337,6 +2769,15 @@ def _gating_request_stats(ctx, page, affected=None) -> None:
         except Exception:  # noqa: BLE001
             base_columns = set()
     page._gating_stat_generation += 1
+    # Track which gates the pending results cover.  Requests coalesce in the
+    # worker, so the scope accumulates until the matching result is applied
+    # (a full request covers everything).
+    if affected is None:
+        page._gating_stats_scope = (True, set())
+    else:
+        full_scope, ids = getattr(page, "_gating_stats_scope", (False, set()))
+        if not full_scope:
+            page._gating_stats_scope = (False, set(ids) | set(affected))
     # Mask columns exposed by an upstream Segmentation module are not in
     # the data file; resolve them here and hand them to the worker.
     virtual = {}
@@ -2346,16 +2787,109 @@ def _gating_request_stats(ctx, page, affected=None) -> None:
         arr = _data_outputs._seg_mask_values(ctx, parquet_path, mask_path)
         if arr is not None:
             virtual[name] = arr
+    subsample = _data_sampling._subsample_row_index(
+        ctx, page._gating_task_id, parquet_path
+    )
+    total_rows = ctx._data_row_count(parquet_path)
+    row_index = None
+    scale = 1.0
+    mode = "full"
+    if subsample is not None:
+        # An upstream Subsample defines the population; the sampled/full
+        # distinction only applies above it.
+        row_index = subsample
+    elif not full:
+        tier = ctx._pool_tier()
+        pool = ctx._pool_rows_cache.get((str(parquet_path), int(tier)))
+        if pool is not None and len(pool):
+            total = total_rows or len(pool)
+            if len(pool) >= total:
+                # The sample already covers every row.
+                row_index = None
+            else:
+                row_index = pool
+                scale = float(total) / float(len(pool))
+                mode = "sampled"
+    page._gating_stats_total = total_rows or (
+        len(row_index) if row_index is not None else 0
+    )
+    page._gating_stats_rows = (
+        len(row_index) if row_index is not None else page._gating_stats_total
+    )
+    page._gating_stats_scale = scale
+    page._gating_stats_mode = mode
+    runlog.action(
+        "gating.stats_request",
+        mode=mode,
+        rows=page._gating_stats_rows,
+        total=page._gating_stats_total,
+        affected=("all" if affected is None else len(affected)),
+    )
+    _gating_update_stats_button(ctx, page)
     worker.request(
         page._gating_stat_generation,
         parquet_path, gates, stages, base_columns, affected, virtual,
-        _data_sampling._subsample_row_index(ctx, page._gating_task_id, parquet_path),
+        row_index,
+        _gating_stage_signature(stages),
     )
+
+
+def _gating_update_stats_button(ctx, page) -> None:
+    """Keep the full-data button's tooltip in step with the current scope."""
+    button = getattr(page, "_gating_full_stats_btn", None)
+    if button is None:
+        return
+    rows = getattr(page, "_gating_stats_rows", 0)
+    total = getattr(page, "_gating_stats_total", 0)
+    if total and rows >= total:
+        button.setToolTip(
+            f"All {total:,} rows are already used, so the gate counts are "
+            "exact; clicking only recomputes them."
+        )
+    elif rows and total:
+        button.setToolTip(
+            f"Recalculate gate counts on all {total:,} rows. Gate editing "
+            f"uses a {rows:,}-row sample instead."
+        )
+    else:
+        button.setToolTip(
+            "Recalculate gate counts on every event. Normal editing uses the "
+            "displayed sample, which is much faster."
+        )
+
+
+def _gating_full_stats(ctx, page) -> None:
+    """Button action: recompute gate counts on the complete data set."""
+    page._gating_stats_announce = True
+    _gating_request_stats(ctx, page, affected=None, full=True)
+    rows = getattr(page, "_gating_stats_rows", 0)
+    try:
+        if rows:
+            ctx.statusBar().showMessage(
+                f"Recomputing gate statistics on {rows:,} rows…", 5000
+            )
+        else:
+            ctx.statusBar().showMessage(
+                "Recomputing gate statistics on full data…", 5000
+            )
+    except Exception:  # noqa: BLE001 - status bar is cosmetic
+        pass
 
 
 def _gating_apply_stats(ctx, page, stats) -> None:
     """Update the gate tree labels with a fresh stats dict."""
+    scale = getattr(page, "_gating_stats_scale", 1.0)
+    if getattr(page, "_gating_stats_mode", "full") == "sampled" and scale > 0:
+        # Sampled counts are scaled to the whole file so the numbers stay
+        # comparable; percentages are already ratios.
+        stats = {
+            gate_id: (int(round(count * scale)), pct)
+            for gate_id, (count, pct) in stats.items()
+        }
     page._gating_last_stats = stats
+    full_scope, scope_ids = getattr(page, "_gating_stats_scope", (True, set()))
+    page._gating_stats_scope = (False, set())
+    only = None if full_scope else set(scope_ids)
     tree = page._gating_tree
     tree.blockSignals(True)
 
@@ -2365,16 +2899,41 @@ def _gating_apply_stats(ctx, page, stats) -> None:
             idx = child.data(0, Qt.ItemDataRole.UserRole)
             if isinstance(idx, int) and 0 <= idx < len(page._gating_gates):
                 gate = page._gating_gates[idx]
-                child.setText(
-                    0, _gating_gate_display_name(ctx, gate, idx, stats)
-                )
+                if only is None or gate.get("id") in only:
+                    child.setText(
+                        0, _gating_gate_display_name(ctx, gate, idx, stats)
+                    )
             update(child)
 
     for i in range(tree.topLevelItemCount()):
         update(tree.topLevelItem(i))
     tree.blockSignals(False)
     tree.resizeColumnToContents(0)
-    _gating_update_labels(ctx, page)
+    _gating_update_labels(ctx, page, only=only)
+    if only is None:
+        # A complete refresh (module open or the full-data button): log the
+        # resulting counts so a "nothing changed" report can be checked.
+        runlog.action(
+            "gating.stats_counts",
+            counts={
+                g.get("name", g["id"]): stats.get(g["id"], (None, None))[0]
+                for g in page._gating_gates
+            },
+        )
+    if getattr(page, "_gating_stats_announce", False):
+        page._gating_stats_announce = False
+        rows = getattr(page, "_gating_stats_rows", 0)
+        total = getattr(page, "_gating_stats_total", 0)
+        try:
+            if total and rows >= total:
+                note = f"Gate statistics updated on all {rows:,} rows."
+            elif rows and total:
+                note = f"Gate statistics updated on {rows:,} of {total:,} rows."
+            else:
+                note = "Gate statistics updated."
+            ctx.statusBar().showMessage(note, 5000)
+        except Exception:  # noqa: BLE001 - status bar is cosmetic
+            pass
 
 
 def _gating_on_stats_timer(ctx, page) -> None:
@@ -2384,10 +2943,17 @@ def _gating_on_stats_timer(ctx, page) -> None:
     worker = getattr(page, "_gating_stats_worker", None)
     if worker is None:
         return
-    for generation, stats in worker.poll():
+    for result in worker.poll():
+        if not result:
+            continue
+        generation, stats = result
         if generation == page._gating_stat_generation:
-            runlog.action("gating.stats_apply",
-                          gates=len(page._gating_gates))
+            runlog.action(
+                "gating.stats_apply",
+                gates=len(page._gating_gates),
+                mode=getattr(page, "_gating_stats_mode", "full"),
+                rows=getattr(page, "_gating_stats_rows", 0),
+            )
             _gating_apply_stats(ctx, page, stats)
             runlog.action("gating.stats_applied")
 
@@ -2404,6 +2970,53 @@ def _gating_gate_display_name(ctx, gate, idx, stats) -> str:
 def _gating_refresh_tree_stats(ctx, page, affected=None) -> None:
     """Refresh gate count/percent labels (background, incremental if affected)."""
     _gating_request_stats(ctx, page, affected=affected)
+
+
+def _gating_flush_adjust(ctx, page) -> None:
+    """Apply the pending post-adjust refresh (statistics + labels)."""
+    pending = getattr(page, "_gating_adjust_affected", "missing")
+    if pending == "missing":
+        return
+    page._gating_adjust_affected = "missing"
+    try:
+        _gating_refresh_tree_stats(ctx, page, affected=pending)
+        _gating_update_labels(ctx, page, only=pending)
+    except RuntimeError:
+        # The page was closed before the refresh ran.
+        pass
+
+
+def _gating_schedule_adjust(ctx, page, affected=None) -> None:
+    """Refresh statistics/labels after a gate adjustment finishes.
+
+    This is called when a drag or line move ends (``sigRegionChangeFinished``
+    / ``sigPositionChangeFinished``), never while the gate is still moving:
+    recomputing the counts for every intermediate shape made dragging stutter
+    and the intermediate numbers were never used.  A very short single-shot
+    delay coalesces the finish/changed signal pair emitted on release.
+    The affected set expands to descendants and to boolean gates that
+    reference a moved gate (see ``_gating_affected_ids``).
+    """
+    timer = getattr(page, "_gating_adjust_timer", None)
+    if timer is None:
+        timer = QTimer(ctx.host)
+        timer.setSingleShot(True)
+        timer.setInterval(50)
+        timer.timeout.connect(lambda: _gating_flush_adjust(ctx, page))
+        page._gating_adjust_timer = timer
+    if affected is not None:
+        # Descendants and the boolean gates that reference a moved gate all
+        # change; see _gating_affected_ids.
+        affected = _gating_affected_ids(ctx, page, affected)
+    previous = getattr(page, "_gating_adjust_affected", "missing")
+    if previous == "missing":
+        previous = set()
+    if affected is None or previous is None:
+        combined = None
+    else:
+        combined = set(previous) | set(affected)
+    page._gating_adjust_affected = combined
+    timer.start()
 
 
 def _gating_on_collapse(ctx, page, item) -> None:
@@ -2464,6 +3077,9 @@ def _gating_rebuild_tree(ctx, page) -> None:
         _gating_set_items_handles_visible(ctx, gate_items, False)
     for entry in page._gating_skewed_lines.values():
         _gating_set_items_handles_visible(ctx, [entry["roi"]], False)
+    overlay = getattr(page, "_gating_gate_overlay", None)
+    if overlay is not None:
+        overlay.update()
     _gating_refresh_tree_stats(ctx, page)
 
 
@@ -2502,6 +3118,9 @@ def _gating_pick_gate_color(ctx, page, button=None) -> None:
 
 def _gating_apply_gate_color(ctx, page) -> None:
     """Re-pen every gate item with the current gate colour."""
+    overlay = getattr(page, "_gating_gate_overlay", None)
+    if overlay is not None:
+        overlay.update()
     color = _gate_color(page._gating_preview)
     hover = _gate_hover_color(color)
     viewbox = getattr(page, "_gating_viewbox", None)

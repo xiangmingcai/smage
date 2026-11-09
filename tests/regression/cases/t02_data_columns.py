@@ -107,8 +107,8 @@ def column_values() -> None:
 
         values = _data_columns._column_data(ctx, "g-1", parquet, ["FL1-A"])
         harness.check(
-            np.allclose(values["FL1-A"], np.log10(raw)),
-            "the upstream scale transform is applied",
+            np.allclose(values["FL1-A"], raw),
+            "Scale is display-only: the values stay raw",
         )
 
         renamed = _data_columns._column_data(ctx, "g-1", parquet, ["NewFL2"])
@@ -180,14 +180,17 @@ def map_stages() -> None:
     try:
         ctx = window._ctx
         stages = _data_columns._map_stages(ctx, "g-1")
-        harness.eq([kind for kind, _stage in stages], ["scale", "compensation"])
-        harness.eq(stages[0][1]["columns"]["FL1-A"]["method"], "arcsinh")
-        harness.eq(stages[0][1]["files"], {parquet})
-        harness.eq(stages[1][1]["names"], ["A", "B"])
+        harness.eq([kind for kind, _stage in stages], ["compensation"],
+                   "scale is display-only and stays out of the data pipeline")
+        harness.eq(stages[0][1]["names"], ["A", "B"])
         harness.check(
-            np.allclose(stages[1][1]["matrix"], np.eye(2)),
+            np.allclose(stages[0][1]["matrix"], np.eye(2)),
             "the matrix is stored as percentages",
         )
+        display = _data_columns._map_stages(ctx, "g-1", include_scale=True)
+        harness.eq([kind for kind, _stage in display], ["scale", "compensation"])
+        harness.eq(display[0][1]["columns"]["FL1-A"]["method"], "arcsinh")
+        harness.eq(display[0][1]["files"], {parquet})
 
         transforms = _data_columns._upstream_scale_transforms(ctx, "g-1")
         harness.eq(list(transforms), ["FL1-A"])
@@ -201,9 +204,57 @@ def map_stages() -> None:
                 task["params"]["columns"][0]["method"] = "log10"
         window.project.save()
         harness.check(
-            _data_columns._map_stage_token(ctx, "g-1") != token,
-            "changing a stage changes the token",
+            _data_columns._map_stage_token(ctx, "g-1") == token,
+            "Scale is display-only: it does not change the data token",
         )
+    finally:
+        _close(window)
+
+
+@harness.case("data.columns.unmix_file_scope", "L2", "data", tags=("fast",))
+def unmix_stage_file_scope() -> None:
+    """An Unmix matrix is not built for files outside its sample list.
+
+    Building it recomputes gate statistics over whole images, which made
+    every axis change on a downstream Gating module slow.
+    """
+    unmix = harness.task_def(
+        "unmix", task_id="u-1", name="Unmix",
+        params={"samples": ["/image.parquet"], "matrix": []},
+        children=[harness.task_def("gating", task_id="g-1", name="Gating")],
+    )
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={"columns": [{"name": "A", "method": "log10"}],
+                "files": None},
+        children=[unmix],
+    )
+    project = harness.new_project("unmix_scope", rows=10, tasks=[scale])
+    window = harness.new_window()
+    harness.open_project(window, project)
+    try:
+        ctx = window._ctx
+        original = ctx._unmix_flow_config
+        calls = {"n": 0}
+
+        def counting(task):
+            calls["n"] += 1
+            return original(task)
+
+        ctx.__dict__["_unmix_flow_config"] = counting
+        try:
+            stages = _data_columns._map_stages(
+                ctx, "g-1", parquet_path="/other.parquet"
+            )
+            harness.eq(stages, [], "scale stays out; unmatched Unmix is skipped")
+            harness.eq(calls["n"], 0, "the Unmix matrix is not built")
+
+            _data_columns._map_stages(
+                ctx, "g-1", parquet_path="/image.parquet"
+            )
+            harness.eq(calls["n"], 1, "a matching file still resolves the matrix")
+        finally:
+            ctx.__dict__.pop("_unmix_flow_config", None)
     finally:
         _close(window)
 

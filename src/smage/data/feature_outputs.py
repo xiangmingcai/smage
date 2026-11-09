@@ -9,6 +9,31 @@ import json
 from pathlib import Path
 
 
+def _feature_signature_rules(params) -> list:
+    """Rules as they affect the aggregated output, for the change signature.
+
+    The default group-key row is stripped from the list, so projects saved
+    before that row existed keep matching their already-calculated outputs
+    (the column it carries was always written). Renaming the row or deleting
+    it (``feature_rule`` false) adds a marker and invalidates the output.
+    """
+    feature = params.get("feature")
+    rules = []
+    marker = None
+    for rule in params.get("rules") or []:
+        if rule.get("method") != "feature":
+            rules.append(rule)
+            continue
+        stored = (rule.get("name") or "").strip()
+        if stored and stored != feature:
+            marker = {"kind": "feature-key", "name": stored}
+    if params.get("feature_rule", True) is False:
+        marker = {"kind": "feature-key", "included": False}
+    if marker is not None:
+        rules = rules + [marker]
+    return rules
+
+
 def _feature_signature(ctx, params, parquet_path, task_id=None) -> str:
     """A change signature for one source file's aggregation output.
 
@@ -23,7 +48,7 @@ def _feature_signature(ctx, params, parquet_path, task_id=None) -> str:
         stat = ""
     payload = {
         "feature": params.get("feature"),
-        "rules": params.get("rules") or [],
+        "rules": _feature_signature_rules(params),
         "source": str(parquet_path),
         "stat": stat,
     }

@@ -80,6 +80,33 @@ def calculate() -> None:
         _close(window)
 
 
+@harness.case("mod.feature.feature_row", "L4", "feature", tags=("fast",))
+def feature_row() -> None:
+    """The feature variable has its own (deletable) row in the rules table."""
+    window, _project, page, parquet = _open("feature_row", ignore=[])
+    try:
+        ctx = window._ctx
+        rules = page._feat_params["rules"]
+        harness.eq([r.get("method") for r in rules], ["count", "feature", "mean"],
+                   "the group-key row is added by default")
+        harness.eq(rules[1].get("name"), "group")
+
+        # Deleting the row (the Delete button sets the same flag) leaves the
+        # identifier column out of the aggregated file.
+        del rules[1]
+        page._feat_params["feature_rule"] = False
+        feature_page._feat_sync_feature_rule(ctx, page)
+        harness.check(
+            not any(r.get("method") == "feature" for r in rules),
+            "a deleted group-key row is not re-created",
+        )
+        feature_page._feat_calculate(ctx, page)
+        record = page._feat_params["outputs"][str(parquet)]
+        harness.eq(record["columns"], ["n", "mean_v"])
+    finally:
+        _close(window)
+
+
 @harness.case("mod.feature.ignore", "L4", "feature", tags=("fast",))
 def ignore_background() -> None:
     window, project, page, parquet = _open("feature_ignore", ignore=[3])

@@ -1278,7 +1278,9 @@ def _seg_calculate_nuclear(ctx, page) -> None:
                     f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}…"
                 )
                 QApplication.processEvents()
-            mask, err = _seg_nuclear_expansion(ctx, parquet_path, params)
+            mask, err = _seg_nuclear_expansion(
+                ctx, parquet_path, params, page._seg_task_id
+            )
             if mask is None:
                 errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {err}")
                 continue
@@ -1307,14 +1309,16 @@ def _seg_calculate_nuclear(ctx, page) -> None:
         status.setText(msg)
 
 
-def _seg_raster_stack(ctx, parquet_path, channels):
+def _seg_raster_stack(ctx, parquet_path, channels, task_id=None):
     """Reconstruct a (C, H, W) float stack of the given channels."""
     import numpy as np
 
     images = []
     shape = None
     for channel in channels:
-        image, err = _seg_raster_channel(ctx, parquet_path, channel)
+        image, err = _seg_raster_channel(
+            ctx, parquet_path, channel, task_id=task_id
+        )
         if image is None:
             return None, err
         if shape is None:
@@ -1381,12 +1385,17 @@ def _seg_calculate_external(ctx, page) -> None:
             page, f"  rasterizing {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}…"
         )
         if cyto:
-            stack, err = _seg_raster_stack(ctx, parquet_path, [cyto, nucleus])
+            stack, err = _seg_raster_stack(
+                ctx, parquet_path, [cyto, nucleus], page._seg_task_id
+            )
             nucleus_idx, cyto_idx = 1, 0
         else:
-            stack, err = _seg_raster_stack(ctx, parquet_path, [nucleus])
+            stack, err = _seg_raster_stack(
+                ctx, parquet_path, [nucleus], page._seg_task_id
+            )
             nucleus_idx, cyto_idx = 0, None
         if stack is None:
+            _seg_log(ctx, page, f"✗ {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {err}")
             continue
         image_npy = tmpdir / f"in_{i}.npy"
         output_npy = tmpdir / f"out_{i}.npy"
@@ -1395,6 +1404,11 @@ def _seg_calculate_external(ctx, page) -> None:
         jobs.append({"parquet": parquet_path, "output": str(output_npy)})
 
     if not jobs:
+        _seg_log(ctx, page, "No file could be rasterized — see the lines above.")
+        if status is not None:
+            status.setText(
+                "No file could be rasterized — see the calculation log."
+            )
         return
 
     manifest_path = tmpdir / "jobs.json"
@@ -1654,38 +1668,83 @@ def _seg_ext_poll(ctx, page) -> None:
         status.setText(msg)
 
 
-def _seg_raster_channel(ctx, parquet_path, channel):
-    """Reconstruct one channel as a 2-D float image (or (None, error))."""
+def _seg_raster_channel(ctx, parquet_path, channel, task_id=None):
+    """Reconstruct one channel as a 2-D float image (or (None, error)).
+
+    Values go through the map pipeline (Unmix / Scale / Compensation …), so
+    channels that only exist as module outputs (for example an unmixed
+    ``DAPI``) can be segmented.  ``task_id`` selects the pipeline position.
+    """
     import numpy as np
-    import pandas as pd
 
     ent = _data_image_index._ensure_image_index(ctx, parquet_path)
     if ent is None or ent.get("manifest") is None:
         return None, "no image index — re-import this file as an image"
     man = ent["manifest"]
-    try:
-        df = pd.read_parquet(parquet_path, columns=["x", "y", channel])
-    except Exception as exc:  # noqa: BLE001
-        return None, str(exc)
+    values = None
+    if task_id:
+        # A precomputed Unmix pyramid already holds the unmixed channel;
+        # reading it avoids re-unmixing every source column again.  Only the
+        # stages below the Unmix module are applied on top.
+        unmix_cols, _stale = _data_outputs._unmix_image_outputs(
+            ctx, task_id, parquet_path
+        )
+        rec = unmix_cols.get(channel)
+        if rec is not None:
+            import pandas as pd
+            from smage.core.pipeline import _evaluate_stages, _stages_after
+
+            df = pd.read_parquet(
+                rec["parquet"], columns=["x", "y", channel]
+            )
+            x_values = df["x"].to_numpy(dtype="float64")
+            y_values = df["y"].to_numpy(dtype="float64")
+            data = pd.to_numeric(
+                df[channel], errors="coerce"
+            ).to_numpy(dtype="float64")
+            post = _stages_after(
+                ctx._map_stages(task_id), "unmix", rec.get("task_id")
+            )
+            if post:
+                evaluated = _evaluate_stages(
+                    post,
+                    {"x": x_values, "y": y_values, channel: data},
+                    [channel],
+                    parquet_path=parquet_path,
+                )
+                data = evaluated.get(channel, data)
+            values = {"x": x_values, "y": y_values, channel: data}
+    if values is None:
+        values = _data_columns._column_data(
+            ctx, task_id, parquet_path, ["x", "y", channel]
+        )
+    if channel not in values:
+        return None, f"'{channel}' is not available in this file"
+    if "x" not in values or "y" not in values:
+        return None, "x/y columns are not available in this file"
     xmin = float(man["xmin"])
     ymin = float(man["ymin"])
     width = int(round(float(man["xmax"]) - xmin)) + 1
     height = int(round(float(man["ymax"]) - ymin)) + 1
-    xi = np.rint(df["x"].to_numpy(dtype="float64") - xmin).astype(np.int64)
-    yi = np.rint(df["y"].to_numpy(dtype="float64") - ymin).astype(np.int64)
-    values = pd.to_numeric(df[channel], errors="coerce").to_numpy(dtype="float64")
+    xi = np.rint(
+        np.asarray(values["x"], dtype="float64") - xmin
+    ).astype(np.int64)
+    yi = np.rint(
+        np.asarray(values["y"], dtype="float64") - ymin
+    ).astype(np.int64)
+    data = np.asarray(values[channel], dtype="float64")
     image = np.zeros((height, width), dtype="float64")
     ok = (
         (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
-        & np.isfinite(values)
+        & np.isfinite(data)
     )
-    image[yi[ok], xi[ok]] = values[ok]
-    if values[ok].size == 0:
+    image[yi[ok], xi[ok]] = data[ok]
+    if not ok.any():
         return None, "no finite pixel values"
     return image, None
 
 
-def _seg_nuclear_expansion(ctx, parquet_path, params):
+def _seg_nuclear_expansion(ctx, parquet_path, params, task_id=None):
     """Threshold → label → filter → expand. Returns (mask, error)."""
     import numpy as np
     from scipy import ndimage
@@ -1693,7 +1752,9 @@ def _seg_nuclear_expansion(ctx, parquet_path, params):
     channel = params.get("channel")
     if not channel:
         return None, "no nucleus channel"
-    image, err = _seg_raster_channel(ctx, parquet_path, channel)
+    image, err = _seg_raster_channel(
+        ctx, parquet_path, channel, task_id=task_id
+    )
     if image is None:
         return None, err
 

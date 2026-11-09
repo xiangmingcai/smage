@@ -12,6 +12,25 @@
 - [ ] Subset 隐藏 `x` / `y` 后，表格类 Figure 无法选择坐标轴；确认是否需要提示或做保护。
 - [ ] 检查各模块在「上游文件集合发生变化」时的提示是否清楚（文件被隐藏、被采样、被重新计算）。
 
+## 显示语义（Scale）
+
+- [x] Scale 改为**纯显示变换**：`_map_stages()` 默认不再输出 scale；`_column_data` / Export / Feature / Heatmap / Cluster / Dimred / Area / Data Clean / Segmentation / Unmix 谱统计都使用真实数据（只应用 Compensation、Unmix、Illumination、Batch Align、Rename）。
+- [x] 散点/直方图/图像在渲染时才应用 Scale；坐标轴仍显示原始值；Scale 的 Min/Max 仍是显示范围。
+- [x] Gating 的门改为按**真实数据坐标**存储：加载时正向变换到绘图坐标，拖动/新建时反向变换回真实值。
+- [ ] **旧项目迁移**：旧版本保存的门是在缩放后坐标下绘制的，新语义会把它们当作真实坐标。旧项目打开后这些门位置会偏，需要重画（或后续补一次性迁移）。
+- [ ] 旧版本生成的下游结果（Unmix 输出、Feature、Cluster 等）是按旧语义算的；用户已确认自行删除重做。
+
+## 工作流结构（复制 / 粘贴）
+
+- [x] 修复：`WorkflowTreeMixin._remap_path_text` 缺少 `self`，导致任何模块的「Paste」都抛 `TypeError`，界面无任何反馈（2026-11-08）。
+- [x] 已补回归用例 `shell.workflow.copy_paste`：单个/分支粘贴、新 id、子节点处理、保存后重新加载。
+- [ ] 待补测试：
+  - [ ] `Module/<旧 id>/…` 路径重写（Scale files、Segmentation masks、Feature outputs、Compensation 文件列表）。
+  - [ ] Gating 的 `gates.json` 随分支复制，并指向粘贴后的新 id。
+  - [ ] 粘贴 generate 模块时 `output.saved` 清空、`locked` 解除。
+  - [ ] 粘贴到锁定 / 草稿节点后的行为。
+  - [ ] 复制后关闭并重新打开项目，剪贴板行为（当前只在窗口内有效）。
+
 ## 未实现的模块
 
 - [ ] Export（占位）

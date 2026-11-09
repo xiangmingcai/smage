@@ -91,6 +91,18 @@ def _pipeline_dependencies(stages, names, parquet_path=None) -> set:
     return needed
 
 
+def _stages_after(stages, kind, task_id):
+    """Stages that follow the given map stage (matched by kind and task id)."""
+    out = []
+    started = task_id is None
+    for stage_kind, stage in stages:
+        if started:
+            out.append((stage_kind, stage))
+        elif stage_kind == kind and stage.get("task_id") == task_id:
+            started = True
+    return out
+
+
 def _linear_combine(sources, weights):
     """Combine arrays with a (outputs × sources) weight matrix.
 
@@ -134,7 +146,11 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
             sources = stage["names"]
             if not all(name in values for name in sources):
                 continue
-            key = ("comp", stage.get("id"), parquet_path)
+            # The row count is part of the key: the same stage can be seen
+            # through a different Subsample scope, and cached arrays are
+            # already filtered to that scope.
+            row_count = len(values[sources[0]]) if sources else 0
+            key = ("comp", stage.get("id"), parquet_path, row_count)
             out = cache.get(key) if cache is not None else None
             if out is None:
                 combined = _linear_combine(
@@ -151,7 +167,8 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
             sources = stage["columns"]
             if not all(name in values for name in sources):
                 continue
-            key = ("unmix", stage.get("task_id"), parquet_path)
+            row_count = len(values[sources[0]]) if sources else 0
+            key = ("unmix", stage.get("task_id"), parquet_path, row_count)
             out = cache.get(key) if cache is not None else None
             if out is None:
                 pinv = stage.get("_pinv")

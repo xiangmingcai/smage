@@ -31,6 +31,7 @@ from smage.widgets.resources import (
 )
 import copy
 import shutil
+from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import pool as _data_pool
 from smage.data import stores as _data_stores
@@ -421,10 +422,25 @@ class ModuleHostMixin:
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""
         _data_stores._write_draft_params(self._ctx, page)
+        saved_id = page.property("task_id")
         # Any saved change can alter the data flowing downstream.
+        _data_columns._bump_stages_revision(self._ctx)
         _data_pool._pool_clear(self._ctx)
         self._channel_range_cache = {}
-        self._unmix_flow_cache = {}
+        # Rebuilding an Unmix matrix recomputes gate statistics over whole
+        # images, so keep the cached matrices of branches this save cannot
+        # affect (anything that is not the Unmix task or upstream of it).
+        if saved_id:
+            keep = {}
+            for unmix_id, value in (self._unmix_flow_cache or {}).items():
+                chain = _data_files._task_chain(self._ctx, unmix_id)
+                upstream_ids = {t.get("id") for t in chain[:-1]}
+                if unmix_id == saved_id or saved_id in upstream_ids:
+                    continue
+                keep[unmix_id] = value
+            self._unmix_flow_cache = keep
+        else:
+            self._unmix_flow_cache = {}
         self._unmix_value_cache = {}
         self._stage_cache = {}
         self._seg_value_cache = {}
@@ -437,7 +453,6 @@ class ModuleHostMixin:
         # Gating gate trees (stored in the module folder).
         self._gating_store_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
-        saved_id = page.property("task_id")
         if saved_id:
             task_def = self._find_task_by_id(saved_id) or {}
             runlog.info(

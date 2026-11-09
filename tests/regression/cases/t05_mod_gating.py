@@ -41,6 +41,46 @@ def _close(window) -> None:
     harness.close_window(window)
 
 
+@harness.case("mod.gating.real_coordinates", "L4", "gating", tags=("fast",))
+def gates_live_in_real_coordinates() -> None:
+    """Gate geometry is stored in real units; Scale only moves it on screen."""
+    gating = harness.task_def("gating", task_id="g-1", name="Gating")
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={"columns": [{"name": "FL1-A", "method": "log10"}],
+                "files": None},
+        children=[gating],
+    )
+    project = harness.new_project("gating_real_coords", rows=60, tasks=[scale])
+    window = harness.new_window()
+    harness.open_project(window, project)
+    try:
+        window._open_module("g-1", "gating", "Gating")
+        harness.pump(400)
+        page = window.tabs.currentWidget()
+        ctx = window._ctx
+        page._gating_preview["x"] = "FL1-A"
+        page._gating_preview["y"] = "FL2-A"
+        gate = {
+            "type": "rect", "x": "FL1-A", "y": "FL2-A",
+            "plot_type": "scatter",
+        }
+        display = {"pos": [2.0, 3.0], "size": [1.0, 5.0]}
+        real = gating_page._gating_geometry_to_real(ctx, page, gate, display)
+        harness.check(np.isclose(real["pos"][0], 100.0),
+                      f"log10 display x=2 is real 100: {real}")
+        harness.check(np.isclose(real["size"][0], 900.0),
+                      "the width follows the transformed corners")
+        harness.check(np.isclose(real["pos"][1], 3.0), "linear Y is unchanged")
+        harness.check(np.isclose(real["size"][1], 5.0))
+
+        back = gating_page._gating_geometry_to_display(ctx, page, gate, real)
+        harness.check(np.allclose(back["pos"], display["pos"]))
+        harness.check(np.allclose(back["size"], display["size"]))
+    finally:
+        _close(window)
+
+
 @harness.case("mod.gating.range", "L4", "gating", tags=("fast",))
 def add_range_gate() -> None:
     window, _project, page = _open("gating_range")
@@ -197,6 +237,42 @@ def shapes() -> None:
         _close(window)
 
 
+@harness.case("mod.gating.live_drag", "L4", "gating", tags=("fast",))
+def live_drag_follows_gate() -> None:
+    """The label follows a drag; statistics refresh when the gate is released."""
+    window, _project, page = _open("gating_live_drag")
+    try:
+        ctx = window._ctx
+        rect = pg.RectROI((2, 2), (8, 8), **_gate_roi_pens("#000000"))
+        gating_page._gating_add_gate(ctx, page, "rect", rect)
+        harness.wait_for(
+            lambda: len(page._gating_labels) == len(page._gating_gates),
+            message="gate labels",
+        )
+        # Let any in-flight statistics settle before measuring the release.
+        harness.pump(300)
+        previous_stats = page._gating_last_stats
+        label = page._gating_labels[-1]
+        before = (label.pos().x(), label.pos().y())
+        generation = page._gating_stat_generation
+        # pyqtgraph emits sigRegionChanged for programmatic and mouse moves.
+        rect.setPos(6.0, 6.0)
+        after = (label.pos().x(), label.pos().y())
+        harness.check(after != before, "the label follows the gate while dragging")
+        harness.eq(page._gating_stat_generation, generation,
+                   "statistics are not recomputed while the gate is moving")
+        # Releasing the mouse emits sigRegionChangeFinished.
+        rect.stateChangeFinished()
+        harness.eq(page._gating_gates[-1]["pos"], [6.0, 6.0],
+                   "the moved geometry is stored on release")
+        harness.wait_for(
+            lambda: page._gating_last_stats is not previous_stats,
+            message="statistics refreshed after the gate is released",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("mod.gating.stats", "L4", "gating", tags=("fast",))
 def stats() -> None:
     window, _project, page = _open("gating_stats")
@@ -345,6 +421,48 @@ def and_gate() -> None:
         harness.eq(boolean["type"], "and")
         harness.eq(len(boolean["sources"]), 2)
         harness.check(" AND " in boolean["name"], boolean["name"])
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.boolean_dependents", "L4", "gating", tags=("fast",))
+def boolean_dependents() -> None:
+    """Moving a gate also refreshes the boolean gates that reference it."""
+    window, _project, page = _open("gating_bool_deps")
+    try:
+        ctx = window._ctx
+        gating_page._gating_add_gate(ctx, page, "range", (0.0, 5.0))
+        gating_page._gating_add_gate(ctx, page, "range", (2.0, 8.0))
+
+        def accept() -> None:
+            for widget in QApplication.topLevelWidgets():
+                if not isinstance(widget, QDialog):
+                    continue
+                for box in widget.findChildren(QCheckBox):
+                    box.setChecked(True)
+                for button in widget.findChildren(QPushButton):
+                    if button.text() == "OK":
+                        button.click()
+                        return
+                widget.accept()
+                return
+
+        QTimer.singleShot(0, accept)
+        gating_page._gating_add_boolean_gate(ctx, page, 0, "and")
+        and_gate = page._gating_gates[-1]
+        gating_page._gating_add_not_gate(ctx, page, len(page._gating_gates) - 1)
+        not_gate = page._gating_gates[-1]
+
+        moved = page._gating_gates[0]
+        affected = gating_page._gating_affected_ids(ctx, page, {moved["id"]})
+        harness.check(and_gate["id"] in affected,
+                      "an AND gate that references the moved gate is affected")
+        harness.check(not_gate["id"] in affected,
+                      "a NOT of that AND follows transitively")
+        harness.eq(
+            affected, {moved["id"], and_gate["id"], not_gate["id"]},
+            "the unrelated sibling gate is not recomputed",
+        )
     finally:
         _close(window)
 

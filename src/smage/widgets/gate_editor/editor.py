@@ -17,6 +17,7 @@ from smage.widgets.controls import (
     _NoWheelComboBox, _NoWheelSpinBox, _SizeField,
 )
 from smage.widgets.gate_editor.canvas import _GatingCanvasView
+from smage.widgets.panels import _param_hint
 from smage.widgets.plot_axes import _gate_color, _gate_tool_icon
 
 
@@ -118,8 +119,10 @@ def _gating_state_init(ctx, page, task_def: dict, locked: bool) -> None:
     page._gating_stats_worker = _GatingStatsWorker()
     page._gating_stat_generation = 0
     page._gating_last_stats = {}
+    page._gating_stats_scope = (False, set())
     page._gating_stat_timer = QTimer(ctx.host)
-    page._gating_stat_timer.setInterval(100)
+    # Short poll: gate counts follow a drag with roughly this latency.
+    page._gating_stat_timer.setInterval(40)
     page._gating_stat_timer.timeout.connect(
         lambda: ctx._gating_on_stats_timer(page)
     )
@@ -204,6 +207,23 @@ def _gating_build_content(ctx, page, locked: bool) -> QWidget:
     tree.itemExpanded.connect(
         lambda item: ctx._gating_on_expand(page, item)
     )
+
+    full_stats_btn = QPushButton("Update statistics with full data")
+    full_stats_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    full_stats_btn.setToolTip(
+        "Recalculate gate counts on every event. Normal editing uses the "
+        "displayed sample, which is much faster."
+    )
+    full_stats_btn.clicked.connect(
+        lambda _=False: ctx._gating_full_stats(page)
+    )
+    tree_lay.addWidget(full_stats_btn)
+    page._gating_full_stats_btn = full_stats_btn
+    tree_lay.addWidget(_param_hint(
+        ctx,
+        "Editing recalculates counts from the plotted sample to keep "
+        "dragging fast. This button recomputes them on the complete data set.",
+    ))
 
     # Middle: tool area (top) + scatter (bottom).
     mid_panel = ctx._build_panel_frame()
@@ -424,6 +444,10 @@ def _gating_render(ctx, page) -> None:
         page._gating_overlay.show()
     else:
         page._gating_overlay.hide()
+    page._gating_gates_hidden = bool(overlay_text)
+    gate_overlay = getattr(page, "_gating_gate_overlay", None)
+    if gate_overlay is not None:
+        gate_overlay.update()
 
     mask = None
     active = page._gating_active_gate_id
@@ -837,6 +861,11 @@ def _gating_cleanup(ctx, page) -> None:
     if timer is not None:
         timer.stop()
         page._gating_stat_timer = None
+    adjust = getattr(page, "_gating_adjust_timer", None)
+    if adjust is not None:
+        adjust.stop()
+        page._gating_adjust_timer = None
+    page._gating_adjust_affected = "missing"
     page._gating_last_stats = {}
 
 

@@ -118,6 +118,8 @@ def _build_feature_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     page._feat_task_def = task_def
     page._feat_task_id = task_def.get("id")
     page._feat_params = params
+    # The feature column is an output column with its own (deletable) row.
+    _feat_sync_feature_rule(ctx, page)
     page._feat_locked = locked
     page._feat_save_btn = save_btn
     page._feat_dirty = False
@@ -277,6 +279,8 @@ def _feat_files_panel(ctx, page) -> QWidget:
 
     def on_column_changed(_=0):
         page._feat_params["feature"] = combo.currentData()
+        # The default group-key row follows the chosen variable.
+        _feat_sync_feature_rule(ctx, page)
         # Keep only the files that contain the chosen feature variable.
         feature = page._feat_params["feature"]
         if feature:
@@ -909,6 +913,55 @@ def _feat_refresh_files(ctx, page) -> None:
     _feat_ignore_refresh(ctx, page)
 
 
+def _feat_feature_rule(params):
+    """The group-key row of the rules table, or None when it was deleted."""
+    for rule in params.get("rules") or []:
+        if rule.get("method") == "feature":
+            return rule
+    return None
+
+
+def _feat_key_name(params):
+    """Output name of the feature-variable column (None = leave it out)."""
+    if params.get("feature_rule", True) is False:
+        return None
+    rule = _feat_feature_rule(params)
+    return ((rule or {}).get("name") or "").strip() or params.get("feature")
+
+
+def _feat_sync_feature_rule(ctx, page) -> None:
+    """Keep the default group-key row in step with the feature variable.
+
+    The feature column is an output column like the aggregated ones, so it
+    gets its own row in the rules table (and can be deleted) instead of
+    being added silently.
+    """
+    params = page._feat_params
+    feature = params.get("feature")
+    rules = params.setdefault("rules", [])
+    rule = _feat_feature_rule(params)
+    if params.get("feature_rule", True) is False:
+        if rule is not None:
+            rules.remove(rule)
+        return
+    if rule is None:
+        if not feature:
+            return
+        rule = {
+            "source": feature, "method": "feature", "lo": 0, "hi": 100,
+            "perc": None, "name": feature,
+        }
+        index = 1 if rules and rules[0].get("method") == "count" else 0
+        rules.insert(index, rule)
+        return
+    # Follow a changed feature variable, unless the user renamed the column.
+    old_source = rule.get("source")
+    name = (rule.get("name") or "").strip()
+    rule["source"] = feature
+    if not name or name == old_source or name == "feature":
+        rule["name"] = feature or ""
+
+
 def _feat_rules_panel(ctx, page) -> QWidget:
     """Right panel: the 4-column aggregation rules table."""
     panel = _widgets_panels._build_panel_frame(ctx)
@@ -935,7 +988,9 @@ def _feat_rules_panel(ctx, page) -> QWidget:
         "Range (% per class): for each class, use only the points between "
         "these two percentiles, sorted by the row's own source variable. "
         "0–100 means all points (e.g. 0–30 = dimmest 30%, 90–100 = "
-        "brightest 10%). The Count row always uses all points."
+        "brightest 10%). The Count row always uses all points. The Feature "
+        "row keeps the feature variable as the identifier column; delete "
+        "it to leave that column out."
     )
     note.setWordWrap(True)
     note.setStyleSheet("color: #6b7785;")
@@ -981,6 +1036,10 @@ def _feat_rules_panel(ctx, page) -> QWidget:
                     ctx.host, "Delete", "The Count row is fixed and cannot be deleted."
                 )
             return
+        rule = rules[row]
+        if rule.get("method") == "feature":
+            # Remember the choice: the row is re-created with the module.
+            page._feat_params["feature_rule"] = False
         del rules[row]
         _feat_refresh_rules(ctx, page)
         _feat_mark_dirty(ctx, page)
@@ -1018,12 +1077,26 @@ def _feat_rebuild_rules(ctx, page) -> None:
 
     for i, rule in enumerate(rules):
         is_count = rule.get("method") == "count"
+        is_feature = rule.get("method") == "feature"
 
-        # Column 0: source variable (fixed label for Count).
+        # Column 0: source variable (fixed label for Count / group key).
         if is_count:
             item = QTableWidgetItem("(all rows)")
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             item.setForeground(QColor("#6b7785"))
+            table.setItem(i, 0, item)
+        elif is_feature:
+            item = QTableWidgetItem(str(rule.get("source") or "(feature variable)"))
+            # Selectable so clicking it makes this the row the Delete button
+            # acts on (unlike the fixed Count row above).
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            item.setForeground(QColor("#6b7785"))
+            item.setToolTip(
+                "The chosen Feature variable. This row keeps its value as an "
+                "output column; delete it to leave the identifier out."
+            )
             table.setItem(i, 0, item)
         else:
             combo = _NoWheelComboBox()
@@ -1057,14 +1130,18 @@ def _feat_rebuild_rules(ctx, page) -> None:
         mh.setContentsMargins(0, 0, 0, 0)
         mh.setSpacing(4)
         method_combo = _NoWheelComboBox()
-        for label, key in FEATURE_METHODS:
-            method_combo.addItem(label, key)
-        midx = method_combo.findData(rule.get("method", "mean"))
-        method_combo.setCurrentIndex(max(0, midx))
+        if is_feature:
+            method_combo.addItem("Group key", "feature")
+            method_combo.setEnabled(False)
+        else:
+            for label, key in FEATURE_METHODS:
+                method_combo.addItem(label, key)
+            midx = method_combo.findData(rule.get("method", "mean"))
+            method_combo.setCurrentIndex(max(0, midx))
         percent_spin = None
         if is_count:
             method_combo.setEnabled(False)
-        else:
+        elif not is_feature:
             def on_method(value, r=rule):
                 r["method"] = value
                 rebuild_soon()
@@ -1105,9 +1182,11 @@ def _feat_rebuild_rules(ctx, page) -> None:
             spin.setSingleStep(1)
             spin.setValue(int(value))
             spin.setFixedWidth(72)
-            spin.setEnabled(enabled and not is_count)
+            spin.setEnabled(enabled and not is_count and not is_feature)
         if is_count:
             tip = "Not used by the Count row (always counts all points)"
+        elif is_feature:
+            tip = "Not used by the group-key row (it keeps the feature value)"
         else:
             tip = ("Use only the points between these percentiles within "
                    "each class (sorted by this row's source variable)")
@@ -1115,7 +1194,7 @@ def _feat_rebuild_rules(ctx, page) -> None:
         hi_spin.setToolTip(tip)
 
         def on_range(_=0, r=rule, lo=lo_spin, hi=hi_spin):
-            if r.get("method") == "count":
+            if r.get("method") in ("count", "feature"):
                 return
             r["lo"] = int(lo.value())
             r["hi"] = int(hi.value())
@@ -1154,6 +1233,8 @@ def _feat_auto_name(ctx, rule) -> str:
     """Default new-column name: <source>_<method> (or 'count')."""
     if rule.get("method") == "count":
         return "count"
+    if rule.get("method") == "feature":
+        return rule.get("source") or "feature"
     source = rule.get("source") or "value"
     method = rule.get("method") or "mean"
     if method == "percentile":
@@ -1227,12 +1308,29 @@ def _feat_validate(ctx, page):
     common = set(_feat_common_columns(ctx, page))
     names = []
     for i, rule in enumerate(rules):
-        if rule.get("method") == "count":
+        method = rule.get("method")
+        if method == "count":
             if i != 0:
                 return False, "Count must be the first row."
             name = (rule.get("name") or "").strip()
             if not name:
                 return False, "Give the Count row a column name."
+            names.append(name)
+            continue
+        if method == "feature":
+            source = rule.get("source")
+            if not source or source != params.get("feature"):
+                return False, (
+                    f"Row {i + 1}: this row keeps the feature variable; "
+                    "delete it or choose the matching variable."
+                )
+            if source not in common:
+                return False, (
+                    f"Row {i + 1}: '{source}' is not present in every selected file."
+                )
+            name = (rule.get("name") or "").strip()
+            if not name:
+                return False, f"Row {i + 1}: give the feature column a name."
             names.append(name)
             continue
         source = rule.get("source")
@@ -1258,11 +1356,6 @@ def _feat_validate(ctx, page):
         names.append(name)
     if len(names) != len(set(names)):
         return False, "New column names must be unique."
-    if params["feature"] in names:
-        return False, (
-            f"'{params['feature']}' is kept as the identifier column; "
-            "choose a different new column name."
-        )
     return True, ""
 
 
@@ -1425,7 +1518,15 @@ def _feat_compute_file(ctx, page, parquet_path):
     feature = params["feature"]
     rules = params.get("rules") or []
     count_name = _feat_count_name(ctx, params)
-    sources = [r["source"] for r in rules if r.get("source")]
+    # The group-key row carries the feature column, which is read separately.
+    sources = []
+    for rule in rules:
+        source = rule.get("source")
+        if not source or rule.get("method") == "feature":
+            continue
+        if source == feature or source in sources:
+            continue
+        sources.append(source)
 
     values = _data_columns._column_data(ctx,
         page._feat_task_id, parquet_path, [feature] + sources
@@ -1471,7 +1572,7 @@ def _feat_compute_file(ctx, page, parquet_path):
         raise ValueError("no rows with a valid feature value")
 
     out, columns, agg_warnings = _feature_aggregate_frame(
-        df, feature, rules, count_name
+        df, feature, rules, count_name, _feat_key_name(params)
     )
     warnings.extend(agg_warnings)
 

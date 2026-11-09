@@ -296,6 +296,9 @@ def _unmix_image_outputs(ctx, task_id, parquet_path):
         for name in names:
             usable.setdefault(name, {
                 "parquet": str(path), "channel": name, "kind": "image",
+                # Kept so the renderer can apply the map stages that sit
+                # between this Unmix module and the reading task.
+                "task_id": task.get("id"),
             })
     return usable, stale
 

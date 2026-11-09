@@ -8,10 +8,14 @@ from __future__ import annotations
 
 def _feature_auto_name(rule) -> str:
     """Default new-column name for a rule: '<source>_<method>' (or 'count')."""
-    if rule.get("method") == "count":
+    method = rule.get("method")
+    if method == "count":
         return "count"
+    if method == "feature":
+        # The group key keeps the feature variable's own name.
+        return rule.get("source") or "feature"
     source = rule.get("source") or "value"
-    method = rule.get("method") or "mean"
+    method = method or "mean"
     if method == "percentile":
         perc = rule.get("perc")
         suffix = f"p{int(perc)}" if perc else "p"
@@ -51,13 +55,18 @@ def _feature_count_name(params) -> str:
     return f"{base}_{n}"
 
 
-def _feature_aggregate_frame(df, feature, rules, count_name):
+def _feature_aggregate_frame(df, feature, rules, count_name, key_name=None):
     """Aggregate `df` by the `feature` column.
 
     Every distinct feature value becomes one output row. The first rule is the
-    fixed Count; the others aggregate one source variable each, optionally
-    restricted to an in-class percentile range (sorted by that row's own
-    source variable). Returns ``(out, columns, warnings)``.
+    fixed Count; a rule with method ``feature`` is the group-key row (it
+    carries the feature value, see ``key_name``); the others aggregate one
+    source variable each, optionally restricted to an in-class percentile
+    range (sorted by that row's own source variable).
+
+    ``key_name`` is the name of the output column holding the group key;
+    ``None`` leaves that column out (the user deleted the group-key row).
+    Returns ``(out, columns, warnings)``.
     """
     import pandas as pd
 
@@ -68,8 +77,9 @@ def _feature_aggregate_frame(df, feature, rules, count_name):
     out[count_name] = sizes.astype("int64")
     warnings = []
 
+    rule_columns = []
     for rule in rules:
-        if rule.get("method") == "count":
+        if rule.get("method") in ("count", "feature"):
             continue
         source = rule["source"]
         method = rule.get("method") or "mean"
@@ -96,6 +106,7 @@ def _feature_aggregate_frame(df, feature, rules, count_name):
         else:
             agg = sub.agg(method)
         out[name] = agg.reindex(out.index)
+        rule_columns.append(name)
         if lo > 0.0 or hi < 100.0:
             empty = int(agg.isna().sum())
             if empty:
@@ -104,9 +115,10 @@ def _feature_aggregate_frame(df, feature, rules, count_name):
                 )
 
     out = out.reset_index()
-    columns = [feature, count_name] + [
-        (r.get("name") or _feature_auto_name(r)).strip()
-        for r in rules
-        if r.get("method") != "count"
-    ]
+    if key_name:
+        if key_name != feature:
+            out = out.rename(columns={feature: key_name})
+    else:
+        out = out.drop(columns=[feature])
+    columns = ([key_name] if key_name else []) + [count_name] + rule_columns
     return out.loc[:, columns], columns, warnings

@@ -26,6 +26,7 @@ from smage.core.pipeline import (  # noqa: E402
     _pipeline_touches,
     _rename_applies,
     _rename_stage,
+    _stages_after,
 )
 
 
@@ -83,11 +84,25 @@ def feature_aggregate() -> None:
         {"method": "count"},
         {"source": "v", "method": "mean", "name": "mean_v"},
     ]
-    out, columns, warnings = _feature_aggregate_frame(frame, "feat", rules, "n")
+    out, columns, warnings = _feature_aggregate_frame(
+        frame, "feat", rules, "n", key_name="feat"
+    )
     harness.eq(columns, ["feat", "n", "mean_v"])
     harness.eq(out["n"].tolist(), [2, 1])
     harness.eq(out["mean_v"].tolist(), [1.5, 10.0])
     harness.eq(warnings, [])
+
+    # The group-key column is optional: deleting its row drops it.
+    out, columns, _ = _feature_aggregate_frame(frame, "feat", rules, "n")
+    harness.eq(columns, ["n", "mean_v"])
+    harness.eq(out["n"].tolist(), [2, 1])
+
+    # A renamed group-key row renames the identifier column.
+    out, columns, _ = _feature_aggregate_frame(
+        frame, "feat", rules, "n", key_name="class"
+    )
+    harness.eq(columns, ["class", "n", "mean_v"])
+    harness.eq(out["class"].tolist(), ["A", "B"])
 
     out, _, _ = _feature_aggregate_frame(
         frame, "feat",
@@ -115,7 +130,7 @@ def feature_aggregate() -> None:
 
     empty = pd.DataFrame({"feat": [], "v": []})
     out, columns, _ = _feature_aggregate_frame(
-        empty, "feat", [{"method": "count"}], "n"
+        empty, "feat", [{"method": "count"}], "n", key_name="feat"
     )
     harness.eq(len(out), 0)
     harness.eq(columns, ["feat", "n"])
@@ -160,6 +175,30 @@ def pipeline_touches() -> None:
     for name in ("A", "B", "C", "D", "E", "F"):
         harness.check(_pipeline_touches(stages, name), f"{name} is touched")
     harness.check(not _pipeline_touches(stages, "G"))
+
+
+@harness.case("core.pipeline.stages_after", "L1", "core", tags=("smoke",))
+def pipeline_stages_after() -> None:
+    unmix = ("unmix", {"task_id": "u-1", "names": ["CD8"], "columns": ["A"]})
+    scale = ("scale", {
+        "columns": {"CD8": {"method": "arcsinh", "param": 1000.0}},
+        "files": None,
+    })
+    stages = [unmix, scale]
+    harness.eq(_stages_after(stages, "unmix", "u-1"), [scale])
+    harness.eq(_stages_after(stages, "unmix", "other"), [])
+
+    # A precomputed unmix raster contains post-unmix values; the downstream
+    # arcsinh must be applied before its Min/Max levels mean anything.
+    evaluated = _evaluate_stages(
+        _stages_after(stages, "unmix", "u-1"),
+        {"CD8": np.array([1000.0, 2000.0])},
+        ["CD8"],
+    )
+    harness.check(
+        np.allclose(evaluated["CD8"], np.arcsinh(np.array([1.0, 2.0]))),
+        "the downstream scale is applied to the precomputed channel",
+    )
 
 
 @harness.case("core.pipeline.dependencies", "L1", "core", tags=("smoke",))

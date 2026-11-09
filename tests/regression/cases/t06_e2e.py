@@ -438,9 +438,10 @@ def map_pipeline_feature() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
+        # Scale is a display transform: it never reaches the data pipeline.
         harness.eq(
             [kind for kind, _stage in _data_columns._map_stages(ctx, "f-1")],
-            ["scale", "compensation", "illumination"],
+            ["compensation", "illumination"],
         )
         page = e2e.open_page(window, "f-1", "feature", "Feature")
         feature_page._feat_calculate(ctx, page)
@@ -448,8 +449,10 @@ def map_pipeline_feature() -> None:
         output = pd.read_parquet(project.path / record["path"]).sort_values("group")
 
         raw = pd.read_parquet(parquet)
-        a = np.log10(raw["FL1-A"].to_numpy(dtype=float))
-        b = np.log10(raw["FL2-A"].to_numpy(dtype=float))
+        # The Scale module is display-only, so aggregation stays on the real
+        # (compensated / illumination-corrected) values.
+        a = raw["FL1-A"].to_numpy(dtype=float)
+        b = raw["FL2-A"].to_numpy(dtype=float)
         combined = a + 0.1 * b
         mask = np.array([[0.5, 0.25], [0.5, 0.5]])
         xi = raw["x"].to_numpy(dtype=int) % 2
@@ -630,7 +633,8 @@ def project_roundtrip() -> None:
         ctx = reopened._ctx
         harness.eq(
             [kind for kind, _stage in _data_columns._map_stages(ctx, "e-1")],
-            ["scale"],
+            [],
+            "Scale is display-only and does not enter the data pipeline",
         )
         gating_task = reopened._find_task_by_id("g-1")
         gates = _data_stores._gating_gates_for(ctx, gating_task, parquet)

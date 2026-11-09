@@ -6,13 +6,15 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton,
+    QGraphicsItem, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from smage.core.formatting import _format_level, _round_level
 from smage.core.image_ops import _pool_mask
-from smage.core.pipeline import _pipeline_touches, _rename_applies
+from smage.core.pipeline import (
+    _evaluate_stages, _pipeline_touches, _rename_applies, _stages_after,
+)
 from smage.core.sampling import _stable_sample_selection
 from smage.core.scale_math import (
     _apply_scale_transforms, _forward_scale_value, _inverse_scale_value,
@@ -96,13 +98,44 @@ def _figure_record(ctx, file_path):
 
 
 def _figure_axis_scale_configs(ctx, task_id, parquet_path, column, column_transforms=None) -> list:
-    """Scale transforms applied to `column` before this module sees it."""
+    """Display-only Scale transforms for `column` at this module.
+
+    The data itself is never scaled; these configs are applied when drawing
+    (and when converting axis labels/ranges back to original values).
+
+    Memoized per context: gate labels ask for the same axis configs on
+    every mouse move while a gate is dragged, and the lookup walks the task
+    chain.  ``_bump_stages_revision`` (module saved / task deleted) clears it.
+    """
     if not column:
         return []
-    stages = ctx._map_stages(task_id) if task_id else []
+    revision = getattr(ctx, "_stages_revision", 0)
+    cache = getattr(ctx, "_axis_scale_cache", None)
+    if cache is None:
+        cache = {}
+        ctx._axis_scale_cache = cache
+    elif getattr(ctx, "_axis_scale_cache_revision", None) != revision:
+        cache.clear()
+    ctx._axis_scale_cache_revision = revision
+    cache_key = (
+        task_id,
+        None if parquet_path is None else str(parquet_path),
+        column,
+    )
+    cached = None if column_transforms else cache.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    stages = (
+        ctx._map_stages(
+            task_id, include_scale=True, parquet_path=parquet_path
+        ) if task_id else []
+    )
     feat = ctx._feature_output(parquet_path)
     if feat is not None and task_id:
-        post = ctx._map_stages(task_id, after=feat.get("feature_task"))
+        post = ctx._map_stages(
+            task_id, after=feat.get("feature_task"), include_scale=True,
+            parquet_path=parquet_path,
+        )
         stages = [(k, st) for k, st in stages if k == "rename"] + post
     configs = []
     for kind, stage in stages:
@@ -122,10 +155,13 @@ def _figure_axis_scale_configs(ctx, task_id, parquet_path, column, column_transf
     configs.extend(extra)
     # Only log10 / arcsinh move the values; a linear config leaves the
     # axis untouched (pyqtgraph's own ticks are the right ones there).
-    return [
+    result = [
         config for config in configs
         if (config or {}).get("method") in ("log10", "arcsinh")
     ]
+    if not column_transforms:
+        cache[cache_key] = result
+    return list(result)
 
 
 def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None) -> None:
@@ -251,6 +287,16 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
         plot_widget.setTitle("No data file", color="#c0392b", size="10pt")
         return
     parquet_path = rec.get("parquet")
+    # Display-only scale transforms (never modify the data itself).
+    display_cache = {}
+
+    def display_configs(column):
+        if column not in display_cache:
+            display_cache[column] = _figure_axis_scale_configs(
+                ctx, task_id, parquet_path, column, column_transforms
+            )
+        return display_cache[column]
+
     ent = ctx._ensure_image_index(parquet_path)
     if ent is None or ent.get("manifest") is None:
         plot_widget.clear()
@@ -271,6 +317,8 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
         plot_widget.clear()
         img = pg.ImageItem(axisOrder="row-major")
         plot_widget.addItem(img)
+        if getattr(plot_widget, "_gate_cache_data", False):
+            img.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
         plot_widget._img_item = img
         plot_widget._img_path = parquet_path
         plot_widget._img_extent = (
@@ -323,7 +371,9 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                 pending[key] = True
                 gating_task = ctx._find_task_by_id(f.get("task_id"))
                 gates = ctx._gating_gates_for(gating_task, parquet_path)
-                stages = ctx._map_stages(f.get("task_id"))
+                stages = ctx._map_stages(
+                    f.get("task_id"), parquet_path=parquet_path
+                )
                 base_columns = set(
                     ctx._column_index.get(
                         ctx._rel_data_key(parquet_path), []
@@ -359,7 +409,9 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
             task_id, parquet_path, manifest, (x0, x1, y0, y1), spacing
         )
 
-    stages = ctx._map_stages(task_id) if task_id else []
+    stages = (
+        ctx._map_stages(task_id, parquet_path=parquet_path) if task_id else []
+    )
     if extra_stages:
         stages = stages + list(extra_stages)
     color_cols = manifest.get("color_cols", [])
@@ -521,6 +573,16 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                 else:
                     unavailable.append(channel)
                 continue
+            # The saved pyramid holds post-unmix values; apply the map stages
+            # below the Unmix task (Scale in particular) so the raster and
+            # the Min/Max controls share one unit system.
+            post = _stages_after(stages, "unmix", rec.get("task_id"))
+            if post:
+                evaluated = _evaluate_stages(
+                    post, {channel: chan}, [channel],
+                    parquet_path=parquet_path,
+                )
+                chan = evaluated.get(channel, chan)
             lo = float(np.nanmin(chan)) if chan.size else 0.0
             hi = float(np.nanmax(chan)) if chan.size else 1.0
             if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -577,6 +639,17 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
             if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
                 lo = float(np.nanmin(chan))
                 hi = float(np.nanmax(chan))
+        # Scale is a display transform: apply it to the raster (and to the
+        # automatic range) without touching the stored data.
+        configs = display_configs(channel)
+        if configs:
+            if cname is not None:
+                lo = _forward_scale_value(lo, configs)
+                hi = _forward_scale_value(hi, configs)
+            chan = _apply_scale_transforms(chan, configs)
+            if cname is None:
+                lo = float(np.nanmin(chan)) if chan.size else 0.0
+                hi = float(np.nanmax(chan)) if chan.size else 1.0
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = 0.0, 1.0
         # Per-channel brightness/contrast: a user-set min/max overrides the
@@ -877,7 +950,16 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
         plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
         return
 
-    transforms = column_transforms or {}
+    # Display transforms (upstream Scale + this module's live scale edits).
+    # The data itself is unscaled; scale is applied only to the drawn values.
+    display_cache = {}
+
+    def display_configs(name):
+        if name not in display_cache:
+            display_cache[name] = _figure_axis_scale_configs(
+                ctx, task_id, rec["parquet"], name, column_transforms
+            )
+        return display_cache[name]
 
     overlay = plot_dict.get("type") == "overlay"
     columns = [x_name, y_name]
@@ -932,8 +1014,8 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
         count = int(ctx._data_row_count(rec["parquet"]) or 0)
         x = arrays[x_name].astype("float64")
         y = arrays[y_name].astype("float64")
-        x = _apply_scale_transforms(x, transforms.get(x_name))
-        y = _apply_scale_transforms(y, transforms.get(y_name))
+        x = _apply_scale_transforms(x, display_configs(x_name))
+        y = _apply_scale_transforms(y, display_configs(y_name))
         keep = np.isfinite(x) & np.isfinite(y)
         if mask is not None:
             mask_values = np.asarray(mask, dtype=bool)
@@ -970,8 +1052,8 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
 
         x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
         y = pd.to_numeric(df[y_name], errors="coerce").to_numpy(dtype="float64")
-        x = _apply_scale_transforms(x, transforms.get(x_name))
-        y = _apply_scale_transforms(y, transforms.get(y_name))
+        x = _apply_scale_transforms(x, display_configs(x_name))
+        y = _apply_scale_transforms(y, display_configs(y_name))
         keep = np.isfinite(x) & np.isfinite(y)
         if mask is not None:
             keep = keep & np.asarray(mask, dtype=bool)
@@ -1032,7 +1114,7 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
                     df[color_param], errors="coerce"
                 ).to_numpy(dtype="float64")[keep]
             values = _apply_scale_transforms(
-                raw, transforms.get(color_param)
+                raw, display_configs(color_param)
             )
 
     # Sample the rows to draw. Pool rows are already in priority order, so
@@ -1192,6 +1274,8 @@ def _figure_image_layer_settings(ctx, layout, plot_dict, columns, enabled, on_ch
         if values is None or values.size == 0:
             hist_plot.clear()
             return
+        # Levels are display units; the stored data itself is unscaled.
+        values = _apply_scale_transforms(values, configs)
         hist_state["values"] = values
         hist, edges = np.histogram(values, bins=200)
         hist_plot.clear()
@@ -1252,7 +1336,11 @@ def _figure_image_layer_settings(ctx, layout, plot_dict, columns, enabled, on_ch
                 "This channel has no finite values", 3000
             )
             return
-        lo, hi = _round_level(bounds[0]), _round_level(bounds[1])
+        configs = ctx._figure_axis_scale_configs(
+            task_id, parquet_path, channel
+        )
+        lo = _forward_scale_value(_round_level(bounds[0]), configs)
+        hi = _forward_scale_value(_round_level(bounds[1]), configs)
         layers[row]["min"] = lo
         layers[row]["max"] = hi
         plot_dict["layers"] = layers
@@ -1591,6 +1679,15 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
     if not x_name:
         plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
         return
+    display_cache = {}
+
+    def display_configs(name):
+        if name not in display_cache:
+            display_cache[name] = _figure_axis_scale_configs(
+                ctx, task_id, rec["parquet"], name, column_transforms
+            )
+        return display_cache[name]
+
     # Same pooled data as the scatter views: one column is plenty for a
     # histogram, and the pool is already in memory for this file.
     pooled_mode = False
@@ -1622,9 +1719,7 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
 
     if pooled_mode:
         x = arrays[x_name].astype("float64")
-        x = _apply_scale_transforms(
-            x, (column_transforms or {}).get(x_name)
-        )
+        x = _apply_scale_transforms(x, display_configs(x_name))
         keep = np.isfinite(x)
         if mask is not None:
             mask_values = np.asarray(mask, dtype=bool)
@@ -1648,7 +1743,7 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
             )
             return
         x = pd.to_numeric(df[x_name], errors="coerce").to_numpy(dtype="float64")
-        x = _apply_scale_transforms(x, (column_transforms or {}).get(x_name))
+        x = _apply_scale_transforms(x, display_configs(x_name))
         keep = np.isfinite(x)
         if mask is not None:
             keep = keep & np.asarray(mask, dtype=bool)
@@ -1685,17 +1780,22 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
     plot_widget._data_ymin = 0.0
     plot_widget._data_ymax = ymax
 
+    cache = getattr(plot_widget, "_gate_cache_data", False)
     if mode in ("histogram", "overlap"):
-        plot_widget.addItem(
-            pg.PlotDataItem(
-                edges, counts, stepMode="center", fillLevel=0,
-                brush=(*hist_color, 60), pen=hist_color,
-            )
+        item = pg.PlotDataItem(
+            edges, counts, stepMode="center", fillLevel=0,
+            brush=(*hist_color, 60), pen=hist_color,
         )
+        if cache:
+            item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        plot_widget.addItem(item)
     if mode in ("curve", "overlap") and curve_y is not None:
-        plot_widget.addItem(
-            pg.PlotDataItem(curve_x, curve_y, pen=pg.mkPen(*curve_color, width=2))
+        item = pg.PlotDataItem(
+            curve_x, curve_y, pen=pg.mkPen(*curve_color, width=2)
         )
+        if cache:
+            item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        plot_widget.addItem(item)
 
     ctx._figure_apply_ranges(plot_dict, plot_widget)
     ctx._figure_apply_display_options(plot_dict, plot_widget)

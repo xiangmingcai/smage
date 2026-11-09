@@ -91,6 +91,7 @@ _TARGETS = {
     "_gating_apply_label_style": ("smage.modules.gating.page", "_gating_apply_label_style"),
     "_gating_compute_mask": ("smage.modules.gating.page", "_gating_compute_mask"),
     "_gating_context_mask": ("smage.modules.gating.page", "_gating_context_mask"),
+    "_gating_full_stats": ("smage.modules.gating.page", "_gating_full_stats"),
     "_gating_gates_for": ("smage.data.stores", "_gating_gates_for"),
     "_gating_image_refresh": ("smage.modules.gating.page", "_gating_image_refresh"),
     "_gating_load_rois": ("smage.modules.gating.page", "_gating_load_rois"),

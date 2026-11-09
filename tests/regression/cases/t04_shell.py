@@ -114,6 +114,47 @@ def workflow_add() -> None:
         _close(window)
 
 
+@harness.case("shell.workflow.copy_paste", "L5", "shell", tags=("fast",))
+def workflow_copy_paste() -> None:
+    """Copied modules paste as new children and survive a reload."""
+    task = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        children=[harness.task_def("export", task_id="e-1", name="Export")],
+    )
+    window, _project = _open("shell_copy_paste", [task])
+    try:
+        # open_project reloads the manifest: edit the window's project, not
+        # the pre-open instance.
+        project = window.project
+        import_task = project.workflow["tasks"][0]
+        source = import_task["children"][0]
+
+        window._copy_task(source, with_branch=False)
+        harness.check(window._clipboard is not None, "copy fills the clipboard")
+        window._paste_task(import_task, with_branch=False)
+        pasted = import_task["children"][-1]
+        harness.eq(pasted["type"], "scale")
+        harness.check(pasted["id"] != source["id"], "the pasted module gets a new id")
+        harness.eq(pasted.get("children"), [], "single paste drops the children")
+
+        window._copy_task(source, with_branch=True)
+        window._paste_task(import_task, with_branch=True)
+        branch = import_task["children"][-1]
+        harness.eq(branch["type"], "scale")
+        harness.eq([c["type"] for c in branch["children"]], ["export"])
+        harness.check(branch["id"] != source["id"])
+        harness.check(branch["children"][0]["id"] != source["children"][0]["id"],
+                      "branch ids are reassigned too")
+
+        from smage.project import Project
+
+        saved = Project.load(project.path)
+        harness.eq(len(saved.workflow["tasks"][0]["children"]), 3,
+                   "single and branch pastes persist")
+    finally:
+        _close(window)
+
+
 @harness.case("shell.workflow.lock", "L5", "shell", tags=("smoke",))
 def workflow_lock() -> None:
     task = harness.task_def("scale", task_id="s-1", name="Scale")

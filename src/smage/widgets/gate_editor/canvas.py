@@ -751,11 +751,12 @@ class _GatingCanvasView(QGraphicsView):
     MAX_SCALE = 3.0
     ZOOM_STEP = 1.15
 
-    def __init__(self, scene, plot_widget, card, parent=None) -> None:
+    def __init__(self, scene, plot_widget, card, gate_overlay=None, parent=None) -> None:
         super().__init__(scene, parent)
         self._plot_widget = plot_widget
         self._plot_viewport = plot_widget.viewport()
         self._card = card
+        self._gate_overlay = gate_overlay
         self._zoom = 1.0
         self._plot_pressed = False
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -784,8 +785,7 @@ class _GatingCanvasView(QGraphicsView):
         """Forward a mouse event to the plot's viewport (translated)."""
         view_pos = event.position().toPoint()
         global_pos = self.viewport().mapToGlobal(view_pos)
-        local = self._plot_widget.mapFromGlobal(global_pos)
-        local = self._plot_viewport.mapFrom(self._plot_widget, local)
+        local = self._plot_viewport.mapFromGlobal(global_pos)
         forwarded = QMouseEvent(
             event.type(), QPointF(local),
             QPointF(self._plot_viewport.mapToGlobal(local)),

@@ -728,12 +728,15 @@ def _scaling_autofill_minmax(ctx, page, row_idx) -> None:
     if not rec or not name:
         return
     import numpy as np
-    import pandas as pd
-    try:
-        df = pd.read_parquet(rec["parquet"], columns=[name])
-    except Exception:
+
+    # Real values (upstream data stages applied); the Scale transform itself
+    # is display-only and does not change the stored Min/Max range.
+    data = _data_columns._column_data(
+        ctx, page._scaling_task_id, rec["parquet"], [name]
+    ).get(name)
+    if data is None:
         return  # column not in this file -> leave empty
-    vals = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype="float64")
+    vals = np.asarray(data, dtype="float64")
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
         return
@@ -826,7 +829,7 @@ def _scaling_render_preview(ctx, page) -> None:
             }]
         _widgets_plot_renderer._figure_render_image(ctx,
             plot_dict, page._scaling_plot_widget,
-            task_id=page._scaling_task_id,
+            column_transforms=transforms, task_id=page._scaling_task_id,
         )
         return
 
@@ -834,6 +837,46 @@ def _scaling_render_preview(ctx, page) -> None:
         preview, page._scaling_plot_widget,
         column_transforms=transforms, task_id=page._scaling_task_id,
     )
+
+
+def _scaling_set_preview_file(ctx, page, file_path, file_name=None) -> None:
+    """Point the preview at another file, keeping the axis/channel choices.
+
+    Switching files used to reset X/Y and the image channel to the new
+    file's first columns, which also discarded the per-column min/max the
+    axis ranges are derived from.  Keep the user's selection; when a chosen
+    parameter is absent from the new file the preview shows the
+    "Parameter not in this file" overlay instead.
+    """
+    preview = page._scaling_preview
+    preview["file"] = file_path
+    preview["file_name"] = file_name or _data_naming._comp_file_name(
+        ctx, file_path, page._scaling_task_id
+    )
+    rec = _widgets_plot_renderer._figure_record(ctx, file_path)
+    columns = _data_columns._columns_for(
+        ctx, rec.get("parquet"), page._scaling_task_id
+    ) if rec else []
+
+    if not preview.get("x"):
+        preview["x"] = columns[0] if columns else None
+    if not preview.get("y"):
+        preview["y"] = (
+            columns[1] if len(columns) > 1
+            else (columns[0] if columns else None)
+        )
+    if not preview.get("color_param"):
+        preview["color_param"] = preview.get("x")
+    channels = [c for c in columns if c not in ("x", "y")]
+    if not preview.get("image_channel"):
+        preview["image_channel"] = channels[0] if channels else None
+
+    # Image display levels belong to the new file; they are not axis
+    # parameters.
+    preview["image_min"] = None
+    preview["image_max"] = None
+    _scaling_render_preview(ctx, page)
+    _scaling_rebuild_settings(ctx, page)
 
 
 def _scaling_set_image_levels(ctx, page, lo, hi) -> None:
@@ -969,25 +1012,12 @@ def _scaling_rebuild_settings(ctx, page) -> None:
         _scaling_rebuild_settings(ctx, page)
         _scaling_render_preview(ctx, page)
 
+    page._scaling_file_combo = file_combo
+
     def on_file_changed():
-        preview["file"] = file_combo.currentData()
-        preview["file_name"] = file_combo.currentText()
-        new_rec = _widgets_plot_renderer._figure_record(ctx, preview["file"])
-        new_cols = _data_columns._columns_for(ctx,
-            new_rec.get("parquet"), page._scaling_task_id
-        ) if new_rec else []
-        preview["x"] = new_cols[0] if new_cols else None
-        preview["y"] = (
-            new_cols[1] if len(new_cols) > 1
-            else (new_cols[0] if new_cols else None)
+        _scaling_set_preview_file(
+            ctx, page, file_combo.currentData(), file_combo.currentText()
         )
-        preview["color_param"] = preview["x"]
-        channels = [c for c in new_cols if c not in ("x", "y")]
-        preview["image_channel"] = channels[0] if channels else None
-        preview["image_min"] = None
-        preview["image_max"] = None
-        _scaling_render_preview(ctx, page)
-        _scaling_rebuild_settings(ctx, page)
 
     def on_param(attr):
         def handler(value):

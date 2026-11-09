@@ -82,10 +82,13 @@ def _pool_start_worker(ctx) -> None:
         ctx._pool_results = queue_mod.Queue()
 
     def run() -> None:
-        while True:
-            job = ctx._pool_jobs.get()
+        pending = []
+        stopping = False
+        while not stopping:
+            job = pending.pop(0) if pending else ctx._pool_jobs.get()
             if job is None:
                 break
+            batch = [job]
             try:
                 kind, key, _generation = job
                 if kind == "rows":
@@ -94,12 +97,33 @@ def _pool_start_worker(ctx) -> None:
                     # Row indices are tiny; columns are stored by the GUI
                     # thread so the memory budget stays accurate.
                     ctx._pool_rows_cache[key] = value
-                else:
-                    parquet, task_id, column = key
-                    value = ctx._pool_build_column(parquet, task_id, column)
-                ctx._pool_results.put((True, job, value))
+                    ctx._pool_results.put((True, job, value))
+                    continue
+                parquet, task_id, _column = key
+                # A plot set queues one job per column.  Drain every queued
+                # column for the same file/task so one parquet read serves
+                # the whole batch instead of one full read per column.
+                while True:
+                    try:
+                        nxt = ctx._pool_jobs.get_nowait()
+                    except queue_mod.Empty:
+                        break
+                    if nxt is None:
+                        stopping = True
+                        break
+                    nkind, nkey, _ = nxt
+                    if (
+                        nkind == "col"
+                        and nkey[0] == parquet
+                        and nkey[1] == task_id
+                    ):
+                        batch.append(nxt)
+                    else:
+                        pending.append(nxt)
+                _pool_emit_columns(ctx, parquet, task_id, batch)
             except Exception as exc:  # noqa: BLE001
-                ctx._pool_results.put((False, job, exc))
+                for item in batch:
+                    ctx._pool_results.put((False, item, exc))
 
     ctx._pool_worker = threading.Thread(target=run, daemon=True)
     ctx._pool_worker.start()
@@ -125,6 +149,35 @@ def _pool_build_indices(ctx, parquet_path, tier):
     # K rows over the whole file.
     order = np.argsort(_row_priorities(indices), kind="stable")
     return indices[order].astype(np.int64)
+
+
+def _pool_emit_columns(ctx, parquet_path, task_id, jobs) -> None:
+    """Read all columns of one file/task in a single pass.
+
+    Every plot queues its columns separately; reading the parquet once per
+    column repeated the same (often full-file) read for every axis.  The
+    results are posted back under each job's own key.
+    """
+    import numpy as np
+
+    tier = ctx._pool_tier()
+    key = (str(parquet_path), tier)
+    indices = ctx._pool_rows_cache.get(key)
+    if indices is None:
+        indices = ctx._pool_build_indices(parquet_path, tier)
+        ctx._pool_rows_cache[key] = indices
+    columns = [job[1][2] for job in jobs]
+    values = ctx._column_data(task_id, parquet_path, columns)
+    for job in jobs:
+        column = job[1][2]
+        array = values.get(column)
+        if array is None:
+            ctx._pool_results.put(
+                (False, job, ValueError(f"'{column}' could not be read"))
+            )
+            continue
+        pooled = np.asarray(array, dtype="float64")[indices].astype("float32")
+        ctx._pool_results.put((True, job, pooled))
 
 
 def _pool_build_column(ctx, parquet_path, task_id, column):

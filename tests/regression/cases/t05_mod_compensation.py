@@ -59,6 +59,43 @@ def save_matrix() -> None:
         _close(window)
 
 
+@harness.case("mod.compensation.cached_columns", "L4", "compensation", tags=("fast",))
+def cached_columns() -> None:
+    """A repeated read of compensated columns is served from the stage cache."""
+    window, _project, page, parquet = _open("comp_cached")
+    try:
+        ctx = window._ctx
+        page._comp_files[:] = [parquet]
+        page._comp_names[:] = ["FL1-A", "FL2-A"]
+        page._comp_matrix[:] = [[100.0, 10.0], [0.0, 100.0]]
+        comp_page._comp_mark_dirty(ctx, page)
+        comp_page._comp_save_now(ctx, page)
+
+        first = _data_columns._column_data(ctx, "g-1", parquet, ["FL1-A"])
+        harness.check("FL1-A" in first)
+
+        calls = {"n": 0}
+        original = pd.read_parquet
+
+        def counting(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        pd.read_parquet = counting
+        try:
+            second = _data_columns._column_data(ctx, "g-1", parquet, ["FL1-A"])
+        finally:
+            pd.read_parquet = original
+
+        harness.eq(calls["n"], 0, "the second read skips the parquet")
+        harness.check(
+            np.array_equal(first["FL1-A"], second["FL1-A"]),
+            "the cached value matches a fresh read",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("mod.compensation.paste", "L4", "compensation", tags=("fast",))
 def paste_matrix() -> None:
     window, _project, page, _parquet = _open("comp_paste")

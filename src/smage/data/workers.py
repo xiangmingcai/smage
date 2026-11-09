@@ -17,6 +17,7 @@ from smage.core.pipeline import (
     _evaluate_stages,
     _pipeline_dependencies,
 )
+from smage.runlog import runlog
 
 
 class _ProcessWorker:
@@ -126,11 +127,17 @@ class _GatingStatsWorker:
         self._current_path = None
         self._masks = {}     # {gate_id: population bool ndarray}
         self._counts = {}    # {gate_id: int}
+        # Compensation/Unmix outputs are properties of the data pipeline,
+        # not of the gate shapes: evaluate them once per (file, pipeline)
+        # and reuse them for every subsequent gate adjustment.
+        self._stage_cache = {}
+        self._stage_sig = None
+        self._row_key = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def request(self, generation, parquet_path, gates, stages, base_columns,
-                affected, virtual=None, row_index=None):
+                affected, virtual=None, row_index=None, stage_sig=None):
         with self._cond:
             prev = self._pending
             if prev is not None:
@@ -142,7 +149,7 @@ class _GatingStatsWorker:
                     affected = set(prev[5]) | set(affected)
             self._pending = (
                 generation, parquet_path, gates, stages, set(base_columns),
-                affected, dict(virtual or {}), row_index,
+                affected, dict(virtual or {}), row_index, stage_sig,
             )
             self._cond.notify()
 
@@ -176,12 +183,18 @@ class _GatingStatsWorker:
                 continue
             try:
                 res = self._compute(*req)
-            except Exception:
+            except Exception as error:  # noqa: BLE001
+                # A silent failure here leaves the gate counts stale with no
+                # hint why, so record it before dropping the result.
+                try:
+                    runlog.error("gating.stats_error", exc=error)
+                except Exception:  # noqa: BLE001 - logging must not break
+                    pass
                 res = None
             self._res_q.put(res)
 
     def _compute(self, generation, parquet_path, gates, stages, base_columns,
-                 affected, virtual=None, row_index=None):
+                 affected, virtual=None, row_index=None, stage_sig=None):
         import numpy as np
         import pandas as pd
         if not parquet_path or not gates:
@@ -190,7 +203,30 @@ class _GatingStatsWorker:
             self._columns = {}
             self._masks = {}
             self._counts = {}
+            self._stage_cache = {}
+            self._stage_sig = None
+            self._row_key = None
             self._current_path = parquet_path
+        row_key = None
+        if row_index is not None:
+            try:
+                row_key = (
+                    len(row_index), int(row_index[0]),
+                    int(row_index[-1]), int(row_index.sum()),
+                )
+            except (IndexError, TypeError, ValueError):
+                row_key = (len(row_index),)
+        if row_key != self._row_key:
+            # Switching between the display sample and the full data
+            # invalidates masks; their arrays have different lengths.
+            self._masks = {}
+            self._counts = {}
+            self._stage_cache = {}
+            self._row_key = row_key
+        if stage_sig != self._stage_sig:
+            # A saved upstream module changed the data pipeline.
+            self._stage_cache = {}
+            self._stage_sig = stage_sig
         if affected is None:
             # Full recompute: the gate set may have changed, so reset caches.
             self._masks = {}
@@ -225,7 +261,9 @@ class _GatingStatsWorker:
                 name: (arr[row_index] if len(arr) == n_rows else arr)
                 for name, arr in arrays.items()
             }
-        arrays = _evaluate_stages(stages, arrays, needed, parquet_path)
+        arrays = _evaluate_stages(
+            stages, arrays, needed, parquet_path, cache=self._stage_cache
+        )
         existing = set(arrays)
         if not arrays:
             return (generation, {})

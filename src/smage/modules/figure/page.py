@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QDialog,
     QFrame,
+    QGraphicsItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
@@ -1666,6 +1667,10 @@ def _figure_draw_colored_scatter(ctx, plot_widget, x, y, values, cmap, size: flo
     scatter.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
     scatter.setAcceptHoverEvents(False)
     plot_widget.addItem(scatter)
+    if getattr(plot_widget, "_gate_cache_data", False):
+        # Gating plot: cache the rendered points so moving a gate ROI does
+        # not re-run the per-point paint.
+        scatter.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
 
 
 def _figure_original_tick_state(ctx, plot_widget) -> dict:

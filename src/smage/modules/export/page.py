@@ -972,7 +972,7 @@ def _export_image_data(ctx, page, path, channels, geometry, q):
 
     xmin, ymin, width, height = geometry
     task_id = page._export_task_id
-    stages = _data_columns._map_stages(ctx, task_id)
+    stages = _data_columns._map_stages(ctx, task_id, parquet_path=path)
     parquet = pq.ParquetFile(path)
     schema_names = set(parquet.schema_arrow.names)
     if "x" not in schema_names or "y" not in schema_names:

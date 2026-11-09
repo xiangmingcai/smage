@@ -41,6 +41,7 @@ from smage.widgets.resources import (
 )
 from uuid import uuid4
 import copy
+from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import stores as _data_stores
 from smage.modules.import_ import page as _import__page
@@ -758,7 +759,7 @@ class WorkflowTreeMixin:
             return self._remap_path_text(value, mapping)
         return value
 
-    def _remap_path_text(text: str, mapping: dict) -> str:
+    def _remap_path_text(self, text: str, mapping: dict) -> str:
         if not text or "Module" not in text:
             return text
         for old, new in mapping.items():
@@ -903,6 +904,8 @@ class WorkflowTreeMixin:
             siblings[index:index + 1] = task_def.get("children", [])
 
         self._cleanup_module_data([i for i in removed_ids if i])
+        # The deleted task changed the stage chain of everything below it.
+        _data_columns._bump_stages_revision(self._ctx)
         if self.project is not None:
             self.project.save()
         self._refresh_workflow_tree()

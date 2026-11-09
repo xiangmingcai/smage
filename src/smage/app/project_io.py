@@ -35,6 +35,7 @@ from smage.runlog import runlog
 import copy
 import shutil
 from functools import partial
+from smage.data import columns as _data_columns
 from smage.data import pool as _data_pool
 from smage.data import stores as _data_stores
 from smage.modules.import_ import page as _import__page
@@ -179,6 +180,7 @@ class ProjectIOMixin:
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
         _data_pool._pool_clear(self._ctx)
+        _data_columns._bump_stages_revision(self._ctx)
         self._channel_range_cache = {}
         self._size_labels.clear()
         self._size_pending.clear()
@@ -209,6 +211,7 @@ class ProjectIOMixin:
         )
 
         self.setWindowTitle(f"{APP_NAME} — {self.project.name}")
+        _data_columns._bump_stages_revision(self._ctx)
         self._column_index = self.project.load_columns()
         self._reset_module_tabs()
         _import__page._load_import_files(self._ctx)

@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 
 from smage.core.formatting import _format_level, _round_level
 from smage.core.scale_math import (
-    _forward_scale_value, _inverse_scale_value,
+    _apply_scale_transforms, _forward_scale_value, _inverse_scale_value,
 )
 from smage.core.settings import _plot_background
 from smage.widgets.plot_axes import _make_original_axis
@@ -101,6 +101,9 @@ def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_mi
         if values is None or values.size == 0:
             hist_plot.clear()
             return
+        # Levels are in display units: apply the Scale (log/arcsinh) configs,
+        # which only affect how the data is shown.
+        values = _apply_scale_transforms(values, configs)
         state["values"] = values
         hist, edges = np.histogram(values, bins=200)
         hist_plot.clear()
@@ -166,7 +169,8 @@ def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_mi
                 "This channel has no finite values", 3000
             )
             return
-        lo, hi = _round_level(bounds[0]), _round_level(bounds[1])
+        lo = _forward_scale_value(_round_level(bounds[0]), configs)
+        hi = _forward_scale_value(_round_level(bounds[1]), configs)
         min_edit.setText(
             _format_level(_inverse_scale_value(lo, configs))
         )

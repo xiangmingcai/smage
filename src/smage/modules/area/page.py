@@ -975,7 +975,10 @@ def _area_histogram(ctx, page, job, q):
         schema_names = set(pf.schema_arrow.names)
     except Exception:  # noqa: BLE001
         schema_names = set()
-    stages = _data_columns._map_stages(ctx, task_id) if task_id else []
+    stages = (
+        _data_columns._map_stages(ctx, task_id, parquet_path=path)
+        if task_id else []
+    )
     needed = _pipeline_dependencies(stages, names, path) if stages else set(names)
     needed = set(needed) | set(names)
     if not needed <= schema_names:
