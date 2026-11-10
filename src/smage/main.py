@@ -42,7 +42,7 @@ from smage.widgets import colormap as _widgets_colormap
 from smage.widgets.colormap import (_CustomColormapDialog, _colormap_groups, _colormap_name_taken, _figure_colormap, _palette_names)
 from smage.widgets.controls import (_CardProxy, _NoWheelComboBox, _NoWheelSpinBox)
 from smage.widgets.plot_axes import (_figure_image_layers)
-from smage.widgets.resources import (_folder_size, _module_icon_pixmap)
+from smage.widgets.resources import (_app_icon, _folder_size, _module_icon_pixmap)
 from smage.widgets.settings import _GlobalSettingsDialog
 from smage.widgets.ui_logger import _UIActionLogger
 from smage.data.image_index import (_build_image_index_files)
@@ -185,6 +185,12 @@ class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin, ExtensionsMixi
 
     def __init__(self) -> None:
         super().__init__()
+        # Application icon for the window, the task bar and every dialog.
+        icon = _app_icon()
+        self.setWindowIcon(icon)
+        application = QApplication.instance()
+        if application is not None:
+            application.setWindowIcon(icon)
         # The context is a thin proxy over this window; create it before any
         # timer or menu wiring captures it.
         self._ctx = AppContext(self)

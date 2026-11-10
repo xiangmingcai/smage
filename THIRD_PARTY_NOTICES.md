@@ -24,6 +24,12 @@ This file is a summary — the authoritative text lives in each package's own
 | scanpy | 1.11.5 | BSD 3-Clause | Used by the Cluster module's PhenoGraph / Leiden methods. |
 | igraph | 0.11.9 | GPL-2.0-or-later | Graph backend required by scanpy's Louvain/Leiden. |
 | leidenalg | 0.12.0 | GPL-3.0 | Leiden community detection for scanpy. |
+| openTSNE | 1.0.4 | BSD 3-Clause | Optional t-SNE backend for the Dimensionality Reduction module. |
+| python-louvain (`community`) | 0.16 | BSD 3-Clause | Louvain implementation used through scanpy. |
+| louvain (C extension) | 0.8.2 | GPL-3.0-or-later | C implementation used by python-louvain. Compatible with Smage's GPL-3.0; when distributing the bundle, point to its corresponding source (upstream repository or sdist). |
+| peacoqc-rs | 0.1.2 | MIT | PeacoQC quality control used by Data Clean (imported as `peacoqc`). |
+| polars | 2.1.0 | MIT | DataFrame engine required by peacoqc-rs. |
+| matplotlib | 3.11.2 | Matplotlib License (BSD-style) | Batch-alignment report figures (SVG/PDF/PNG). |
 
 ## Optional extensions (installed by the user, not bundled)
 
@@ -59,6 +65,10 @@ confirm the licensing of any pretrained model weights before redistributing.
 - **BSD / MIT components**: retain their copyright notice and disclaimer.
 - **Apache 2.0 components** (pyarrow, TensorFlow): also ship the full license
   text and any `NOTICE`, and state the changes you made.
+- **GPL components** (igraph, leidenalg, louvain): compatible with Smage's
+  GPL-3.0, but their complete corresponding source must be available when the
+  application is redistributed — link to each upstream repository or sdist in
+  the release notes.
 - **LGPL components** (PySide6/Qt): keep the LGPL text and make the Qt libraries
   replaceable (standard dynamic linking is sufficient for a Python app).
 - **Do not** use the names of the copyright holders to endorse or promote Smage

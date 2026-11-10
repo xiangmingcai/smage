@@ -114,6 +114,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="Smage",
+    icon=os.path.join(ROOT, "src", "smage", "icons", "logo.ico"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -1,0 +1,56 @@
+name: Bug report
+description: Something in Smage does not work as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The newest file in your project's `log/`
+        folder is usually the fastest way to see what happened — please
+        paste the relevant lines or attach the file.
+
+        **Security problems:** please do not report them here, use the
+        "Security problem" link instead.
+  - type: input
+    id: version
+    attributes:
+      label: Smage version
+      placeholder: "0.1.0 (portable zip) or 0.1.0 (from source)"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 23H2, 64-bit"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open project ...
+        2. Add a Gating module ...
+        3. Drag the gate ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt or file
+      description: Lines from `<project>.smage/log/` around the problem.
+    validations:
+      required: false

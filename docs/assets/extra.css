@@ -1,0 +1,14 @@
+/* Custom primary colour (#a1afc9, a muted blue-grey).
+   Material derives the header, links and a few UI accents from these tokens;
+   they are kept together here so the palette can be tuned in one place.
+   The header background is light, so the text on it is dark. */
+:root,
+[data-md-color-primary] {
+  --md-primary-fg-color:        #a1afc9;
+  --md-primary-fg-color--light: #c0cade;
+  --md-primary-fg-color--dark:  #8494b6;
+  --md-primary-bg-color:        #1f2a3a;
+  --md-primary-bg-color--light: rgba(31, 42, 58, 0.72);
+  /* Links need more contrast than the header on a white page. */
+  --md-typeset-a-color:         #5b6f92;
+}

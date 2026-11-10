@@ -134,7 +134,26 @@ class ProjectIOMixin:
         settings_menu.addAction(settings_action)
 
         help_menu = bar.addMenu("&Help")
-        help_menu.addAction(QAction("About Smage", self))
+        about_action = QAction("About Smage", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    def _show_about(self) -> None:
+        """Version, copyright and license — also what a bug report needs."""
+        QMessageBox.about(
+            self,
+            f"About {APP_NAME}",
+            f"<h3>{APP_NAME} {APP_VERSION}</h3>"
+            "<p>Image and flow-cytometry analysis.</p>"
+            "<p>Copyright (C) 2026 Amsterdam UMC, the Netherlands.<br>"
+            "Author: Xiangming Cai<br>"
+            "Advisor: Juan J. Garcia Vallejo</p>"
+            "<p>This program is free software under the GNU General Public "
+            "License, version 3. It comes with ABSOLUTELY NO WARRANTY.<br>"
+            "See the LICENSE file for details.</p>"
+            "<p><a href='https://github.com/xiangmingcai/smage'>"
+            "github.com/xiangmingcai/smage</a></p>",
+        )
 
     def _save_window_geometry(self) -> None:
         settings = _global_settings()

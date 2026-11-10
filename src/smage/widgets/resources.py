@@ -12,6 +12,18 @@ from smage.frozen import bundle_root, package_root
 _MODULE_ICON_CACHE: dict = {}
 _MODULE_ICON_DIR = None
 _MODULE_ICON_DIR_CHECKED = False
+_APP_ICON = None
+
+
+def _app_icon() -> QIcon:
+    """The Smage application icon (window title bar, task bar, dialogs)."""
+    global _APP_ICON
+    if _APP_ICON is not None:
+        return _APP_ICON
+    path = package_root() / "icons" / "logo.png"
+    _APP_ICON = QIcon(str(path)) if path.is_file() else QIcon()
+    return _APP_ICON
+
 
 def _dot_pixmap(color: str) -> QPixmap:
     """Build a small colored-dot pixmap (placeholder for an icon)."""

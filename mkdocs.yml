@@ -1,0 +1,117 @@
+site_name: Smage
+site_description: Image and flow-cytometry analysis for Windows
+site_url: https://xiangmingcai.github.io/smage/
+repo_url: https://github.com/xiangmingcai/smage
+repo_name: xiangmingcai/smage
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2026 Amsterdam UMC — GPL-3.0
+
+extra_css:
+  - assets/extra.css
+
+theme:
+  name: material
+  language: en
+  logo: assets/logo.png
+  favicon: assets/favicon.png
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  palette:
+    scheme: default
+    primary: light-blue
+    accent: light-blue
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Quick start: getting-started/quickstart.md
+      - Projects and data: getting-started/project-and-data.md
+  - Guides:
+      - Image workflow: guides/image-workflow.md
+      - FCS workflow: guides/fcs-workflow.md
+  - Modules:
+      - Overview: modules/index.md
+      - Import:
+          - Data Import: modules/import.md
+          - Rename: modules/rename.md
+          - Subsample: modules/subsample.md
+          - Subset: modules/subset.md
+      - Map values:
+          - Compensation: modules/compensation.md
+          - Unmix — Spectrum Extraction: modules/unmix.md
+          - Unmix — Matrix Unmixing: modules/unmix-matrix.md
+          - Illumination Correction: modules/illumination.md
+          - Batch Align: modules/batch-align.md
+      - Display:
+          - Scale: modules/scale.md
+      - Gating:
+          - Gating: modules/gating.md
+      - Image analysis:
+          - Segmentation: modules/segmentation.md
+          - Area: modules/area.md
+      - Features:
+          - Feature Down: modules/feature-down.md
+          - Feature Up: modules/feature-up.md
+          - Gate2Col: modules/gate2col.md
+      - Computation:
+          - Cluster: modules/cluster.md
+          - Dimensionality Reduction: modules/dimred.md
+          - Data Clean: modules/data-clean.md
+      - Output:
+          - Figure: modules/figure.md
+          - Heatmap: modules/heatmap.md
+          - Export: modules/export.md
+  - Reference:
+      - FAQ and troubleshooting: reference/faq.md
+      - Release notes: reference/release-notes.md
+  - Development:
+      - Build from source: development/build.md
+      - Regression tests: development/testing.md
+      - Packaging: development/packaging.md
+  - Contributing: contributing.md
+  - License: license.md
+
+plugins:
+  - search:
+      lang: en
+
+# docs/tools/ holds the screenshot generator; it is not part of the site.
+# docs/review/ holds the generated review copy (see docs/review/README.md).
+exclude_docs: |
+  tools/
+  review/
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/xiangmingcai/smage
+      name: Smage on GitHub

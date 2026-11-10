@@ -86,7 +86,7 @@
 
 - [ ] 打包为 Windows 可执行程序（PyInstaller 等）并验证 `pythonw` 启动方式。
   - [x] 路径已改为经 `smage/frozen.py` 的 `bundle_root()` / `package_root()` 解析（图标、runner 脚本、`sys.path`）。
-  - [ ] `--add-data` 打入 `src/smage/icons` → `smage/icons` 和 `src/smage/runners` → `smage/runners`。
+  - [x] `--add-data` 打入 icons / runners（`packaging/smage.spec` 的 `datas`，另含回归测试目录）。
   - [ ] 在没装 Python 的干净 Windows 上，从任意目录双击 exe，跑通导入 → 门控 → 导出。
   - [ ] 扩展管理器不应把 `Smage.exe` 当成 Python 解释器（已在 `_detect_python_interpreters` 中过滤 frozen 的 `sys.executable`）。
   - [x] 动态导入已覆盖：`packaging/smage.spec` 对 `smage`、numba、llvmlite、umap、scanpy 做 `collect_submodules`；`smage/selfcheck.py` + `Smage.exe --self-test` 会在冻结包里逐个导入验证。
@@ -96,15 +96,32 @@
   - [ ] 从干净环境安装后生成 `requirements-lock.txt`（`pip freeze`），构建时改为 `pip install -r requirements-lock.txt`，保证每次打包的依赖、体积和行为一致。
   - [ ] 把构建期依赖（PyInstaller 等）拆到 `requirements-build.txt`，不混进运行期清单。
   - [ ] 升级任何依赖时重新生成锁文件，并在 `--full` 回归套件上验证后再发布。
-- [ ] **确定以 GPL-3.0 发布**：
-  - [ ] 根目录添加 `LICENSE`（GPL-3.0 全文），README 写明 "Smage is free software under GPL-3.0"。
-  - [ ] 发布安装包时必须向用户提供完整对应源码（公开 GitHub 仓库，或随包提供源码包/下载链接）。
+- [x] **确定以 GPL-3.0 发布**：
+  - [x] 根目录添加 `LICENSE`（GPL-3.0 全文），README 写明 "Smage is free software under GPL-3.0"。
+  - [x] 版权归属文件：`NOTICE`（版权人、作者、指导者）+ `AUTHORS.md`（角色与单位）+ `CITATION` 待补。
+  - [ ] **待 Amsterdam UMC 确认**：劳动合同约定软著归单位，`NOTICE`/README 目前按「Copyright (C) 2026 Amsterdam UMC」写；需要单位书面同意以 GPL-3.0 公开发布，并确认版权行署名方式（单位全称/是否加部门）。
+  - [ ] 发布安装包时必须向用户提供完整对应源码（公开 GitHub 仓库，或随包提供源码包/下载链接）；捆绑的 GPL 组件（igraph、leidenalg、louvain）需附其上游源码链接。
   - [ ] 用户协议/EULA 不得附加与 GPL 冲突的限制（禁止再分发、禁止商用等）。
-  - [ ] 决定是否接受外部代码贡献；若接受，先确定 CLA / DCO 策略，以保留将来双许可的可能性。
+  - [x] 决定是否接受外部代码贡献；已确定为接受 PR + DCO（不引入 CLA，项目无商业/双许可计划）。
   - [ ] 发布前用 `pip-licenses` / ScanCode 审计全部依赖的许可证（重点排查 GPL-2.0-only 等与 GPL-3.0 不兼容的项，以及 Cellpose/StarDist 模型权重的独立条款），生成 `LICENSES/` 目录随安装包分发。
 - [ ] **代码签名**：给 `Smage.exe` 和安装包都签名，避免用户看到 SmartScreen“未知发布者”警告，并降低杀软误报。
   - [ ] 首选申请 **SignPath Foundation**（面向开源项目的免费代码签名）；备选 Azure Trusted Signing 或商业 OV/EV 证书。
   - [ ] 签名流程写进发布构建（先 `Smage.exe`，再 `Setup.exe`），并加可信时间戳。
   - [ ] 不启用 UPX 等压缩/加壳；若仍被误报，向 Microsoft 提交样本申诉。
-- [ ] 补齐 README（功能列表、截图、安装说明）。
+- [x] README 重写（功能列表、模块表、安装说明、数据位置、构建方式、许可证）。
+  - [ ] 发布前补截图/GIF（当前 README 未放图片）。
+- [ ] **引用信息**：添加 `CITATION.cff`（作者 Xiangming Cai，`affiliation: Amsterdam UMC`；标题、版本、仓库地址；指导者 Juan J. Garcia Vallejo 放在 acknowledgements，不算作者），评估是否申请 Zenodo DOI 并写进 README 的 Citation 段落。
+- [ ] GitHub 仓库元信息：About 描述、topics（`flow-cytometry`、`image-analysis`、`bioinformatics`、`pyside6`）、启用 Issues、启用私有漏洞报告（Security → Private vulnerability reporting），并开启 tag 保护/发布流程。
+- [ ] **文档站点**（MkDocs Material，`docs/` + `mkdocs.yml` + `.github/workflows/docs.yml`）：
+  - [ ] **GitHub Actions 页面构建**：`.github/workflows/docs.yml` 已写好（push 到 `main` 且改动 `docs/**` / `mkdocs.yml` 时自动 `mkdocs build --strict` 并部署 Pages）。待办：
+    - [ ] 仓库 Settings → Pages → Source 选 **GitHub Actions**
+    - [ ] push 后到 Actions 页确认 `docs` workflow 首次运行成功；若因 Pages 未启用失败，启用后 **Re-run all jobs**
+    - [ ] 确认发布地址 https://xiangmingcai.github.io/smage/ 可访问、搜索和截图正常
+    - [ ] 可选手动触发：Actions → docs → Run workflow（`workflow_dispatch`）
+  - [x] 截图：用户已提供真实界面截图（`E:\smage\data\snapshot`），已复制到 `docs/assets/screenshots/`（23 张，含 Unmix 两页和 subset）。
+  - [ ] 需要时用 `docs/tools/make_screenshots.py` 重新生成占位图（脚本保留，供自动化使用）。
+  - [x] 首页下载按钮指向 `releases/latest`（无需每次发版改链接）。
+  - [ ] 文档内容随模块更新：每次改参数/流程时同步更新对应页（`--module` 回归通过不代表文档正确）
+- [ ] 发布流程脚本化：打 tag → `packaging/build_win.py` → 压缩 `dist/Smage` → 生成 `SHA256SUMS` → 上传 GitHub Release（可选 GitHub Actions `windows-latest`）。
+- [ ] 清理本地临时文件：`build_install.log` 等构建日志不要提交（已在 `.gitignore`）。
 - [ ] 统一错误提示与日志格式。

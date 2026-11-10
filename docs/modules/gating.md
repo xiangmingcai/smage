@@ -1,0 +1,57 @@
+# Gating
+
+Draws gates on scatter, histogram or image plots and reports the number and
+percentage of events in each gate.
+
+![Gating](../assets/screenshots/gating.png)
+
+## Plot settings
+
+| Setting | Description |
+|---|---|
+| File | The data file to gate. |
+| Plot type | Scatter, histogram or image. |
+| X / Y parameter | The axes of the plot. |
+| Color mode | Density, a parameter, or a solid color. |
+| Palette / point size | Display options for the points. |
+| Gate labels | Show or hide gate names and percentages on the plot. |
+
+## Tools
+
+| Tool | Interaction |
+|---|---|
+| Rectangle / Ellipse | Drag a box or oval. |
+| Polygon | Click vertices; double-click to close. |
+| Quadrant | Click to place a crosshair; four quadrant gates are created. |
+| Split | Click to place a vertical line; two gates are created. |
+| Range | Drag from the low to the high end of a range. |
+| NOT / AND / OR | Combine existing gates into a boolean gate. |
+
+Gates form a tree: select a gate and draw again to create children. Each gate
+also has a name, color and per-file shape overrides.
+
+## Statistics
+
+- Counts and percentages are computed in the background.
+- While you edit, they are computed on the **displayed sample** (fast);
+  releasing the mouse refreshes them.
+- **Update statistics with full data** recomputes every gate on all rows.
+- Moving a gate also refreshes boolean gates that reference it and their
+  children.
+
+## Outputs
+
+- The gate tree (stored in `Module/gating-<id>/gates.json`).
+- Gate membership is available to [Figure](figure.md), [Gate2Col](gate2col.md)
+  and [Export](export.md) as filters or columns.
+
+## Notes
+
+- Gates are stored in original data units; a [Scale](scale.md) module above
+  only changes how they are drawn.
+- The gate tree is saved with **Save**; closing with unsaved changes asks for
+  confirmation.
+
+## Related
+
+[Gate2Col](gate2col.md) · [Figure](figure.md) · [Scale](scale.md)

@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a new module, option or workflow improvement.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the analysis task or the workflow that is awkward today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you imagine it could work in Smage.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Smage version
+      placeholder: "0.1.0"
+    validations:
+      required: false

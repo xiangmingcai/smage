@@ -13,9 +13,20 @@ env/
 # --- Build artifacts ---
 build/
 dist/
+site/
 # Only ignore stray specs at the repository root; packaging/smage.spec is
 # tracked.
 /*.spec
+# Local build/test logs (the app writes its own logs inside projects).
+/build_install.log
+/*.log
+
+# --- Generated review artifacts ---
+# Sources: review/overview.md + docs/tools/build_review_*.py
+# Review copies are meant for institutional review and stay local until the
+# release is approved; the tooling itself is tracked.
+/review/
+/docs/review/
 
 # --- IDE / editor ---
 .vscode/
