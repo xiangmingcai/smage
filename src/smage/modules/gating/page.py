@@ -493,7 +493,9 @@ def _gating_make_plot(ctx, page):
     except (RuntimeError, TypeError):
         pass
     plot_item.autoBtn.clicked.connect(
-        lambda _=None: _widgets_plot_renderer._figure_apply_ranges(ctx, page._gating_preview, plot_widget)
+        lambda _=None: _widgets_plot_renderer._figure_apply_ranges(
+            ctx, page._gating_preview, plot_widget, page._gating_task_id
+        )
     )
     plot_item._on_fit = lambda: _widgets_plot_renderer._figure_fit_all(ctx, page._gating_preview, plot_widget)
     # Gate editing moves ROI items on top of the data.  The data items are

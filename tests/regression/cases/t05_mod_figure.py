@@ -54,6 +54,71 @@ def add_plots() -> None:
         _close(window)
 
 
+@harness.case("mod.figure.scale_defaults", "L4", "figure", tags=("fast",))
+def scale_axis_defaults() -> None:
+    """Auto axes take their default range from the nearest upstream Scale."""
+    project = harness.new_project("figure_scale_defaults", rows=80)
+    parquet = str(project.data_dir / "case.parquet")
+    figure = harness.task_def("figure", task_id="fig-1", name="Figure")
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={
+            "files": [parquet],
+            "columns": [
+                {"name": "FL1-A", "method": "linear", "param": None,
+                 "min": 10.0, "max": 90.0},
+                # Only the lower side is configured on this channel.
+                {"name": "FL2-A", "method": "linear", "param": None,
+                 "min": 5.0, "max": None},
+            ],
+        },
+        children=[figure],
+    )
+    project.workflow["tasks"][0]["children"].append(scale)
+    project.save()
+
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("fig-1", "figure", "Figure")
+    harness.pump(400)
+    try:
+        ctx = window._ctx
+        page = window.tabs.currentWidget()
+        _figure_page._figure_add_plot(ctx, page, "scatter")
+        harness.pump(250)
+        plot = page._fig_plots[0]
+        card = page._fig_cards[0]
+
+        plot["x"], plot["y"] = "FL1-A", "FL2-A"
+        plot["xmin"] = plot["xmax"] = None
+        plot["ymin"] = plot["ymax"] = None
+        _figure_page._figure_apply_change(ctx, page, 0, plot)
+        xr, _yr = card.plot_widget().getPlotItem().getViewBox().viewRange()
+        harness.check(abs(xr[0] - 10.0) < 1e-6, f"x min from Scale: {xr}")
+        harness.check(abs(xr[1] - 90.0) < 1e-6, f"x max from Scale: {xr}")
+
+        # A saved manual range wins over the Scale default.
+        plot["xmin"], plot["xmax"] = 20.0, 40.0
+        _figure_page._figure_apply_change(ctx, page, 0, plot)
+        xr, _yr = card.plot_widget().getPlotItem().getViewBox().viewRange()
+        harness.check(abs(xr[0] - 20.0) < 1e-6, f"saved x min kept: {xr}")
+        harness.check(abs(xr[1] - 40.0) < 1e-6, f"saved x max kept: {xr}")
+
+        # One configured side uses Scale, the other falls back to the data.
+        plot["x"] = "FL2-A"
+        plot["xmin"] = plot["xmax"] = None
+        _figure_page._figure_apply_change(ctx, page, 0, plot)
+        xr, _yr = card.plot_widget().getPlotItem().getViewBox().viewRange()
+        data_max = getattr(card.plot_widget(), "_data_xmax", None)
+        harness.check(abs(xr[0] - 5.0) < 1e-6, f"one-sided min: {xr}")
+        harness.check(
+            data_max is not None and abs(xr[1] - data_max) < 1e-6,
+            f"one-sided other side uses data: {xr} vs {data_max}",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("mod.figure.duplicate_delete", "L4", "figure", tags=("fast",))
 def duplicate_delete() -> None:
     window, _project, page = _open("figure_dup")

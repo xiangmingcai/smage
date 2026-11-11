@@ -188,7 +188,7 @@ def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, ta
         )
 
 
-def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: bool, on_commit=None, auto_checked: bool=True, configs=None) -> QWidget:
+def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: bool, on_commit=None, auto_checked: bool=True, configs=None, task_id=None, column_transforms=None) -> QWidget:
     """Build an Auto/Min/Max row for one axis range.
 
     The spin boxes show the axis in ORIGINAL (pre-Scale) values even
@@ -252,7 +252,9 @@ def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: boo
         max_spin.set_enabled(enabled and not auto.isChecked())
         # A range change only affects the view, so apply the range directly
         # instead of re-reading and re-rendering the plot's data.
-        ctx._figure_apply_ranges(plot_dict, plot_widget)
+        ctx._figure_apply_ranges(
+            plot_dict, plot_widget, task_id, column_transforms
+        )
         if on_commit is not None:
             on_commit()
 
@@ -935,6 +937,8 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
 
     plot_widget.clear()
     plot_widget._fig_cancelled = False
+    plot_widget._fig_task_id = task_id
+    plot_widget._fig_column_transforms = column_transforms
     token = ctx._figure_bump_render_token(plot_widget)
     # A scatter render removes any cached image item; invalidate the image
     # state so the next image render re-adds it.
@@ -1153,7 +1157,9 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
         plot_widget, x, y, values, cmap, size=size, px_mode=px_mode,
         solid_color=solid, point_colors=point_colors,
     )
-    ctx._figure_apply_ranges(plot_dict, plot_widget)
+    ctx._figure_apply_ranges(
+        plot_dict, plot_widget, task_id, column_transforms
+    )
     ctx._figure_apply_display_options(plot_dict, plot_widget)
     # Scaled axes keep the transformed points but show original tick values.
     parquet = rec.get("parquet")
@@ -1588,7 +1594,11 @@ def _figure_make_plot_widget(ctx, plot_dict: dict):
     except (RuntimeError, TypeError):
         pass
     plot_item.autoBtn.clicked.connect(
-        lambda _=None: ctx._figure_apply_ranges(plot_dict, plot_widget)
+        lambda _=None: ctx._figure_apply_ranges(
+            plot_dict, plot_widget,
+            getattr(plot_widget, "_fig_task_id", None),
+            getattr(plot_widget, "_fig_column_transforms", None),
+        )
     )
     # "F" button fits to the full data extent (without changing settings).
     plot_item._on_fit = lambda: ctx._figure_fit_all(plot_dict, plot_widget)
@@ -1624,7 +1634,50 @@ def _figure_fit_all(ctx, plot_dict: dict, plot_widget) -> None:
         vb.enableAutoRange("y", True)
 
 
-def _figure_apply_ranges(ctx, plot_dict: dict, plot_widget) -> None:
+def _figure_scale_axis_bounds(ctx, task_id, parquet, column,
+                              column_transforms=None):
+    """Default (min, max) display bounds from the nearest upstream Scale.
+
+    The nearest Scale module that stores a Min and/or Max for the column
+    wins; a side that is not configured is returned as None so the caller can
+    fall back to the data extent. Bounds are stored in original units and
+    converted through the same display transforms the plot uses.
+    """
+    if not task_id or not parquet or not column:
+        return None
+    try:
+        stages = ctx._map_stages(
+            task_id, include_scale=True, parquet_path=parquet
+        ) or []
+    except Exception:  # noqa: BLE001 - a missing pipeline must not break a plot
+        return None
+    config = None
+    for kind, stage in reversed(stages):
+        if kind != "scale":
+            continue
+        files = stage.get("files")
+        if files is not None and parquet not in files:
+            continue
+        candidate = (stage.get("columns") or {}).get(column)
+        if not candidate:
+            continue
+        if candidate.get("min") is None and candidate.get("max") is None:
+            continue
+        config = candidate
+        break
+    if config is None:
+        return None
+    configs = _figure_axis_scale_configs(
+        ctx, task_id, parquet, column, column_transforms
+    )
+    return (
+        _forward_scale_value(config.get("min"), configs),
+        _forward_scale_value(config.get("max"), configs),
+    )
+
+
+def _figure_apply_ranges(ctx, plot_dict: dict, plot_widget,
+                         task_id=None, column_transforms=None) -> None:
     """Apply manual/auto X and Y ranges from the plot settings."""
     if plot_dict.get("type") == "image":
         # Image plots keep autoRange off: fit to the settings range, else
@@ -1649,11 +1702,45 @@ def _figure_apply_ranges(ctx, plot_dict: dict, plot_widget) -> None:
             )
         return
     xmin, xmax = plot_dict.get("xmin"), plot_dict.get("xmax")
+    ymin, ymax = plot_dict.get("ymin"), plot_dict.get("ymax")
+    # Auto axes default to the nearest upstream Scale's Min/Max; a side that
+    # Scale does not configure falls back to the rendered data extent.
+    # Overlay plots and histogram counts keep their existing behaviour.
+    ptype = plot_dict.get("type")
+    parquet = plot_dict.get("file")
+    if ptype in ("scatter", "histogram") and task_id and parquet:
+        if xmin is None or xmax is None:
+            bounds = _figure_scale_axis_bounds(
+                ctx, task_id, parquet, plot_dict.get("x"),
+                column_transforms,
+            )
+            if bounds is not None:
+                if xmin is None:
+                    xmin = bounds[0]
+                if xmax is None:
+                    xmax = bounds[1]
+                if xmin is None:
+                    xmin = getattr(plot_widget, "_data_xmin", None)
+                if xmax is None:
+                    xmax = getattr(plot_widget, "_data_xmax", None)
+        if ptype == "scatter" and (ymin is None or ymax is None):
+            bounds = _figure_scale_axis_bounds(
+                ctx, task_id, parquet, plot_dict.get("y"),
+                column_transforms,
+            )
+            if bounds is not None:
+                if ymin is None:
+                    ymin = bounds[0]
+                if ymax is None:
+                    ymax = bounds[1]
+                if ymin is None:
+                    ymin = getattr(plot_widget, "_data_ymin", None)
+                if ymax is None:
+                    ymax = getattr(plot_widget, "_data_ymax", None)
     if xmin is not None and xmax is not None and xmax > xmin:
         plot_widget.setXRange(float(xmin), float(xmax), padding=0)
     else:
         plot_widget.enableAutoRange("x", True)
-    ymin, ymax = plot_dict.get("ymin"), plot_dict.get("ymax")
     if ymin is not None and ymax is not None and ymax > ymin:
         plot_widget.setYRange(float(ymin), float(ymax), padding=0)
     else:
@@ -1667,6 +1754,8 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
 
     plot_widget.clear()
     plot_widget._fig_cancelled = False
+    plot_widget._fig_task_id = task_id
+    plot_widget._fig_column_transforms = column_transforms
     token = ctx._figure_bump_render_token(plot_widget)
     # Same as scatter: invalidate any cached image item.
     plot_widget._img_fitted = False
@@ -1797,7 +1886,9 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
             item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
         plot_widget.addItem(item)
 
-    ctx._figure_apply_ranges(plot_dict, plot_widget)
+    ctx._figure_apply_ranges(
+        plot_dict, plot_widget, task_id, column_transforms
+    )
     ctx._figure_apply_display_options(plot_dict, plot_widget)
     ctx._figure_set_original_ticks(
         plot_widget, "bottom",

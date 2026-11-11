@@ -1988,7 +1988,10 @@ def _figure_plot_pan_start(ctx, page, item, scene_pos) -> bool:
     # Corner buttons (bottom-left): "A" resets to settings range, "F" fits all.
     if local.y() >= card.height() - 40:
         if local.x() <= 21:
-            _widgets_plot_renderer._figure_apply_ranges(ctx, page._fig_plots[focused], card.plot_widget())
+            _widgets_plot_renderer._figure_apply_ranges(ctx,
+                page._fig_plots[focused], card.plot_widget(),
+                page._fig_task_id, page._fig_column_transforms,
+            )
             return True
         if local.x() <= 40:
             _widgets_plot_renderer._figure_fit_all(ctx, page._fig_plots[focused], card.plot_widget())
@@ -2219,6 +2222,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
     layout.addWidget(_widgets_plot_renderer._figure_range_row(ctx,
         plot_dict, "x", plot_widget, enabled,
         lambda: _figure_mark_dirty(ctx, page), configs=x_configs,
+        task_id=page._fig_task_id,
+        column_transforms=page._fig_column_transforms,
     ))
 
     # Y range (scatter/histogram/image: histograms show the Count axis).
@@ -2226,6 +2231,8 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
     layout.addWidget(_widgets_plot_renderer._figure_range_row(ctx,
         plot_dict, "y", plot_widget, enabled,
         lambda: _figure_mark_dirty(ctx, page), configs=y_configs,
+        task_id=page._fig_task_id,
+        column_transforms=page._fig_column_transforms,
     ))
 
     # Size (width/height in canvas units).

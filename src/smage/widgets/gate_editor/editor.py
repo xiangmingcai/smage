@@ -593,6 +593,7 @@ def _gating_rebuild_settings(ctx, page) -> None:
                 page._gating_task_id, preview.get("file"),
                 preview.get("x"),
             ),
+            task_id=page._gating_task_id,
         ))
     if plot_type == "scatter":
         layout.addWidget(QLabel("Y range"))
@@ -603,6 +604,7 @@ def _gating_rebuild_settings(ctx, page) -> None:
                 page._gating_task_id, preview.get("file"),
                 preview.get("y"),
             ),
+            task_id=page._gating_task_id,
         ))
 
     # ----- plot size on the canvas (same controls as the Figure module) --

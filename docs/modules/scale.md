@@ -13,12 +13,18 @@ in plots and the coordinates used for gate shapes on screen.
 | Variables | One row per transformed column. |
 | Method | `linear`, `log10` or `arcsinh`. |
 | Param | The cofactor for `arcsinh` (ignored for the other methods). |
-| Min / Max | Optional display range in original units. |
+| Min / Max | Optional default axis range in original units. Downstream scatter and histogram plots use it while their axis is **Auto**. |
 
 ## Behaviour
 
 - Plots below the module are drawn in transformed coordinates, with axis
   labels converted back to original values.
+- **Min / Max are also the default axis range** for downstream scatter and
+  histogram plots (Figure, N×N cells, Gating, Area) when their axis is set to
+  **Auto**: the nearest upstream Scale that configures the channel wins, one
+  configured side is combined with the data extent on the other side, and
+  Overlay plots are excluded. A range saved in a plot's settings always wins;
+  **Auto** clears it and falls back to these defaults.
 - Gates are stored in **original data units**, so moving a scale module or
   changing its settings never invalidates gates or statistics.
 - The data pipeline (compensation, unmixing, gating, export) ignores Scale

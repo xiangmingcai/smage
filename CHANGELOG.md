@@ -12,6 +12,11 @@ All notable changes to Smage are recorded here. The format follows
   seeds each nucleus at its distance-map maximum and assigns pixels to the
   nearest seed, giving clumped nuclei separate labels. A **split minimum
   separation** setting controls how strong the split is (Auto by default).
+- Scale **Min / Max** now act as the default axis range for downstream
+  scatter and histogram plots (Figure, N×N cells, Gating, Area) while their
+  axis is **Auto**. The nearest upstream Scale wins; a configured side is
+  combined with the data extent on the other, and Overlay plots are excluded.
+  Ranges saved in a plot always take precedence.
 
 ### Fixed
 

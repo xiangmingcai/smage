@@ -12,6 +12,7 @@ histogram and image plots, several per module.
 | Plot type | Scatter, histogram or image. |
 | File | The data file plotted by this figure. |
 | Filter | Restrict the plotted events (for example to a gate). |
+| X/Y range | **Auto** uses the nearest upstream [Scale](scale.md) Min/Max as the default, falling back to the data extent; a manual range is saved and always wins. Overlay plots do not use Scale defaults. |
 | X / Y parameter | The axes (Y is hidden for histograms). |
 | Color mode | Density, a parameter value, or a solid color. |
 | Color parameter / palette / point size | Appearance of the points. |
