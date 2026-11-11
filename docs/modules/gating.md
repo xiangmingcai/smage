@@ -11,6 +11,10 @@ percentage of events in each gate.
 |---|---|
 | File | The data file to gate. |
 | Plot type | Scatter, histogram or image. |
+
+Image plots show the cursor position and the displayed channel values on a
+row below the X axis name; the readout hides while a gate is being drawn or
+dragged.
 | X / Y parameter | The axes of the plot. |
 | Color mode | Density, a parameter, or a solid color. |
 | Palette / point size | Display options for the points. |

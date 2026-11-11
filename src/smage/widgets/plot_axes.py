@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import pyqtgraph as pg
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import (
+    QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygonF,
+)
+from PySide6.QtWidgets import QGraphicsSimpleTextItem
 
 from smage.core.formatting import _format_sci
 from smage.core.scale_math import _inverse_scale_value
@@ -235,18 +238,75 @@ def _make_fit_plot_item(viewbox=None):
         def __init__(self):
             super().__init__(viewBox=viewbox)
             self._on_fit = None
+            self._readout_row_reserved = False
             self.fitBtn = pg.ButtonItem(_letter_pixmap("F"), 14, self)
             self.fitBtn.clicked.connect(lambda _=None: self._fit_clicked())
+            # Cursor readout: x/y and the displayed channel values, shown on
+            # its own row below the X axis name (plain text, no frame).
+            self.readoutText = QGraphicsSimpleTextItem("", self)
+            font = QFont()
+            font.setPointSizeF(8.5)
+            self.readoutText.setFont(font)
+            self.readoutText.setBrush(QBrush(QColor(60, 70, 85)))
+            self.readoutText.setVisible(False)
+
+        def reserve_readout_row(self) -> None:
+            """Keep a blank row under the X axis for the cursor readout."""
+            if self._readout_row_reserved:
+                return
+            left, top, right, bottom = self.getContentsMargins()
+            self.setContentsMargins(left, top, right, bottom + 20)
+            self._readout_row_reserved = True
+            self._place_buttons()
+
+        def release_readout_row(self) -> None:
+            """Give the extra bottom row back when the plot is not an image."""
+            if not self._readout_row_reserved:
+                return
+            left, top, right, bottom = self.getContentsMargins()
+            self.setContentsMargins(left, top, right, max(0, bottom - 20))
+            self._readout_row_reserved = False
+            self._place_buttons()
+
+        def set_readout(self, text: str) -> None:
+            """Show/hide the cursor readout (empty text hides it)."""
+            text = (text or "").strip()
+            if not text:
+                self.readoutText.setVisible(False)
+                return
+            self.readoutText.setText(text)
+            self.readoutText.setVisible(True)
+            self._position_readout()
+
+        def _position_readout(self) -> None:
+            # The row below the X axis name; its left edge never moves, so
+            # changing digit counts cannot make the readout jitter.
+            y = self.size().height() - 19
+            self.readoutText.setPos(4, max(2, y))
+
+        def _button_row_y(self, button) -> float:
+            """Bottom of the X axis name row (above the readout row)."""
+            base = self.size().height()
+            if self._readout_row_reserved:
+                try:
+                    base -= self.getContentsMargins()[3]
+                except (AttributeError, TypeError):
+                    base -= 20
+            return base - button.boundingRect().height()
 
         def _fit_clicked(self):
             if self._on_fit is not None:
                 self._on_fit()
 
+        def _place_buttons(self) -> None:
+            w = self.autoBtn.boundingRect().width()
+            self.autoBtn.setPos(0, self._button_row_y(self.autoBtn))
+            self.fitBtn.setPos(w + 2, self._button_row_y(self.fitBtn))
+            self._position_readout()
+
         def resizeEvent(self, ev):
             super().resizeEvent(ev)
-            w = self.autoBtn.boundingRect().width()
-            y = self.size().height() - self.fitBtn.boundingRect().height()
-            self.fitBtn.setPos(w + 2, y)
+            self._place_buttons()
 
     return _FitPlotItem()
 

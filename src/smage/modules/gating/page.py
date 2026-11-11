@@ -505,11 +505,22 @@ def _gating_make_plot(ctx, page):
     return plot_widget, viewbox
 
 
+def _gating_readout_suppress(page, flag: bool) -> None:
+    """Hide the image cursor readout while a gate is being drawn or moved."""
+    plot = getattr(page, "_gating_plot_widget", None)
+    if plot is None:
+        return
+    plot._cursor_readout_suppressed = bool(flag)
+    if flag:
+        _widgets_plot_renderer._figure_hide_cursor_readout(plot)
+
+
 def _gating_set_tool(ctx, page, tool) -> None:
     page._gating_tool = tool
     page._gating_viewbox.set_gate_tool(tool)
     for key, btn in page._gating_tool_buttons.items():
         btn.setChecked(key == tool)
+    _gating_readout_suppress(page, tool is not None)
 
 
 def _gating_update_tools(ctx, page) -> None:
@@ -749,6 +760,7 @@ def _gating_apply_group_geometry(ctx, page, group_id, geometry) -> None:
 
 
 def _gating_on_roi_drag(ctx, page, gate, roi) -> None:
+    _gating_readout_suppress(page, page._gating_tool is not None)
     geometry = _gating_sync_gate(ctx, gate, roi)
     geometry = _gating_geometry_to_real(ctx, page, gate, geometry)
     _gating_apply_geometry(ctx, page, gate, geometry)
@@ -785,10 +797,12 @@ def _gating_on_roi_move(ctx, page, gate, roi) -> None:
     """Move the label with the ROI while dragging; statistics wait for release."""
     if roi is None:
         return
+    _gating_readout_suppress(page, True)
     _gating_move_label(page, gate, _gating_sync_gate(ctx, gate, roi))
 
 
 def _gating_quadrant_sync(ctx, page, crosshair_id, key, line) -> None:
+    _gating_readout_suppress(page, page._gating_tool is not None)
     entry = page._gating_crosshairs.get(crosshair_id)
     geometry = {}
     if entry is not None and len(entry["lines"]) == 2:
@@ -810,6 +824,7 @@ def _gating_quadrant_sync(ctx, page, crosshair_id, key, line) -> None:
 
 
 def _gating_split_sync(ctx, page, split_id, line) -> None:
+    _gating_readout_suppress(page, page._gating_tool is not None)
     affected = {
         g["id"] for g in page._gating_gates
         if g.get("split_id") == split_id
@@ -826,6 +841,7 @@ def _gating_split_sync(ctx, page, split_id, line) -> None:
 
 
 def _gating_range_sync(ctx, page, gate, key, line) -> None:
+    _gating_readout_suppress(page, page._gating_tool is not None)
     idx = next(
         (i for i, g in enumerate(page._gating_gates) if g["id"] == gate["id"]),
         -1,
@@ -850,6 +866,7 @@ def _gating_range_sync(ctx, page, gate, key, line) -> None:
 
 
 def _gating_skewed_sync(ctx, page, skewed_id) -> None:
+    _gating_readout_suppress(page, page._gating_tool is not None)
     entry = page._gating_skewed_lines.get(skewed_id)
     if entry is None:
         return
@@ -889,6 +906,7 @@ def _gating_group_move(page, group_key, display) -> None:
 
 
 def _gating_quadrant_move(ctx, page, crosshair_id, key, line) -> None:
+    _gating_readout_suppress(page, True)
     entry = page._gating_crosshairs.get(crosshair_id)
     if entry is None or len(entry["lines"]) != 2:
         return
@@ -904,6 +922,7 @@ def _gating_quadrant_move(ctx, page, crosshair_id, key, line) -> None:
 
 
 def _gating_split_move(ctx, page, split_id, line) -> None:
+    _gating_readout_suppress(page, True)
     gate = next(
         (g for g in page._gating_gates if g.get("split_id") == split_id), None
     )
@@ -913,6 +932,7 @@ def _gating_split_move(ctx, page, split_id, line) -> None:
 
 
 def _gating_range_move(ctx, page, gate, key, line) -> None:
+    _gating_readout_suppress(page, True)
     idx = next(
         (i for i, g in enumerate(page._gating_gates) if g["id"] == gate["id"]),
         -1,
@@ -924,6 +944,7 @@ def _gating_range_move(ctx, page, gate, key, line) -> None:
 
 
 def _gating_skewed_move(ctx, page, skewed_id) -> None:
+    _gating_readout_suppress(page, True)
     entry = page._gating_skewed_lines.get(skewed_id)
     if entry is None:
         return

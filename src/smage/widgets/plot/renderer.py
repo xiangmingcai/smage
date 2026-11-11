@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QFrame,
@@ -272,6 +272,114 @@ def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: boo
     return row
 
 
+class _CursorLeaveFilter(QObject):
+    """Hide the cursor readout when the pointer leaves an image plot."""
+
+    def __init__(self, plot_widget) -> None:
+        super().__init__(plot_widget)
+        self._plot_widget = plot_widget
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.Leave:
+            _figure_hide_cursor_readout(self._plot_widget)
+        return False
+
+
+def _figure_hide_cursor_readout(plot_widget) -> None:
+    item = plot_widget.getPlotItem()
+    setter = getattr(item, "set_readout", None)
+    if setter is not None:
+        setter("")
+
+
+def _figure_release_cursor_row(plot_widget) -> None:
+    """Give back the extra row under the X axis (non-image plots)."""
+    item = plot_widget.getPlotItem()
+    release = getattr(item, "release_readout_row", None)
+    if release is not None:
+        release()
+
+
+def _figure_install_cursor_readout(plot_widget) -> None:
+    """Wire scene mouse-move events to the image cursor readout once."""
+    item = plot_widget.getPlotItem()
+    reserve = getattr(item, "reserve_readout_row", None)
+    if reserve is not None:
+        reserve()
+    if getattr(plot_widget, "_cursor_readout_ready", False):
+        return
+    plot_widget._cursor_readout_ready = True
+    last = {"time": 0.0}
+
+    def on_move(pos) -> None:
+        import time
+
+        now = time.monotonic()
+        if now - last["time"] < 0.03:
+            return
+        last["time"] = now
+        _figure_update_cursor_readout(plot_widget, pos)
+
+    plot_widget.scene().sigMouseMoved.connect(on_move)
+    leave_filter = _CursorLeaveFilter(plot_widget)
+    plot_widget.installEventFilter(leave_filter)
+    viewport = plot_widget.viewport()
+    if viewport is not None:
+        viewport.installEventFilter(leave_filter)
+    plot_widget._cursor_leave_filter = leave_filter
+
+
+def _figure_format_cursor_value(value) -> str:
+    """One decimal place, plain (never scientific) for the cursor readout."""
+    import math
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(numeric):
+        return "—"
+    return f"{numeric:.1f}"
+
+
+def _figure_update_cursor_readout(plot_widget, scene_pos) -> None:
+    """Show x/y and every visible layer's value under the cursor."""
+    item = plot_widget.getPlotItem()
+    setter = getattr(item, "set_readout", None)
+    if setter is None:
+        return
+    probe = getattr(plot_widget, "_image_probe", None)
+    if not probe or getattr(plot_widget, "_cursor_readout_suppressed", False):
+        setter("")
+        return
+    viewbox = item.getViewBox()
+    if not viewbox.sceneBoundingRect().contains(scene_pos):
+        setter("")
+        return
+    point = viewbox.mapSceneToView(scene_pos)
+    x, y = float(point.x()), float(point.y())
+    parts = [f"x: {int(round(x))}", f"y: {int(round(y))}"]
+    for layer in probe.get("layers") or []:
+        array = layer.get("array")
+        rect = layer.get("rect")
+        if array is None or rect is None:
+            continue
+        if rect.width() <= 0 or rect.height() <= 0:
+            continue
+        u = (x - rect.x()) / rect.width()
+        v = (y - rect.y()) / rect.height()
+        if not (0.0 <= u < 1.0 and 0.0 <= v < 1.0):
+            continue
+        rows, cols = array.shape[:2]
+        i = min(cols - 1, max(0, int(u * cols)))
+        j = min(rows - 1, max(0, int(v * rows)))
+        value = array[j, i]
+        text = _figure_format_cursor_value(value)
+        name = layer.get("name") or layer.get("channel") or ""
+        parts.append(f"{name}: {text}".strip(": "))
+    setter("  ".join(parts))
+
+
 def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, row_mask=None) -> None:
     """Render an Image plot as a raster (LOD pyramid), ImageJ-style.
 
@@ -281,6 +389,8 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
     """
     import numpy as np
     ctx._figure_bump_render_token(plot_widget)
+    plot_widget._image_probe = None
+    _figure_hide_cursor_readout(plot_widget)
     ctx._figure_update_image_legend(plot_widget, [])
     rec = ctx._figure_record(plot_dict.get("file"))
     if not rec:
@@ -441,6 +551,7 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
 
     rasters = []
     rendered_layers = []
+    probe_layers = []
     ref_shape = None
     ref_rect = None
     has_mask = False
@@ -692,12 +803,22 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
             "color": color,
             "name": str(layer.get("name") or channel),
         })
+        # Keep the values used to paint this layer so the cursor readout can
+        # index them without re-reading the image.
+        probe_layers.append({
+            "channel": str(channel),
+            "name": str(layer.get("name") or channel),
+            "array": chan,
+            "rect": rect,
+        })
         if ref_shape is None:
             ref_shape = norm.shape
             ref_rect = rect
 
     if not rasters or ref_shape is None:
         img.setVisible(False)
+        plot_widget._image_probe = None
+        _figure_hide_cursor_readout(plot_widget)
         ctx._figure_update_image_legend(plot_widget, [])
         if missing_pyramid:
             plot_widget.setTitle(
@@ -736,6 +857,14 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
     img.setImage(rgba, autoLevels=False)
     img.setRect(ref_rect)
     img.setVisible(True)
+    # Only layers that were actually composited (same shape) can be read.
+    plot_widget._image_probe = {
+        "layers": [
+            layer for layer in probe_layers
+            if layer["array"].shape == ref_shape
+        ]
+    }
+    _figure_install_cursor_readout(plot_widget)
     ctx._figure_apply_display_options(plot_dict, plot_widget)
     for axis in ("bottom", "left"):
         ctx._figure_set_original_ticks(plot_widget, axis, None)
@@ -939,6 +1068,9 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
     plot_widget._fig_cancelled = False
     plot_widget._fig_task_id = task_id
     plot_widget._fig_column_transforms = column_transforms
+    plot_widget._image_probe = None
+    _figure_hide_cursor_readout(plot_widget)
+    _figure_release_cursor_row(plot_widget)
     token = ctx._figure_bump_render_token(plot_widget)
     # A scatter render removes any cached image item; invalidate the image
     # state so the next image render re-adds it.
@@ -1756,6 +1888,9 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
     plot_widget._fig_cancelled = False
     plot_widget._fig_task_id = task_id
     plot_widget._fig_column_transforms = column_transforms
+    plot_widget._image_probe = None
+    _figure_hide_cursor_readout(plot_widget)
+    _figure_release_cursor_row(plot_widget)
     token = ctx._figure_bump_render_token(plot_widget)
     # Same as scatter: invalidate any cached image item.
     plot_widget._img_fitted = False

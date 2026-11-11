@@ -17,6 +17,11 @@ All notable changes to Smage are recorded here. The format follows
   axis is **Auto**. The nearest upstream Scale wins; a configured side is
   combined with the data extent on the other, and Overlay plots are excluded.
   Ranges saved in a plot always take precedence.
+- Image plots show a live cursor readout on a row under the X axis name:
+  pixel x/y and the value of every visible layer at that pixel. Values come
+  from the raster already used to draw the plot (no disk reads, no extra
+  full-image cache): exact pixels at deep zoom, block means when zoomed out.
+  The readout hides while a gate is being drawn or dragged.
 
 ### Fixed
 

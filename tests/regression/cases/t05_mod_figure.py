@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import QDialog
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -13,6 +14,7 @@ import _e2e_helpers as e2e  # noqa: E402
 from smage.modules.figure.page import _FigurePermuteDialog  # noqa: E402
 from smage.modules.figure import page as _figure_page
 from smage.widgets import picker as _widgets_picker  # noqa: E402
+from smage.widgets.plot import renderer as _widgets_plot_renderer  # noqa: E402
 
 
 def _open(case_id: str):
@@ -115,6 +117,39 @@ def scale_axis_defaults() -> None:
             data_max is not None and abs(xr[1] - data_max) < 1e-6,
             f"one-sided other side uses data: {xr} vs {data_max}",
         )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.image_readout", "L4", "figure", tags=("fast",))
+def image_cursor_readout() -> None:
+    """An image plot reports x/y and every visible layer's value."""
+    figure = harness.task_def("figure", task_id="fig-1", name="Figure")
+    project, _parquet = e2e.image_project("figure_readout", tasks=[figure])
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("fig-1", "figure", "Figure")
+    harness.pump(350)
+    try:
+        ctx = window._ctx
+        page = window.tabs.currentWidget()
+        _figure_page._figure_add_plot(ctx, page, "image")
+        harness.pump(400)
+        widget = page._fig_cards[0].plot_widget()
+        probe = getattr(widget, "_image_probe", None)
+        harness.check(probe is not None, "the image probe is retained")
+        harness.check(bool(probe.get("layers")), "one layer is probeable")
+
+        viewbox = widget.getPlotItem().getViewBox()
+        scene_pos = viewbox.mapViewToScene(QPointF(7.0, 7.0))
+        _widgets_plot_renderer._figure_update_cursor_readout(
+            widget, scene_pos
+        )
+        text = widget.getPlotItem().readoutText.text()
+        harness.check("x: 7" in text and "y: 7" in text, text)
+        harness.check("Channel 1:" in text, text)
+        harness.check("200.0" in text, "one-decimal intensity: " + text)
+        harness.check("—" not in text, text)
     finally:
         _close(window)
 

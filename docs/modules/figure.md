@@ -38,6 +38,10 @@ PNG/SVG/PDF, or turn on the module's own export action.
 - Display transforms from an upstream [Scale](scale.md) module are applied
   automatically, and range fields are shown in the transformed units.
 - Image plots can overlay a gate mask or a segmentation mask.
+- Image plots show a cursor readout on a row below the X axis name: pixel
+  x/y and the value of every visible layer under the cursor. It reads the
+  raster already drawn, so it is instant; zoomed-out values are block means
+  and deep-zoom values are exact pixels.
 
 ## Related
 
