@@ -18,7 +18,11 @@ estimating a per-tile brightness profile and dividing it out.
 
 **Auto set** estimates the tile size and background threshold from the data.
 The preview plot shows the corrected channel, with its own display range and
-palette.
+palette. Zooming or panning re-samples the image at the current magnification,
+so detail stays sharp when zoomed in. The button below the previews copies
+the zoom and position of the preview under the pointer to the other one; its
+arrow (**Sync view →** or **Sync view ←**) shows the direction that will be
+used.
 
 ## Output
 

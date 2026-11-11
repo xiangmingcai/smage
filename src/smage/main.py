@@ -22,7 +22,9 @@ from PySide6.QtCore import (QTimer, Qt)
 from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMessageBox, QPushButton)
 
 from smage.extensions_registry import EXTENSION_DEFS, _extension_def
-from smage.app.logging_setup import _install_excepthook, _install_qt_message_handler
+from smage.app.logging_setup import (
+    _install_excepthook, _install_faulthandler, _install_qt_message_handler,
+)
 from smage.runlog import runlog
 from smage.app.module_sizes import ModuleSizesMixin
 from smage.app.project_io import ProjectIOMixin
@@ -419,6 +421,7 @@ def main() -> int:
             return 2
         return _run_script(sys.argv[index + 1])
     _install_excepthook()
+    _install_faulthandler()
     _install_qt_message_handler()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

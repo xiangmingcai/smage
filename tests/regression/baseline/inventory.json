@@ -2050,6 +2050,14 @@
       "line": 1007
     },
     {
+      "key": "src/smage/modules/illumination/page.py|_illum_rebuild_right|button|Sync view →|0",
+      "file": "src/smage/modules/illumination/page.py",
+      "function": "_illum_rebuild_right",
+      "kind": "button",
+      "label": "Sync view →",
+      "line": 444
+    },
+    {
       "key": "src/smage/modules/illumination/page.py|_illum_rebuild_right|splitter|<dynamic>|0",
       "file": "src/smage/modules/illumination/page.py",
       "function": "_illum_rebuild_right",

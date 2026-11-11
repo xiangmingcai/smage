@@ -855,16 +855,23 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
     else:
         rgba[..., 3] = 255
     img.setImage(rgba, autoLevels=False)
+    # Keep the composited array alive for as long as the image item is shown
+    # (ImageItem paints a QImage that can reference this buffer).
+    plot_widget._img_data = rgba
     img.setRect(ref_rect)
     img.setVisible(True)
-    # Only layers that were actually composited (same shape) can be read.
-    plot_widget._image_probe = {
-        "layers": [
-            layer for layer in probe_layers
-            if layer["array"].shape == ref_shape
-        ]
-    }
-    _figure_install_cursor_readout(plot_widget)
+    item = plot_widget.getPlotItem()
+    if getattr(item, "set_readout", None) is not None:
+        # Only plots that can show the readout keep the raster values.
+        plot_widget._image_probe = {
+            "layers": [
+                layer for layer in probe_layers
+                if layer["array"].shape == ref_shape
+            ]
+        }
+        _figure_install_cursor_readout(plot_widget)
+    else:
+        plot_widget._image_probe = None
     ctx._figure_apply_display_options(plot_dict, plot_widget)
     for axis in ("bottom", "left"):
         ctx._figure_set_original_ticks(plot_widget, axis, None)
@@ -940,13 +947,29 @@ def _figure_apply_display_options(ctx, plot_dict: dict, plot_widget) -> None:
     sample_size = max(
         6, int(plot_dict.get("sample_name_font_size", 9) or 9)
     )
+    show_axes = plot_dict.get("show_axes", True)
+    show_names = plot_dict.get("show_axis_names", True)
+    show_indices = plot_dict.get("show_indices", True)
+    title = (
+        plot_dict.get("file_name")
+        if plot_dict.get("show_sample_name", True)
+        else None
+    )
+    # Applying the same labels/styles again still re-lays out the axes; with
+    # an aspect-locked image view that can change the range, which schedules
+    # another LOD render and eventually loops forever. Skip unchanged calls.
+    signature = (
+        x_name, y_name, name_size, index_size, sample_size,
+        show_axes, show_names, show_indices, title,
+    )
+    if getattr(plot_widget, "_display_signature", None) == signature:
+        return
+    plot_widget._display_signature = signature
+
     label_style = {"font-size": f"{name_size}pt", "color": "#000000"}
     plot_item.setLabel("bottom", x_name or "", **label_style)
     plot_item.setLabel("left", y_name or "", **label_style)
 
-    show_axes = plot_dict.get("show_axes", True)
-    show_names = plot_dict.get("show_axis_names", True)
-    show_indices = plot_dict.get("show_indices", True)
     tick_font = QFont()
     tick_font.setPointSize(index_size)
     for ax in ("bottom", "left"):
@@ -955,10 +978,9 @@ def _figure_apply_display_options(ctx, plot_dict: dict, plot_widget) -> None:
         axis.showLabel(show_names)
         axis.setStyle(showValues=show_indices, tickFont=tick_font)
 
-    if plot_dict.get("show_sample_name", True) and plot_dict.get("file_name"):
+    if title:
         plot_item.setTitle(
-            plot_dict["file_name"], color="#808080",
-            size=f"{sample_size}pt",
+            title, color="#808080", size=f"{sample_size}pt",
         )
     else:
         plot_item.setTitle(None)

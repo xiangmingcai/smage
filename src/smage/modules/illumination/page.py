@@ -1,9 +1,12 @@
 """Illumination Correction module: per-tile flat-field correction."""
 from __future__ import annotations
 
+from smage.runlog import runlog
 from smage.widgets.panels import _FlowArrowBand
 
 from PySide6.QtCore import (
+    QEvent,
+    QObject,
     QRectF,
     QTimer,
     Qt,
@@ -420,12 +423,36 @@ def _illum_rebuild_right(ctx, page) -> None:
     top_lay.addWidget(_illum_params_panel(ctx, page, sub), 2)
     top_lay.addWidget(_illum_mask_panel(ctx, page, sub), 2)
     bottom = QWidget()
-    bottom_lay = QHBoxLayout(bottom)
+    bottom_box = QVBoxLayout(bottom)
+    bottom_box.setContentsMargins(0, 0, 0, 0)
+    bottom_box.setSpacing(4)
+    bottom_lay = QHBoxLayout()
     bottom_lay.setContentsMargins(0, 0, 0, 0)
     bottom_lay.setSpacing(12)
-    bottom_lay.addWidget(_illum_plot_panel(ctx, page, sub, "Before"), 2)
-    bottom_lay.addWidget(_illum_plot_panel(ctx, page, sub, "After"), 2)
+    previews = QVBoxLayout()
+    previews.setContentsMargins(0, 0, 0, 0)
+    previews.setSpacing(4)
+    plots_row = QHBoxLayout()
+    plots_row.setContentsMargins(0, 0, 0, 0)
+    plots_row.setSpacing(12)
+    plots_row.addWidget(_illum_plot_panel(ctx, page, sub, "Before"), 1)
+    plots_row.addWidget(_illum_plot_panel(ctx, page, sub, "After"), 1)
+    previews.addLayout(plots_row, 1)
+    sync_row = QHBoxLayout()
+    sync_row.setContentsMargins(0, 0, 0, 0)
+    sync_row.addStretch()
+    sync_btn = QPushButton("Sync view →")
+    sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    sync_btn.setFixedWidth(100)
+    sync_btn.clicked.connect(lambda _=False: _illum_sync_views(ctx, page))
+    sync_row.addWidget(sync_btn)
+    sync_row.addStretch()
+    previews.addLayout(sync_row)
+    bottom_lay.addLayout(previews, 4)
     bottom_lay.addWidget(_illum_plot_settings(ctx, page, sub), 1)
+    bottom_box.addLayout(bottom_lay, 1)
+    page._illum_sync_btn = sync_btn
+    _illum_update_sync_label(page)
     splitter.addWidget(top)
     splitter.addWidget(bottom)
     splitter.setSizes([320, 520])
@@ -846,6 +873,70 @@ def _illum_render_mask(ctx, page, sub) -> None:
         )
 
 
+class _IllumPointerFilter(QObject):
+    """Remember which preview plot the pointer was last over."""
+
+    def __init__(self, parent, page, plot) -> None:
+        super().__init__(parent)
+        self._page = page
+        self._plot = plot
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in (
+            QEvent.Type.Enter,
+            QEvent.Type.MouseMove,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.Wheel,
+        ):
+            self._page._illum_sync_source = self._plot
+            _illum_update_sync_label(self._page)
+        return False
+
+
+def _illum_update_sync_label(page) -> None:
+    """Show which direction the Sync views button will copy."""
+    button = getattr(page, "_illum_sync_btn", None)
+    if button is None:
+        return
+    if getattr(page, "_illum_sync_source", None) is getattr(
+        page, "_illum_after_plot", None
+    ):
+        button.setText("Sync view ←")
+        button.setToolTip(
+            "Copy the zoom and position of the After preview to Before"
+        )
+    else:
+        button.setText("Sync view →")
+        button.setToolTip(
+            "Copy the zoom and position of the Before preview to After"
+        )
+
+
+def _illum_sync_views(ctx, page) -> None:
+    """Copy the active preview's zoom/position to the other one, once.
+
+    A one-shot copy avoids the feedback and repaint problems of a live
+    range link (which could crash while wheel-zooming).
+    """
+    before = getattr(page, "_illum_before_plot", None)
+    after = getattr(page, "_illum_after_plot", None)
+    if before is None or after is None or before is after:
+        return
+    source = getattr(page, "_illum_sync_source", None)
+    if source not in (before, after):
+        source = before
+    target = after if source is before else before
+    xr, yr = source.getPlotItem().getViewBox().viewRange()
+    target.getPlotItem().getViewBox().setRange(
+        xRange=xr, yRange=yr, padding=0
+    )
+    runlog.action(
+        "illum.sync_views",
+        source="After" if source is after else "Before",
+    )
+    _illum_update_sync_label(page)
+
+
 def _illum_plot_panel(ctx, page, sub, title: str) -> QWidget:
     panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
@@ -859,6 +950,32 @@ def _illum_plot_panel(ctx, page, sub, title: str) -> QWidget:
         "left": _make_sci_axis("left"),
     })
     lay.addWidget(plot, 1)
+    # Re-sample the image at the current zoom so magnified views stay sharp.
+    lod = getattr(page, "_illum_lod_timer", None)
+    if lod is None:
+        lod = QTimer(ctx.host)
+        lod.setSingleShot(True)
+        lod.setInterval(80)
+        lod.timeout.connect(lambda: _illum_render_preview(ctx, page))
+        page._illum_lod_timer = lod
+
+    def on_range(*_args) -> None:
+        import time
+
+        if getattr(page, "_illum_rendering", False):
+            return
+        if time.monotonic() < getattr(
+            page, "_illum_ignore_range_until", 0.0
+        ):
+            return
+        lod.start()
+
+    plot.getPlotItem().getViewBox().sigRangeChanged.connect(on_range)
+    pointer = _IllumPointerFilter(plot, page, plot)
+    plot.installEventFilter(pointer)
+    viewport = plot.viewport()
+    if viewport is not None:
+        viewport.installEventFilter(pointer)
     if title == "Before":
         page._illum_before_plot = plot
     else:
@@ -1077,6 +1194,20 @@ def _illum_preview_stages(ctx, page, subs):
 
 
 def _illum_render_preview(ctx, page) -> None:
+    """Render both previews without letting their own range changes loop."""
+    import time
+
+    page._illum_rendering = True
+    try:
+        _illum_render_preview_now(ctx, page)
+    finally:
+        page._illum_rendering = False
+        # Ignore the layout/range signals emitted while the render settled;
+        # a user wheel event still arrives well after this window.
+        page._illum_ignore_range_until = time.monotonic() + 0.05
+
+
+def _illum_render_preview_now(ctx, page) -> None:
     sub = _illum_selected_sub(ctx, page)
     plot_dict = getattr(page, "_illum_plot", None)
     before = getattr(page, "_illum_before_plot", None)
@@ -1090,6 +1221,10 @@ def _illum_render_preview(ctx, page) -> None:
     earlier = page._illum_submodules[:index]
     before_stages = _illum_preview_stages(ctx, page, earlier)
     after_stages = _illum_preview_stages(ctx, page, earlier + [sub])
+    runlog.action(
+        "illum.preview", type=str(plot_dict.get("type")),
+        file=str(plot_dict.get("file")), channel=str(plot_dict.get("color_param")),
+    )
     for plot_widget in (before, after):
         _illum_clear_tile_grid(ctx, plot_widget)
     _widgets_plot_renderer._figure_render(ctx,
@@ -1330,7 +1465,9 @@ def _illum_close(ctx, page) -> None:
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._illum_task_def["params"] = page._illum_snapshot
-    for name in ("_illum_poll_timer", "_illum_order_timer"):
+    for name in (
+        "_illum_poll_timer", "_illum_order_timer", "_illum_lod_timer",
+    ):
         timer = getattr(page, name, None)
         if timer is not None:
             timer.stop()

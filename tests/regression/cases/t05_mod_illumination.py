@@ -33,6 +33,33 @@ def _close(window) -> None:
     harness.close_window(window)
 
 
+@harness.case("mod.illumination.sync_views", "L4", "illumination", tags=("fast",))
+def sync_views() -> None:
+    """The one-shot button copies the active preview's range to the other."""
+    window, _project, page, _parquet = _open("illum_sync")
+    try:
+        ctx = window._ctx
+        illum_page._illum_add_submodule(ctx, page)
+        harness.pump(200)
+        before = page._illum_before_plot
+        after = page._illum_after_plot
+        harness.check(before is not None, "the Before preview exists")
+        harness.check(after is not None, "the After preview exists")
+
+        before.getPlotItem().getViewBox().setRange(
+            xRange=(10.0, 20.0), yRange=(30.0, 40.0), padding=0
+        )
+        page._illum_sync_source = before
+        illum_page._illum_sync_views(ctx, page)
+        xr, yr = after.getPlotItem().getViewBox().viewRange()
+        harness.check(abs(xr[0] - 10.0) < 1e-6, f"x min: {xr}")
+        harness.check(abs(xr[1] - 20.0) < 1e-6, f"x max: {xr}")
+        harness.check(abs(yr[0] - 30.0) < 1e-6, f"y min: {yr}")
+        harness.check(abs(yr[1] - 40.0) < 1e-6, f"y max: {yr}")
+    finally:
+        _close(window)
+
+
 @harness.case("mod.illumination.submodules", "L4", "illumination", tags=("fast",))
 def submodules() -> None:
     window, _project, page, _parquet = _open("illum_submodules")

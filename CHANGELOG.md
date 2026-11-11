@@ -25,6 +25,11 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Fixed
 
+- Image plots: LOD refreshes no longer re-apply unchanged axis labels,
+  titles and tick styles. On an aspect-locked view that re-layout could
+  change the range, schedule another refresh and loop forever (visible as
+  high-frequency flicker and runaway CPU/memory use, followed by a crash
+  elsewhere).
 - Export: dragging a channel row onto another row no longer loses rows. The
   list reports the drop and the page reorders its own parameters, so Qt's
   internal move (which can remove the dragged row) is never used; the list
@@ -36,6 +41,13 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Changed
 
+- Illumination Correction: zooming or panning a preview re-samples the
+  image, so magnified views stay sharp instead of showing the initial
+  low-resolution raster.
+- Illumination Correction: a **Sync view →** / **Sync view ←** button
+  below the previews copies the zoom and position of the preview under the
+  pointer to the other one. The arrow shows the direction that will be used.
+  It replaces the live view link, which could crash while wheel-zooming.
 - Scale: an explanatory line at the top of the page states that the module
   only changes visualisation and gate display, never the stored data.
 - Export: selecting files no longer preselects every channel automatically;

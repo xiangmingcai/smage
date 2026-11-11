@@ -48,6 +48,29 @@ def _install_qt_message_handler() -> None:
     qInstallMessageHandler(handler)
 
 
+_FAULT_HANDLER_FILE = None
+
+
+def _install_faulthandler() -> None:
+    """Record native crashes (segfaults/aborts) in ``fault.log``.
+
+    Python's excepthook never sees a Qt/native crash, so without this a hard
+    crash leaves no trace beyond the action log.
+    """
+    global _FAULT_HANDLER_FILE
+    try:
+        import faulthandler
+
+        _settings_dir().mkdir(parents=True, exist_ok=True)
+        handle = (_settings_dir() / "fault.log").open(
+            "a", encoding="utf-8"
+        )
+        faulthandler.enable(file=handle, all_threads=True)
+        _FAULT_HANDLER_FILE = handle
+    except Exception:  # noqa: BLE001 - diagnostics must never block start-up
+        pass
+
+
 def _install_excepthook() -> None:
     """Log uncaught exceptions instead of losing them in a windowless app."""
 
