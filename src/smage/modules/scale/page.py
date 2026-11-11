@@ -384,6 +384,17 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     tl.addWidget(close_btn)
     layout.addWidget(bar)
 
+    # Display-only notice, top-left under the toolbar.
+    notice = QLabel(
+        "Scale is visualisation only: it changes how values are plotted and "
+        "where gates are drawn, never the stored data."
+    )
+    notice.setWordWrap(True)
+    notice.setStyleSheet(
+        "color: #6b7785; padding: 6px 12px 0 12px; font-size: 8.5pt;"
+    )
+    layout.addWidget(notice)
+
     page._scaling_task_def = task_def
     page._scaling_task_id = task_def.get("id")
     page._scaling_locked = locked

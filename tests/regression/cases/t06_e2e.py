@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 import _e2e_helpers as e2e  # noqa: E402
 
+from smage.app import module_host  # noqa: E402
 from smage.app import workflow_tree  # noqa: E402
 from smage.modules.feature import page as feature_page  # noqa: E402
 from smage.modules.scale import page as scale_page  # noqa: E402
@@ -228,6 +229,58 @@ def lock_draft() -> None:
         saved = Project.load(project.path)
         official = saved.workflow["tasks"][0]["children"][0]
         harness.eq(official["params"]["columns"][0]["method"], "linear")
+    finally:
+        _close_window(window)
+
+
+@harness.case("e2e.unlock_clean_draft", "L6", "e2e", tags=("fast", "e2e"))
+def unlock_clean_draft() -> None:
+    """Unlocking an untouched draft keeps the open page instead of reloading."""
+    project = harness.new_project("e2e_unlock_clean", rows=40)
+    parquet = str(project.data_dir / "case.parquet")
+
+    generate = harness.task_def("segmentation", task_id="seg-1",
+                                name="Segmentation")
+    generate["output"] = {"saved": True}
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={"columns": [{"name": "FL1-A", "method": "linear",
+                             "param": None, "min": None, "max": None}],
+                "files": [parquet]},
+        children=[generate],
+    )
+    project.workflow["tasks"][0]["children"].append(scale)
+    project.save()
+
+    window = e2e.open_window(project)
+    try:
+        window._open_module("s-1", "scale", "Scale")
+        harness.pump(300)
+        page = window.tabs.currentWidget()
+        harness.check("s-1" in window._draft_task_ids,
+                      "a locked module opens as a draft")
+
+        with harness.patch_dialogs(
+            module_host, question=QMessageBox.StandardButton.Yes
+        ):
+            window._module_unlock(page)
+        harness.pump(150)
+
+        harness.check(window.tabs.currentWidget() is page,
+                      "a clean draft is unlocked without reloading")
+        harness.check(not hasattr(page, "_draft_task_def"),
+                      "the draft task definition is gone")
+        harness.check("s-1" not in window._draft_task_ids)
+        harness.check("s-1" in window._session_unlocked)
+        task = window._find_task_by_id("s-1")
+        harness.check(page._scaling_task_def is task,
+                      "the page now writes to the real task")
+        harness.check(not window._task_locked(task),
+                      "the module is unlocked for the session")
+        harness.check(
+            not (project.path / "Module" / "s-1" / "draft").exists(),
+            "the empty draft folder is removed",
+        )
     finally:
         _close_window(window)
 

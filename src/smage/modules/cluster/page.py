@@ -285,15 +285,15 @@ def _cluster_center_panel(ctx, page) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Variables</b>"))
+    lay.addWidget(QLabel("<b>Channels</b>"))
     hint = QLabel(
-        "Variables shared by every selected file. All files are clustered "
-        "together, so only common variables can be used."
+        "Channels shared by every selected file. All files are clustered "
+        "together, so only common channels can be used."
     )
     hint.setWordWrap(True)
     hint.setStyleSheet("color: #6b7785;")
     lay.addWidget(hint)
-    vars_btn = QPushButton("Select variables…")
+    vars_btn = QPushButton("Select channels…")
     vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     vars_btn.setEnabled(not page._cluster_locked)
     lay.addWidget(vars_btn)
@@ -465,11 +465,11 @@ def _cluster_right_panel(ctx, page) -> QWidget:
     normalize.setEnabled(not page._cluster_locked)
     lay.addWidget(normalize)
     lay.addWidget(_widgets_panels._param_hint(ctx,
-        "Z-score the variables first, so no channel dominates the distance."
+        "Z-score the channels first, so no channel dominates the distance."
     ))
     page._cluster_normalize = normalize
 
-    lay.addWidget(QLabel("<b>New column name</b>"))
+    lay.addWidget(QLabel("<b>New channel name</b>"))
     name_row = QWidget()
     nh = QHBoxLayout(name_row)
     nh.setContentsMargins(0, 0, 0, 0)
@@ -477,7 +477,7 @@ def _cluster_right_panel(ctx, page) -> QWidget:
     name_edit = QLineEdit()
     nh.addWidget(name_edit, 1)
     warn = QLabel("⚠")
-    warn.setToolTip("Duplicate column name")
+    warn.setToolTip("Duplicate channel name")
     warn.setStyleSheet("color: #b58900; font-weight: bold;")
     nh.addWidget(warn)
     lay.addWidget(name_row)
@@ -627,14 +627,14 @@ def _cluster_select_vars(ctx, page) -> None:
     options = _cluster_common_columns(ctx, page)
     if not options:
         QMessageBox.information(
-            ctx.host, "Select variables", "Select data files first."
+            ctx.host, "Select channels", "Select data files first."
         )
         return
     chosen = _widgets_picker._pick_items_dialog(ctx,
-        "Select variables",
+        "Select channels",
         options,
         page._cluster_params.get("columns") or [],
-        "Filter variables...",
+        "Filter channels...",
     )
     if chosen is None:
         return
@@ -775,7 +775,7 @@ def _cluster_refresh(ctx, page) -> None:
         page._cluster_vars_box.clear()
         for c in columns:
             page._cluster_vars_box.addItem(str(c))
-        page._cluster_vars_count.setText(f"{len(columns)} variable(s) selected")
+        page._cluster_vars_count.setText(f"{len(columns)} channel(s) selected")
     finally:
         page._cluster_updating = False
     _cluster_update_name(ctx, page)
@@ -786,12 +786,12 @@ def _cluster_validate(ctx, page):
     if not params.get("files"):
         return False, "Select at least one data file."
     if not params.get("columns"):
-        return False, "Select at least one variable."
+        return False, "Select at least one channel."
     name = (params.get("name") or "").strip()
     if not name:
-        return False, "Set the new column name."
+        return False, "Set the new channel name."
     if _cluster_name_conflict(ctx, page):
-        return False, "The new column name collides with an existing column."
+        return False, "The new channel name collides with an existing column."
     return True, ""
 
 
@@ -973,7 +973,7 @@ def _cluster_run(ctx, page, q):
             q.put(("status", f"Reading {i + 1}/{n_files} ({25 * (i + 1) // n_files}%)"))
             values = _data_columns._column_data(ctx, page._cluster_task_id, path, columns)
             if any(c not in values for c in columns):
-                raise ValueError(f"{name} is missing a column")
+                raise ValueError(f"{name} is missing a channel")
             X = np.column_stack([values[c] for c in columns]).astype("float64")
             n_vis = len(X)
             total_before += n_vis
@@ -1000,7 +1000,7 @@ def _cluster_run(ctx, page, q):
         if not parts:
             raise ValueError("no data to cluster")
         X = np.vstack(parts)
-        q.put(("log", f"Combined {X.shape[0]} row(s) × {X.shape[1]} variable(s)"))
+        q.put(("log", f"Combined {X.shape[0]} row(s) × {X.shape[1]} channel(s)"))
         if max_events > 0 and total_after < total_before:
             q.put(("log", f"Downsampled {total_before:,} → {total_after:,} points "
                           f"(max {max_events:,} per file)"))
@@ -1056,7 +1056,7 @@ def _cluster_run(ctx, page, q):
                     params, path, page._cluster_task_id
                 ),
             }
-            q.put(("log", f"✓ {name} → {Path(rel).name} ({len(cols)} column)"))
+            q.put(("log", f"✓ {name} → {Path(rel).name} ({len(cols)} channel)"))
         q.put(("done", outputs, len(outputs), failed))
     except Exception as exc:  # noqa: BLE001
         q.put(("error", str(exc)))

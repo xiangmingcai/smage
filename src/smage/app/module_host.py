@@ -407,6 +407,21 @@ class ModuleHostMixin:
         task_type = task.get("type")
         index = self.tabs.indexOf(page)
         title = self.tabs.tabText(index) if index > 0 else name
+        state = (self._module_registry.get(str(task_id)) or {}).get("state")
+        if (
+            getattr(page, "_draft_task_def", None) is not None
+            and state == MODULE_STATE_UNMODIFIED
+            and self._draft_folder_is_clean(task_id)
+        ):
+            # Nothing was edited while the module was locked, so the draft is
+            # identical to the saved state: keep the open page instead of
+            # paying the full reload (several seconds for large modules).
+            self._unlock_in_place(page, task, task_id)
+            runlog.action(
+                "module.unlock", id=str(task_id or ""),
+                type=str(task_type or ""), reload=False,
+            )
+            return
         # Closing the draft discards Module/<id>/draft and stops its workers.
         self._close_module_page(page)
         self._session_unlocked.add(str(task_id))
@@ -416,8 +431,83 @@ class ModuleHostMixin:
             self.tabs.tabBar().moveTab(new_index, index)
         runlog.action(
             "module.unlock", id=str(task_id or ""),
-            type=str(task_type or ""),
+            type=str(task_type or ""), reload=True,
         )
+
+    def _draft_folder_is_clean(self, task_id) -> bool:
+        """True when the draft folder holds only the seeded state files.
+
+        A page may write to its draft folder while merely being open (for
+        example a preview cache); in that case adopting the draft as the real
+        module could leave stale files, so the reload path is used instead.
+        """
+        if self.project is None:
+            return True
+        folder = self.project.path / "Module" / str(task_id) / "draft"
+        if not folder.is_dir():
+            return True
+        seeded = {"gates.json", "heatmap.json"}
+        for path in folder.rglob("*"):
+            if path.is_file() and path.name not in seeded:
+                return False
+        return True
+
+    def _unlock_in_place(self, page, task, task_id) -> None:
+        """Turn a clean draft page into a normal session-unlocked page.
+
+        The draft was built on a deep copy of the task; with no edits, the
+        copy is identical to the saved task, so the page can keep running.
+        Its task/parameter references are pointed at the real task, the
+        draft-only Save guard and badges are removed, and the leftover draft
+        folder is deleted.
+        """
+        draft = getattr(page, "_draft_task_def", None)
+        if isinstance(draft, dict):
+            if isinstance(draft.get("params"), dict):
+                task["params"] = draft["params"]
+            if "output" in draft:
+                task["output"] = draft["output"]
+            for attr, value in list(vars(page).items()):
+                if value is draft:
+                    setattr(page, attr, task)
+        if hasattr(page, "_draft_task_def"):
+            try:
+                delattr(page, "_draft_task_def")
+            except AttributeError:
+                pass
+
+        # Remove the draft Save guards and restore a neutral tooltip.
+        guards = list(getattr(page, "_draft_save_guards", ()))
+        save_buttons = [
+            button for button in page.findChildren(QPushButton)
+            if button.text().strip() == "Save"
+        ]
+        for guard in guards:
+            for button in save_buttons:
+                button.removeEventFilter(guard)
+            guard.deleteLater()
+        page._draft_save_guards = []
+        for button in save_buttons:
+            button.setToolTip("")
+
+        for label in page.findChildren(QLabel):
+            if label.text() in ("Temporary draft", "Draft (locked)"):
+                label.deleteLater()
+
+        unlock_btn = getattr(page, "_unlock_btn", None)
+        if unlock_btn is not None:
+            unlock_btn.deleteLater()
+            page._unlock_btn = None
+
+        self._draft_task_ids.discard(str(task_id))
+        if self.project is not None:
+            shutil.rmtree(
+                self.project.path / "Module" / str(task_id) / "draft",
+                ignore_errors=True,
+            )
+        self._session_unlocked.add(str(task_id))
+        self._add_session_badge(page)
+        self._refresh_workflow_tree()
 
     def _module_saved(self, page) -> None:
         """Mark a module as saved and push updates to its open downstream modules."""

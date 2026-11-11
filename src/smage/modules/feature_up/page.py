@@ -177,7 +177,7 @@ def _fup_files_panel(ctx, page) -> QWidget:
     lay.setSpacing(6)
 
     lay.addWidget(QLabel("<b>From Files</b>"))
-    hint_from = QLabel("The new (aggregated) files whose columns are mapped across.")
+    hint_from = QLabel("The new (aggregated) files whose channels are mapped across.")
     hint_from.setWordWrap(True)
     hint_from.setStyleSheet("color: #6b7785;")
     lay.addWidget(hint_from)
@@ -194,7 +194,7 @@ def _fup_files_panel(ctx, page) -> QWidget:
     page._fup_from_box = from_box
 
     lay.addWidget(QLabel("<b>To Files</b>"))
-    hint_to = QLabel("The old (target) files that will receive the new columns.")
+    hint_to = QLabel("The old (target) files that will receive the new channels.")
     hint_to.setWordWrap(True)
     hint_to.setStyleSheet("color: #6b7785;")
     lay.addWidget(hint_to)
@@ -282,8 +282,8 @@ def _fup_features_panel(ctx, page) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Features to map</b>"))
-    select_btn = QPushButton("Select features…")
+    lay.addWidget(QLabel("<b>Channels to map</b>"))
+    select_btn = QPushButton("Select channels…")
     select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     select_btn.setEnabled(not page._fup_locked)
     lay.addWidget(select_btn)
@@ -291,7 +291,7 @@ def _fup_features_panel(ctx, page) -> QWidget:
     table = QTableWidget()
     table.setColumnCount(2)
     table.setHorizontalHeaderLabels(
-        ["Feature in From Files", "New name in To Files"]
+        ["Channel in From File", "New name in To Files"]
     )
     header = table.horizontalHeader()
     header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -408,13 +408,13 @@ def _fup_select_files(ctx, page, which) -> None:
 def _fup_select_features(ctx, page) -> None:
     from_cols = _fup_common_columns(ctx, page, "from_files")
     if not from_cols:
-        QMessageBox.information(ctx.host, "Features", "Select From files first.")
+        QMessageBox.information(ctx.host, "Channels", "Select From files first.")
         return
     key_from = page._fup_params.get("key_from")
     options = [c for c in from_cols if c != key_from]
     existing = [f.get("source") for f in page._fup_params.get("features") or []]
     chosen = _widgets_picker._pick_items_dialog(ctx,
-        "Select features", options, existing, "Filter columns..."
+        "Select channels", options, existing, "Filter channels..."
     )
     if chosen is None:
         return
@@ -465,7 +465,7 @@ def _fup_rebuild_features(ctx, page) -> None:
         name_edit = QLineEdit(str(feat.get("name") or ""))
         name_edit.setEnabled(enabled)
         warn = QLabel("⚠")
-        warn.setToolTip("Duplicate column name")
+        warn.setToolTip("Duplicate channel name")
         warn.setStyleSheet("color: #b58900; font-weight: bold;")
 
         def on_name(text, f=feat, warn_label=warn):
@@ -723,7 +723,7 @@ def _fup_validate(ctx, page):
         return False, "Choose a key column for both From and To files."
     features = params.get("features") or []
     if not features:
-        return False, "Select at least one feature to map."
+        return False, "Select at least one channel to map."
     from_common = set(_fup_common_columns(ctx, page, "from_files"))
     to_common = set(_fup_common_columns(ctx, page, "to_files"))
     if params.get("key_from") not in from_common:
@@ -732,10 +732,10 @@ def _fup_validate(ctx, page):
         return False, f"Key '{params['key_to']}' is not in every To file."
     for feat in features:
         if feat.get("source") not in from_common:
-            return False, f"Feature '{feat.get('source')}' is not in every From file."
+            return False, f"Channel '{feat.get('source')}' is not in every From file."
     names = [(feat.get("name") or "").strip() for feat in features]
     if any(not n for n in names):
-        return False, "Give every mapped feature a new column name."
+        return False, "Give every mapped channel a new column name."
     if len(names) != len(set(names)):
         return False, "New column names must be unique."
     existing = _fup_existing_columns(ctx, page)
@@ -810,7 +810,7 @@ def _fup_calculate(ctx, page) -> None:
             }
             done += 1
             _fup_log(ctx,
-                page, f"✓ {name} → {Path(rel).name} ({len(columns)} column(s))"
+                page, f"✓ {name} → {Path(rel).name} ({len(columns)} channel(s))"
             )
     finally:
         QApplication.restoreOverrideCursor()

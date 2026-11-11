@@ -932,15 +932,15 @@ def _heatmap_variables_panel(ctx, page) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Variables (columns)</b>"))
+    lay.addWidget(QLabel("<b>Channels</b>"))
     hint = QLabel(
-        "Columns shared by every selected file. Drag columns to change "
+        "Channels shared by every selected file. Drag channels to change "
         "their order."
     )
     hint.setWordWrap(True)
     hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
     lay.addWidget(hint)
-    vars_btn = QPushButton("Select variables…")
+    vars_btn = QPushButton("Select channels…")
     vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     vars_btn.setEnabled(not page._heatmap_locked)
     vars_btn.clicked.connect(
@@ -954,7 +954,7 @@ def _heatmap_variables_panel(ctx, page) -> QWidget:
     box.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
     box.setDefaultDropAction(Qt.DropAction.MoveAction)
     box.setDragEnabled(not page._heatmap_locked)
-    box.setToolTip("Drag columns to change their order")
+    box.setToolTip("Drag channels to change their order")
     box.model().rowsMoved.connect(
         lambda *a: _heatmap_on_order(ctx, page, "variables", box)
     )
@@ -1415,14 +1415,14 @@ def _heatmap_select_variables(ctx, page) -> None:
     columns = _heatmap_common_columns(ctx, page)
     if not columns:
         QMessageBox.information(
-            ctx.host, "Select variables",
-            "Select data files with common columns first.",
+            ctx.host, "Select channels",
+            "Select data files with common channels first.",
         )
         return
     chosen = _widgets_picker._pick_items_dialog(ctx,
-        "Select variables", columns,
+        "Select channels", columns,
         page._heatmap_params.get("variables") or [],
-        "Filter variables...", reorder=True,
+        "Filter channels...", reorder=True,
     )
     if chosen is None:
         return
@@ -1434,10 +1434,17 @@ def _heatmap_select_variables(ctx, page) -> None:
 def _heatmap_on_order(ctx, page, key, box) -> None:
     if page._heatmap_syncing:
         return
-    values = [
-        box.item(i).data(Qt.ItemDataRole.UserRole)
-        for i in range(box.count())
-    ]
+    values = []
+    for i in range(box.count()):
+        item = box.item(i)
+        value = item.data(Qt.ItemDataRole.UserRole)
+        if not value and key != "gates":
+            # A drag-and-drop move can lose the custom role while the row
+            # text survives; recover the channel instead of dropping it.
+            value = item.text()
+            if value:
+                item.setData(Qt.ItemDataRole.UserRole, value)
+        values.append(value)
     if key == "gates":
         by_key = {
             f"{g.get('task')}|{g.get('id')}": g
@@ -1533,7 +1540,7 @@ def _heatmap_refresh(ctx, page) -> None:
         f"{len(params['gates'])} gate(s)"
     )
     page._heatmap_vars_count.setText(
-        f"{len(params['variables'])} variable(s)"
+        f"{len(params['variables'])} channel(s)"
     )
 
     _heatmap_sync_sampling_controls(ctx, page)
@@ -1694,7 +1701,7 @@ def _heatmap_calculate(ctx, page) -> None:
         return
     if not params.get("variables"):
         QMessageBox.warning(
-            ctx.host, "Calculate", "Select at least one variable."
+            ctx.host, "Calculate", "Select at least one channel."
         )
         return
     sampling = params.get("sampling") or {}
@@ -2046,7 +2053,7 @@ def _heatmap_apply_result(ctx, page, payload) -> None:
     files = len(payload.get("files") or [])
     _heatmap_log(ctx,
         page,
-        f"✓ {gates} gates × {variables} variables "
+        f"✓ {gates} gates × {variables} channels "
         f"({files} files, {payload.get('seconds', 0):.2f} s)",
     )
     _heatmap_log(ctx, page, "Matrix saved to the module folder.")

@@ -466,10 +466,10 @@ def _gating_render(ctx, page) -> None:
         active, context,
     )
     preserved = None
-    if (
-        active and plot_type != "image"
-        and getattr(page, "_gating_render_key", None) == render_key
-    ):
+    same_view = getattr(page, "_gating_render_key", None) == render_key
+    # Image views keep their zoom across re-renders (the extent is fixed by
+    # the image); scatter views only restore the range for a subset view.
+    if same_view and (plot_type == "image" or active):
         preserved = viewbox.viewRange()
     page._gating_render_key = render_key
 

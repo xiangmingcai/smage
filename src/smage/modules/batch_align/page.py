@@ -351,15 +351,15 @@ def _ba_center_panel(ctx, page) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Variables</b>"))
+    lay.addWidget(QLabel("<b>Channels</b>"))
     hint = QLabel(
-        "Variables shared by every selected file. These are the columns "
-        "that get aligned; other columns pass through unchanged."
+        "Channels shared by every selected file. These are the channels "
+        "that get aligned; other channels pass through unchanged."
     )
     hint.setWordWrap(True)
     hint.setStyleSheet("color: #6b7785;")
     lay.addWidget(hint)
-    vars_btn = QPushButton("Select variables…")
+    vars_btn = QPushButton("Select channels…")
     vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     vars_btn.setEnabled(not page._ba_locked)
     lay.addWidget(vars_btn)
@@ -587,13 +587,13 @@ def _ba_select_vars(ctx, page) -> None:
     ]
     if not options:
         QMessageBox.information(
-            ctx.host, "Select variables",
-            "Select data files with common columns first."
+            ctx.host, "Select channels",
+            "Select data files with common channels first."
         )
         return
     chosen = _widgets_picker._pick_items_dialog(ctx,
-        "Select variables", options,
-        page._ba_params.get("columns") or [], "Filter variables...",
+        "Select channels", options,
+        page._ba_params.get("columns") or [], "Filter channels...",
     )
     if chosen is None:
         return
@@ -887,7 +887,7 @@ def _ba_refresh(ctx, page) -> None:
         page._ba_vars_box.clear()
         for column in columns:
             page._ba_vars_box.addItem(str(column))
-        page._ba_vars_count.setText(f"{len(columns)} variable(s) selected")
+        page._ba_vars_count.setText(f"{len(columns)} channel(s) selected")
     finally:
         page._ba_updating = False
     _ba_paint_table(ctx, page)
@@ -899,7 +899,7 @@ def _ba_validate(ctx, page):
     if not params.get("files"):
         return False, "Select at least one data file."
     if not params.get("columns"):
-        return False, "Select at least one variable to align."
+        return False, "Select at least one channel to align."
     batches = params.get("batches") or {}
     missing = [
         _data_naming._comp_file_name(ctx, path, page._ba_task_id)
@@ -1862,7 +1862,7 @@ def _ba_write_report(ctx, page, payload):
         f"<div class='muted'>Module: {page._ba_task_id} · "
         f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>",
         f"<p><b>Method:</b> {method_line}<br>",
-        f"<b>Variables ({len(columns)}):</b> {', '.join(columns)}</p>",
+        f"<b>Channels ({len(columns)}):</b> {', '.join(columns)}</p>",
         "<h2>1 · Batch spread per channel</h2>",
         "<p class='muted'>Largest difference between a batch median and the "
         "median across batches, before and after correction. "

@@ -259,7 +259,7 @@ def _build_unmix_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._unmix_spectrum_timer = QTimer(ctx.host)
     page._unmix_spectrum_timer.setSingleShot(True)
     page._unmix_spectrum_timer.timeout.connect(
-        lambda: _unmix_refresh_outputs(ctx, page)
+        lambda: _unmix_start_spectrum_refresh(ctx, page)
     )
     # Debounced apply of a signature-table row drag.
     page._unmix_sig_order_timer = QTimer(ctx.host)
@@ -275,6 +275,10 @@ def _build_unmix_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
         ]
     # Per-spectrum value cache, cleared whenever anything changes.
     page._unmix_spectrum_cache = {}
+    # Guards the cross-thread column cache used by background spectrum
+    # recomputation (gate edits).
+    if getattr(ctx, "_unmix_column_lock", None) is None:
+        ctx._unmix_column_lock = threading.Lock()
 
     tabs = QTabWidget()
     tabs.addTab(_unmix_extraction_subpage(ctx, page), "Spectrum Extraction")
@@ -522,22 +526,40 @@ def _unmix_on_gating_dirty(ctx, page, holder) -> None:
     """A gate tree changed: mark the module dirty and refresh its spectrum."""
     if page._unmix_locked:
         return
-    _unmix_mark_dirty(ctx, page)
+    tree = _unmix_tree_for_holder(ctx, page, holder)
+    if tree is None:
+        _unmix_mark_dirty(ctx, page, data=False)
+        return
+    # Gate edits only change the spectra that read this tree; keep the
+    # vectors of the other spectra cached.
+    cache = getattr(page, "_unmix_spectrum_cache", None)
+    if cache is not None:
+        for spectrum in page._unmix_spectra:
+            if spectrum.get("tree_id") == tree["id"]:
+                cache.pop(spectrum["id"], None)
+    # Any in-flight background result is now stale.
+    page._unmix_spectrum_gen = getattr(page, "_unmix_spectrum_gen", 0) + 1
+    _unmix_mark_dirty(ctx, page, data=False)
     # If the displayed spectrum comes from this tree, recompute it soon.
     spectrum = page._unmix_active_spectrum
-    if spectrum is None:
-        return
-    tree = _unmix_tree_for_holder(ctx, page, holder)
-    if tree is not None and tree["id"] == spectrum.get("tree_id"):
+    if spectrum is not None and spectrum.get("tree_id") == tree["id"]:
         page._unmix_spectrum_timer.start(250)
 
 
 def _unmix_cleanup(ctx, page) -> None:
     """Stop every embedded gate tree (workers and timers)."""
-    for name in ("_unmix_spectrum_timer", "_unmix_sig_order_timer"):
+    for name in (
+        "_unmix_spectrum_timer", "_unmix_sig_order_timer",
+        "_unmix_spectrum_poll_timer",
+    ):
         timer = getattr(page, name, None)
         if timer is not None:
             timer.stop()
+    # Discard any result a background spectrum worker still posts.
+    page._unmix_spectrum_gen = getattr(page, "_unmix_spectrum_gen", 0) + 1
+    page._unmix_spectrum_queue = None
+    # Release the column arrays cached for fast gate edits.
+    ctx._unmix_column_cache = {}
     for tree in list(page._unmix_trees):
         if tree.get("holder") is not None:
             _widgets_gate_editor_editor._gating_cleanup(ctx, tree["holder"])
@@ -1189,6 +1211,43 @@ def _unmix_spectrum_arrays(ctx, page, spectrum):
     )
 
 
+_UNMIX_COLUMN_CACHE_ENTRIES = 2
+
+
+def _unmix_cached_columns(ctx, task_id, parquet, names):
+    """Column values for a gate tree, cached across gate moves.
+
+    Moving a gate changes the mask, not the channel values, so re-reading a
+    multi-million-row parquet on every release is wasted work. The cache is
+    keyed by the pipeline revision, the file and the column set, and keeps
+    at most two entries so a large image does not pin unbounded memory.
+    """
+    key = (task_id, str(parquet), tuple(sorted(names)))
+    revision = getattr(ctx, "_stages_revision", 0)
+    lock = getattr(ctx, "_unmix_column_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        ctx._unmix_column_lock = lock
+    with lock:
+        cache = getattr(ctx, "_unmix_column_cache", None)
+        if (
+            cache is None
+            or getattr(ctx, "_unmix_column_revision", None) != revision
+        ):
+            cache = {}
+            ctx._unmix_column_cache = cache
+            ctx._unmix_column_revision = revision
+        cached = cache.get(key)
+    if cached is not None:
+        return cached
+    data = _data_columns._column_data(ctx, task_id, parquet, list(names))
+    with lock:
+        cache[key] = data
+        while len(cache) > _UNMIX_COLUMN_CACHE_ENTRIES:
+            cache.pop(next(iter(cache)))
+    return data
+
+
 def _unmix_spectrum_arrays_for(ctx, task_id, params, spectrum, columns, trees=None):
     """Return (names, arrays, error) for a spectrum from task parameters.
 
@@ -1219,7 +1278,12 @@ def _unmix_spectrum_arrays_for(ctx, task_id, params, spectrum, columns, trees=No
     needed = set()
     for g in gates:
         needed |= _gate_needed_columns(g, by_id)
-    gate_values = _data_columns._column_data(ctx, task_id, parquet, list(needed))
+    # One read serves both the gate mask and the spectrum columns.
+    wanted = sorted(needed | set(columns))
+    all_values = _unmix_cached_columns(ctx, task_id, parquet, wanted)
+    gate_values = {
+        name: all_values[name] for name in needed if name in all_values
+    }
     try:
         mask = _compute_gate_filter_mask(
             gates, gate["id"], parquet, {},
@@ -1230,7 +1294,7 @@ def _unmix_spectrum_arrays_for(ctx, task_id, params, spectrum, columns, trees=No
     if mask is None:
         return None, None, "Could not compute the gate (missing parameters)."
 
-    data = _data_columns._column_data(ctx, task_id, parquet, columns)
+    data = all_values
     names = [p for p in columns if p in data]
     if not names:
         return None, None, "No parameters selected."
@@ -1254,12 +1318,18 @@ def _unmix_spectrum_values(ctx, page, spectrum):
     heatmap of the gated subset and `y_range` is the raw value range the
     heatmap spans.
     """
-    import numpy as np
-
     names, arrays, error = _unmix_spectrum_arrays(ctx, page, spectrum)
     if error:
         return None, None, None, None, error
     stat = page._unmix_spectrum_cfg.get("stat", "median")
+    names, values, hist, y_range = _unmix_values_from_arrays(names, arrays, stat)
+    return names, values, hist, y_range, None
+
+
+def _unmix_values_from_arrays(names, arrays, stat: str):
+    """Reduce the gated arrays to per-channel statistics and a heatmap."""
+    import numpy as np
+
     values = []
     for arr in arrays:
         if arr.size == 0:
@@ -1293,18 +1363,106 @@ def _unmix_spectrum_values(ctx, page, spectrum):
         peak = counts.max()
         if peak > 0:
             hist[:, i] = (counts / float(peak)).astype("float32")
-    return names, values, hist, (lo, hi), None
+    return names, values, hist, (lo, hi)
+
+
+def _unmix_start_spectrum_refresh(ctx, page) -> None:
+    """Recompute the active spectrum off the UI thread after gate edits."""
+    spectrum = page._unmix_active_spectrum
+    if spectrum is None:
+        _unmix_refresh_outputs(ctx, page)
+        return
+    cfg = page._unmix_spectrum_cfg
+    ordered = _unmix_sync_spectrum_params(ctx, page)
+    enabled = set(cfg.get("enabled") or [])
+    columns = [p for p in ordered if p in enabled]
+    trees = [
+        {"id": t["id"], "params": copy.deepcopy(t["store"].get("params", {}))}
+        for t in page._unmix_trees
+    ]
+    page._unmix_spectrum_gen = getattr(page, "_unmix_spectrum_gen", 0) + 1
+    gen = page._unmix_spectrum_gen
+    q = queue.Queue()
+    page._unmix_spectrum_queue = q
+    thread = threading.Thread(
+        target=_unmix_spectrum_worker,
+        args=(ctx, page._unmix_task_id, q, gen, copy.deepcopy(spectrum),
+              columns, trees, cfg.get("stat", "median")),
+        daemon=True,
+    )
+    page._unmix_spectrum_thread = thread
+    thread.start()
+    timer = getattr(page, "_unmix_spectrum_poll_timer", None)
+    if timer is None:
+        timer = QTimer(ctx.host)
+        timer.setInterval(100)
+        timer.timeout.connect(lambda: _unmix_poll_spectrum(ctx, page))
+        page._unmix_spectrum_poll_timer = timer
+    timer.start()
+
+
+def _unmix_spectrum_worker(ctx, task_id, q, gen, spectrum, columns, trees,
+                           stat) -> None:
+    """Background: gate mask, masked channel values and statistics."""
+    try:
+        names, arrays, error = _unmix_spectrum_arrays_for(
+            ctx, task_id, {}, spectrum, columns, trees=trees
+        )
+        if error:
+            q.put(("done", gen, spectrum.get("id"), None, error))
+            return
+        names, values, hist, y_range = _unmix_values_from_arrays(
+            names, arrays, stat
+        )
+        q.put(("done", gen, spectrum.get("id"),
+               (names, values, hist, y_range), None))
+    except Exception as exc:  # noqa: BLE001
+        q.put(("done", gen, spectrum.get("id"), None, str(exc)))
+
+
+def _unmix_poll_spectrum(ctx, page) -> None:
+    """Apply a background spectrum result on the UI thread."""
+    q = getattr(page, "_unmix_spectrum_queue", None)
+    if q is None:
+        return
+    msg = None
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+    if msg is None:
+        return
+    timer = getattr(page, "_unmix_spectrum_poll_timer", None)
+    if timer is not None:
+        timer.stop()
+    page._unmix_spectrum_queue = None
+    _kind, gen, spectrum_id, payload, error = msg
+    if gen != getattr(page, "_unmix_spectrum_gen", 0):
+        return
+    spectrum = page._unmix_active_spectrum
+    if spectrum is None or spectrum.get("id") != spectrum_id:
+        return
+    if error:
+        _unmix_show_spectrum_error(ctx, page, error)
+        return
+    names, values, hist, y_range = payload
+    cache = getattr(page, "_unmix_spectrum_cache", None)
+    if cache is None:
+        cache = {}
+        page._unmix_spectrum_cache = cache
+    cache[spectrum_id] = dict(zip(names, values))
+    _unmix_paint_spectrum(ctx, page, spectrum, names, values, hist, y_range)
+    _unmix_refresh_matrix_views(ctx, page)
 
 
 def _unmix_render_spectrum_plot(ctx, page) -> None:
-    import numpy as np
-
-    plot_widget = page._unmix_spectrum_plot
-    plot_item = plot_widget.getPlotItem()
-    plot_item.clear()
-    axis = plot_item.getAxis("bottom")
+    """Compute and draw the active spectrum (synchronous path)."""
+    plot_item = page._unmix_spectrum_plot.getPlotItem()
     spectrum = page._unmix_active_spectrum
     if spectrum is None:
+        plot_item.clear()
+        axis = plot_item.getAxis("bottom")
         axis.setTicks(None)
         axis.setHeight(None)
         plot_item.setTitle("")
@@ -1313,10 +1471,29 @@ def _unmix_render_spectrum_plot(ctx, page) -> None:
         page, spectrum
     )
     if error:
-        axis.setTicks(None)
-        axis.setHeight(None)
-        plot_item.setTitle(f"<span style='color:#b00000'>{error}</span>")
+        _unmix_show_spectrum_error(ctx, page, error)
         return
+    _unmix_paint_spectrum(ctx, page, spectrum, names, values, hist, y_range)
+
+
+def _unmix_show_spectrum_error(ctx, page, error) -> None:
+    """Show a computation error in place of the spectrum plot."""
+    plot_item = page._unmix_spectrum_plot.getPlotItem()
+    plot_item.clear()
+    axis = plot_item.getAxis("bottom")
+    axis.setTicks(None)
+    axis.setHeight(None)
+    plot_item.setTitle(f"<span style='color:#b00000'>{error}</span>")
+
+
+def _unmix_paint_spectrum(ctx, page, spectrum, names, values, hist,
+                          y_range) -> None:
+    """Draw precomputed spectrum values and their distribution heatmap."""
+    import numpy as np
+
+    plot_item = page._unmix_spectrum_plot.getPlotItem()
+    plot_item.clear()
+    axis = plot_item.getAxis("bottom")
     cfg = page._unmix_spectrum_cfg
     plot_item.setTitle(spectrum.get("name", ""))
     xs = list(range(len(names)))
@@ -1573,8 +1750,8 @@ def _unmix_matrix_panel(ctx, page) -> QWidget:
 
     tabs = QTabWidget()
     tabs.setDocumentMode(True)
-    tabs.addTab(_unmix_matrix_tab_page(ctx, page), "Spectral matrix")
-    tabs.addTab(_unmix_curve_tab_page(ctx, page), "Spectral curve")
+    tabs.addTab(_unmix_matrix_tab_page(ctx, page), "Signature matrix")
+    tabs.addTab(_unmix_curve_tab_page(ctx, page), "Signature curves")
     tabs.addTab(_unmix_similarity_tab_page(ctx, page), "Similarity matrix")
     lay.addWidget(tabs, 1)
 
@@ -2103,7 +2280,7 @@ def _unmix_signature_panel(ctx, page) -> QWidget:
     table = QTableWidget()
     table.setColumnCount(4)
     table.setHorizontalHeaderLabels(
-        ["Positive signature", "Negative signature", "Normalize", "Name"]
+        ["Positive spectrum", "Negative spectrum", "Normalize", "Name"]
     )
     table.setStyleSheet(
         "QTableWidget { background: #ffffff; border: none; }"
@@ -2149,27 +2326,22 @@ def _unmix_sample_panel(ctx, page) -> QWidget:
     head = QHBoxLayout()
     head.addWidget(QLabel("<b>Samples to be unmixed</b>"))
     head.addStretch()
-    all_btn = QPushButton("All")
-    none_btn = QPushButton("None")
-    for btn in (all_btn, none_btn):
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setFixedWidth(56)
-        btn.setEnabled(not page._unmix_locked)
-    all_btn.clicked.connect(lambda _=False: _unmix_set_all_samples(ctx, page, True))
-    none_btn.clicked.connect(
-        lambda _=False: _unmix_set_all_samples(ctx, page, False)
-    )
-    head.addWidget(all_btn)
-    head.addWidget(none_btn)
     lay.addLayout(head)
+
+    select_btn = QPushButton("Select files…")
+    select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    select_btn.setEnabled(not page._unmix_locked)
+    select_btn.clicked.connect(
+        lambda _=False: _unmix_select_samples(ctx, page)
+    )
+    lay.addWidget(select_btn)
 
     samples_list = QListWidget()
     samples_list.setStyleSheet(
         "QListWidget { background: #ffffff; border: none; }"
     )
-    samples_list.setEnabled(not page._unmix_locked)
-    samples_list.itemChanged.connect(
-        lambda _item: _unmix_on_samples_changed(ctx, page)
+    samples_list.setSelectionMode(
+        QAbstractItemView.SelectionMode.NoSelection
     )
     page._unmix_samples_list = samples_list
     lay.addWidget(samples_list, 1)
@@ -2232,72 +2404,78 @@ def _unmix_rebuild_signature_table(ctx, page) -> None:
     table.setRowCount(0)
     table.setRowCount(len(rows))
     for i, row in enumerate(rows):
-        pos_combo = _NoWheelComboBox()
-        for spectrum in spectra:
-            pos_combo.addItem(spectrum["name"], spectrum["id"])
-        index = pos_combo.findData(row.get("positive"))
-        pos_combo.setCurrentIndex(index if index >= 0 else 0)
-        pos_combo.setEnabled(editable)
-
-        neg_combo = _NoWheelComboBox()
-        neg_combo.addItem("NA", None)
-        for spectrum in spectra:
-            neg_combo.addItem(spectrum["name"], spectrum["id"])
-        index = neg_combo.findData(row.get("negative"))
-        neg_combo.setCurrentIndex(index if index >= 0 else 0)
-        neg_combo.setEnabled(editable)
-
-        norm_box = QCheckBox()
-        norm_box.setChecked(bool(row.get("normalize", True)))
-        norm_box.setEnabled(editable)
-        norm_host = QWidget()
-        norm_lay = QHBoxLayout(norm_host)
-        norm_lay.setContentsMargins(0, 0, 0, 0)
-        norm_lay.addStretch()
-        norm_lay.addWidget(norm_box)
-        norm_lay.addStretch()
-
-        name_edit = QLineEdit(row.get("name", ""))
-        name_edit.setEnabled(editable)
-
-        pos_combo.currentIndexChanged.connect(
-            lambda _=0, r=row, c=pos_combo: _unmix_on_signature_field(ctx,
-                page, r, "positive", c.currentData()
-            )
-        )
-        neg_combo.currentIndexChanged.connect(
-            lambda _=0, r=row, c=neg_combo: _unmix_on_signature_field(ctx,
-                page, r, "negative", c.currentData()
-            )
-        )
-        norm_box.toggled.connect(
-            lambda checked, r=row: _unmix_on_signature_field(ctx,
-                page, r, "normalize", bool(checked)
-            )
-        )
-        name_edit.editingFinished.connect(
-            lambda r=row, e=name_edit: _unmix_set_signature_name(ctx,
-                page, r, e
-            )
-        )
-        # Cell widgets swallow the table's context menu, so each one gets
-        # its own "Remove signature" entry.
-        for widget in (pos_combo, neg_combo, norm_box, norm_host, name_edit):
-            widget.setContextMenuPolicy(
-                Qt.ContextMenuPolicy.CustomContextMenu
-            )
-            widget.customContextMenuRequested.connect(
-                lambda pos, w=widget, r=row: _unmix_signature_widget_menu(ctx,
-                    page, r, w, pos
-                )
-            )
-
-        table.setCellWidget(i, 0, pos_combo)
-        table.setCellWidget(i, 1, neg_combo)
-        table.setCellWidget(i, 2, norm_host)
-        table.setCellWidget(i, 3, name_edit)
+        _unmix_fill_signature_row(ctx, page, table, i, row, spectra, editable)
     table.setVerticalHeaderLabels([r.get("name", "") for r in rows])
     table.resizeRowsToContents()
+
+
+def _unmix_fill_signature_row(ctx, page, table, i, row, spectra,
+                              editable) -> None:
+    """Build the widgets of one signature row (combo, combo, tick, name)."""
+    pos_combo = _NoWheelComboBox()
+    for spectrum in spectra:
+        pos_combo.addItem(spectrum["name"], spectrum["id"])
+    index = pos_combo.findData(row.get("positive"))
+    pos_combo.setCurrentIndex(index if index >= 0 else 0)
+    pos_combo.setEnabled(editable)
+
+    neg_combo = _NoWheelComboBox()
+    neg_combo.addItem("NA", None)
+    for spectrum in spectra:
+        neg_combo.addItem(spectrum["name"], spectrum["id"])
+    index = neg_combo.findData(row.get("negative"))
+    neg_combo.setCurrentIndex(index if index >= 0 else 0)
+    neg_combo.setEnabled(editable)
+
+    norm_box = QCheckBox()
+    norm_box.setChecked(bool(row.get("normalize", True)))
+    norm_box.setEnabled(editable)
+    norm_host = QWidget()
+    norm_lay = QHBoxLayout(norm_host)
+    norm_lay.setContentsMargins(0, 0, 0, 0)
+    norm_lay.addStretch()
+    norm_lay.addWidget(norm_box)
+    norm_lay.addStretch()
+
+    name_edit = QLineEdit(row.get("name", ""))
+    name_edit.setEnabled(editable)
+
+    pos_combo.currentIndexChanged.connect(
+        lambda _=0, r=row, c=pos_combo: _unmix_on_signature_field(ctx,
+            page, r, "positive", c.currentData()
+        )
+    )
+    neg_combo.currentIndexChanged.connect(
+        lambda _=0, r=row, c=neg_combo: _unmix_on_signature_field(ctx,
+            page, r, "negative", c.currentData()
+        )
+    )
+    norm_box.toggled.connect(
+        lambda checked, r=row: _unmix_on_signature_field(ctx,
+            page, r, "normalize", bool(checked)
+        )
+    )
+    name_edit.editingFinished.connect(
+        lambda r=row, e=name_edit: _unmix_set_signature_name(ctx,
+            page, r, e
+        )
+    )
+    # Cell widgets swallow the table's context menu, so each one gets
+    # its own "Remove signature" entry.
+    for widget in (pos_combo, neg_combo, norm_box, norm_host, name_edit):
+        widget.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        widget.customContextMenuRequested.connect(
+            lambda pos, w=widget, r=row: _unmix_signature_widget_menu(ctx,
+                page, r, w, pos
+            )
+        )
+
+    table.setCellWidget(i, 0, pos_combo)
+    table.setCellWidget(i, 1, neg_combo)
+    table.setCellWidget(i, 2, norm_host)
+    table.setCellWidget(i, 3, name_edit)
 
 
 def _unmix_signature_reordered(ctx, page) -> None:
@@ -2389,17 +2567,33 @@ def _unmix_add_signature(ctx, page) -> None:
         "name": _unmix_unique_signature_name(ctx, page, spectrum["name"]),
     }
     page._unmix_matrix.append(row)
-    _unmix_rebuild_signature_table(ctx, page)
+    table = page._unmix_signature_table
+    index = len(page._unmix_matrix) - 1
+    table.insertRow(index)
+    _unmix_fill_signature_row(
+        ctx, page, table, index, row, page._unmix_spectra,
+        not page._unmix_locked,
+    )
+    table.setVerticalHeaderLabels(
+        [r.get("name", "") for r in page._unmix_matrix]
+    )
+    table.resizeRowToContents(index)
     _unmix_refresh_matrix_views(ctx, page)
-    _unmix_mark_dirty(ctx, page)
+    # Signatures do not change the spectrum vectors, so the per-spectrum
+    # cache stays valid.
+    _unmix_mark_dirty(ctx, page, data=False)
 
 
 def _unmix_remove_signature(ctx, page, index: int) -> None:
     if 0 <= index < len(page._unmix_matrix):
         del page._unmix_matrix[index]
-        _unmix_rebuild_signature_table(ctx, page)
+        table = page._unmix_signature_table
+        table.removeRow(index)
+        table.setVerticalHeaderLabels(
+            [r.get("name", "") for r in page._unmix_matrix]
+        )
         _unmix_refresh_matrix_views(ctx, page)
-        _unmix_mark_dirty(ctx, page)
+        _unmix_mark_dirty(ctx, page, data=False)
 
 
 def _unmix_unique_signature_name(ctx, page, base: str) -> str:
@@ -2419,7 +2613,8 @@ def _unmix_on_signature_field(ctx, page, row, key: str, value) -> None:
         return
     row[key] = value
     _unmix_refresh_matrix_views(ctx, page)
-    _unmix_mark_dirty(ctx, page)
+    # The row changed, not the spectra — keep the spectrum-vector cache.
+    _unmix_mark_dirty(ctx, page, data=False)
 
 
 def _unmix_set_signature_name(ctx, page, row, edit) -> None:
@@ -2464,43 +2659,44 @@ def _unmix_set_signature_name(ctx, page, row, edit) -> None:
     _unmix_mark_dirty(ctx, page, data=False)
 
 
-def _unmix_rebuild_sample_list(ctx, page) -> None:
-    samples_list = page._unmix_samples_list
-    selected = set(page._unmix_params.get("samples") or [])
-    samples_list.blockSignals(True)
-    samples_list.clear()
-    for rec in _data_files._available_files(ctx, page._unmix_task_id):
-        path = rec.get("parquet")
-        item = QListWidgetItem(rec.get("name", ""))
-        item.setData(Qt.ItemDataRole.UserRole, path)
-        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        item.setCheckState(
-            Qt.CheckState.Checked
-            if path in selected
-            else Qt.CheckState.Unchecked
-        )
-        samples_list.addItem(item)
-    samples_list.blockSignals(False)
-
-
-def _unmix_on_samples_changed(ctx, page) -> None:
-    samples_list = page._unmix_samples_list
-    page._unmix_params["samples"] = [
-        samples_list.item(i).data(Qt.ItemDataRole.UserRole)
-        for i in range(samples_list.count())
-        if samples_list.item(i).checkState() == Qt.CheckState.Checked
+def _unmix_select_samples(ctx, page) -> None:
+    """Pick the samples to unmix with the shared multi-select dialog."""
+    records = _data_files._available_files(ctx, page._unmix_task_id)
+    names = [rec.get("name", "") for rec in records]
+    by_name = {rec.get("name", ""): rec.get("parquet") for rec in records}
+    current = [
+        _data_naming._comp_file_name(ctx, p, page._unmix_task_id)
+        for p in page._unmix_params.get("samples") or []
     ]
+    chosen = _widgets_picker._pick_items_dialog(ctx,
+        "Samples to be unmixed", names, current, "Filter files..."
+    )
+    if chosen is None:
+        return
+    page._unmix_params["samples"] = [
+        by_name[name] for name in chosen if name in by_name
+    ]
+    _unmix_rebuild_sample_list(ctx, page)
     _unmix_mark_dirty(ctx, page)
 
 
-def _unmix_set_all_samples(ctx, page, checked: bool) -> None:
+def _unmix_rebuild_sample_list(ctx, page) -> None:
+    """Show the selected samples (selection happens in the picker dialog)."""
     samples_list = page._unmix_samples_list
+    selected = list(page._unmix_params.get("samples") or [])
+    names = {
+        rec.get("parquet"): rec.get("name", "")
+        for rec in _data_files._available_files(ctx, page._unmix_task_id)
+    }
     samples_list.blockSignals(True)
-    state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-    for i in range(samples_list.count()):
-        samples_list.item(i).setCheckState(state)
+    samples_list.clear()
+    for path in selected:
+        if path not in names:
+            continue
+        item = QListWidgetItem(names[path])
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        samples_list.addItem(item)
     samples_list.blockSignals(False)
-    _unmix_on_samples_changed(ctx, page)
 
 
 def _unmix_on_method_changed(ctx, page, combo) -> None:
@@ -2793,10 +2989,19 @@ def _unmix_zoom_matrix(ctx, page, factor, pos=None) -> None:
 
 
 def _unmix_refresh_matrix_views(ctx, page) -> None:
-    """Redraw the three matrix sub-pages from the current signatures."""
-    _unmix_render_matrix(ctx, page)
-    _unmix_render_curve(ctx, page)
-    _unmix_render_similarity(ctx, page)
+    """Redraw the active matrix sub-page from the current signatures.
+
+    The other tabs are redrawn when the user switches to them (see
+    :func:`_unmix_on_matrix_tab`), so adding or editing a signature does
+    not pay for three renders.
+    """
+    key = getattr(page, "_unmix_matrix_tab", "matrix")
+    if key == "curve":
+        _unmix_render_curve(ctx, page)
+    elif key == "similarity":
+        _unmix_render_similarity(ctx, page)
+    else:
+        _unmix_render_matrix(ctx, page)
 
 
 def _unmix_refresh_outputs(ctx, page) -> None:
@@ -2835,13 +3040,16 @@ def _unmix_spectrum_vector(ctx, page, spectrum):
 def _unmix_mark_dirty(ctx, page, data: bool=True) -> None:
     """Mark the module modified.
 
-    `data=False` is for display-only settings (matrix/curve colours, cell
-    sizes, line width, visibility): the cached spectrum vectors stay valid,
-    so changing them does not re-read every channel of every sample file.
+    `data=False` is for changes that keep the spectrum vectors valid:
+    matrix/curve colours, cell sizes, line width, visibility, and editing
+    signature rows (which only combine spectra differently). Those paths
+    must not force every channel of every sample file to be re-read.
     """
     page._unmix_dirty = True
     if data:
         page._unmix_spectrum_cache = {}
+        # Invalidate a background spectrum refresh that is still running.
+        page._unmix_spectrum_gen = getattr(page, "_unmix_spectrum_gen", 0) + 1
     _unmix_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 

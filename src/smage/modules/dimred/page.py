@@ -357,15 +357,15 @@ def _dimred_center_panel(ctx, page) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Variables</b>"))
+    lay.addWidget(QLabel("<b>Channels</b>"))
     hint = QLabel(
-        "Variables shared by every selected file. All files are reduced "
-        "together in one embedding, so only common variables can be used."
+        "Channels shared by every selected file. All files are reduced "
+        "together in one embedding, so only common channels can be used."
     )
     hint.setWordWrap(True)
     hint.setStyleSheet("color: #6b7785;")
     lay.addWidget(hint)
-    vars_btn = QPushButton("Select variables…")
+    vars_btn = QPushButton("Select channels…")
     vars_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     vars_btn.setEnabled(not page._dimred_locked)
     lay.addWidget(vars_btn)
@@ -491,7 +491,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     normalize.setEnabled(not page._dimred_locked)
     lay.addWidget(normalize)
     lay.addWidget(_widgets_panels._param_hint(ctx,
-        "Z-score every variable first, so no channel dominates the distance."
+        "Z-score every channel first, so no channel dominates the distance."
     ))
     page._dimred_normalize = normalize
 
@@ -501,7 +501,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     lay.addWidget(pca)
     lay.addWidget(_widgets_panels._param_hint(ctx,
         "Reduce to 50 dimensions with PCA before fitting, when more "
-        "variables are selected. Standard practice, usually faster."
+        "channels are selected. Standard practice, usually faster."
     ))
     page._dimred_pca = pca
 
@@ -515,7 +515,7 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     ))
     page._dimred_parallel = parallel
 
-    lay.addWidget(QLabel("<b>New column names</b>"))
+    lay.addWidget(QLabel("<b>New channel names</b>"))
     name_box = QWidget()
     nh = QGridLayout(name_box)
     nh.setContentsMargins(0, 0, 0, 0)
@@ -523,14 +523,14 @@ def _dimred_right_panel(ctx, page) -> QWidget:
     name1 = QLineEdit()
     nh.addWidget(name1, 0, 1)
     warn1 = QLabel("⚠")
-    warn1.setToolTip("Duplicate column name")
+    warn1.setToolTip("Duplicate channel name")
     warn1.setStyleSheet("color: #b58900; font-weight: bold;")
     nh.addWidget(warn1, 0, 2)
     nh.addWidget(QLabel("Dim 2"), 1, 0)
     name2 = QLineEdit()
     nh.addWidget(name2, 1, 1)
     warn2 = QLabel("⚠")
-    warn2.setToolTip("Duplicate column name")
+    warn2.setToolTip("Duplicate channel name")
     warn2.setStyleSheet("color: #b58900; font-weight: bold;")
     nh.addWidget(warn2, 1, 2)
     lay.addWidget(name_box)
@@ -696,22 +696,22 @@ def _dimred_select_vars(ctx, page) -> None:
     files = page._dimred_params.get("files") or []
     if not files:
         QMessageBox.information(
-            ctx.host, "Select variables", "Select data files first."
+            ctx.host, "Select channels", "Select data files first."
         )
         return
     options = _dimred_common_columns(ctx, page)
     if not options:
         QMessageBox.information(
-            ctx.host, "Select variables",
-            "The selected files have no common variables.\n"
-            "Dimension reduction needs variables shared by every file.",
+            ctx.host, "Select channels",
+            "The selected files have no common channels.\n"
+            "Dimension reduction needs channels shared by every file.",
         )
         return
     chosen = _widgets_picker._pick_items_dialog(ctx,
-        "Select variables",
+        "Select channels",
         options,
         page._dimred_params.get("columns") or [],
-        "Filter variables...",
+        "Filter channels...",
     )
     if chosen is None:
         return
@@ -887,7 +887,7 @@ def _dimred_refresh(ctx, page) -> None:
         page._dimred_vars_box.clear()
         for c in columns:
             page._dimred_vars_box.addItem(str(c))
-        page._dimred_vars_count.setText(f"{len(columns)} variable(s) selected")
+        page._dimred_vars_count.setText(f"{len(columns)} channel(s) selected")
     finally:
         page._dimred_updating = False
     _dimred_update_names(ctx, page)
@@ -899,14 +899,14 @@ def _dimred_validate(ctx, page):
     if not params.get("files"):
         return False, "Select at least one data file."
     if not params.get("columns"):
-        return False, "Select at least one variable."
+        return False, "Select at least one channel."
     names = params.get("names") or ["", ""]
     if not names[0] or not names[1]:
-        return False, "Set both new column names."
+        return False, "Set both new channel names."
     if names[0] == names[1]:
-        return False, "The two new column names must differ."
+        return False, "The two new channel names must differ."
     if _dimred_name_conflicts(ctx, page):
-        return False, "A new column name collides with an existing column."
+        return False, "A new channel name collides with an existing column."
     return True, ""
 
 
@@ -982,7 +982,7 @@ def _dimred_run(ctx, page, q):
             q.put(("status", f"Reading {i + 1}/{n_files} ({25 * (i + 1) // n_files}%)"))
             values = _data_columns._column_data(ctx, page._dimred_task_id, path, columns)
             if any(c not in values for c in columns):
-                raise ValueError(f"{name} is missing a column")
+                raise ValueError(f"{name} is missing a channel")
             X = np.column_stack([values[c] for c in columns]).astype("float64")
             n_vis = len(X)
             total_before += n_vis
@@ -1009,7 +1009,7 @@ def _dimred_run(ctx, page, q):
         if not parts:
             raise ValueError("no data to reduce")
         X = np.vstack(parts)
-        q.put(("log", f"Combined {X.shape[0]} row(s) × {X.shape[1]} variable(s)"))
+        q.put(("log", f"Combined {X.shape[0]} row(s) × {X.shape[1]} channel(s)"))
         if max_events > 0 and total_after < total_before:
             q.put(("log", f"Downsampled {total_before:,} → {total_after:,} points "
                           f"(max {max_events:,} per file)"))
@@ -1067,7 +1067,7 @@ def _dimred_run(ctx, page, q):
                     params, path, page._dimred_task_id
                 ),
             }
-            q.put(("log", f"✓ {name} → {Path(rel).name} ({len(cols)} column(s))"))
+            q.put(("log", f"✓ {name} → {Path(rel).name} ({len(cols)} channel(s))"))
         q.put(("done", outputs, len(outputs), failed))
     except Exception as exc:  # noqa: BLE001
         q.put(("error", str(exc)))

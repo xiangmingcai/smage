@@ -1,7 +1,7 @@
 # Segmentation
 
 Segments nuclei (and optionally whole cells) from an image channel and writes
-a mask column that downstream modules can use as the feature variable.
+a mask column that downstream modules can use as the feature channel.
 
 ![Segmentation](../assets/screenshots/segmentation.png)
 
@@ -10,8 +10,10 @@ a mask column that downstream modules can use as the feature variable.
 | Method | Runs where | Description |
 |---|---|---|
 | Nuclear Expansion | Inside Smage | Classical threshold → components → size filter → optional split → expansion. |
-| Cellpose | External Python environment | Learned segmentation; installed from the Extension Manager. |
 | StarDist | External Python environment | Star-convex nucleus segmentation; installed from the Extension Manager. |
+| Cellpose GPU | External Python environment | Learned segmentation on an NVIDIA GPU; installed from the Extension Manager. |
+| Cellpose CPU | External Python environment | Learned segmentation on the CPU. Much slower than the GPU variant — use it only when no NVIDIA GPU is available. |
+| Mask Input | Inside Smage | Import precomputed mask TIFF files. |
 
 ### Nuclear Expansion algorithm
 
@@ -68,7 +70,7 @@ downstream modules as a label column (each object has a unique integer).
 
 ## Notes
 
-- The mask column is a valid **feature variable** for
+- The mask column is a valid **feature channel** for
   [Feature Down](feature-down.md) and can be used for gating, plotting and
   export.
 - Cellpose and StarDist run in the separate environment created by the

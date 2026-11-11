@@ -1,7 +1,7 @@
 # Cluster
 
 Groups events by similarity and adds a cluster label column that downstream
-modules can use as a feature variable.
+modules can use as a feature channel.
 
 ![Cluster](../assets/screenshots/cluster.png)
 
@@ -22,10 +22,10 @@ modules can use as a feature variable.
 | Setting | Description |
 |---|---|
 | Files | The files to cluster. |
-| Columns | The parameters used to compute distances. |
+| Channels | The channels used to compute distances. |
 | Max events per file | Upper bound on the events used for training. |
 | Method parameters | Per-method options (k, resolution, number of clusters, epsilon, …). |
-| New column name | The name of the resulting label column. |
+| New channel name | The name of the resulting label column. |
 
 ## Output
 
@@ -35,7 +35,7 @@ A cluster label per event, exposed as a column to downstream modules.
 
 - FlowSOM and PARC are not bundled; install them from the
   **Extension Manager** into a separate Python environment.
-- Cluster labels are integers; use them as the **feature variable** in
+- Cluster labels are integers; use them as the **feature channel** in
   [Feature Down](feature-down.md) to build per-cluster feature tables.
 
 ## Related

@@ -9,11 +9,11 @@ feature table that can be clustered, plotted or exported.
 
 | Setting | Description |
 |---|---|
-| Feature variable | The column that defines the classes (a segmentation mask label, a sample ID, a cluster column, …). |
+| Feature channel | The channel that defines the classes (a segmentation mask label, a sample ID, a cluster column, …). |
 | Data files | The files to aggregate. |
-| Aggregation rules | One row per output column: **Source variable**, **Method** (count, sum, min, max, mean, median, percentile), **Range (% per class)** and **New column name**. |
-| Group-key row | By default a row named after the feature variable is added right below Count. It carries the class label into the output; delete it to leave the identifier column out. |
-| Background ignore | Values of the feature variable that are excluded before aggregation (for example the background label `0` of a mask). |
+| Aggregation rules | One row per output column: **Source channel**, **Method** (count, sum, min, max, mean, median, percentile), **Range (% per class)** and **New column name**. |
+| Group-key row | By default a row named after the feature channel is added right below Count. It carries the class label into the output; delete it to leave the identifier column out. |
+| Background ignore | Values of the feature channel that are excluded before aggregation (for example the background label `0` of a mask). |
 
 ### The Count row
 
@@ -23,7 +23,7 @@ be deleted or edited. The group-key row below it is a normal, deletable row.
 ### Range (% per class)
 
 `0–100` uses every point. `0–30` uses only the dimmest 30 % of each class
-(sorted by that row's own source variable); `90–100` the brightest 10 %.
+(sorted by that row's own source channel); `90–100` the brightest 10 %.
 
 ## Output
 

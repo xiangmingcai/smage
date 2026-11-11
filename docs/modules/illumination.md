@@ -14,7 +14,7 @@ estimating a per-tile brightness profile and dividing it out.
 | Bin | Binning used when building the brightness profile. |
 | Resolution | Resolution of the estimated correction map. |
 | Correction method | How tile factors are combined into the correction map. |
-| Files for the calculation | Which files contribute to the estimate (and which files the correction is applied to). |
+| Files for illumination pattern recognition | Which files contribute to the estimate (and which files the correction is applied to). |
 
 **Auto set** estimates the tile size and background threshold from the data.
 The preview plot shows the corrected channel, with its own display range and
@@ -29,7 +29,7 @@ corrected channel; the raw data is unchanged.
 
 - The correction map is estimated once per channel and cached; changing a
   downstream module does not re-estimate it.
-- The mask used for estimation is persisted under
+- The illumination pattern used for estimation is persisted under
   `Module/illumination-<id>/` inside the project.
 
 ## Related

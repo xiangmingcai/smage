@@ -256,6 +256,39 @@ def workflow_delete() -> None:
         _close(window)
 
 
+@harness.case("shell.workflow.import_menu", "L5", "shell", tags=("smoke",))
+def import_card_menu() -> None:
+    """The Data Import card cannot be copied, pasted over or deleted."""
+    scale = harness.task_def("scale", task_id="s-1", name="Scale")
+    window, _project = _open("shell_import_menu", [scale])
+    try:
+        import_task = window.project.workflow["tasks"][0]
+        child = import_task["children"][0]
+
+        menu = window._build_actions_menu(import_task, None)
+        labels = [action.text() for action in menu.actions() if action.text()]
+        blocked = {
+            "Copy", "Copy branch", "Delete", "Delete branch",
+        }
+        harness.check(not (blocked & set(labels)), str(labels))
+        harness.check(
+            {"Paste", "Paste branch"} <= set(labels),
+            "the Paste actions stay: " + str(labels),
+        )
+        harness.check("Rename" in labels, labels)
+
+        child_menu = window._build_actions_menu(child, import_task)
+        child_labels = [
+            action.text() for action in child_menu.actions() if action.text()
+        ]
+        harness.check(
+            {"Copy", "Delete"} <= set(child_labels),
+            "other module cards keep copy/delete: " + str(child_labels),
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("shell.project.new_open", "L5", "shell", tags=("smoke",))
 def project_new_open() -> None:
     window, project = _open("shell_project")

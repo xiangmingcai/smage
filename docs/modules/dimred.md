@@ -12,10 +12,10 @@ scatter plot, a gate, or an [Area](area.md) measurement.
 | Files | The files included in the embedding. |
 | Method | UMAP or t-SNE. |
 | Backend | `sklearn` (default) or `openTSNE` (experimental) for t-SNE. |
-| Columns | The parameters used to compute distances. |
+| Channels | The channels used to compute distances. |
 | Max events per file | Upper bound on the events used to fit the embedding. |
 | PCA components | Dimensionality of the PCA preprocessing step (default 50). |
-| New column names | The two output columns (for example `umap_1`, `umap_2`). |
+| New channel names | The two output columns (for example `umap_1`, `umap_2`). |
 
 ## Output
 

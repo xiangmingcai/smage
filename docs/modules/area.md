@@ -11,8 +11,8 @@ using a density grid and an intensity threshold.
 |---|---|
 | Files | The files to measure; checked files receive the batch settings. |
 | X / Y | The two columns that define the plane (for example a UMAP embedding). |
-| Signal | The column whose intensity defines the area (for example a marker). |
-| Low / High | The signal values used to estimate the per-cell intensity. |
+| Channel | The channel whose intensity defines the area (for example a marker). |
+| Low / High | The channel values used to estimate the per-cell intensity. |
 | Density > | Minimum point density (points per grid cell) that counts as occupied. |
 | Grid cells (longer axis) | Resolution of the density grid; finer grids give a more precise area but a stricter threshold. |
 

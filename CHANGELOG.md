@@ -15,12 +15,48 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Fixed
 
+- Export: dragging a channel row onto another row no longer loses rows. The
+  list reports the drop and the page reorders its own parameters, so Qt's
+  internal move (which can remove the dragged row) is never used; the list
+  is rebuilt from the reordered data. Heatmap's channel list gains the text
+  fallback for the same drag-and-drop role loss.
 - Ellipse gates drawn on a log or arcsinh axis now select exactly the shape
   that was drawn. The outline is stored in data units and used for the mask,
   instead of a data-space ellipse that appears as a skewed diamond.
 
 ### Changed
 
+- Scale: an explanatory line at the top of the page states that the module
+  only changes visualisation and gate display, never the stored data.
+- Export: selecting files no longer preselects every channel automatically;
+  the user chooses the channels with **Select channels…**.
+- Locked modules: **Unlock** on a module that was not edited no longer
+  reloads the page. The untouched draft is adopted as the real module, so
+  large modules open immediately instead of being rebuilt.
+- Unmix: moving a gate no longer freezes the window. The spectrum is
+  recomputed on a worker thread, only the spectra that read the edited tree
+  lose their cache, and image plots keep their zoom across re-renders. The
+  channel values of the gate tree's file are cached (bounded to two column
+  sets), so a gate edit only re-applies the mask instead of re-reading
+  millions of rows.
+- Unmix: **Samples to be unmixed** now uses the shared multi-select dialog
+  (**Select files…**) instead of a checklist with All/None buttons.
+- Segmentation: the method chooser now lists Nuclear Expansion, StarDist,
+  Cellpose GPU, Cellpose CPU and Mask Input in that order, and Cellpose CPU
+  explains under the chooser that it is much slower than the GPU variant.
+- Workflow tree: the **Data Import** card no longer offers Copy, Copy
+  branch, Delete or Delete branch — it is the fixed root of the workflow.
+  **Paste** and **Paste branch** stay (they add a copied module or branch
+  at the top level); Rename and Lock remain.
+- Terminology: measurement columns are now called **channels** in the UI —
+  Segmentation (Select Files), Feature Down (Feature channel / Source
+  channel), Batch Alignment, Area, Gate2Col (Convert table, From gate, New
+  channel name), Feature Up (Channels to map, Channel in From File),
+  Dimension Reduction, Cluster, Heatmap and Export. Unmix uses **Positive
+  spectrum / Negative spectrum** in the signature table and **Signature
+  matrix / Signature curves** for its matrix tabs. Illumination Correction
+  uses **Illumination pattern**, **Files for illumination pattern
+  recognition** and **Recognize Illumination Pattern**.
 - Segmentation: the calculation log is now a shared dark log box below the
   Calculate button, splitting the parameters panel into a 4:1 parameter/log
   layout.

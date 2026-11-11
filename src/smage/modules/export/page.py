@@ -8,7 +8,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
@@ -198,6 +198,38 @@ def _export_files_panel(ctx, page, kind: str) -> QWidget:
     return panel
 
 
+class _ExportOrderList(QListWidget):
+    """Reorder list driven by the page's data model.
+
+    Qt's internal move removes the dragged rows after the drop unless the
+    model performed the move itself, which can lose a channel when the drop
+    lands on another row. This widget reports the intended move and accepts
+    the drop as a copy, so Qt never removes anything; the page applies the
+    new order to its parameters and rebuilds the list from them.
+    """
+
+    orderRequested = Signal(int, int)
+
+    def dropEvent(self, event) -> None:
+        source = self.currentRow()
+        if source < 0:
+            source = next(
+                (self.row(item) for item in self.selectedItems()), -1
+            )
+        index = self.indexAt(event.position().toPoint())
+        target = index.row() if index.isValid() else self.count()
+        if (
+            index.isValid()
+            and self.dropIndicatorPosition()
+            == QAbstractItemView.DropIndicatorPosition.BelowItem
+        ):
+            target += 1
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        if source >= 0:
+            self.orderRequested.emit(source, target)
+
+
 def _export_columns_panel(ctx, page, kind: str) -> QWidget:
     pane = _export_pane(ctx, page, kind)
     panel = _widgets_panels._build_panel_frame(ctx)
@@ -205,7 +237,7 @@ def _export_columns_panel(ctx, page, kind: str) -> QWidget:
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
 
-    title = "Columns" if kind == "table" else "Channels"
+    title = "Channels"
     lay.addWidget(QLabel(f"<b>{title}</b>"))
     if kind == "image":
         fixed = QLabel(
@@ -217,28 +249,29 @@ def _export_columns_panel(ctx, page, kind: str) -> QWidget:
     count = QLabel("")
     count.setStyleSheet("color: #6b7785;")
     lay.addWidget(count)
-    btn = QPushButton(
-        "Select columns…" if kind == "table" else "Select channels…"
-    )
+    btn = QPushButton("Select channels…")
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setEnabled(not page._export_locked)
     btn.clicked.connect(lambda _=False: _export_select_columns(ctx, page, kind))
     lay.addWidget(btn)
-    box = QListWidget()
+    box = _ExportOrderList()
     box.setStyleSheet(
         "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
     )
     box.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
     box.setDefaultDropAction(Qt.DropAction.MoveAction)
     box.setDragEnabled(not page._export_locked)
+    box.setDropIndicatorShown(True)
     box.setToolTip("Drag rows to change their order in the exported file")
-    box.model().rowsMoved.connect(
-        lambda *a: _export_on_order(ctx, page, kind)
+    box.orderRequested.connect(
+        lambda source, target: _export_reorder(
+            ctx, page, kind, source, target
+        )
     )
     lay.addWidget(box, 1)
     hint = QLabel(
-        "Only columns shared by every selected file are offered. Drag to "
-        "reorder — this is the column order in the exported file."
+        "Only channels shared by every selected file are offered. Drag to "
+        "reorder — this is the channel order in the exported file."
         if kind == "table" else
         "Only channels shared by every selected image file are offered. "
         "Drag to reorder — this is the channel order in the TIFF."
@@ -439,9 +472,6 @@ def _export_select_files(ctx, page, kind: str) -> None:
     section["files"] = [
         by_label[label] for label in chosen if label in by_label
     ]
-    if kind == "image" and not section.get("channels"):
-        # Convenience: start with every available channel selected.
-        section["channels"] = _export_common_columns(ctx, page, kind)
     _export_mark_dirty(ctx, page)
     _export_refresh(ctx, page)
 
@@ -452,14 +482,14 @@ def _export_select_columns(ctx, page, kind: str) -> None:
     options = _export_common_columns(ctx, page, kind)
     if not options:
         QMessageBox.information(
-            ctx.host, "Select " + ("columns" if kind == "table" else "channels"),
-            "Select data files with common columns first.",
+            ctx.host, "Select channels",
+            "Select data files with common channels first.",
         )
         return
     chosen = _widgets_picker._pick_items_dialog(ctx,
-        "Select columns" if kind == "table" else "Select channels",
+        "Select channels",
         options, section.get(key) or [],
-        "Filter columns...", reorder=True,
+        "Filter channels...", reorder=True,
     )
     if chosen is None:
         return
@@ -468,19 +498,29 @@ def _export_select_columns(ctx, page, kind: str) -> None:
     _export_refresh(ctx, page)
 
 
-def _export_on_order(ctx, page, kind: str) -> None:
-    pane = _export_pane(ctx, page, kind)
-    if pane.syncing:
-        return
-    values = [
-        pane.cols_box.item(i).data(Qt.ItemDataRole.UserRole)
-        for i in range(pane.cols_box.count())
-    ]
+def _export_reorder(ctx, page, kind: str, source: int, target: int) -> None:
+    """Move one row and rebuild the list from the parameters.
+
+    The list itself never performs the move (see _ExportOrderList), so the
+    exact rows shown always come back from the data model.
+    """
+    section = _export_params_for(ctx, page, kind)
     key = "columns" if kind == "table" else "channels"
-    _export_params_for(ctx, page, kind)[key] = [
-        value for value in values if value
-    ]
+    values = list(section.get(key) or [])
+    if not (0 <= source < len(values)):
+        return
+    value = values.pop(source)
+    if target > source:
+        target -= 1
+    target = max(0, min(target, len(values)))
+    values.insert(target, value)
+    section[key] = values
+    _export_refresh_pane(ctx, page, kind)
     _export_mark_dirty(ctx, page)
+    runlog.action(
+        "export.reorder", kind=kind, source=source, target=target,
+        count=len(values),
+    )
 
 
 def _export_browse(ctx, page, kind: str) -> None:
@@ -547,6 +587,7 @@ def _export_refresh_pane(ctx, page, kind: str) -> None:
     pane.files_box.blockSignals(False)
 
     pane.syncing = True
+    scroll = pane.cols_box.verticalScrollBar().value()
     pane.cols_box.blockSignals(True)
     pane.cols_box.clear()
     for name in section[key]:
@@ -558,6 +599,7 @@ def _export_refresh_pane(ctx, page, kind: str) -> None:
         )
         pane.cols_box.addItem(item)
     pane.cols_box.blockSignals(False)
+    pane.cols_box.verticalScrollBar().setValue(scroll)
     pane.syncing = False
 
     files = len(section["files"])
@@ -565,14 +607,9 @@ def _export_refresh_pane(ctx, page, kind: str) -> None:
         f"{files} file{'s' if files != 1 else ''} selected"
     )
     count = len(section[key])
-    if kind == "table":
-        pane.cols_count.setText(
-            f"{count} column{'s' if count != 1 else ''} selected"
-        )
-    else:
-        pane.cols_count.setText(
-            f"{count} channel{'s' if count != 1 else ''} selected"
-        )
+    pane.cols_count.setText(
+        f"{count} channel{'s' if count != 1 else ''} selected"
+    )
     _export_update_buttons(ctx, page, kind)
 
 
@@ -676,9 +713,7 @@ def _export_start(ctx, page, kind: str) -> None:
         return
     if not selected:
         QMessageBox.warning(
-            ctx.host, "Export",
-            "Select " + ("columns" if kind == "table" else "channels")
-            + " first.",
+            ctx.host, "Export", "Select channels first."
         )
         return
     if not folder:
@@ -723,7 +758,7 @@ def _export_confirm(ctx, page, kind: str, files, selected, folder: str) -> bool:
     preview = ", ".join(selected[:8])
     if len(selected) > 8:
         preview += " …"
-    label = "Columns" if kind == "table" else "Channels"
+    label = "Channels"
     count = len(files)
     lines = [
         f"Export {count} file{'s' if count != 1 else ''} "
@@ -775,7 +810,7 @@ def _export_job_table(ctx, page, q, params) -> None:
     out_dir = Path(str(params.get("dir") or "")).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     q.put(("log", f"Table export ({fmt.upper()}) — {len(files)} file(s), "
-                  f"{len(columns)} column(s)"))
+                  f"{len(columns)} channel(s)"))
     items = _export_targets(ctx, page, files, ext)
     conflicts = _export_conflicts(ctx, out_dir, items)
     if conflicts:
@@ -806,7 +841,7 @@ def _export_job_table(ctx, page, q, params) -> None:
             raise
         total_rows += len(frame)
         q.put(("log", f"  wrote {len(frame):,} rows × "
-                      f"{len(frame.columns)} columns"))
+                      f"{len(frame.columns)} channels"))
         q.put(("progress", index + 1, len(items)))
     q.put(("done", {
         "files": len(items), "rows": total_rows, "dir": str(out_dir),

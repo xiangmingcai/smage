@@ -9,12 +9,12 @@ so that event-level modules (gating, plots, export) can use per-class values.
 
 | Setting | Description |
 |---|---|
-| From Files | The aggregated (feature) files whose columns are mapped across. |
-| To Files | The event-level files that receive the new columns. |
+| From Files | The aggregated (feature) files whose channels are mapped across. |
+| To Files | The event-level files that receive the new channels. |
 | Key in From Files | The column in the feature table that identifies a class. |
 | Key in To Files | The column in the target files that matches that key. |
 | Match | How keys are matched (exact value, renamed pairs, …). |
-| Features to map | The feature columns that should be copied to the target files. |
+| Channels to map | The feature channels that should be copied to the target files. |
 
 ## Output
 

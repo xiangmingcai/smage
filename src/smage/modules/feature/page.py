@@ -228,7 +228,7 @@ def _feat_files_panel(ctx, page) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Feature variable</b>"))
+    lay.addWidget(QLabel("<b>Feature channel</b>"))
 
     combo = _NoWheelComboBox()
     combo.addItem("", None)
@@ -309,7 +309,7 @@ def _feat_ignore_section(ctx, page) -> QWidget:
     header.setSpacing(6)
     header.addWidget(QLabel("<b>Background ignore</b>"))
     header.addStretch()
-    status = QLabel("Select a feature variable and files")
+    status = QLabel("Select a feature channel and files")
     status.setStyleSheet("color: #8a94a6; font-size: 8pt;")
     header.addWidget(status)
     lay.addLayout(header)
@@ -685,7 +685,7 @@ def _feat_ignore_refresh(ctx, page) -> None:
         page._feat_ignore_default = None
         _feat_ignore_fill(ctx, page, [])
         if status is not None:
-            status.setText("Select a feature variable and files")
+            status.setText("Select a feature channel and files")
         return
     _feat_ignore_start_worker(ctx, page)
     pending = []
@@ -848,7 +848,7 @@ def _feat_select_files(ctx, page) -> None:
     feature = page._feat_params.get("feature")
     if not feature:
         QMessageBox.information(
-            ctx.host, "Select files", "Choose the feature variable first."
+            ctx.host, "Select files", "Choose the feature channel first."
         )
         return
     candidates = [
@@ -973,7 +973,7 @@ def _feat_rules_panel(ctx, page) -> QWidget:
     table = QTableWidget()
     table.setColumnCount(4)
     table.setHorizontalHeaderLabels(
-        ["Source variable", "Method", "Range (% per class)", "New column name"]
+        ["Source channel", "Method", "Range (% per class)", "New column name"]
     )
     header = table.horizontalHeader()
     for column in range(4):
@@ -986,10 +986,10 @@ def _feat_rules_panel(ctx, page) -> QWidget:
 
     note = QLabel(
         "Range (% per class): for each class, use only the points between "
-        "these two percentiles, sorted by the row's own source variable. "
+        "these two percentiles, sorted by the row's own source channel. "
         "0–100 means all points (e.g. 0–30 = dimmest 30%, 90–100 = "
         "brightest 10%). The Count row always uses all points. The Feature "
-        "row keeps the feature variable as the identifier column; delete "
+        "row keeps the feature channel as the identifier column; delete "
         "it to leave that column out."
     )
     note.setWordWrap(True)
@@ -1086,7 +1086,7 @@ def _feat_rebuild_rules(ctx, page) -> None:
             item.setForeground(QColor("#6b7785"))
             table.setItem(i, 0, item)
         elif is_feature:
-            item = QTableWidgetItem(str(rule.get("source") or "(feature variable)"))
+            item = QTableWidgetItem(str(rule.get("source") or "(feature channel)"))
             # Selectable so clicking it makes this the row the Delete button
             # acts on (unlike the fixed Count row above).
             item.setFlags(
@@ -1094,7 +1094,7 @@ def _feat_rebuild_rules(ctx, page) -> None:
             )
             item.setForeground(QColor("#6b7785"))
             item.setToolTip(
-                "The chosen Feature variable. This row keeps its value as an "
+                "The chosen Feature channel. This row keeps its value as an "
                 "output column; delete it to leave the identifier out."
             )
             table.setItem(i, 0, item)
@@ -1189,7 +1189,7 @@ def _feat_rebuild_rules(ctx, page) -> None:
             tip = "Not used by the group-key row (it keeps the feature value)"
         else:
             tip = ("Use only the points between these percentiles within "
-                   "each class (sorted by this row's source variable)")
+                   "each class (sorted by this row's source channel)")
         lo_spin.setToolTip(tip)
         hi_spin.setToolTip(tip)
 
@@ -1299,7 +1299,7 @@ def _feat_validate(ctx, page):
     """Return (ok, message) for the current settings."""
     params = page._feat_params
     if not params.get("feature"):
-        return False, "Choose the feature variable first."
+        return False, "Choose the feature channel first."
     if not params.get("files"):
         return False, "Select at least one data file."
     rules = params.get("rules") or []
@@ -1321,8 +1321,8 @@ def _feat_validate(ctx, page):
             source = rule.get("source")
             if not source or source != params.get("feature"):
                 return False, (
-                    f"Row {i + 1}: this row keeps the feature variable; "
-                    "delete it or choose the matching variable."
+                    f"Row {i + 1}: this row keeps the feature channel; "
+                    "delete it or choose the matching channel."
                 )
             if source not in common:
                 return False, (
@@ -1335,7 +1335,7 @@ def _feat_validate(ctx, page):
             continue
         source = rule.get("source")
         if not source:
-            return False, f"Row {i + 1}: choose a source variable."
+            return False, f"Row {i + 1}: choose a source channel."
         if source not in common:
             return False, (
                 f"Row {i + 1}: '{source}' is not present in every selected file."

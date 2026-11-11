@@ -644,23 +644,32 @@ class WorkflowTreeMixin:
         structure can still be edited (delete, paste, add children).
         """
         menu = QMenu(self)
+        # Data Import is the fixed root of the workflow: it cannot be copied,
+        # pasted over or deleted. The Paste actions stay: they are how a
+        # copied module or branch becomes a top-level module.
+        is_import = task_def.get("type") == "import"
 
-        copy_action = QAction("Copy", self)
-        copy_action.triggered.connect(lambda: self._copy_task(task_def, False))
-        menu.addAction(copy_action)
+        if not is_import:
+            copy_action = QAction("Copy", self)
+            copy_action.triggered.connect(lambda: self._copy_task(task_def, False))
+            menu.addAction(copy_action)
 
-        copy_branch_action = QAction("Copy branch", self)
-        copy_branch_action.triggered.connect(lambda: self._copy_task(task_def, True))
-        menu.addAction(copy_branch_action)
+            copy_branch_action = QAction("Copy branch", self)
+            copy_branch_action.triggered.connect(
+                lambda: self._copy_task(task_def, True)
+            )
+            menu.addAction(copy_branch_action)
 
-        menu.addSeparator()
+            menu.addSeparator()
 
         paste_action = QAction("Paste", self)
         paste_action.triggered.connect(lambda: self._paste_task(task_def, False))
         menu.addAction(paste_action)
 
         paste_branch_action = QAction("Paste branch", self)
-        paste_branch_action.triggered.connect(lambda: self._paste_task(task_def, True))
+        paste_branch_action.triggered.connect(
+            lambda: self._paste_task(task_def, True)
+        )
         menu.addAction(paste_branch_action)
 
         menu.addSeparator()
@@ -680,17 +689,18 @@ class WorkflowTreeMixin:
         lock_action.triggered.connect(lambda: self._lock_task(task_def))
         menu.addAction(lock_action)
 
-        delete_action = QAction("Delete", self)
-        delete_action.triggered.connect(
-            lambda: self._delete_task(task_def, parent_task_def, False)
-        )
-        menu.addAction(delete_action)
+        if not is_import:
+            delete_action = QAction("Delete", self)
+            delete_action.triggered.connect(
+                lambda: self._delete_task(task_def, parent_task_def, False)
+            )
+            menu.addAction(delete_action)
 
-        delete_branch_action = QAction("Delete branch", self)
-        delete_branch_action.triggered.connect(
-            lambda: self._delete_task(task_def, parent_task_def, True)
-        )
-        menu.addAction(delete_branch_action)
+            delete_branch_action = QAction("Delete branch", self)
+            delete_branch_action.triggered.connect(
+                lambda: self._delete_task(task_def, parent_task_def, True)
+            )
+            menu.addAction(delete_branch_action)
         return menu
 
     def _copy_task(self, task_def: dict, with_branch: bool = False) -> None:

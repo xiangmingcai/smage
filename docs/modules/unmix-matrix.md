@@ -10,8 +10,8 @@ selected images.
 
 | Column | Description |
 |---|---|
-| Positive signature | The spectrum of the fluorophore, taken from its single-stain control. |
-| Negative signature | The spectrum of the negative control, subtracted as autofluorescence. |
+| Positive spectrum | The spectrum of the fluorophore, taken from its single-stain control. |
+| Negative spectrum | The spectrum of the negative control, subtracted as autofluorescence. |
 | Normalize | Normalise the signature to its maximum (on by default). |
 | Name | The fluorophore name; this becomes the output channel name. |
 
@@ -22,8 +22,8 @@ fluorophore plus any autofluorescence signatures (`AF_tissue`, `AF_RBC`).
 
 | Tab | Shows |
 |---|---|
-| Spectral matrix | Signature × parameter matrix as a heatmap with the values in each cell. |
-| Spectral curve | The signatures drawn as curves across the parameters. |
+| Signature matrix | Signature × parameter matrix as a heatmap with the values in each cell. |
+| Signature curves | The signatures drawn as curves across the parameters. |
 | Similarity matrix | Cosine similarity between signatures, fixed to the −1…1 scale. |
 
 The similarity matrix is the quickest check: two very similar fluorophores
@@ -36,8 +36,8 @@ clipboard**.
 
 ## Samples to be unmixed
 
-Tick the images that should be unmixed; **All** / **None** select or clear the
-list. Only these files get unmixed channels downstream.
+Click **Select files…** to choose the images that should be unmixed in the
+shared multi-select dialog. Only these files get unmixed channels downstream.
 
 ## Running
 

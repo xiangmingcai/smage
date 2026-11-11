@@ -387,13 +387,20 @@ def _seg_files_panel(ctx, page) -> QWidget:
         lambda _=0: _seg_on_method_changed(ctx, page)
     )
     tlay.addWidget(method_combo)
+    method_hint = QLabel("")
+    method_hint.setWordWrap(True)
+    method_hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+    method_hint.setVisible(False)
+    tlay.addWidget(method_hint)
+    page._seg_method_hint = method_hint
     page._seg_method_combo = method_combo
+    _seg_update_method_hint(ctx, page)
 
     bottom = QWidget()
     blay = QVBoxLayout(bottom)
     blay.setContentsMargins(0, 0, 0, 0)
     blay.setSpacing(6)
-    set_btn = QPushButton("Set Files")
+    set_btn = QPushButton("Select Files")
     set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     set_btn.setEnabled(not page._seg_locked)
     set_btn.clicked.connect(lambda _=False: _seg_set_files(ctx, page))
@@ -563,8 +570,34 @@ def _seg_column_edited(ctx, page) -> None:
 
 def _seg_on_method_changed(ctx, page) -> None:
     page._seg_params["method"] = page._seg_method_combo.currentData()
+    _seg_update_method_hint(ctx, page)
     _seg_rebuild_method_panel(ctx, page)
     _seg_mark_dirty(ctx, page)
+
+
+def _seg_update_method_hint(ctx, page) -> None:
+    """Explain the method under the chooser (e.g. CPU is slow)."""
+    hint = getattr(page, "_seg_method_hint", None)
+    if hint is None:
+        return
+    if page._seg_params.get("method") == "cellpose-cpu":
+        hint.setText(
+            "Cellpose CPU is much slower than Cellpose GPU — use it only "
+            "when no NVIDIA GPU is available."
+        )
+        hint.setVisible(True)
+    else:
+        hint.setText("")
+        hint.setVisible(False)
+
+
+def _seg_method_label(method) -> str:
+    """Display name of a segmentation method (matches the chooser)."""
+    for text, value in SEG_METHODS:
+        if value == method:
+            return text
+    entry = _extension_def(method)
+    return entry["name"] if entry is not None else str(method or "")
 
 
 def _seg_rebuild_method_panel(ctx, page) -> None:
@@ -834,7 +867,7 @@ def _seg_external_method_panel(ctx, page, host) -> None:
     enabled = not page._seg_locked
     ready = ctx._ext_ready(method)
 
-    lay.addWidget(QLabel(f"<b>{entry['name']}</b>"))
+    lay.addWidget(QLabel(f"<b>{_seg_method_label(method)}</b>"))
     lay.addWidget(QLabel(entry["desc"]))
     lay.addWidget(QLabel("Runs in an external Python environment."))
 
@@ -845,8 +878,8 @@ def _seg_external_method_panel(ctx, page, host) -> None:
         banner.setStyleSheet("color: #1a7f37; font-weight: bold;")
     else:
         banner.setText(
-            f"{entry['name']} extension is not configured.\n"
-            "Open Extension → Manage Extension to set it up first."
+            f"{_seg_method_label(method)} extension is not configured.\n"
+            "Open Extension → Manage Extension to set it up first.",
         )
         banner.setStyleSheet("color: #b58900; font-weight: bold;")
     lay.addWidget(banner)
@@ -1549,7 +1582,7 @@ def _seg_calculate_external(ctx, page) -> None:
         QMessageBox.information(
             ctx.host,
             "Calculate",
-            f"{entry['name']} extension is not configured.\n"
+            f"{_seg_method_label(method)} extension is not configured.\n"
             "Open Extension → Manage Extension to set it up first.",
         )
         return
@@ -1730,15 +1763,19 @@ def _seg_ext_launch(ctx, page, jobs, manifest_path) -> None:
     page._seg_ext_activity = ""
     page._seg_ext_finished = False
     page._seg_ext_start_time = time.monotonic()
-    # Keep appending to the existing log so each run's history is preserved.
-    _seg_log(ctx, page, f"===== {entry['name']} run — {len(jobs)} file(s) =====")
+    _seg_log(ctx,
+        page,
+        f"===== {_seg_method_label(page._seg_ext_method)} run — "
+        f"{len(jobs)} file(s) =====",
+    )
     worker = ctx._ext_worker()
     worker.clear()  # drop any stale results from earlier operations
     worker.run(("seg-batch",), argv)
-    _seg_log(ctx, page, f"Running {entry['name']} on {len(jobs)} file(s)…")
+    label = _seg_method_label(page._seg_ext_method)
+    _seg_log(ctx, page, f"Running {label} on {len(jobs)} file(s)…")
     status = getattr(page, "_seg_calc_status", None)
     if status is not None:
-        status.setText(f"Running {entry['name']} on {len(jobs)} file(s)…")
+        status.setText(f"Running {label} on {len(jobs)} file(s)…")
 
 
 def _seg_store_log(ctx, page) -> None:
@@ -2579,10 +2616,10 @@ def _seg_render_overlay(ctx, page) -> None:
 
 SEG_METHODS = [
     ("Nuclear Expansion", "nuclear_expansion"),
+    ("StarDist", "stardist-cpu"),
+    ("Cellpose GPU", "cellpose-gpu"),
+    ("Cellpose CPU", "cellpose-cpu"),
     ("Mask Input", "mask_input"),
-    ("Cellpose-CPU", "cellpose-cpu"),
-    ("Cellpose-GPU", "cellpose-gpu"),
-    ("StarDist-CPU", "stardist-cpu"),
 ]
 
 

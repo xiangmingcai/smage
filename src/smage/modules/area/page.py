@@ -269,7 +269,7 @@ def _area_center_panel(ctx, page) -> QWidget:
 
     table = QTableWidget(0, 9)
     table.setHorizontalHeaderLabels([
-        "File", "X", "Y", "Signal", "Low", "High", "Density", "Area", "Status",
+        "File", "X", "Y", "Channel", "Low", "High", "Density", "Area", "Status",
     ])
     table.verticalHeader().setVisible(False)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1399,7 +1399,7 @@ def _area_draw_overlay(ctx, page, path) -> None:
 def _area_copy(ctx, page) -> None:
     params = page._area_params
     headers = [
-        "File", "X", "Y", "Signal", "Low", "High", "Density", "Area", "Status",
+        "File", "X", "Y", "Channel", "Low", "High", "Density", "Area", "Status",
     ]
     lines = ["\t".join(headers)]
     for path in page._area_paths:

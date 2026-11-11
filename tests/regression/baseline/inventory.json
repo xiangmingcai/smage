@@ -2866,20 +2866,12 @@
       "line": 1043
     },
     {
-      "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|button|All|0",
+      "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|button|Select files…|0",
       "file": "src/smage/modules/unmix/page.py",
       "function": "_unmix_sample_panel",
       "kind": "button",
-      "label": "All",
-      "line": 2143
-    },
-    {
-      "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|button|None|0",
-      "file": "src/smage/modules/unmix/page.py",
-      "function": "_unmix_sample_panel",
-      "kind": "button",
-      "label": "None",
-      "line": 2144
+      "label": "Select files…",
+      "line": 2154
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|list|<dynamic>|0",

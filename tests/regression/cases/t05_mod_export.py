@@ -54,6 +54,40 @@ def _run(window, page, project, out_dir: Path, fmt: str, columns):
     return _drain(q)
 
 
+@harness.case("mod.export.reorder", "L4", "export", tags=("fast",))
+def reorder_keeps_channels() -> None:
+    """Dropping a row onto another must not lose a channel.
+
+    The list reports the drag and the page reorders its parameters; the
+    widget itself never removes rows, so the rebuilt list is always complete.
+    """
+    window, project, page = _open("export_reorder")
+    try:
+        ctx = window._ctx
+        kind = "table"
+        section = _export_page._export_params_for(ctx, page, kind)
+        section["files"] = [str(project.data_dir / "case.parquet")]
+        section["columns"] = ["x", "FL1-A"]
+        _export_page._export_refresh_pane(ctx, page, kind)
+        pane = _export_page._export_pane(ctx, page, kind)
+        harness.eq(pane.cols_box.count(), 2)
+
+        # Move the last row to the top, as a drop on the first row would.
+        _export_page._export_reorder(ctx, page, kind, 1, 0)
+
+        harness.eq(section["columns"], ["FL1-A", "x"],
+                   "the channel order follows the drop")
+        harness.eq(pane.cols_box.count(), 2,
+                   "no row disappears from the list")
+        harness.eq(
+            [pane.cols_box.item(i).text() for i in range(2)],
+            ["FL1-A", "x"],
+            "the list is rebuilt from the reordered parameters",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("mod.export.csv", "L4", "export", tags=("fast",))
 def export_csv() -> None:
     window, project, page = _open("export_csv")

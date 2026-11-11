@@ -11,7 +11,7 @@ labels or using gates as features.
 | Setting | Description |
 |---|---|
 | Data files | The files the gates apply to. |
-| Convert gates | One row per gate: which gating module it comes from, the gate, and the output column name. |
+| Convert table | One row per gate: which gating module it comes from (**From gate**), the gate, and the **New channel name**. |
 
 ## Output
 

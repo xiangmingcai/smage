@@ -15,7 +15,7 @@ or clustered together. Two methods are available:
 | Setting | Description |
 |---|---|
 | Files | The files to align. |
-| Columns | The channels the alignment is computed on. |
+| Channels | The channels the alignment is computed on. |
 | Batches | Batch assignment per file (editable column in the file table). |
 
 ## CytoNorm (reference-based)
@@ -51,7 +51,7 @@ the batches overlap in marker space.
 
 ## Output
 
-Aligned values for the selected columns; downstream modules see them under the
+Aligned values for the selected channels; downstream modules see them under the
 same names.
 
 ## Notes

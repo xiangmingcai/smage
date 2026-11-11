@@ -204,7 +204,7 @@ def _illum_refresh_list(ctx, page) -> None:
         item = QListWidgetItem(sub.get("name", ""))
         item.setData(Qt.ItemDataRole.UserRole, sub.get("id"))
         if sub.get("mask") is None:
-            item.setToolTip("Mask not calculated yet")
+            item.setToolTip("Pattern not recognized yet")
         sub_list.addItem(item)
     sub_list.blockSignals(False)
     if page._illum_selected:
@@ -640,7 +640,7 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
     lay.addLayout(bins_row)
     lay.addWidget(_widgets_panels._param_hint(ctx,
         "Bin = tile size of the coarse grid; Resolution = number of bins "
-        "across the image. The mask is fitted on that grid."
+        "across the image. The pattern is fitted on that grid."
     ))
 
     lay.addWidget(QLabel("Correction method"))
@@ -657,7 +657,7 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
         "median level and is the safe default."
     ))
 
-    lay.addWidget(QLabel("Files for the calculation"))
+    lay.addWidget(QLabel("Files for illumination pattern recognition"))
     calc_list = QListWidget()
     calc_list.setStyleSheet(
         "QListWidget { background: #ffffff; border: none; }"
@@ -680,7 +680,7 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
     page._illum_calc_list = calc_list
 
     calc_row = QHBoxLayout()
-    calc_btn = QPushButton("Calculate Illumination")
+    calc_btn = QPushButton("Recognize Illumination Pattern")
     calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     calc_btn.setEnabled(editable and bool(sub.get("channel")))
     calc_btn.clicked.connect(
@@ -703,7 +703,7 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
             sub["mask"] = None
             sub["mask_source"] = None
             _illum_drop_mask_file(ctx, page._illum_task_id, sub)
-            status.setText("Parameters changed — recalculate the mask.")
+            status.setText("Parameters changed — re-recognize the pattern.")
             cleared = True
         _illum_mark_dirty(ctx, page)
         if cleared:
@@ -725,7 +725,7 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
             sub["mask"] = None
             sub["mask_source"] = None
             _illum_drop_mask_file(ctx, page._illum_task_id, sub)
-            status.setText("Parameters changed — recalculate the mask.")
+            status.setText("Parameters changed — re-recognize the pattern.")
         _illum_mark_dirty(ctx, page)
 
     def on_resolution(value):
@@ -734,7 +734,7 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
             sub["mask"] = None
             sub["mask_source"] = None
             _illum_drop_mask_file(ctx, page._illum_task_id, sub)
-            status.setText("Parameters changed — recalculate the mask.")
+            status.setText("Parameters changed — re-recognize the pattern.")
         _illum_mark_dirty(ctx, page)
 
     def on_method():
@@ -776,12 +776,12 @@ def _illum_divisibility_hint(ctx, sub) -> str:
     if width % tile_w:
         messages.append(
             f"Width {width} is not divisible by tile width {tile_w}: "
-            "the edge strip is excluded from the mask calculation."
+            "the edge strip is excluded from the pattern recognition."
         )
     if height % tile_h:
         messages.append(
             f"Height {height} is not divisible by tile height {tile_h}: "
-            "the edge strip is excluded from the mask calculation."
+            "the edge strip is excluded from the pattern recognition."
         )
     return "\n".join(messages)
 
@@ -791,7 +791,7 @@ def _illum_mask_panel(ctx, page, sub) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Illumination mask</b>"))
+    lay.addWidget(QLabel("<b>Illumination pattern</b>"))
     plot = pg.PlotWidget(background=_plot_background())
     plot.getPlotItem().hideAxis("bottom")
     plot.getPlotItem().hideAxis("left")
@@ -820,7 +820,7 @@ def _illum_render_mask(ctx, page, sub) -> None:
     if not mask_data:
         image_item.clear()
         if source is not None:
-            source.setText("No mask yet. Click Calculate Illumination.")
+            source.setText("No pattern yet. Click Recognize Illumination Pattern.")
         return
     mask = np.asarray(mask_data, dtype="float64")
     finite = mask[np.isfinite(mask)]
@@ -842,7 +842,7 @@ def _illum_render_mask(ctx, page, sub) -> None:
             f" · bin {source_params.get('bin', sub.get('bin'))}"
             f" · resolution {source_params.get('resolution', sub.get('resolution'))}\n"
             f"channel {sub.get('channel')} · method {sub.get('method')}\n"
-            f"mask range {lo:.4g} – {hi:.4g}"
+            f"pattern range {lo:.4g} – {hi:.4g}"
         )
 
 
@@ -1204,7 +1204,7 @@ def _illum_calculate(ctx, page, sub, button) -> None:
     if not channel or not x_name or not y_name:
         QMessageBox.information(
             ctx.host,
-            "Calculate Illumination",
+            "Recognize Illumination Pattern",
             "Select the channel and the X/Y parameters first.",
         )
         return
@@ -1212,14 +1212,14 @@ def _illum_calculate(ctx, page, sub, button) -> None:
     if not files:
         QMessageBox.information(
             ctx.host,
-            "Calculate Illumination",
-            "Select at least one file to calculate the mask from.",
+            "Recognize Illumination Pattern",
+            "Select at least one file to recognize the pattern from.",
         )
         return
     if int(sub.get("resolution", 10)) < int(sub.get("bin", 5)):
         QMessageBox.information(
             ctx.host,
-            "Calculate Illumination",
+            "Recognize Illumination Pattern",
             "Resolution must be greater than or equal to bin.",
         )
         return
@@ -1271,7 +1271,7 @@ def _illum_on_poll(ctx, page) -> None:
         if error:
             if status is not None:
                 status.setText(error)
-            QMessageBox.warning(ctx.host, "Calculate Illumination", error)
+            QMessageBox.warning(ctx.host, "Recognize Illumination Pattern", error)
             continue
         sub = next(
             (s for s in page._illum_submodules if s["id"] == key), None

@@ -36,13 +36,13 @@ Every pixel becomes a row with its `x`, `y` and channel values.
 ## 4. Aggregate per object
 
 1. Add **Feature Down**.
-2. Set **Feature variable** to the mask column.
+2. Set **Feature channel** to the mask column.
 3. Add one aggregation rule per marker (for example `Mean` of `CD8`).
 4. Check the **Background ignore** values so the background label is excluded.
 5. **Calculate** — one row per segmented object is written per image.
 
 The default rules table already contains the Count row and a group-key row
-named after the feature variable; the group-key row can be deleted if you do
+named after the feature channel; the group-key row can be deleted if you do
 not want the identifier column in the output.
 
 ## 5. Compare and visualise

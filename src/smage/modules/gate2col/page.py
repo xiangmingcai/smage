@@ -287,7 +287,7 @@ def _g2c_select_files(ctx, page) -> None:
     if rejected:
         QMessageBox.warning(
             ctx.host, "Select files",
-            "These files were not added because they lack the columns "
+            "These files were not added because they lack the channels "
             "needed by the selected gates:\n" + "\n".join(rejected),
         )
     page._g2c_params["files"] = accepted
@@ -353,11 +353,11 @@ def _g2c_rules_panel(ctx, page) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Convert gates</b>"))
+    lay.addWidget(QLabel("<b>Convert table</b>"))
 
     table = QTableWidget()
     table.setColumnCount(2)
-    table.setHorizontalHeaderLabels(["Gate", "New column name"])
+    table.setHorizontalHeaderLabels(["From gate", "New channel name"])
     header = table.horizontalHeader()
     header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
     header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -494,7 +494,7 @@ def _g2c_rebuild_rules(ctx, page) -> None:
         name_edit = QLineEdit(str(rule.get("name") or ""))
         name_edit.setEnabled(enabled)
         warn = QLabel("⚠")
-        warn.setToolTip("Duplicate column name")
+        warn.setToolTip("Duplicate channel name")
         warn.setStyleSheet("color: #b58900; font-weight: bold;")
 
         def on_name(text, r=rule, warn_label=warn):
@@ -576,12 +576,12 @@ def _g2c_validate(ctx, page):
             return False, f"Row {i + 1}: choose a gate."
         name = (rule.get("name") or "").strip()
         if not name:
-            return False, f"Row {i + 1}: give the new column a name."
+            return False, f"Row {i + 1}: give the new channel a name."
         names.append(name)
     if len(names) != len(set(names)):
-        return False, "New column names must be unique."
+        return False, "New channel names must be unique."
     if any(name in existing for name in names):
-        return False, "A new column name collides with an existing column."
+        return False, "A new channel name collides with an existing channel."
     return True, ""
 
 
