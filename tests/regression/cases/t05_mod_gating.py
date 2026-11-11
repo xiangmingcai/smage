@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
 from smage.modules.gating import page as gating_page  # noqa: E402
+from smage.core.gates import _gate_mask  # noqa: E402
 from smage.widgets.gate_editor.canvas import _GatePolygonROI  # noqa: E402
 from smage.widgets.plot_axes import _gate_roi_pens  # noqa: E402
 from smage.data import naming as _data_naming
@@ -77,6 +78,57 @@ def gates_live_in_real_coordinates() -> None:
         back = gating_page._gating_geometry_to_display(ctx, page, gate, real)
         harness.check(np.allclose(back["pos"], display["pos"]))
         harness.check(np.allclose(back["size"], display["size"]))
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.ellipse_scale", "L4", "gating", tags=("fast",))
+def ellipse_follows_the_drawn_shape() -> None:
+    """An ellipse drawn on a log axis keeps the outline that was drawn."""
+    gating = harness.task_def("gating", task_id="g-1", name="Gating")
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={"columns": [{"name": "FL1-A", "method": "log10"}],
+                "files": None},
+        children=[gating],
+    )
+    project = harness.new_project(
+        "gating_ellipse_scale", rows=200, tasks=[scale]
+    )
+    window = harness.new_window()
+    harness.open_project(window, project)
+    try:
+        window._open_module("g-1", "gating", "Gating")
+        harness.pump(400)
+        page = window.tabs.currentWidget()
+        ctx = window._ctx
+        page._gating_preview["x"] = "FL1-A"
+        page._gating_preview["y"] = "FL2-A"
+
+        pos, size = (1.0, 2.0), (2.0, 1.0)
+        roi = pg.EllipseROI(pos, size, **_gate_roi_pens("#000000"))
+        gating_page._gating_add_gate(ctx, page, "ellipse", roi)
+        gate = page._gating_gates[-1]
+        harness.check(gate.get("points"), "the gate stores its outline")
+
+        display = gating_page._gating_geometry_to_display(ctx, page, gate, gate)
+        cx, cy = pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0
+        rx, ry = size[0] / 2.0, size[1] / 2.0
+        for px, py in display["points"]:
+            value = ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2
+            harness.check(
+                abs(value - 1.0) < 1e-6,
+                "outline vertices return to the drawn ellipse",
+            )
+
+        # Log10 is the transform of the x axis; y (FL2-A) stays linear.
+        inside_x = 10.0 ** (cx + 0.9 * rx)
+        outside_x = 10.0 ** (cx + 1.1 * rx)
+        mask = _gate_mask(
+            np.array([inside_x, outside_x]), np.array([cy, cy]), gate
+        )
+        harness.check(bool(mask[0]), "a point inside the drawn ellipse is selected")
+        harness.check(not bool(mask[1]), "a point outside it is not")
     finally:
         _close(window)
 

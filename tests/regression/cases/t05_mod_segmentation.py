@@ -13,7 +13,6 @@ import harness  # noqa: E402
 from smage.data.image_index import _build_image_index_files  # noqa: E402
 from smage.importer import import_file  # noqa: E402
 from smage.modules.segmentation import page as seg_page  # noqa: E402
-from smage.modules.segmentation import page as seg_page
 
 
 def _open(case_id: str):
@@ -156,6 +155,96 @@ def import_mask() -> None:
         harness.eq(sorted(set(np.unique(loaded).tolist()) - {0}), [1, 2])
     finally:
         _close(window)
+
+
+@harness.case("mod.segmentation.log", "L4", "segmentation", tags=("fast",))
+def calculation_log() -> None:
+    """The calculation log reports each file, is saved, and is never cleared."""
+    window, _project, page, parquet = _open("seg_log")
+    try:
+        ctx = window._ctx
+        page._seg_params["files"] = [parquet]
+        params = page._seg_params.setdefault("method_params", {}).setdefault(
+            "nuclear_expansion", {}
+        )
+        params.update({
+            "channel": "Channel 1",
+            "threshold_mode": "manual",
+            "threshold": 100.0,
+            "min_area": 4,
+            "expand": 0,
+        })
+
+        seg_page._seg_calculate_nuclear(ctx, page)
+        harness.wait_for(
+            lambda: not getattr(page, "_seg_calc_running", False),
+            timeout=30,
+            message="background segmentation run",
+        )
+        lines = page._seg_log_lines
+        harness.check(
+            any("Nuclear Expansion run" in line for line in lines),
+            "the run is announced",
+        )
+        harness.check(
+            any("→ Calculating 1/1" in line for line in lines),
+            "every file reports its progress",
+        )
+        harness.check(
+            any("✓" in line and "nucleus(s)" in line for line in lines),
+            "the per-file result is logged",
+        )
+        harness.eq(page._seg_params["log"], lines,
+                   "the log is stored in the module params")
+
+        before = len(lines)
+        seg_page._seg_calculate_nuclear(ctx, page)
+        harness.wait_for(
+            lambda: not getattr(page, "_seg_calc_running", False),
+            timeout=30,
+            message="second background segmentation run",
+        )
+        harness.check(
+            len(page._seg_log_lines) > before,
+            "a rerun appends to the history instead of clearing it",
+        )
+
+        # A rebuilt log box replays the saved history (reopen / rebuild).
+        seg_page._seg_method_panel(ctx, page)
+        text = page._seg_calc_log.toPlainText()
+        harness.check("Nuclear Expansion run" in text, text)
+        harness.check("→ Calculating 1/1" in text, text)
+    finally:
+        _close(window)
+
+
+@harness.case("mod.segmentation.split", "L4", "segmentation", tags=("fast",))
+def split_touching_nuclei() -> None:
+    """Two touching disks get separate labels when splitting is enabled."""
+    from scipy import ndimage
+
+    yy, xx = np.mgrid[0:40, 0:40]
+    first = (xx - 14) ** 2 + (yy - 20) ** 2 <= 8 ** 2
+    second = (xx - 25) ** 2 + (yy - 20) ** 2 <= 8 ** 2
+    binary = first | second
+    labels, _count = ndimage.label(binary)
+    harness.eq(int(labels.max()), 1, "the disks touch and form one component")
+
+    split = seg_page._seg_split_touching_nuclei(labels, min_area=20)
+    harness.eq(int(split.max()), 2, "the touching disks are separated")
+    harness.eq(sorted(set(np.unique(split).tolist()) - {0}), [1, 2])
+    harness.check(np.array_equal(split > 0, binary),
+                  "splitting keeps the segmented region unchanged")
+
+    wide = seg_page._seg_split_touching_nuclei(
+        labels, min_area=20, separation=15
+    )
+    harness.eq(int(wide.max()), 1,
+               "a larger separation keeps the touching disks together")
+
+    single, _ = ndimage.label(first)
+    kept = seg_page._seg_split_touching_nuclei(single, min_area=20)
+    harness.eq(int(kept.max()), 1, "a single nucleus is not split")
 
 
 if __name__ == "__main__":

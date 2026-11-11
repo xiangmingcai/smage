@@ -49,6 +49,10 @@ also has a name, color and per-file shape overrides.
 
 - Gates are stored in original data units; a [Scale](scale.md) module above
   only changes how they are drawn.
+- An ellipse drawn on a log or arcsinh axis is stored as a sampled outline of
+  that ellipse, so the selected events are exactly the ones inside the shape
+  you drew. (A mathematical ellipse in data units would not match the drawn
+  shape on a non-linear axis.)
 - The gate tree is saved with **Save**; closing with unsaved changes asks for
   confirmation.
 

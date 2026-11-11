@@ -6,6 +6,32 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Segmentation (Nuclear Expansion): optional **Split touching nuclei**, which
+  seeds each nucleus at its distance-map maximum and assigns pixels to the
+  nearest seed, giving clumped nuclei separate labels. A **split minimum
+  separation** setting controls how strong the split is (Auto by default).
+
+### Fixed
+
+- Ellipse gates drawn on a log or arcsinh axis now select exactly the shape
+  that was drawn. The outline is stored in data units and used for the mask,
+  instead of a data-space ellipse that appears as a skewed diamond.
+
+### Changed
+
+- Segmentation: the calculation log is now a shared dark log box below the
+  Calculate button, splitting the parameters panel into a 4:1 parameter/log
+  layout.
+- Segmentation: the log reports progress per file, is saved with the module,
+  is restored when the module reopens, and a rerun appends to the history
+  instead of clearing it.
+- Segmentation: calculations no longer freeze the window. Nuclear Expansion
+  runs on a worker thread, and Cellpose / StarDist rasterize their images on
+  a worker thread before the external process starts; the Calculate button
+  is disabled until the run finishes.
+
 ### Planned
 
 - Code signing for the Windows executable and installer (SignPath Foundation).

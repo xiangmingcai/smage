@@ -4,8 +4,8 @@ from __future__ import annotations
 from PySide6.QtCore import QPointF, QSize, QTimer, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout,
-    QWidget,
+    QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QScrollArea,
+    QVBoxLayout, QWidget,
 )
 
 from smage.widgets.plot_axes import _triangle_icon
@@ -19,6 +19,21 @@ def _param_hint(ctx, text: str) -> QLabel:
         "color: #8a94a6; font-size: 8pt; margin: 0 0 6px 0;"
     )
     return label
+
+
+def _log_widget(placeholder: str = "Calculation output appears here…",
+                height: int | None = None) -> QPlainTextEdit:
+    """The read-only dark log box shared by the calculation modules."""
+    log = QPlainTextEdit()
+    log.setReadOnly(True)
+    log.setPlaceholderText(placeholder)
+    log.setStyleSheet(
+        "background: #1e1e1e; color: #d4d4d4; "
+        "font-family: Consolas, monospace; font-size: 9pt;"
+    )
+    if height is not None:
+        log.setFixedHeight(int(height))
+    return log
 
 
 def _build_panel_frame(ctx) -> QFrame:

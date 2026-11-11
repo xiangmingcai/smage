@@ -12,7 +12,11 @@ from smage.core.scale_math import _apply_scale_transforms
 # Geometry fields that can differ per file (never the gate type or axes).
 _GATE_GEOMETRY_KEYS = {
     "rect": ("pos", "size"),
-    "ellipse": ("pos", "size"),
+    # Ellipse gates also carry a polygon approximation in data units: an
+    # ellipse drawn on a non-linear axis (log / arcsinh) is not an ellipse in
+    # data space, so the sampled outline is the shape that actually matches
+    # the drawn gate.
+    "ellipse": ("pos", "size", "points"),
     "polygon": ("points",),
     "quadrant": ("vx", "hy"),
     "split": ("vx",),
@@ -30,14 +34,32 @@ def _point_in_polygon(x, y, points):
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     inside = np.zeros(x.shape, dtype=bool)
+    if n < 3:
+        return inside
+    # Points outside the polygon's bounding box can never be inside; testing
+    # only the rest keeps large polygons (and the sampled ellipse outline)
+    # fast on files with millions of events.
+    flat_x = x.ravel()
+    flat_y = y.ravel()
+    candidate = (
+        (flat_x >= float(px.min())) & (flat_x <= float(px.max()))
+        & (flat_y >= float(py.min())) & (flat_y <= float(py.max()))
+    )
+    if not candidate.any():
+        return inside
+    cx = flat_x[candidate]
+    cy = flat_y[candidate]
+    result = np.zeros(cx.shape, dtype=bool)
     for i in range(n):
         xi, yi = px[i], py[i]
         xj, yj = px[(i + 1) % n], py[(i + 1) % n]
-        cond = (yi > y) != (yj > y)
+        cond = (yi > cy) != (yj > cy)
         with np.errstate(divide="ignore", invalid="ignore"):
-            x_cross = (xj - xi) * (y - yi) / (yj - yi) + xi
-        inside ^= cond & (x < x_cross)
-    return inside
+            x_cross = (xj - xi) * (cy - yi) / (yj - yi) + xi
+        result ^= cond & (cx < x_cross)
+    flat_inside = np.zeros(flat_x.shape, dtype=bool)
+    flat_inside[candidate] = result
+    return flat_inside.reshape(x.shape)
 
 
 def _gate_mask(x, y, gate):
@@ -49,6 +71,12 @@ def _gate_mask(x, y, gate):
         w, h = gate["size"]
         return (x >= x0) & (x <= x0 + w) & (y >= y0) & (y <= y0 + h)
     if t == "ellipse":
+        points = gate.get("points")
+        if points and len(points) >= 3:
+            # The stored outline is the inverse image of the drawn ellipse;
+            # testing the polygon keeps the selection identical to the shape
+            # on screen even on a non-linear axis.
+            return _point_in_polygon(x, y, points)
         x0, y0 = gate["pos"]
         w, h = gate["size"]
         cx = x0 + w / 2.0

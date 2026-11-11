@@ -112,8 +112,12 @@
   - [ ] 发布前补截图/GIF（当前 README 未放图片）。
 - [ ] **引用信息**：添加 `CITATION.cff`（作者 Xiangming Cai，`affiliation: Amsterdam UMC`；标题、版本、仓库地址；指导者 Juan J. Garcia Vallejo 放在 acknowledgements，不算作者），评估是否申请 Zenodo DOI 并写进 README 的 Citation 段落。
 - [ ] GitHub 仓库元信息：About 描述、topics（`flow-cytometry`、`image-analysis`、`bioinformatics`、`pyside6`）、启用 Issues、启用私有漏洞报告（Security → Private vulnerability reporting），并开启 tag 保护/发布流程。
-- [ ] **文档站点**（MkDocs Material，`docs/` + `mkdocs.yml` + `.github/workflows/docs.yml`）：
-  - [ ] **GitHub Actions 页面构建**：`.github/workflows/docs.yml` 已写好（push 到 `main` 且改动 `docs/**` / `mkdocs.yml` 时自动 `mkdocs build --strict` 并部署 Pages）。待办：
+- [ ] **文档站点**（MkDocs Material，`docs/` + `mkdocs.yml`）：
+  - [ ] **把 `.github/workflows/docs.yml` 推上 GitHub**（当前只在本机，未跟踪）。GitHub 拒绝推送的原因是 token 缺少 `workflow` 权限：
+    - 方案 A：给现有 PAT 加 **Repository permissions → Workflows: Read and write**（经典 token 勾 `workflow` scope），然后告诉我补提交推送
+    - 方案 B：在 GitHub 网页 Add file → Create new file，路径 `.github/workflows/docs.yml`，内容复制本机文件
+    - 推送后 `git add` 该文件并提交
+  - [ ] **GitHub Actions 页面构建**（workflow 就位后）：push 到 `main` 且改动 `docs/**` / `mkdocs.yml` 时自动 `mkdocs build --strict` 并部署 Pages。待办：
     - [ ] 仓库 Settings → Pages → Source 选 **GitHub Actions**
     - [ ] push 后到 Actions 页确认 `docs` workflow 首次运行成功；若因 Pages 未启用失败，启用后 **Re-run all jobs**
     - [ ] 确认发布地址 https://xiangmingcai.github.io/smage/ 可访问、搜索和截图正常

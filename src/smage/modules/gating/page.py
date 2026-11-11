@@ -105,6 +105,14 @@ def _gate_label_position(gate):
     yr = (gate.get("ymin", 0.0), gate.get("ymax", 1.0))
     dx = (xr[1] - xr[0]) * 0.12
     dy = (yr[1] - yr[0]) * 0.12
+    if t == "ellipse" and gate.get("points"):
+        # The outline is a polygon; use its centroid so the label stays
+        # centred on the shape actually drawn.
+        pts = gate["points"]
+        return (
+            sum(p[0] for p in pts) / len(pts),
+            sum(p[1] for p in pts) / len(pts),
+        )
     if t in ("rect", "ellipse"):
         x0, y0 = gate["pos"]
         w, h = gate["size"]
@@ -196,6 +204,12 @@ def _gating_convert_geometry(gate, geometry, xmap, ymap) -> dict:
             w, h = geometry["size"]
             out["pos"] = [xmap(x), ymap(y)]
             out["size"] = [xmap(x + w) - xmap(x), ymap(y + h) - ymap(y)]
+        if t == "ellipse" and "points" in geometry:
+            # The outline of an ellipse on a non-linear axis is a curve in
+            # data space; each vertex is converted independently.
+            out["points"] = [
+                [xmap(p[0]), ymap(p[1])] for p in geometry["points"]
+            ]
     elif t == "polygon":
         if "points" in geometry:
             out["points"] = [
@@ -645,14 +659,59 @@ def _gating_file_key(ctx, page):
     return preview.get("file") if isinstance(preview, dict) else None
 
 
+_GATE_ELLIPSE_SAMPLES = 48
+
+
+def _gating_ellipse_points(pos, size, count: int = _GATE_ELLIPSE_SAMPLES):
+    """Sample an ellipse (in plot units) into a polygon outline.
+
+    The outline is converted to data units by the caller. Storing it makes
+    the gate's selection match the ellipse the user drew, which a data-space
+    ellipse cannot do on a non-linear (log / arcsinh) axis.
+    """
+    import math
+
+    x0, y0 = float(pos[0]), float(pos[1])
+    w, h = float(size[0]), float(size[1])
+    if w <= 0.0 or h <= 0.0:
+        return []
+    cx, cy = x0 + w / 2.0, y0 + h / 2.0
+    rx, ry = w / 2.0, h / 2.0
+    step = 2.0 * math.pi / count
+    return [
+        [cx + rx * math.cos(step * i), cy + ry * math.sin(step * i)]
+        for i in range(count)
+    ]
+
+
 def _gating_sync_gate(ctx, gate: dict, roi):
     """Extract the geometry dict for a rect/ellipse/polygon ROI."""
     t = gate.get("type")
     if t in ("rect", "ellipse"):
-        return {
+        # An ellipse reloaded from a sampled gate is a polygon ROI; editing
+        # it updates the outline directly.
+        if t == "ellipse" and isinstance(roi, _GatePolygonROI):
+            ox = roi.pos().x()
+            oy = roi.pos().y()
+            points = [[p.x() + ox, p.y() + oy] for p in roi.getState()["points"]]
+            if not points:
+                return {}
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            return {
+                "points": points,
+                "pos": [min(xs), min(ys)],
+                "size": [max(xs) - min(xs), max(ys) - min(ys)],
+            }
+        geometry = {
             "pos": [roi.pos().x(), roi.pos().y()],
             "size": [roi.size().x(), roi.size().y()],
         }
+        if t == "ellipse":
+            points = _gating_ellipse_points(geometry["pos"], geometry["size"])
+            if points:
+                geometry["points"] = points
+        return geometry
     if t == "polygon":
         ox = roi.pos().x()
         oy = roi.pos().y()
@@ -1783,14 +1842,23 @@ def _gating_load_rois(ctx, page) -> None:
                 )
                 items = [roi]
             elif t == "ellipse":
-                roi = pg.EllipseROI(
-                    (rgate["pos"][0], rgate["pos"][1]),
-                    (
-                        max(float(rgate["size"][0]), _MIN_GATE_SPAN),
-                        max(float(rgate["size"][1]), _MIN_GATE_SPAN),
-                    ),
-                    **_gate_roi_pens(gate_color),
-                )
+                if rgate.get("points"):
+                    # The stored outline is the exact shape the user drew on
+                    # this axis; an EllipseROI would only match its bounding
+                    # box and select a different set of points.
+                    roi = _GatePolygonROI(
+                        [tuple(p) for p in rgate["points"]],
+                        closed=True, **_gate_roi_pens(gate_color),
+                    )
+                else:
+                    roi = pg.EllipseROI(
+                        (rgate["pos"][0], rgate["pos"][1]),
+                        (
+                            max(float(rgate["size"][0]), _MIN_GATE_SPAN),
+                            max(float(rgate["size"][1]), _MIN_GATE_SPAN),
+                        ),
+                        **_gate_roi_pens(gate_color),
+                    )
                 _gating_style_handles(ctx, roi)
                 roi.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
                 roi.setAcceptHoverEvents(True)

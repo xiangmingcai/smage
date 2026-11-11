@@ -14,7 +14,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
+    QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -56,6 +55,8 @@ from smage.widgets.controls import (
 from smage.widgets.plot_axes import _make_sci_axis
 from smage.widgets.resources import _lock_pixmap
 import copy
+import queue
+import threading
 import time
 from smage.data import columns as _data_columns
 from smage.data import files as _data_files
@@ -255,6 +256,7 @@ def _build_segmentation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     params.setdefault("masks", {})
     params.setdefault("applied", {})
     params.setdefault("plot", {})
+    params.setdefault("log", [])
     page._seg_task_def = task_def
     page._seg_task_id = task_def.get("id")
     page._seg_params = params
@@ -266,7 +268,10 @@ def _build_segmentation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     page._seg_overlay_item = None
     page._seg_mask_cache = {}
     page._seg_ext_running = False
-    page._seg_log_lines = []
+    page._seg_calc_running = False
+    # The calculation log belongs to the module: it is saved with the task
+    # params, restored when the page reopens, and never cleared by a rerun.
+    page._seg_log_lines = list(params.get("log") or [])
     save_btn.clicked.connect(lambda _=False: _seg_save_now(ctx, page))
 
     content = QWidget()
@@ -584,8 +589,16 @@ def _seg_method_panel(ctx, page) -> QWidget:
     host.setLayout(QVBoxLayout())
     host.layout().setContentsMargins(0, 0, 0, 0)
     host.layout().setSpacing(6)
-    lay.addWidget(host, 1)
+    # Parameters (4) above, calculation log (1) below the Calculate button.
+    lay.addWidget(host, 4)
+    log = _widgets_panels._log_widget()
+    # Replay the saved history so the log survives closing and reopening.
+    for line in getattr(page, "_seg_log_lines", []):
+        log.appendPlainText(line)
+    log.verticalScrollBar().setValue(log.verticalScrollBar().maximum())
+    lay.addWidget(log, 1)
     page._seg_method_host = host
+    page._seg_calc_log = log
     return panel
 
 
@@ -707,6 +720,36 @@ def _seg_method_params_panel(ctx, page, host) -> None:
         "How far each nucleus grows to approximate the cell body."
     ))
 
+    split_check = QCheckBox("Split touching nuclei")
+    split_check.setChecked(bool(params.get("split", False)))
+    split_check.setEnabled(enabled)
+    lay.addWidget(split_check)
+    lay.addWidget(_widgets_panels._param_hint(ctx,
+        "Seeds each nucleus from the maximum of its distance map and "
+        "assigns every pixel to the nearest seed, so nuclei that touch get "
+        "separate labels."
+    ))
+    page._seg_split_check = split_check
+
+    lay.addWidget(QLabel("Split minimum separation"))
+    sep_spin = _NoWheelSpinBox()
+    sep_spin.setRange(0, 200)
+    sep_spin.setValue(int(params.get("split_separation", 0) or 0))
+    sep_spin.setSpecialValueText("Auto")
+    sep_spin.setSuffix(" px")
+    sep_spin.setEnabled(enabled and split_check.isChecked())
+    sep_spin.setToolTip(
+        "Minimum distance between two nucleus centres before they are split. "
+        "Larger = fewer splits, smaller = more. Auto uses the radius of a "
+        "nucleus with the minimum area."
+    )
+    lay.addWidget(sep_spin)
+    lay.addWidget(_widgets_panels._param_hint(ctx,
+        "Split strength: how far apart two nucleus centres must be to count "
+        "as separate objects."
+    ))
+    page._seg_split_separation = sep_spin
+
     calc_btn = QPushButton("Calculate")
     calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     calc_btn.setEnabled(enabled)
@@ -752,10 +795,21 @@ def _seg_method_params_panel(ctx, page, host) -> None:
         params["expand"] = int(value)
         _seg_mark_dirty(ctx, page)
 
+    def on_split(checked):
+        params["split"] = bool(checked)
+        sep_spin.setEnabled(enabled and bool(checked))
+        _seg_mark_dirty(ctx, page)
+
+    def on_separation(value):
+        params["split_separation"] = int(value)
+        _seg_mark_dirty(ctx, page)
+
     channel_combo.currentIndexChanged.connect(on_channel)
     mode_combo.currentIndexChanged.connect(on_mode)
     area_spin.valueChanged.connect(on_area)
     exp_spin.valueChanged.connect(on_expand)
+    split_check.toggled.connect(on_split)
+    sep_spin.valueChanged.connect(on_separation)
     calc_btn.clicked.connect(lambda _=False: _seg_calculate(ctx, page))
 
 
@@ -922,19 +976,10 @@ def _seg_external_method_panel(ctx, page, host) -> None:
     status.setStyleSheet("color: #6b7785;")
     status.setWordWrap(True)
     lay.addWidget(status)
-    log = QPlainTextEdit()
-    log.setReadOnly(True)
-    log.setPlaceholderText("Calculation output appears here…")
-    log.setStyleSheet(
-        "background: #1e1e1e; color: #d4d4d4; "
-        "font-family: Consolas, monospace; font-size: 9pt;"
-    )
-    for line in getattr(page, "_seg_log_lines", []):
-        log.appendPlainText(line)
-    lay.addWidget(log, 1)
+    # The log box is created once by _seg_method_panel (below the Calculate
+    # button) and shared by every method.
     page._seg_calc_btn = calc_btn
     page._seg_calc_status = status
-    page._seg_calc_log = log
 
     def on_channel(_=0):
         params["channel"] = channel_combo.currentData()
@@ -1138,11 +1183,17 @@ def _seg_import_masks(ctx, page) -> None:
 
     done = 0
     errors = []
-    for parquet_path, rec in pending:
+    _seg_log(ctx, page, f"===== Mask import — {len(pending)} file(s) =====")
+    for i, (parquet_path, rec) in enumerate(pending):
+        name = _data_naming._comp_file_name(
+            ctx, parquet_path, page._seg_task_id
+        )
+        _seg_log(ctx, page, f"→ Importing {i + 1}/{len(pending)}: {name}…")
         ent = _data_image_index._ensure_image_index(ctx, parquet_path)
         if ent is None or ent.get("manifest") is None:
             rec["state"] = SEG_IMPORT_UNKNOWN
-            errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: no image index")
+            errors.append(f"{name}: no image index")
+            _seg_log(ctx, page, f"✗ {name}: no image index")
             continue
         man = ent["manifest"]
         height = int(round(man["ymax"] - man["ymin"])) + 1
@@ -1151,31 +1202,42 @@ def _seg_import_masks(ctx, page) -> None:
         suffix = Path(src).suffix.lower()
         if suffix not in (".tif", ".tiff", ".ome.tif", ".ome.tiff"):
             rec["state"] = SEG_IMPORT_FORMAT
+            _seg_log(ctx, page, f"✗ {name}: not a TIFF file")
             continue
         try:
             arr = tifffile.imread(src)
         except Exception:  # noqa: BLE001
             rec["state"] = SEG_IMPORT_FORMAT
+            _seg_log(ctx, page, f"✗ {name}: could not read the TIFF file")
             continue
         arr = np.asarray(arr)
         while arr.ndim > 2:
             arr = arr[0]
         if arr.ndim != 2:
             rec["state"] = SEG_IMPORT_FORMAT
+            _seg_log(ctx, page, f"✗ {name}: the mask is not a 2-D image")
             continue
         if arr.shape[0] != height or arr.shape[1] != width:
             rec["state"] = SEG_IMPORT_SIZE
+            _seg_log(ctx,
+                page,
+                f"✗ {name}: mask is {arr.shape[1]}×{arr.shape[0]} but the "
+                f"image is {width}×{height}",
+            )
             continue
         try:
             rel = _seg_write_mask(ctx, page._seg_task_id, parquet_path, arr)
         except Exception:  # noqa: BLE001
             rec["state"] = SEG_IMPORT_UNKNOWN
+            _seg_log(ctx, page, f"✗ {name}: could not save the mask")
             continue
         rec["path"] = rel
         rec["source"] = "import"
         rec["state"] = SEG_IMPORT_DONE
         done += 1
+        _seg_log(ctx, page, f"✓ {name}: {int(arr.max())} object(s)")
 
+    _seg_log(ctx, page, f"Imported {done} mask(s).")
     _seg_after_masks_changed(ctx, page)
     _seg_refresh_input_table(ctx, page)
     _seg_refresh_files(ctx, page)
@@ -1254,7 +1316,17 @@ def _seg_calculate(ctx, page) -> None:
 
 
 def _seg_calculate_nuclear(ctx, page) -> None:
-    """Run Nuclear Expansion on every selected file."""
+    """Start Nuclear Expansion on every selected file, in the background.
+
+    The mask computation runs on a worker thread so the window stays
+    responsive; progress arrives through a queue and is applied by
+    :func:`_seg_poll_nuclear` on the UI thread.
+    """
+    if getattr(page, "_seg_calc_running", False):
+        ctx.statusBar().showMessage(
+            "Segmentation: a calculation is already running"
+        )
+        return
     rows = _seg_file_rows(ctx, page)
     params = _seg_map_params(ctx, page)
     status = getattr(page, "_seg_calc_status", None)
@@ -1266,47 +1338,153 @@ def _seg_calculate_nuclear(ctx, page) -> None:
             ctx.host, "Calculate", "Choose the nucleus channel first."
         )
         return
-    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+    page._seg_calc_running = True
+    page._seg_calc_cancel = False
+    page._seg_calc_finished = False
+    btn = getattr(page, "_seg_calc_btn", None)
+    if btn is not None:
+        page._seg_calc_btn_prev_enabled = btn.isEnabled()
+        btn.setEnabled(False)
+    if status is not None:
+        status.setText(f"Starting Nuclear Expansion on {len(rows)} file(s)…")
+
+    q = queue.Queue()
+    page._seg_nuclear_queue = q
+    thread = threading.Thread(
+        target=_seg_run_nuclear_bg,
+        # A snapshot: parameter edits during the run must not mix two
+        # configurations into one batch.
+        args=(ctx, page, q, rows, copy.deepcopy(params)),
+        daemon=True,
+    )
+    page._seg_nuclear_thread = thread
+    thread.start()
+
+    timer = QTimer(ctx.host)
+    timer.setInterval(100)
+    timer.timeout.connect(lambda: _seg_poll_nuclear(ctx, page))
+    timer.start()
+    page._seg_nuclear_timer = timer
+
+
+def _seg_run_nuclear_bg(ctx, page, q, rows, params) -> None:
+    """Compute and write masks on a worker thread, posting progress events."""
     done = 0
     cells = 0
     errors = []
     try:
+        q.put(("log",
+               f"===== Nuclear Expansion run — {len(rows)} file(s) ====="))
         for i, parquet_path in enumerate(rows):
-            if status is not None:
-                status.setText(
-                    f"Calculating {i + 1}/{len(rows)}: "
-                    f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}…"
-                )
-                QApplication.processEvents()
+            if getattr(page, "_seg_calc_cancel", False):
+                q.put(("log", "Calculation cancelled."))
+                break
+            name = _data_naming._comp_file_name(
+                ctx, parquet_path, page._seg_task_id
+            )
+            q.put(("log", f"→ Calculating {i + 1}/{len(rows)}: {name}…"))
+            q.put(("status",
+                   f"Calculating {i + 1}/{len(rows)}: {name}…"))
             mask, err = _seg_nuclear_expansion(
                 ctx, parquet_path, params, page._seg_task_id
             )
             if mask is None:
-                errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {err}")
+                errors.append(f"{name}: {err}")
+                q.put(("log", f"✗ {name}: {err}"))
                 continue
             try:
-                rel = _seg_write_mask(ctx, page._seg_task_id, parquet_path, mask)
+                rel = _seg_write_mask(
+                    ctx, page._seg_task_id, parquet_path, mask
+                )
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {exc}")
+                errors.append(f"{name}: {exc}")
+                q.put(("log", f"✗ {name}: {exc}"))
                 continue
+            nucleus_count = int(mask.max())
+            done += 1
+            cells += nucleus_count
+            q.put(("file", parquet_path, rel, nucleus_count))
+            q.put(("log", f"✓ {name}: {nucleus_count} nucleus(s)"))
+    except Exception as exc:  # noqa: BLE001
+        q.put(("error", str(exc)))
+        return
+    q.put(("done", done, cells, errors))
+
+
+def _seg_poll_nuclear(ctx, page) -> None:
+    """Apply a background Nuclear Expansion run's events on the UI thread."""
+    q = getattr(page, "_seg_nuclear_queue", None)
+    if q is None:
+        return
+    status = getattr(page, "_seg_calc_status", None)
+    finished = False
+    error = None
+    done = 0
+    cells = 0
+    errors = []
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+        kind = msg[0]
+        if kind == "log":
+            _seg_log(ctx, page, msg[1])
+        elif kind == "status":
+            if status is not None:
+                status.setText(msg[1])
+        elif kind == "file":
+            parquet_path, rel = msg[1], msg[2]
+            # Mask records belong to the page, so they are updated here
+            # rather than on the worker thread.
             rec = _seg_mask_record_live(ctx, page, parquet_path, create=True)
             rec["path"] = rel
             rec["source"] = "builtin"
             rec["state"] = SEG_IMPORT_DONE
-            done += 1
-            cells += int(mask.max())
-    finally:
-        QApplication.restoreOverrideCursor()
+        elif kind == "done":
+            done, cells, errors = msg[1], msg[2], msg[3]
+            finished = True
+        elif kind == "error":
+            error = msg[1]
+            finished = True
+    if not finished:
+        return
 
+    timer = getattr(page, "_seg_nuclear_timer", None)
+    if timer is not None:
+        timer.stop()
+    page._seg_nuclear_queue = None
+    page._seg_calc_running = False
+    page._seg_calc_finished = True
+
+    if error is not None:
+        _seg_log(ctx, page, f"✗ Calculation failed: {error}")
+        if status is not None:
+            status.setText(f"Calculation failed: {error}")
+        _seg_restore_calc_btn(ctx, page)
+        return
+
+    _seg_log(ctx, page, f"Calculated {done} mask(s) · {cells} nucleus(s).")
     _seg_after_masks_changed(ctx, page)
     _seg_refresh_files(ctx, page)
     # The refresh rebuilds the parameter panel, so re-read its status label.
     status = getattr(page, "_seg_calc_status", status)
     if status is not None:
-        msg = f"Calculated {done} mask(s) · {cells} cell(s)."
+        msg = f"Calculated {done} mask(s) · {cells} nucleus(s)."
         if errors:
             msg += "\n" + "\n".join(errors)
         status.setText(msg)
+
+
+def _seg_restore_calc_btn(ctx, page) -> None:
+    """Re-enable Calculate after a background run that did not rebuild it."""
+    btn = getattr(page, "_seg_calc_btn", None)
+    if btn is not None:
+        btn.setEnabled(
+            bool(getattr(page, "_seg_calc_btn_prev_enabled", True))
+            and not page._seg_locked
+        )
 
 
 def _seg_raster_stack(ctx, parquet_path, channels, task_id=None):
@@ -1330,12 +1508,18 @@ def _seg_raster_stack(ctx, parquet_path, channels, task_id=None):
 
 
 def _seg_calculate_external(ctx, page) -> None:
-    """Run Cellpose / StarDist on the selected files in one subprocess."""
-    import json
+    """Run Cellpose / StarDist on the selected files in one subprocess.
+
+    Rasterizing the channels is done on a worker thread so the window stays
+    responsive; the subprocess itself is already asynchronous.
+    """
     import tempfile
 
-    import numpy as np
-
+    if getattr(page, "_seg_calc_running", False):
+        ctx.statusBar().showMessage(
+            "Segmentation: a calculation is already running"
+        )
+        return
     method = page._seg_params.get("method")
     entry = _extension_def(method)
     params = _seg_map_params(ctx, page)
@@ -1370,59 +1554,166 @@ def _seg_calculate_external(ctx, page) -> None:
         )
         return
 
-    python = ctx._ext_python(method)
-    runner = str(ctx._ext_runner_path(method))
     tmpdir = Path(tempfile.mkdtemp(prefix="smage-seg-"))
-    jobs = []
-    manifest = []
     nucleus = params.get("channel")
     cyto = params.get("cyto_channel") if entry["family"] == "cellpose" else None
-    # Reconstructing the channel image happens in the main app, before the
-    # external subprocess starts, so log it (this is the silent phase).
-    _seg_log(ctx, page, f"Rasterizing {len(rows)} file(s)…")
-    for i, parquet_path in enumerate(rows):
-        _seg_log(ctx,
-            page, f"  rasterizing {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}…"
-        )
-        if cyto:
-            stack, err = _seg_raster_stack(
-                ctx, parquet_path, [cyto, nucleus], page._seg_task_id
-            )
-            nucleus_idx, cyto_idx = 1, 0
-        else:
-            stack, err = _seg_raster_stack(
-                ctx, parquet_path, [nucleus], page._seg_task_id
-            )
-            nucleus_idx, cyto_idx = 0, None
-        if stack is None:
-            _seg_log(ctx, page, f"✗ {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {err}")
-            continue
-        image_npy = tmpdir / f"in_{i}.npy"
-        output_npy = tmpdir / f"out_{i}.npy"
-        np.save(image_npy, stack)
-        manifest.append({"image": str(image_npy), "output": str(output_npy)})
-        jobs.append({"parquet": parquet_path, "output": str(output_npy)})
 
-    if not jobs:
-        _seg_log(ctx, page, "No file could be rasterized — see the lines above.")
-        if status is not None:
-            status.setText(
-                "No file could be rasterized — see the calculation log."
+    page._seg_calc_running = True
+    page._seg_calc_cancel = False
+    page._seg_calc_finished = False
+    page._seg_ext_running = True
+    page._seg_ext_entry = entry
+    page._seg_ext_method = method
+    page._seg_ext_params = copy.deepcopy(params)
+    page._seg_ext_python = ctx._ext_python(method)
+    page._seg_ext_runner = str(ctx._ext_runner_path(method))
+    page._seg_ext_tmpdir = tmpdir
+    btn = getattr(page, "_seg_calc_btn", None)
+    if btn is not None:
+        page._seg_calc_btn_prev_enabled = btn.isEnabled()
+        btn.setEnabled(False)
+    if status is not None:
+        status.setText(f"Preparing {len(rows)} file(s)…")
+
+    q = queue.Queue()
+    page._seg_ext_queue = q
+    thread = threading.Thread(
+        target=_seg_prepare_external,
+        args=(ctx, page, q, rows, nucleus, cyto, tmpdir),
+        daemon=True,
+    )
+    page._seg_ext_thread = thread
+    thread.start()
+
+    # Stop a previous run's poll timer (defensive; normally already stopped).
+    old_timer = getattr(page, "_seg_ext_timer", None)
+    if old_timer is not None:
+        old_timer.stop()
+    timer = QTimer(ctx.host)
+    timer.setInterval(150)
+    timer.timeout.connect(lambda: _seg_ext_poll(ctx, page))
+    timer.start()
+    page._seg_ext_timer = timer
+
+
+def _seg_prepare_external(ctx, page, q, rows, nucleus, cyto,
+                          tmpdir) -> None:
+    """Rasterize the channels for Cellpose / StarDist on a worker thread."""
+    import json
+
+    import numpy as np
+
+    jobs = []
+    manifest = []
+    nucleus_idx, cyto_idx = 0, None
+    try:
+        q.put(("log", f"Rasterizing {len(rows)} file(s)…"))
+        for i, parquet_path in enumerate(rows):
+            if getattr(page, "_seg_calc_cancel", False):
+                q.put(("cancelled", "Calculation cancelled."))
+                return
+            name = _data_naming._comp_file_name(
+                ctx, parquet_path, page._seg_task_id
             )
+            q.put(("log", f"  rasterizing {name}…"))
+            q.put(("status", f"Rasterizing {i + 1}/{len(rows)}: {name}…"))
+            if cyto:
+                stack, err = _seg_raster_stack(
+                    ctx, parquet_path, [cyto, nucleus], page._seg_task_id
+                )
+                nucleus_idx, cyto_idx = 1, 0
+            else:
+                stack, err = _seg_raster_stack(
+                    ctx, parquet_path, [nucleus], page._seg_task_id
+                )
+                nucleus_idx, cyto_idx = 0, None
+            if stack is None:
+                q.put(("log", f"✗ {name}: {err}"))
+                continue
+            image_npy = tmpdir / f"in_{i}.npy"
+            output_npy = tmpdir / f"out_{i}.npy"
+            np.save(image_npy, stack)
+            manifest.append(
+                {"image": str(image_npy), "output": str(output_npy)}
+            )
+            jobs.append(
+                {"parquet": parquet_path, "output": str(output_npy)}
+            )
+        if not jobs:
+            q.put(("cancelled",
+                   "No file could be rasterized — see the lines above."))
+            return
+        manifest_path = tmpdir / "jobs.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        q.put(("ready", jobs, str(manifest_path), nucleus_idx, cyto_idx))
+    except Exception as exc:  # noqa: BLE001
+        q.put(("error", str(exc)))
+
+
+def _seg_ext_prepare_poll(ctx, page, q) -> None:
+    """Drain rasterizing events; launch the subprocess once ready."""
+    status = getattr(page, "_seg_calc_status", None)
+    ready = None
+    problem = None
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+        kind = msg[0]
+        if kind == "log":
+            _seg_log(ctx, page, msg[1])
+        elif kind == "status":
+            if status is not None:
+                status.setText(msg[1])
+        elif kind == "ready":
+            ready = msg
+        elif kind == "cancelled":
+            problem = msg[1] if len(msg) > 1 else "Calculation cancelled."
+        elif kind == "error":
+            problem = f"✗ Calculation failed: {msg[1]}"
+    if ready is None and problem is None:
         return
 
-    manifest_path = tmpdir / "jobs.json"
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    page._seg_ext_queue = None
+    if problem is not None:
+        _seg_log(ctx, page, problem)
+        if status is not None:
+            status.setText(problem)
+        page._seg_calc_running = False
+        page._seg_ext_running = False
+        timer = getattr(page, "_seg_ext_timer", None)
+        if timer is not None:
+            timer.stop()
+        _seg_restore_calc_btn(ctx, page)
+        tmpdir = getattr(page, "_seg_ext_tmpdir", None)
+        if tmpdir is not None:
+            import shutil
 
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    _jobs, manifest_path, nucleus_idx, cyto_idx = (
+        ready[1], ready[2], ready[3], ready[4]
+    )
+    page._seg_ext_nucleus_idx = nucleus_idx
+    page._seg_ext_cyto_idx = cyto_idx
+    _seg_ext_launch(ctx, page, _jobs, manifest_path)
+
+
+def _seg_ext_launch(ctx, page, jobs, manifest_path) -> None:
+    """Start the Cellpose / StarDist subprocess (it already streams)."""
+    entry = page._seg_ext_entry
+    params = page._seg_ext_params
     argv = [
-        python, runner, "segment",
-        "--manifest", str(manifest_path),
-        "--nucleus", str(nucleus_idx),
+        page._seg_ext_python, page._seg_ext_runner, "segment",
+        "--manifest", manifest_path,
+        "--nucleus", str(page._seg_ext_nucleus_idx),
         "--model", entry["model"],
         "--device", entry["device"],
     ]
-    if cyto_idx is not None:
-        argv += ["--cyto", str(cyto_idx)]
+    if page._seg_ext_cyto_idx is not None:
+        argv += ["--cyto", str(page._seg_ext_cyto_idx)]
     if entry["family"] == "stardist":
         argv += [
             "--prob", str(params.get("prob", 0.5)),
@@ -1431,7 +1722,6 @@ def _seg_calculate_external(ctx, page) -> None:
         ]
 
     page._seg_ext_jobs = jobs
-    page._seg_ext_tmpdir = tmpdir
     page._seg_ext_done = set()
     page._seg_ext_errors = []
     page._seg_ext_cells = 0
@@ -1439,32 +1729,40 @@ def _seg_calculate_external(ctx, page) -> None:
     page._seg_ext_tile = None
     page._seg_ext_activity = ""
     page._seg_ext_finished = False
-    page._seg_ext_running = True
     page._seg_ext_start_time = time.monotonic()
     # Keep appending to the existing log so each run's history is preserved.
-    _seg_log(ctx,
-        page,
-        f"===== {entry['name']} run — {len(jobs)} file(s) =====",
-    )
+    _seg_log(ctx, page, f"===== {entry['name']} run — {len(jobs)} file(s) =====")
     worker = ctx._ext_worker()
     worker.clear()  # drop any stale results from earlier operations
-    # Stop any previous run's poll timer so it can't steal this run's events.
-    old_timer = getattr(page, "_seg_ext_timer", None)
-    if old_timer is not None:
-        old_timer.stop()
     worker.run(("seg-batch",), argv)
+    _seg_log(ctx, page, f"Running {entry['name']} on {len(jobs)} file(s)…")
+    status = getattr(page, "_seg_calc_status", None)
     if status is not None:
         status.setText(f"Running {entry['name']} on {len(jobs)} file(s)…")
 
-    timer = QTimer(ctx.host)
-    timer.setInterval(150)
-    timer.timeout.connect(lambda: _seg_ext_poll(ctx, page))
-    timer.start()
-    page._seg_ext_timer = timer
+
+def _seg_store_log(ctx, page) -> None:
+    """Mirror the in-memory log into the task params so it is saved.
+
+    The snapshot is updated too: the log is a product of the module rather
+    than an unsaved parameter edit, so it must survive "close without saving".
+    """
+    lines = list(getattr(page, "_seg_log_lines", []))
+    params = getattr(page, "_seg_params", None)
+    if params is not None:
+        params["log"] = lines
+    snapshot = getattr(page, "_seg_snapshot", None)
+    if isinstance(snapshot, dict):
+        snapshot["log"] = lines
 
 
 def _seg_log(ctx, page, text) -> None:
-    """Append a timestamped line to the segmentation calculation log."""
+    """Append a timestamped line to the calculation log.
+
+    The log is a property of the module: lines are kept in ``params["log"]``
+    so they survive closing/reopening the page, and a new calculation
+    appends to the history instead of clearing it.
+    """
     ts = datetime.now().strftime("%H:%M:%S")
     lines = getattr(page, "_seg_log_lines", None)
     if lines is None:
@@ -1473,11 +1771,16 @@ def _seg_log(ctx, page, text) -> None:
     for line in text.splitlines():
         if line.strip():
             lines.append(f"[{ts}] {line}")
+    if len(lines) > SEG_LOG_LIMIT:
+        del lines[:-SEG_LOG_LIMIT]
+    _seg_store_log(ctx, page)
     box = getattr(page, "_seg_calc_log", None)
     if box is not None:
         for line in text.splitlines():
             if line.strip():
                 box.appendPlainText(f"[{ts}] {line}")
+        bar = box.verticalScrollBar()
+        bar.setValue(bar.maximum())
     page._seg_log_last_is_tile = False
 
 
@@ -1493,6 +1796,9 @@ def _seg_log_tile(ctx, page, i, total) -> None:
         lines[-1] = text
     else:
         lines.append(text)
+        if len(lines) > SEG_LOG_LIMIT:
+            del lines[:-SEG_LOG_LIMIT]
+    _seg_store_log(ctx, page)
     box = getattr(page, "_seg_calc_log", None)
     if box is not None:
         if getattr(page, "_seg_log_last_is_tile", False):
@@ -1503,6 +1809,8 @@ def _seg_log_tile(ctx, page, i, total) -> None:
             cursor.insertText(text)
         else:
             box.appendPlainText(text)
+        bar = box.verticalScrollBar()
+        bar.setValue(bar.maximum())
     page._seg_log_last_is_tile = True
 
 
@@ -1511,6 +1819,13 @@ def _seg_ext_poll(ctx, page) -> None:
     import shutil
 
     import numpy as np
+
+    # While the channels are still being rasterized, only the prepare queue
+    # has events; the subprocess starts once it reports "ready".
+    prep = getattr(page, "_seg_ext_queue", None)
+    if prep is not None:
+        _seg_ext_prepare_poll(ctx, page, prep)
+        return
 
     worker = ctx._ext_worker()
     status = getattr(page, "_seg_calc_status", None)
@@ -1644,6 +1959,8 @@ def _seg_ext_poll(ctx, page) -> None:
     timer = getattr(page, "_seg_ext_timer", None)
     if timer is not None:
         timer.stop()
+    page._seg_calc_running = False
+    page._seg_calc_finished = True
     shutil.rmtree(page._seg_ext_tmpdir, ignore_errors=True)
     ok_count = len(jobs) - len(errors)
     start = getattr(page, "_seg_ext_start_time", None)
@@ -1744,8 +2061,89 @@ def _seg_raster_channel(ctx, parquet_path, channel, task_id=None):
     return image, None
 
 
+def _seg_split_touching_nuclei(labels, min_area: int, separation: int = 0):
+    """Split touching nuclei at distance-map maxima.
+
+    Only connected components are ever split, so separate nuclei stay
+    separate regardless of the strength setting. ``separation`` is the
+    minimum distance in pixels between two nucleus centres for them to count
+    as separate objects: larger values split less, smaller values split more.
+    ``0`` uses ``sqrt(min_area / pi)`` — the radius of a nucleus with the
+    minimum area. Each component with at least two seeds is partitioned by
+    nearest seed (a constrained Voronoi split); fragments below ``min_area``
+    are dropped afterwards.
+    """
+    import math
+
+    import numpy as np
+    from scipy import ndimage
+
+    labels = np.asarray(labels)
+    binary = labels > 0
+    if not binary.any():
+        return labels
+    distance = ndimage.distance_transform_edt(binary)
+    # Candidate maxima (3×3 neighbourhood); plateaus merge when labeled.
+    peaks = (distance == ndimage.maximum_filter(distance, size=3)) & binary
+    sep = (
+        float(separation) if separation > 0
+        else math.sqrt(max(int(min_area), 1) / math.pi)
+    )
+    sep = max(1.0, sep)
+    sep2 = sep * sep
+
+    out = labels.astype(np.int32, copy=True)
+    next_label = int(out.max()) + 1
+    slices = ndimage.find_objects(out)
+    for index, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        component = out[sl] == index
+        if not component.any():
+            continue
+        peak_slice = peaks[sl] & component
+        if not peak_slice.any():
+            continue
+        peak_labels, peak_count = ndimage.label(peak_slice)
+        if peak_count <= 1:
+            continue
+        centers = ndimage.center_of_mass(
+            peak_slice, peak_labels, range(1, peak_count + 1)
+        )
+        heights = [
+            distance[sl][int(round(y)), int(round(x))] for y, x in centers
+        ]
+        order = np.argsort(np.asarray(heights))[::-1]
+        # Greedy non-maximum suppression: keep the highest peaks that are at
+        # least `sep` apart. This is the strength control — a large distance
+        # merges nearby maxima and keeps the clump as one object.
+        kept = []
+        for index_peak in order:
+            y, x = centers[index_peak]
+            if any(
+                (y - ky) ** 2 + (x - kx) ** 2 < sep2 for ky, kx in kept
+            ):
+                continue
+            kept.append((y, x))
+        if len(kept) <= 1:
+            continue
+        seeds = np.zeros(component.shape, dtype=np.int32)
+        for label, (y, x) in enumerate(kept, start=1):
+            seeds[int(round(y)), int(round(x))] = label
+        # For every pixel of this component, the nearest seed.
+        _distance, (iy, ix) = ndimage.distance_transform_edt(
+            seeds == 0, return_indices=True
+        )
+        assigned = np.where(component, seeds[iy, ix], 0).astype(np.int32)
+        block = out[sl]
+        block[component] = next_label + assigned[component]
+        out[sl] = block
+        next_label += len(kept)
+    return _relabel_sequential(out, int(min_area))
+
+
 def _seg_nuclear_expansion(ctx, parquet_path, params, task_id=None):
-    """Threshold → label → filter → expand. Returns (mask, error)."""
+    """Threshold → label → filter → (split) → expand. Returns (mask, error)."""
     import numpy as np
     from scipy import ndimage
 
@@ -1768,6 +2166,12 @@ def _seg_nuclear_expansion(ctx, parquet_path, params, task_id=None):
     binary = ndimage.binary_opening(binary, structure=np.ones((3, 3)))
     labels, _count = ndimage.label(binary)
     labels = _relabel_sequential(labels, int(params.get("min_area", 1)))
+    if params.get("split"):
+        labels = _seg_split_touching_nuclei(
+            labels,
+            int(params.get("min_area", 1)),
+            int(params.get("split_separation", 0) or 0),
+        )
     expand = int(params.get("expand", 0))
     if expand > 0 and labels.any():
         distance, (iy, ix) = ndimage.distance_transform_edt(
@@ -1834,7 +2238,9 @@ def _seg_save_now(ctx, page) -> None:
 
 
 def _seg_close(ctx, page) -> None:
-    if getattr(page, "_seg_ext_running", False):
+    if getattr(page, "_seg_ext_running", False) or getattr(
+        page, "_seg_calc_running", False
+    ):
         reply = QMessageBox.question(
             ctx.host,
             "Close Segmentation",
@@ -1844,7 +2250,9 @@ def _seg_close(ctx, page) -> None:
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        ctx._ext_worker().kill()
+        page._seg_calc_cancel = True
+        if getattr(page, "_seg_ext_running", False):
+            ctx._ext_worker().kill()
     if page._seg_dirty:
         reply = QMessageBox.question(
             ctx.host,
@@ -1855,7 +2263,7 @@ def _seg_close(ctx, page) -> None:
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._seg_task_def["params"] = page._seg_snapshot
-    for name in ("_seg_overlay_timer", "_seg_ext_timer"):
+    for name in ("_seg_overlay_timer", "_seg_ext_timer", "_seg_nuclear_timer"):
         timer = getattr(page, name, None)
         if timer is not None:
             timer.stop()
@@ -2178,6 +2586,10 @@ SEG_METHODS = [
 ]
 
 
+# Saved history is capped so the project file does not grow without bound.
+SEG_LOG_LIMIT = 500
+
+
 SEG_STATUS_NO_MASK = "no mask"
 
 
@@ -2211,5 +2623,7 @@ SEG_DEFAULT_PARAMS = {
     "threshold": 0.0,
     "min_area": 30,
     "expand": 5,
+    "split": False,
+    "split_separation": 0,
 }
 
