@@ -35,8 +35,8 @@ from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import pool as _data_pool
 from smage.data import stores as _data_stores
-from smage.modules.area import page as _area_page
 from smage.modules.batch_align import page as _batch_align_page
+from smage.modules.calculation import page as _calculation_page
 from smage.modules.cluster import page as _cluster_page
 from smage.modules.compensation import page as _compensation_page
 from smage.modules.data_clean import page as _data_clean_page
@@ -50,6 +50,8 @@ from smage.modules.gating import page as _gating_page
 from smage.modules.heatmap import page as _heatmap_page
 from smage.modules.illumination import page as _illumination_page
 from smage.modules.import_ import page as _import__page
+from smage.modules.region import page as _region_page
+from smage.modules.region_size import page as _region_size_page
 from smage.modules.rename import page as _rename_page
 from smage.modules.scale import page as _scale_page
 from smage.modules.segmentation import page as _segmentation_page
@@ -108,7 +110,8 @@ class ModuleHostMixin:
                 or getattr(widget, "_cluster_dirty", False)
                 or getattr(widget, "_dc_dirty", False)
                 or getattr(widget, "_ba_dirty", False)
-                or getattr(widget, "_area_dirty", False)
+                or getattr(widget, "_region_dirty", False)
+                or getattr(widget, "_rs_dirty", False)
             ):
                 return True
         return False
@@ -542,6 +545,8 @@ class ModuleHostMixin:
         self._ba_row_cache = {}
         # Gating gate trees (stored in the module folder).
         self._gating_store_cache = {}
+        # Region stores (also in the module folder).
+        self._region_store_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
         if saved_id:
             task_def = self._find_task_by_id(saved_id) or {}
@@ -595,12 +600,16 @@ class ModuleHostMixin:
             _dimred_page._dimred_refresh(self._ctx, page)
         elif task_type == "cluster":
             _cluster_page._cluster_refresh(self._ctx, page)
-        elif task_type == "area":
-            _area_page._area_refresh(self._ctx, page)
+        elif task_type == "region":
+            _region_page._region_refresh(self._ctx, page)
+        elif task_type == "region_size":
+            _region_size_page._rs_refresh(self._ctx, page)
         elif task_type == "data_clean":
             _data_clean_page._dc_refresh(self._ctx, page)
         elif task_type == "batch_align":
             _batch_align_page._ba_refresh(self._ctx, page)
+        elif task_type == "calculation":
+            _calculation_page._calc_refresh(self._ctx, page)
         elif task_type == "export":
             _export_page._export_refresh(self._ctx, page)
 
@@ -642,7 +651,9 @@ class ModuleHostMixin:
                     pending = None
                 if pending is not None:
                     # Do not reuse `name` here: it is the module title.
-                    for state_name in ("gates.json", "heatmap.json"):
+                    for state_name in (
+                        "gates.json", "heatmap.json", "regions.json"
+                    ):
                         source = official / state_name
                         if source.is_file():
                             try:
@@ -686,12 +697,22 @@ class ModuleHostMixin:
             page = _dimred_page._build_dimred_page(self._ctx, name, task_def, locked)
         elif task_type == "cluster":
             page = _cluster_page._build_cluster_page(self._ctx, name, task_def, locked)
-        elif task_type == "area":
-            page = _area_page._build_area_page(self._ctx, name, task_def, locked)
+        elif task_type == "region":
+            page = _region_page._build_region_page(
+                self._ctx, name, task_def, locked
+            )
+        elif task_type == "region_size":
+            page = _region_size_page._build_region_size_page(
+                self._ctx, name, task_def, locked
+            )
         elif task_type == "data_clean":
             page = _data_clean_page._build_dc_page(self._ctx, name, task_def, locked)
         elif task_type == "batch_align":
             page = _batch_align_page._build_ba_page(self._ctx, name, task_def, locked)
+        elif task_type == "calculation":
+            page = _calculation_page._build_calculation_page(
+                self._ctx, name, task_def, locked
+            )
         elif kind == "generate":
             page = self._build_generate_page(name, task_def)
         else:
@@ -766,6 +787,12 @@ class ModuleHostMixin:
                 _export_page._export_cleanup(self._ctx, page)
             elif task_type == "figure":
                 _figure_page._figure_cancel_rendering(self._ctx, page)
+            elif task_type == "calculation":
+                _calculation_page._calc_cleanup(self._ctx, page)
+            elif task_type == "region":
+                _region_page._region_cleanup(self._ctx, page)
+            elif task_type == "region_size":
+                _region_size_page._rs_cleanup(self._ctx, page)
         except Exception:  # noqa: BLE001 - teardown must never raise
             pass
         # Feature Down counts values in a background thread regardless of how

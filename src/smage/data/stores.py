@@ -21,11 +21,69 @@ def _attach_gating_stores(ctx, task: dict) -> None:
     while stack:
         node = stack.pop()
         stack.extend(node.get("children", []))
-        if node.get("type") != "gating" or ctx.project is None or not node.get("id"):
+        if ctx.project is None or not node.get("id"):
+            continue
+        if node.get("type") == "region":
+            from smage.data import regions as _regions
+
+            local = _regions._region_store_load(ctx, node)
+            if local.get("gates") or local.get("files") or local.get("regions"):
+                node["_region_store"] = copy.deepcopy(local)
+            continue
+        if node.get("type") != "gating":
             continue
         store = ctx._gating_store_load(node)
         if store.get("gates") or store.get("files") or store.get("per_file"):
             node["_gating_store"] = copy.deepcopy(store)
+
+
+def _restore_region_store(ctx, task: dict, store: dict,
+                          mapping: dict | None = None) -> None:
+    """Write a pasted Region store to the new module folder."""
+    from smage.data import regions as _regions
+
+    mapping = mapping or {}
+    if mapping:
+        store["files"] = [
+            ctx._remap_path_text(path, mapping)
+            for path in store.get("files") or []
+        ]
+        store["per_file"] = {
+            gate_id: {
+                ctx._remap_path_text(path, mapping): geometry
+                for path, geometry in (overrides or {}).items()
+            }
+            for gate_id, overrides in (store.get("per_file") or {}).items()
+        }
+        for region in store.get("regions") or []:
+            samples = region.get("samples") or {}
+            region["samples"] = {
+                ctx._remap_path_text(str(path), mapping): value
+                for path, value in samples.items()
+            }
+    visible = {
+        rec.get("parquet")
+        for rec in ctx._available_files(task.get("id"))
+    }
+    if visible:
+        store["files"] = [
+            path for path in store.get("files") or [] if path in visible
+        ]
+        store["per_file"] = {
+            gate_id: {
+                path: geometry
+                for path, geometry in (overrides or {}).items()
+                if path in visible
+            }
+            for gate_id, overrides in (store.get("per_file") or {}).items()
+        }
+        for region in store.get("regions") or []:
+            samples = region.get("samples") or {}
+            region["samples"] = {
+                path: value for path, value in samples.items()
+                if path in visible
+            }
+    _regions._region_store_save(ctx, task, store)
 
 
 def _restore_gating_stores(ctx, task: dict, mapping: dict | None=None) -> None:
@@ -35,6 +93,9 @@ def _restore_gating_stores(ctx, task: dict, mapping: dict | None=None) -> None:
     while stack:
         node = stack.pop()
         stack.extend(node.get("children", []))
+        region_store = node.pop("_region_store", None)
+        if isinstance(region_store, dict):
+            _restore_region_store(ctx, node, region_store, mapping)
         store = node.pop("_gating_store", None)
         if not isinstance(store, dict):
             continue
@@ -61,12 +122,17 @@ def _restore_gating_stores(ctx, task: dict, mapping: dict | None=None) -> None:
 
 
 def _gating_gates_for(ctx, task_def, parquet_path=None) -> list:
-    """The gate list of a Gating task, resolved for `parquet_path`.
+    """The gate list of a Gating or Region task, resolved for `parquet_path`.
 
-    Downstream consumers (Figure, Gate2Col) use this instead of reading
-    ``params.gates``, so per-file adjustments are honoured and the gate
-    tree no longer needs to live inside ``project.json``.
+    Downstream consumers (Figure, Gate2Col, Heatmap) use this instead of
+    reading ``params.gates``, so per-file adjustments are honoured and the
+    gate tree no longer needs to live inside ``project.json``.  A Region
+    module exposes each of its Regions as one spatial gate.
     """
+    if (task_def or {}).get("type") == "region":
+        from smage.data import regions as _regions
+
+        return _regions._region_gates_for(ctx, task_def, parquet_path)
     if (task_def.get("params") or {}).get("gates") and not ctx._gating_store_path(task_def):
         # A legacy task without a store yet — fall back to inline gates.
         return list(task_def.get("params", {}).get("gates") or [])

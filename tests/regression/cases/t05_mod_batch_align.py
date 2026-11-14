@@ -41,7 +41,7 @@ def validate() -> None:
 
         page._ba_params["files"] = [parquet]
         ok, message = ba_page._ba_validate(ctx, page)
-        harness.check("variable" in message, message)
+        harness.check("channel" in message, message)
 
         page._ba_params["columns"] = ["FL1-A"]
         ok, message = ba_page._ba_validate(ctx, page)

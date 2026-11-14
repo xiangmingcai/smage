@@ -79,4 +79,4 @@ downstream modules as a label column (each object has a unique integer).
 
 ## Related
 
-[Feature Down](feature-down.md) · [Area](area.md) · [Figure](figure.md)
+[Feature Down](feature-down.md) · [Region](region.md) · [Figure](figure.md)

@@ -35,10 +35,12 @@ own settings, and passes the result down.
 | Map values | [Unmix — Matrix Unmixing](unmix-matrix.md) | Signatures, similarity and running the unmixing |
 | Map values | [Illumination Correction](illumination.md) | Correct uneven illumination per channel |
 | Map values | [Batch Align](batch-align.md) | Align batches with CytoNorm (reference-based) or ComBat (reference-free) |
+| Map values | [Calculation](calculation.md) | Build new channels with Clip, Scale, Add or a custom contrast curve |
 | Display | [Scale](scale.md) | log10 / arcsinh / linear display transform |
 | Gating | [Gating](gating.md) | Create gates and per-gate statistics |
 | Image | [Segmentation](segmentation.md) | Cellpose, StarDist or threshold masks |
-| Image | [Area](area.md) | Density-based area per class |
+| Image | [Region](region.md) | Detect and manage image regions as spatial gates |
+| Analyse | [Region Size](region-size.md) | Pixel area of each Region in each image file |
 | Features | [Feature Down](feature-down.md) | Aggregate values per class into a feature table |
 | Features | [Feature Up](feature-up.md) | Map feature-table columns back to events |
 | Features | [Gate2Col](gate2col.md) | Turn gate membership into 0/1 columns |

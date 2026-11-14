@@ -62,10 +62,14 @@ def dimensions() -> None:
     info = read_dimensions(IMAGE)
     harness.eq(info["kind"], "image")
     harness.eq(info["channels"], 3)
+    harness.eq(info["width"], 64)
+    harness.eq(info["height"], 64)
     harness.eq(parameter_names(info), ["Channel 1", "Channel 2", "Channel 3"])
 
     info = read_dimensions(SINGLE)
     harness.eq(info["channels"], 1)
+    harness.eq(info["width"], 64)
+    harness.eq(info["height"], 64)
     harness.eq(parameter_names(info), ["Channel 1"])
 
     with harness.raises(ValueError, match="Unsupported"):
@@ -175,6 +179,109 @@ def _set_files(window, paths, sampling="full", percent=10) -> None:
 
 def _close(window) -> None:
     harness.close_window(window)
+
+
+@harness.case("import.image.resize", "L3", "import", tags=("fast",))
+def image_resize_core() -> None:
+    """The Qt-free plane resizer: shapes, dtype, nearest values, NaN-safe."""
+    import numpy as np
+
+    from smage.core.image_ops import _resize_plane
+
+    plane = np.arange(16, dtype=np.uint16).reshape(4, 4)
+    smooth = _resize_plane(plane, 2, 2, "smooth")
+    harness.eq(smooth.shape, (2, 2))
+    harness.eq(smooth.dtype, plane.dtype)
+    harness.check(bool(np.isfinite(smooth).all()), "smooth output is finite")
+    harness.check(
+        abs(float(smooth.mean()) - float(plane.mean())) < 1.0,
+        "downscaling keeps the average level",
+    )
+
+    nearest = _resize_plane(plane, 2, 2, "nearest")
+    harness.eq(nearest.shape, (2, 2))
+    harness.check(
+        set(int(v) for v in nearest.ravel())
+        <= set(int(v) for v in plane.ravel()),
+        "nearest keeps original pixel values",
+    )
+
+    big = _resize_plane(plane, 8, 8, "smooth")
+    harness.eq(big.shape, (8, 8))
+    harness.eq(int(big[0, 0]), int(plane[0, 0]))
+    harness.eq(int(big[-1, -1]), int(plane[-1, -1]))
+
+    nan_plane = plane.astype("float32")
+    nan_plane[0, 0] = np.nan
+    nan_out = _resize_plane(nan_plane, 2, 2, "smooth")
+    harness.eq(nan_out.shape, (2, 2))
+    harness.check(
+        bool(np.isfinite(nan_out).any()),
+        "a NaN corner does not blank the whole resized plane",
+    )
+
+    # A checkerboard separates the two interpolation modes: Smooth averages,
+    # Nearest keeps the original levels.
+    checker = np.array([
+        [0, 255, 0, 255],
+        [255, 0, 255, 0],
+        [0, 255, 0, 255],
+        [255, 0, 255, 0],
+    ], dtype=np.uint8)
+    smooth_checker = _resize_plane(checker, 2, 2, "smooth")
+    nearest_checker = _resize_plane(checker, 2, 2, "nearest")
+    harness.check(
+        any(int(value) not in (0, 255) for value in smooth_checker.ravel()),
+        "smooth interpolation averages the checkerboard",
+    )
+    harness.check(
+        set(int(value) for value in nearest_checker.ravel()) <= {0, 255},
+        "nearest interpolation only keeps source levels",
+    )
+
+
+@harness.case("import.image.resize_import", "L3", "import", tags=("fast",))
+def image_resize_import() -> None:
+    """import_file resizes images, records the sizes, and ignores sampling."""
+    work = _work("import_image_resize")
+    info = read_dimensions(IMAGE)
+    out = work / "resized.parquet"
+    result = import_file(
+        str(IMAGE), _params(info), "partial", 50, out,
+        image_resize={
+            "enabled": True, "width": 32, "height": 20,
+            "keep_aspect": False, "method": "nearest",
+        },
+    )
+    harness.eq(result["rows"], 32 * 20)
+    harness.eq(result["original_size"], [64, 64])
+    harness.eq(result["imported_size"], [32, 20])
+    frame = pd.read_parquet(out)
+    harness.eq(len(frame), 32 * 20)
+    harness.eq(int(frame["x"].max()), 31)
+    harness.eq(int(frame["y"].max()), 19)
+    harness.eq(
+        list(frame.columns),
+        ["x", "y", "Channel 1", "Channel 2", "Channel 3"],
+    )
+
+    # A single-channel 2-D TIFF imports (and resizes) too.
+    single = read_dimensions(SINGLE)
+    result = import_file(
+        str(SINGLE), _params(single), "all", 100, work / "single.parquet",
+        image_resize={"enabled": True, "width": 32, "height": 16},
+    )
+    harness.eq(result["rows"], 32 * 16)
+    harness.eq(result["imported_size"], [32, 16])
+    harness.eq(result["columns"], ["x", "y", "Channel 1"])
+
+    # Enlarging is allowed too.
+    result = import_file(
+        str(SINGLE), _params(single), "all", 100, work / "up.parquet",
+        image_resize={"enabled": True, "width": 128, "height": 128},
+    )
+    harness.eq(result["rows"], 128 * 128)
+    harness.eq(result["imported_size"], [128, 128])
 
 
 @harness.case("import.page.peek", "L3", "import", tags=("smoke",))
@@ -352,6 +459,102 @@ def page_image() -> None:
             (index_dir / "manifest.json").is_file(),
             "the image level-of-detail index is built during import",
         )
+    finally:
+        _close(window)
+
+
+@harness.case("import.page.image_resize", "L3", "import", tags=("fast",))
+def page_image_resize() -> None:
+    """The image entry exposes resize controls; import writes the new size."""
+    import json
+
+    from smage.modules.import_ import page as import_page
+
+    window, _project = _import_page("import_page_image_resize")
+    try:
+        _set_files(window, [IMAGE, FCS])
+        ctx = window._ctx
+        with harness.patch_dialogs(
+            import_page, question=QMessageBox.StandardButton.Yes
+        ):
+            _import__page._peek_files(ctx)
+
+        ctx.import_list.setCurrentRow(0)  # the image
+        harness.pump(30)
+        harness.check(ctx._resize_enabled is not None,
+                      "image entries show the resize controls")
+        harness.check(not ctx._resize_enabled.isChecked(),
+                      "resize is off by default")
+        harness.eq(ctx._resize_width.value(), 64)
+        harness.eq(ctx._resize_height.value(), 64)
+        harness.check(ctx._resize_keep.isChecked(),
+                      "the aspect ratio is kept by default")
+        harness.check(not ctx.sample_combo.isEnabled(),
+                      "sampling is disabled for images")
+
+        ctx._resize_enabled.setChecked(True)
+        ctx._resize_width.setValue(128)
+        harness.eq(ctx._resize_width.value(), 128,
+                   "enlarging is allowed")
+        harness.eq(ctx._resize_height.value(), 128,
+                   "the height follows the width")
+        ctx._resize_width.setValue(32)
+        harness.eq(ctx._resize_height.value(), 32,
+                   "the height follows the width")
+        settings = ctx._import_files[0]["image_resize"]
+        harness.eq(settings["width"], 32)
+        harness.eq(settings["height"], 32)
+
+        # Import just the image.
+        window._import_files[1]["checked"] = False
+        _import__page._refresh_import_list(ctx)
+        ctx.import_list.setCurrentRow(0)
+        with harness.patch_dialogs(
+            import_page, question=QMessageBox.StandardButton.Yes
+        ):
+            _import__page._run_import(ctx)
+        harness.wait_for(
+            lambda: not getattr(window, "_import_running", False),
+            timeout=60,
+            message="resized image import to finish",
+        )
+        record = window._processed_files[0]
+        harness.eq(record["rows"], 32 * 32)
+        harness.eq(record["original_size"], [64, 64])
+        harness.eq(record["imported_size"], [32, 32])
+        parquet = Path(record["parquet"])
+        manifest = json.loads(
+            (Path(str(parquet) + ".imgidx") / "manifest.json").read_text()
+        )
+        harness.eq(manifest["xmax"], 31.0)
+        harness.eq(manifest["ymax"], 31.0)
+
+        # Aspect lock can be turned off, then on again.
+        ctx._resize_keep.setChecked(False)
+        ctx._resize_width.setValue(48)
+        ctx._resize_height.setValue(24)
+        settings = ctx._import_files[0]["image_resize"]
+        harness.eq([settings["width"], settings["height"]], [48, 24])
+        harness.check(settings["keep_aspect"] is False)
+        ctx._resize_method.setCurrentIndex(
+            ctx._resize_method.findData("nearest")
+        )
+        settings = ctx._import_files[0]["image_resize"]
+        harness.eq(settings["method"], "nearest")
+        ctx._resize_keep.setChecked(True)
+        ctx._resize_width.setValue(40)
+        harness.eq(ctx._resize_height.value(), 40,
+                   "the aspect lock restores the original ratio")
+        harness.eq(
+            ctx._import_files[0]["image_resize"]["height"], 40
+        )
+
+        ctx.import_list.setCurrentRow(1)  # the FCS file
+        harness.pump(30)
+        harness.check(ctx._resize_enabled is None,
+                      "tables do not show resize controls")
+        harness.check(ctx.sample_combo.isEnabled(),
+                      "sampling is available for tables")
     finally:
         _close(window)
 

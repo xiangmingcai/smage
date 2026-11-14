@@ -54,6 +54,6 @@ not want the identifier column in the output.
 
 ## Notes
 
-- Areas per class can be measured with [Area](../modules/area.md).
+- Regions and their pixel areas can be measured with [Region](../modules/region.md) and [Region Size](../modules/region-size.md).
 - Feature Up can map per-class values back onto individual objects for
   plotting.

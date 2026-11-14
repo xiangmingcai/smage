@@ -90,15 +90,21 @@ def _image_raster_raw(ctx, parquet_path, manifest, bbox, channel, mask_ent=None,
     return chan, rect, frac
 
 
-def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel, mask_ent=None, stages=None):
+def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel, mask_ent=None, stages=None, force_raw=False):
     """Return (channel_2d_array, data_rect, mask_fraction) for the visible bbox.
 
     `stages` evaluates the ordered map pipeline (Scale / Compensation /
     Unmix). Linear stages are exact on the block means; Scale stages are
-    applied to the aggregated values.
+    applied to the aggregated values. With `force_raw` (used by gate subset
+    views) the pixels are read at full resolution: block means would blend
+    masked and unmasked pixels and make the selection look inaccurate.
     """
     import math
     import numpy as np
+    if force_raw:
+        return ctx._image_raster_raw(
+            parquet_path, manifest, bbox, channel, mask_ent, stages
+        )
     color_cols = manifest.get("color_cols", [])
     if not color_cols:
         return None, None, None

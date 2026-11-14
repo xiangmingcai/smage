@@ -8,6 +8,39 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Added
 
+- **Region** (new map module): detects image regions and exposes each one to
+  downstream modules as a spatial gate. It provides an internal detection-gate
+  tree, **Signal Expansion** and **SAM 3** (external environment) detection,
+  a Region → Sample → Sub-region tree with per-item visibility, rename,
+  delete and branch copy/paste, and per-Region fill/edge drawing styles.
+  Sub-region polygons live on the full image and are available to Figure
+  filters/image overlays, Gate2Col 0/1 columns, Heatmap annotations and
+  Region Size. Internal detection gates support **boolean gates** (NOT /
+  AND / OR) and **per-file geometry** (adjust a gate separately on each
+  file, or copy one file's shape to all).
+- **Region Size** (new module, replaces Area): calculates the pixel area of
+  each selected Region in each selected image file as a file × Region table.
+  Missing Samples are **NA**, empty Samples are **0**, and overlapping
+  sub-regions are counted once. Rows and columns can be reordered, the table
+  is copied as TSV, and **Calculate** saves the result and locks upstream
+  modules until **Clear results** is used.
+- Extension Manager: **SAM 3** entry. It installs torch/transformers into a
+  separate environment and downloads the gated `facebook/sam3` weights; Smage
+  never bundles them.
+- **Calculation** (new map module): builds new channels from existing ones
+  with an ordered list of calculation rows — **Clip**, real-value **Scale**
+  (Log/Asinh), weighted **Add**, and a custom **Contrast** curve. A row may
+  use a channel produced by a row above it, apply to a subset of the files,
+  and be hidden from downstream modules while still feeding later rows. The
+  module writes no data: saved rows become a map stage evaluated on demand,
+  so every module below it sees the new channels; unsaved edits appear only
+  in the live preview.
+- Data Import: image files can be **resized while importing**. The Parameter
+  panel gains an **Image resize** group with Width/Height (the height follows
+  the width when **Keep aspect ratio** is on), and a **Smooth
+  (anti-aliased)** / **Nearest neighbor** choice. The original TIFF is not
+  changed; only the imported pixel table is smaller (or larger). Resizing
+  replaces random sampling for images, which is now disabled for them.
 - Segmentation (Nuclear Expansion): optional **Split touching nuclei**, which
   seeds each nucleus at its distance-map maximum and assigns pixels to the
   nearest seed, giving clumped nuclei separate labels. A **split minimum
@@ -22,9 +55,27 @@ All notable changes to Smage are recorded here. The format follows
   from the raster already used to draw the plot (no disk reads, no extra
   full-image cache): exact pixels at deep zoom, block means when zoomed out.
   The readout hides while a gate is being drawn or dragged.
+- Figure: right-click a plot and choose **Save as…** to write the plot as
+  it is currently shown, zoom included. **PDF** keeps axes, tick labels,
+  titles and the image colour legend as editable text and vector lines,
+  while the plot area is embedded as a high-resolution bitmap; **PNG** and
+  **JPEG** are written at three times the screen resolution. The right-click
+  menu now opens from the plot itself, not only from the card margins.
 
 ### Fixed
 
+- Gating: polygon gates drawn on a log or arcsinh axis now use a densely
+  sampled outline in data space, so the mask matches the edges drawn on
+  screen. Previously only the corner vertices were stored, and the straight
+  data-space polygon selected a different set of points.
+- Gating: opening a NOT/AND/OR gate subset keeps the source gate shapes
+  visible, so the selected points can be compared with the polygon or
+  ellipse that defines them. Image gate subsets are rasterised at full pixel
+  resolution, so block-mean pooling can no longer show pixels from inside a
+  polygon in a NOT subset.
+- Segmentation: the distance-map peaks used by **Split touching nuclei**
+  are smoothed first, so the ridge along a touching neck is no longer
+  detected as an extra nucleus.
 - Image plots: LOD refreshes no longer re-apply unchanged axis labels,
   titles and tick styles. On an aspect-locked view that re-layout could
   change the range, schedule another refresh and loop forever (visible as
@@ -38,9 +89,35 @@ All notable changes to Smage are recorded here. The format follows
 - Ellipse gates drawn on a log or arcsinh axis now select exactly the shape
   that was drawn. The outline is stored in data units and used for the mask,
   instead of a data-space ellipse that appears as a skewed diamond.
+- Gating / Unmix: reloading an ellipse gate (including the copy created by
+  **Duplicate** on a spectrum) keeps a normal ellipse with its handles. The
+  stored mask outline is no longer drawn as dozens of polygon anchors; it is
+  used only to compute the selection.
+- Figure: picking a new color for an Image channel now refreshes that
+  channel's swatch in the settings table as well as the legend. Previously
+  the swatch kept the old color until the panel was rebuilt.
+- Figure / Calculation: Image plots now always label their axes **x** and
+  **y** (pixel coordinates). The selected channel is only the colour layer
+  and the cursor value, so it can no longer appear as an axis name and the
+  left axis no longer shows "Count".
+- Calculation: switching the preview from Scatter to Image now renders the
+  calculated channel. Pipeline dependency resolution was treating the
+  produced channel as a source column, so the image raster request asked
+  the parquet file for a column that does not exist and gave up.
+
+### Removed
+
+- The **Area** module was removed; use **Region** + **Region Size** instead.
 
 ### Changed
 
+- Calculation, Region and Region Size: a new module starts with **no data
+  files selected**; choose the files explicitly instead of the module
+  defaulting to every imported file.
+- **Add module**: **Region** now sits in the **Gate & select** group,
+  directly after **Gating** (it is a spatial gate producer).
+- Figure filters and image overlays, Gate2Col and Heatmap now accept Regions
+  from upstream Region modules alongside Gating gates.
 - Illumination Correction: zooming or panning a preview re-samples the
   image, so magnified views stay sharp instead of showing the initial
   low-resolution raster.

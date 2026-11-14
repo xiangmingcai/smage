@@ -17,7 +17,8 @@ _GATE_GEOMETRY_KEYS = {
     # data space, so the sampled outline is the shape that actually matches
     # the drawn gate.
     "ellipse": ("pos", "size", "points"),
-    "polygon": ("points",),
+    "polygon": ("points", "mask_points"),
+    "region": ("polygons",),
     "quadrant": ("vx", "hy"),
     "split": ("vx",),
     "range": ("x1", "x2"),
@@ -86,7 +87,13 @@ def _gate_mask(x, y, gate):
         with np.errstate(divide="ignore", invalid="ignore"):
             return ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1.0
     if t == "polygon":
-        return _point_in_polygon(x, y, gate["points"])
+        # `mask_points` is a densely sampled data-space outline of the shape
+        # drawn on screen. On a non-linear axis the straight edges of the
+        # drawn polygon map to curves in data space; the dense outline keeps
+        # the mask identical to the shape the user sees. Older gates only
+        # have the corner vertices.
+        points = gate.get("mask_points") or gate.get("points")
+        return _point_in_polygon(x, y, points)
     if t == "quadrant":
         vx = gate.get("vx", 0.0)
         hy = gate.get("hy", 0.0)
@@ -103,6 +110,15 @@ def _gate_mask(x, y, gate):
         x1 = min(gate["x1"], gate["x2"])
         x2 = max(gate["x1"], gate["x2"])
         return (x >= x1) & (x <= x2)
+    if t == "region":
+        # A Region is the union of its sub-region polygons on one file.
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        inside = np.zeros(x.shape, dtype=bool)
+        for polygon in gate.get("polygons") or ():
+            if len(polygon) >= 3:
+                inside |= _point_in_polygon(x, y, polygon)
+        return inside
     if t == "categorical":
         # Col2Gate: the point's `x` (the chosen column) equals a category value.
         return x == gate.get("value")

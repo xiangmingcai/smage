@@ -43,6 +43,7 @@ licenses, and are not part of the Smage installer.
 | scanpy / igraph / leidenalg (FlowSOM's dependencies) | BSD-3 / GPL-2.0-or-later / GPL-3.0 | Also installed by the user when setting up the FlowSOM extension. |
 | PARC (Python package `parc`) | MIT | Used by the Cluster module as an external process. Not bundled; the user installs it in the same kind of separate environment. |
 | hnswlib / pybind11 (PARC's native dependencies) | Apache-2.0 / BSD-3 | Installed with PARC in the user's environment; not part of the Smage installer. |
+| SAM 3 (`facebook/sam3` code and weights) | SAM License (Meta, 2025-11-19) | Used by the Region module as an external process. Smage does not bundle or redistribute the code or weights; the user installs them in a separate environment and accepts Meta's license, which permits commercial and research use but restricts military, nuclear, espionage and weapons use. Research publications must acknowledge SAM. |
 
 ## Build-time only (not bundled into the application)
 

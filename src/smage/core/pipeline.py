@@ -8,6 +8,10 @@ No Qt and no project state: callers pass the stages and values in.
 """
 from __future__ import annotations
 
+from smage.core.calculation import (
+    _apply_calculation,
+    _calculation_dependencies,
+)
 from smage.core.scale_math import _apply_scale_transform
 
 
@@ -53,6 +57,10 @@ def _pipeline_touches(stages, name) -> bool:
         if kind == "rename":
             if name in stage["map"] or name in stage["map"].values():
                 return True
+        if kind == "calculation":
+            for row in stage.get("rows") or []:
+                if row.get("output") == name:
+                    return True
     return False
 
 
@@ -87,6 +95,10 @@ def _pipeline_dependencies(stages, names, parquet_path=None) -> set:
                 continue
             reverse = {v: k for k, v in stage["map"].items()}
             needed = {reverse.get(n, n) for n in needed}
+        elif kind == "calculation":
+            # The requested name may be produced by this stage; replace it
+            # with the columns it reads (an output is not a source column).
+            needed = _calculation_dependencies(stage, needed)
     needed.discard(None)
     return needed
 
@@ -238,6 +250,10 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                     # On a name collision the renamed value wins (the user was
                     # warned in the module and chose to proceed).
                     values[new] = values.pop(old)
+            continue
+        if kind == "calculation":
+            _apply_calculation(stage, values, parquet_path)
+            continue
     return {name: values[name] for name in names if name in values}
 
 

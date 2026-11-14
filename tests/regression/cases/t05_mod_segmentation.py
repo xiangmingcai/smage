@@ -210,7 +210,8 @@ def calculation_log() -> None:
         )
 
         # A rebuilt log box replays the saved history (reopen / rebuild).
-        seg_page._seg_method_panel(ctx, page)
+        # Keep the rebuilt panel alive: its log box is a child of it.
+        panel = seg_page._seg_method_panel(ctx, page)
         text = page._seg_calc_log.toPlainText()
         harness.check("Nuclear Expansion run" in text, text)
         harness.check("→ Calculating 1/1" in text, text)

@@ -8,6 +8,8 @@ from smage.widgets.controls import _CardProxy
 from PySide6.QtCore import Signal
 
 from PySide6.QtCore import (
+    QEvent,
+    QObject,
     QRect,
     QRectF,
     QSize,
@@ -89,6 +91,7 @@ from smage.widgets.plot_axes import (
 )
 from smage.widgets.resources import _lock_pixmap
 import copy
+from pathlib import Path
 from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import sampling as _data_sampling
@@ -96,6 +99,7 @@ from smage.data import stores as _data_stores
 from smage.widgets import colormap as _widgets_colormap
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
+from smage.widgets.plot import export as _widgets_plot_export
 from smage.widgets.plot import renderer as _widgets_plot_renderer
 
 
@@ -306,6 +310,42 @@ class _FigureCard(QFrame):
     def set_focused(self, focused: bool) -> None:
         self._focused = focused
         self._apply_style()
+
+
+class _ContextMenuFilter(QObject):
+    """Open the card's right-click menu from the embedded plot area.
+
+    A right-click over the plot lands on the plot's own viewport, not on
+    the card proxy, so without this filter the card menu would only open
+    from the card margins.
+    """
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._callback = callback
+
+    @staticmethod
+    def _global_pos(event):
+        getter = getattr(event, "globalPosition", None)
+        if getter is not None:
+            try:
+                pos = getter()
+            except TypeError:
+                pos = None
+            if pos is not None:
+                return pos.toPoint() if hasattr(pos, "toPoint") else pos
+        return event.globalPos()
+
+    def eventFilter(self, obj, event) -> bool:
+        # Only the press: some platforms also send a ContextMenu event after
+        # it, which would open the menu a second time once the first closes.
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.RightButton
+        ):
+            self._callback(self._global_pos(event))
+            return True
+        return False
 
 
 class _FigurePermuteDialog(QDialog):
@@ -731,13 +771,14 @@ def _figure_new_card(ctx, page, plot_dict, render: bool=True) -> int:
         plot_dict["size"] = list(size)
     w, h = int(size[0]), int(size[1])
 
+    side_widget = (
+        _widgets_plot_renderer._figure_attach_legend(ctx, plot_widget)
+        if plot_dict.get("type") == "image" else None
+    )
     card = _FigureCard(
         plot_widget, index,
         select_callback=lambda i: _figure_select(ctx, page, i),
-        side_widget=(
-            _widgets_plot_renderer._figure_attach_legend(ctx, plot_widget)
-            if plot_dict.get("type") == "image" else None
-        ),
+        side_widget=side_widget,
     )
     proxy = _CardProxy(
         on_select=lambda ctrl: _figure_card_clicked(ctx, page, card.index(), ctrl),
@@ -761,8 +802,17 @@ def _figure_new_card(ctx, page, plot_dict, render: bool=True) -> int:
     )
     card.installEventFilter(click_filter)
     plot_widget.viewport().installEventFilter(click_filter)
+    # Right-click inside the plot (or its side legend) opens the card menu,
+    # while the proxy handles right-clicks on the card margins.
+    menu_filter = _ContextMenuFilter(
+        lambda pos: _figure_card_context_menu(ctx, page, card.index(), pos)
+    )
+    plot_widget.viewport().installEventFilter(menu_filter)
+    if side_widget is not None:
+        side_widget.installEventFilter(menu_filter)
     page._fig_filters = getattr(page, "_fig_filters", [])
     page._fig_filters.append(click_filter)
+    page._fig_filters.append(menu_filter)
 
     # Double-click focuses the plot (wheel/drag act on its data).
     dbl_click_filter = _DoubleClickFilter(lambda: _figure_focus(ctx, page, card.index()))
@@ -985,6 +1035,12 @@ def _figure_card_context_menu(ctx, page, index, global_pos) -> None:
     permute.setToolTip(
         "Select a single plot to permute it across files, an axis or filters"
     )
+    menu.addSeparator()
+    save_as = menu.addAction("Save as…")
+    save_as.setToolTip(
+        "Save this plot as currently shown (zoom included): an editable PDF "
+        "with vector axes and text, or a PNG/JPEG image"
+    )
     _debug_log(f"card menu: index={index} selected={selected} plots={len(page._fig_plots)}")
     chosen = menu.exec(global_pos)
     _debug_log(f"card menu chose: {chosen.text() if chosen is not None else None}")
@@ -996,6 +1052,49 @@ def _figure_card_context_menu(ctx, page, index, global_pos) -> None:
         _figure_delete_selected(ctx, page)
     elif chosen is permute:
         _figure_permute(ctx, page, selected[0])
+    elif chosen is save_as:
+        _figure_save_plot_as(ctx, page, index)
+
+
+def _figure_export_name(plot_dict: dict) -> str:
+    """A readable default filename for one plot."""
+    parts = []
+    file_name = plot_dict.get("file_name")
+    if file_name:
+        parts.append(Path(str(file_name)).stem)
+    if plot_dict.get("type") == "image":
+        parts.append("image")
+    else:
+        x_name = plot_dict.get("x")
+        y_name = plot_dict.get("y")
+        if x_name:
+            parts.append(str(x_name))
+        if y_name:
+            parts.append(f"vs {y_name}")
+    return " ".join(parts) or "plot"
+
+
+def _figure_save_plot_as(ctx, page, index: int) -> None:
+    """Save one plot exactly as it is currently displayed."""
+    if not (0 <= index < len(page._fig_cards)):
+        return
+    plot_dict = (
+        page._fig_plots[index] if index < len(page._fig_plots) else {}
+    )
+    try:
+        path = _widgets_plot_export._plot_export_save(
+            page._fig_cards[index].plot_widget(),
+            ctx.host,
+            _figure_export_name(plot_dict),
+        )
+    except Exception as exc:  # noqa: BLE001 - report, never break the page
+        _log_exception(exc)
+        QMessageBox.critical(
+            ctx.host, "Save Plot As", f"Could not save the plot:\n{exc}"
+        )
+        return
+    if path:
+        _debug_log(f"figure saved plot: {path}")
 
 
 def _figure_scroll_to(ctx, page, index) -> None:
@@ -1481,7 +1580,7 @@ def _figure_filter_options(ctx, figure_task_id):
     for task in _data_files._task_chain(ctx, figure_task_id):
         if task.get("id") == figure_task_id:
             continue
-        if task.get("type") != "gating":
+        if task.get("type") not in ("gating", "region"):
             continue
         module_name = task.get("name", "Gating")
         for gate in _data_stores._gating_gates_for(ctx, task):
@@ -2992,7 +3091,7 @@ def _figure_overlay_gate_options(ctx, page, plot_dict) -> list:
     for task in _data_files._task_chain(ctx, page._fig_task_id):
         if task.get("id") == page._fig_task_id:
             continue
-        if task.get("type") != "gating":
+        if task.get("type") not in ("gating", "region"):
             continue
         for gate in _data_stores._gating_gates_for(ctx, task, path):
             options.append({

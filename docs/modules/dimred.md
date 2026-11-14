@@ -1,7 +1,7 @@
 # Dimensionality Reduction
 
 Computes a 2-D embedding (UMAP or t-SNE) that can be used as the axes of a
-scatter plot, a gate, or an [Area](area.md) measurement.
+scatter plot, a gate, or a [Region](region.md).
 
 ![Dimensionality Reduction](../assets/screenshots/dimred.png)
 
@@ -32,4 +32,4 @@ gate or measure.
 
 ## Related
 
-[Cluster](cluster.md) · [Gating](gating.md) · [Area](area.md)
+[Cluster](cluster.md) · [Gating](gating.md) · [Region](region.md)

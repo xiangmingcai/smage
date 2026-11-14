@@ -168,7 +168,8 @@ def _g2c_gate_options(ctx, page):
     opts = []
     gating_tasks = [
         t for t in _data_files._task_chain(ctx, page._g2c_task_id)
-        if t.get("id") != page._g2c_task_id and t.get("type") == "gating"
+        if t.get("id") != page._g2c_task_id
+        and t.get("type") in ("gating", "region")
     ]
     multi = len(gating_tasks) > 1
     for task in gating_tasks:

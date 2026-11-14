@@ -19,8 +19,25 @@ reads this table (or files generated from it).
 | Files | The files to import. Each file is imported once and listed under `data/`. |
 | Original name / Imported name | The column name in the source file and the name it gets inside the project. |
 | Extract | Tick the columns that should be kept. Unticked columns are not written. |
-| Sampling | Optional per-file down-sampling applied while importing (for very large files). |
+| Sampling | Optional per-file down-sampling applied while importing (for very large tables). Images are always imported in full; use **Image resize** instead. |
 | Apply to all files | Copies the current parameter settings to every selected file. |
+
+## Resizing images
+
+When Peek recognises a TIFF image, the Parameter panel gains an **Image
+resize** group. Resizing happens while importing; the source TIFF is never
+modified.
+
+| Control | Description |
+|---|---|
+| Resize on import | Off by default. The width/height fields are pre-filled with the original size. |
+| Width / Height | Target pixel size. Smaller values reduce the stored table and speed up every downstream module; larger values upscale the image. |
+| Keep aspect ratio (Y follows X) | When ticked, Height is computed from Width so the proportions stay the same, and the Height field is read-only. |
+| Method | **Smooth (anti-aliased)** for intensity images, or **Nearest neighbor** to keep exact source pixel values (labels, masks). |
+
+The imported size is shown in the Processed list and in the file's tooltip.
+Sampling is disabled for image files: dropping random pixel rows would punch
+holes in the image.
 
 ## Output
 

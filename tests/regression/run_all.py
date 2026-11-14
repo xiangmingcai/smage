@@ -53,8 +53,10 @@ def _t06_scripts() -> list[Path]:
 
 
 def _module_script(module: str) -> Path:
-    stem = "import" if module in ("import", "import_") else module
-    return CASES_DIR / f"t05_mod_{stem}.py"
+    if module in ("import", "import_"):
+        # Data Import is covered by the import/project script, not t05.
+        return CASES_DIR / "t03_import.py"
+    return CASES_DIR / f"t05_mod_{module}.py"
 
 
 def _changed_files() -> list[str]:
@@ -143,6 +145,15 @@ def scripts_for(args) -> list[Path]:
         elif case_id.startswith("e2e."):
             script = None
             return _t06_scripts()
+        elif case_id.startswith("calc."):
+            script = CASES_DIR / "t05_mod_calculation.py"
+        elif case_id.startswith("import."):
+            script = CASES_DIR / "t03_import.py"
+        elif case_id.startswith("project."):
+            script = CASES_DIR / "t03_project.py"
+        elif case_id.startswith("data."):
+            script = None
+            return sorted(CASES_DIR.glob("t02_*.py"))
         else:
             return _all_scripts()
         if script is None or not script.is_file():
@@ -160,7 +171,11 @@ def scripts_for(args) -> list[Path]:
             )
         return ([CASES_DIR / "t00_static.py"] if not args.no_preflight else []) + [script]
 
-    if args.smoke:
+    if args.tag:
+        # Tags apply to cases, so every script must be considered; the
+        # harness drops the scripts that contain none of the requested tags.
+        selected = _all_scripts()
+    elif args.smoke:
         selected = [CASES_DIR / "t00_static.py", *_t01_scripts()]
         selected.append(CASES_DIR / "t04_page_smoke.py")
         if (CASES_DIR / "t99_teardown.py").is_file():

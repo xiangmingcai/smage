@@ -17,7 +17,6 @@ from functools import partial
 _TARGETS = {
     "_add_more_colormaps": ("smage.widgets.colormap", "_add_more_colormaps"),
     "_apply_appearance_settings": ("smage.widgets.settings", "_apply_appearance_settings"),
-    "_area_render_plot": ("smage.modules.area.page", "_area_render_plot"),
     "_available_files": ("smage.data.files", "_available_files"),
     "_ba_stage": ("smage.modules.batch_align.page", "_ba_stage"),
     "_build_panel_frame": ("smage.widgets.panels", "_build_panel_frame"),
@@ -152,6 +151,7 @@ _TARGETS = {
     "_pool_tier": ("smage.data.pool", "_pool_tier"),
     "_populate_palette_combo": ("smage.widgets.colormap", "_populate_palette_combo"),
     "_read_columns": ("smage.data.columns", "_read_columns"),
+    "_region_render_image": ("smage.modules.region.page", "_region_render_image"),
     "_refresh_plots_for_settings": ("smage.widgets.settings", "_refresh_plots_for_settings"),
     "_rel_data_key": ("smage.data.files", "_rel_data_key"),
     "_rename_columns_forward": ("smage.modules.rename.page", "_rename_columns_forward"),

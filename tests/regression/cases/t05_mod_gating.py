@@ -19,11 +19,14 @@ from PySide6.QtWidgets import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
+import _e2e_helpers as e2e  # noqa: E402
 
 from smage.modules.gating import page as gating_page  # noqa: E402
 from smage.core.gates import _gate_mask  # noqa: E402
+from smage.widgets.gate_editor import editor as _gate_editor  # noqa: E402
 from smage.widgets.gate_editor.canvas import _GatePolygonROI  # noqa: E402
 from smage.widgets.plot_axes import _gate_roi_pens  # noqa: E402
+from smage.widgets.plot import renderer as _plot_renderer  # noqa: E402
 from smage.data import naming as _data_naming
 from smage.modules.gating import page as gating_page
 
@@ -121,6 +124,21 @@ def ellipse_follows_the_drawn_shape() -> None:
                 "outline vertices return to the drawn ellipse",
             )
 
+        # Reloading must keep an editable ellipse, not turn the stored mask
+        # outline into dozens of polygon anchors.
+        gating_page._gating_reload_rois(ctx, page)
+        loaded = page._gating_rois[-1][0]
+        harness.check(isinstance(loaded, pg.EllipseROI))
+        harness.check(not isinstance(loaded, _GatePolygonROI))
+        harness.check(
+            np.allclose([loaded.pos().x(), loaded.pos().y()], pos),
+            "the reloaded ellipse keeps the drawn position",
+        )
+        harness.check(
+            np.allclose([loaded.size().x(), loaded.size().y()], size),
+            "the reloaded ellipse keeps the drawn size",
+        )
+
         # Log10 is the transform of the x axis; y (FL2-A) stays linear.
         inside_x = 10.0 ** (cx + 0.9 * rx)
         outside_x = 10.0 ** (cx + 1.1 * rx)
@@ -185,6 +203,190 @@ def not_gate() -> None:
         harness.eq(not_gate["type"], "not")
         harness.eq(not_gate["source"], source["id"])
         harness.check(not_gate["name"].startswith("NOT "), not_gate["name"])
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.image_polygon_not", "L4", "gating", tags=("fast",))
+def image_polygon_not() -> None:
+    """An image NOT subset is pixel-exact: the polygon interior is hidden."""
+    gating = harness.task_def("gating", task_id="g-1", name="Gating")
+    project, _parquet = e2e.image_project(
+        "gating_image_polygon_not", tasks=[gating]
+    )
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("g-1", "gating", "Gating")
+    harness.pump(450)
+    page = window.tabs.currentWidget()
+    try:
+        ctx = window._ctx
+        page._gating_preview["type"] = "image"
+        page._gating_preview["x"] = "x"
+        page._gating_preview["y"] = "y"
+        gating_page._gating_update_tools(ctx, page)
+        gating_page._gating_reload_rois(ctx, page)
+        _gate_editor._gating_render(ctx, page)
+        harness.pump(250)
+
+        points = [(8.0, 8.0), (24.0, 8.0), (24.0, 24.0), (8.0, 24.0)]
+        roi = _GatePolygonROI(
+            points, closed=True, **_gate_roi_pens("#000000")
+        )
+        gating_page._gating_add_gate(ctx, page, "polygon", roi)
+        gating_page._gating_add_not_gate(
+            ctx, page, len(page._gating_gates) - 1
+        )
+        not_gate = page._gating_gates[-1]
+        gating_page._gating_open_gate_subset(ctx, page, not_gate["id"])
+        harness.pump(400)
+
+        image = page._gating_plot_widget._img_item.image
+        harness.check(image is not None, "the subset image is rendered")
+        harness.eq(int(image[12, 12, 3]), 0,
+                   "a pixel inside the polygon is hidden")
+        harness.eq(int(image[2, 2, 3]), 255,
+                   "a pixel outside the polygon is shown")
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.polygon_not", "L4", "gating", tags=("fast",))
+def polygon_not_subset() -> None:
+    """A polygon NOT gate selects exactly the complement and keeps its shape."""
+    window, _project, page = _open("gating_polygon_not")
+    try:
+        ctx = window._ctx
+        preview = page._gating_preview
+        parquet = preview["file"]
+        from smage.core.gates import _point_in_polygon
+        from smage.data import columns as _data_columns
+
+        data = _data_columns._column_data(
+            ctx, page._gating_task_id, parquet,
+            [preview["x"], preview["y"]],
+        )
+        points = [(0.0, 0.0), (25.0, 0.0), (25.0, 1.0), (0.0, 1.0)]
+        roi = _GatePolygonROI(
+            points, closed=True, **_gate_roi_pens("#000000")
+        )
+        gating_page._gating_add_gate(ctx, page, "polygon", roi)
+        polygon = page._gating_gates[-1]
+        gating_page._gating_add_not_gate(
+            ctx, page, len(page._gating_gates) - 1
+        )
+        not_gate = page._gating_gates[-1]
+
+        direct = _point_in_polygon(
+            data[preview["x"]], data[preview["y"]], polygon["points"]
+        )
+        source_mask = gating_page._gating_compute_mask(
+            ctx, page, polygon["id"], parquet
+        )
+        not_mask = gating_page._gating_compute_mask(
+            ctx, page, not_gate["id"], parquet
+        )
+        harness.eq(int(np.asarray(source_mask).sum()), int(direct.sum()),
+                   "the polygon mask matches the drawn outline")
+        harness.check(
+            np.array_equal(
+                np.asarray(not_mask, dtype=bool),
+                ~np.asarray(source_mask, dtype=bool),
+            ),
+            "NOT selects exactly the complement of the polygon",
+        )
+
+        gating_page._gating_open_gate_subset(ctx, page, not_gate["id"])
+        visible = gating_page._gating_visible_ids(ctx, page)
+        harness.check(
+            polygon["id"] in visible,
+            "the source polygon stays visible in the NOT subset",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.polygon_scaled", "L4", "gating", tags=("fast",))
+def polygon_scaled_axes() -> None:
+    """A polygon drawn on an arcsinh axis selects the drawn shape."""
+    project = harness.new_project("gating_polygon_scaled", rows=200)
+    parquet = str(project.data_dir / "case.parquet")
+    gating = harness.task_def("gating", task_id="g-1", name="Gating")
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={
+            "files": [parquet],
+            "columns": [
+                {"name": "FSC-A", "method": "arcsinh", "param": 3.0,
+                 "min": None, "max": None},
+                {"name": "SSC-A", "method": "arcsinh", "param": 3.0,
+                 "min": None, "max": None},
+            ],
+        },
+        children=[gating],
+    )
+    project.workflow["tasks"][0]["children"].append(scale)
+    project.save()
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("g-1", "gating", "Gating")
+    harness.pump(450)
+    page = window.tabs.currentWidget()
+    try:
+        ctx = window._ctx
+        from smage.core.gates import _point_in_polygon
+        from smage.core.scale_math import _apply_scale_transforms
+        from smage.data import columns as _data_columns
+
+        x_name, y_name = "FSC-A", "SSC-A"
+        page._gating_preview["x"] = x_name
+        page._gating_preview["y"] = y_name
+        # Display-space (arcsinh) square, as the user would draw it.
+        display_points = [(5.0, 5.0), (9.0, 5.0), (9.0, 9.0), (5.0, 9.0)]
+        roi = _GatePolygonROI(
+            display_points, closed=True, **_gate_roi_pens("#000000")
+        )
+        gating_page._gating_add_gate(ctx, page, "polygon", roi)
+        polygon = page._gating_gates[-1]
+        harness.check(
+            bool(polygon.get("mask_points")),
+            "the polygon stores a sampled mask outline",
+        )
+        gating_page._gating_add_not_gate(
+            ctx, page, len(page._gating_gates) - 1
+        )
+        not_gate = page._gating_gates[-1]
+
+        data = _data_columns._column_data(
+            ctx, "g-1", parquet, [x_name, y_name]
+        )
+        xcfg = _plot_renderer._figure_axis_scale_configs(
+            ctx, "g-1", parquet, x_name
+        )
+        ycfg = _plot_renderer._figure_axis_scale_configs(
+            ctx, "g-1", parquet, y_name
+        )
+        xd = _apply_scale_transforms(
+            np.asarray(data[x_name], dtype="float64"), xcfg
+        )
+        yd = _apply_scale_transforms(
+            np.asarray(data[y_name], dtype="float64"), ycfg
+        )
+        drawn = _point_in_polygon(xd, yd, display_points)
+        source_mask = gating_page._gating_compute_mask(
+            ctx, page, polygon["id"], parquet
+        )
+        not_mask = gating_page._gating_compute_mask(
+            ctx, page, not_gate["id"], parquet
+        )
+        harness.eq(
+            int(np.asarray(source_mask).sum()), int(drawn.sum()),
+            "the mask selects the points inside the drawn polygon",
+        )
+        harness.eq(
+            int((np.asarray(not_mask, bool) & drawn).sum()), 0,
+            "the NOT subset excludes every point inside the drawn polygon",
+        )
     finally:
         _close(window)
 

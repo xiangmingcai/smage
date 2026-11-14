@@ -51,13 +51,15 @@ nav:
           - Unmix — Matrix Unmixing: modules/unmix-matrix.md
           - Illumination Correction: modules/illumination.md
           - Batch Align: modules/batch-align.md
+          - Calculation: modules/calculation.md
       - Display:
           - Scale: modules/scale.md
       - Gating:
           - Gating: modules/gating.md
       - Image analysis:
           - Segmentation: modules/segmentation.md
-          - Area: modules/area.md
+          - Region: modules/region.md
+          - Region Size: modules/region-size.md
       - Features:
           - Feature Down: modules/feature-down.md
           - Feature Up: modules/feature-up.md

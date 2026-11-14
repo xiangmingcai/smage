@@ -21,12 +21,13 @@ see the data produced by the ones above them.
 | Group | Modules |
 |---|---|
 | Input | Data Import (FCS, image stacks, tables) |
-| Map raw values | Compensation, Unmix, Illumination Correction, Batch Align, Rename |
+| Map raw values | Compensation, Unmix, Illumination Correction, Batch Align, Calculation, Rename |
 | Display only | Scale (changes how values are drawn, never the data) |
 | Sampling | Subsample, Subset |
 | Gating | Gating (rect / ellipse / polygon / quadrant / split / range gates, boolean gates) |
-| Image analysis | Segmentation (Cellpose, StarDist, classical thresholding) |
-| Features | Feature Down (aggregate per class), Feature Up, Gate2Col, Area |
+| Image analysis | Segmentation (Cellpose, StarDist, classical thresholding), Region (Signal Expansion / SAM 3) |
+| Analyse | Region Size (pixel area per Region) |
+| Features | Feature Down (aggregate per class), Feature Up, Gate2Col |
 | Computation | Cluster, Dimensionality Reduction, Data Clean |
 | Output | Figure, Heatmap, Export |
 

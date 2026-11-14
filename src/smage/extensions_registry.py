@@ -54,6 +54,21 @@ EXTENSION_DEFS = [
                 "for the Cluster module",
     },
     {
+        # SAM 3 is a large model: the user installs torch/transformers and
+        # downloads the gated weights into a separate environment.  The
+        # Region module calls it as an external process.
+        "id": "sam3",
+        "name": "SAM 3",
+        "family": "sam3",
+        "device": "gpu",
+        "pip": "transformers",
+        "deps": ["torch", "accelerate", "pillow", "safetensors",
+                 "huggingface_hub"],
+        "runner": "sam_runner.py",
+        "model": "facebook/sam3",
+        "desc": "SAM 3 automatic mask generation for the Region module",
+    },
+    {
         # PARC brings native extensions (hnswlib, pybind11) that nothing else
         # in Smage needs, so it also lives in an external environment.
         "id": "parc",

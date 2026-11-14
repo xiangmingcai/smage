@@ -304,8 +304,8 @@ def _refresh_plots_for_settings(ctx) -> None:
                 ctx._figure_refresh_all(page)
             elif hasattr(page, "_gating_plot_widget"):
                 ctx._gating_render(page)
-            elif hasattr(page, "_area_plot"):
-                ctx._area_render_plot(page)
+            elif hasattr(page, "_region_plot_widget"):
+                ctx._region_render_image(page)
         except Exception:
             continue
 

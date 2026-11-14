@@ -28,10 +28,21 @@ A Figure module can hold several plots; each has its own settings and its own
 place in the export. Plots are listed in the module and can be removed
 individually.
 
-## Output
+## Saving a plot
 
-The plots are live views; use [Export](export.md) to write them as
-PNG/SVG/PDF, or turn on the module's own export action.
+Right-click a plot and choose **Save as…**. The saved file shows the plot
+exactly as it currently looks, including the current zoom and pan:
+
+| Format | What is saved |
+|---|---|
+| PDF | Editable axes, tick labels, titles and image legend; the plot area is a high-resolution bitmap. |
+| PNG | A lossless image at three times the screen resolution. |
+| JPEG | A compressed image at three times the screen resolution. |
+
+The A/F corner buttons and the cursor readout are not part of the saved
+figure.
+
+To write plot data or a whole batch of files, use [Export](export.md).
 
 ## Notes
 

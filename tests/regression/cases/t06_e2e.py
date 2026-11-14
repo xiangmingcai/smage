@@ -261,7 +261,7 @@ def unlock_clean_draft() -> None:
                       "a locked module opens as a draft")
 
         with harness.patch_dialogs(
-            module_host, question=QMessageBox.StandardButton.Yes
+            module_host, warning=QMessageBox.StandardButton.Yes
         ):
             window._module_unlock(page)
         harness.pump(150)

@@ -108,6 +108,15 @@ def _gating_state_init(ctx, page, task_def: dict, locked: bool) -> None:
         page._gating_files = []
         page._gating_gates = params.setdefault("gates", [])
         page._gating_per_file = {}
+    # Older polygon gates have only their corner vertices; on a non-linear
+    # axis that data-space polygon does not match the drawn edges. Add the
+    # sampled outline used by the mask.
+    try:
+        from smage.modules.gating import page as _gating_page_module
+
+        _gating_page_module._gating_migrate_polygon_outlines(ctx, page)
+    except Exception:  # noqa: BLE001 - migration must not block opening
+        pass
     page._gating_rois = []
     page._gating_labels = []
     page._gating_crosshairs = {}

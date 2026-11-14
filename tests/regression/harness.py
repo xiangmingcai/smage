@@ -295,6 +295,7 @@ def close_window(window) -> None:
     except Exception:  # noqa: BLE001 - best-effort test cleanup
         pass
     window.close()
+    window.deleteLater()
     pump(100)
 
 

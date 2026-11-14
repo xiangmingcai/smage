@@ -392,6 +392,10 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
     plot_widget._image_probe = None
     _figure_hide_cursor_readout(plot_widget)
     ctx._figure_update_image_legend(plot_widget, [])
+    # Apply the axis labels before any early return: switching from a
+    # scatter plot to an image must show x/y even if this file cannot be
+    # rastered yet. The later call is a no-op thanks to the signature check.
+    ctx._figure_apply_display_options(plot_dict, plot_widget)
     rec = ctx._figure_record(plot_dict.get("file"))
     if not rec:
         plot_widget.clear()
@@ -727,7 +731,14 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                 # module (the raster pipeline maps the name back to the
                 # stored column).
                 produced = any(
-                    kind == "unmix" and channel in stage["names"]
+                    (kind == "unmix" and channel in stage["names"])
+                    or (
+                        kind == "calculation"
+                        and any(
+                            row.get("output") == channel
+                            for row in stage.get("rows") or []
+                        )
+                    )
                     for kind, stage in stages
                 )
                 renamed = any(
@@ -743,6 +754,9 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
             chan, rect, frac = ctx._image_raster(
                 parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
                 mask_ent, raster_stages,
+                # A gate subset must be pixel-exact: pooled block means mix
+                # masked and unmasked pixels and look like the wrong region.
+                force_raw=row_mask is not None,
             )
             if chan is None:
                 continue
@@ -939,8 +953,17 @@ def _figure_display_toggles(ctx, layout, plot_dict, enabled, on_change) -> None:
 def _figure_apply_display_options(ctx, plot_dict: dict, plot_widget) -> None:
     """Apply axis labels, visibility, tick notation, and sample-name title."""
     plot_item = plot_widget.getPlotItem()
-    x_name = plot_dict.get("x")
-    y_name = plot_dict.get("y") if _is_scatter_plot(plot_dict.get("type")) else "Count"
+    if plot_dict.get("type") == "image":
+        # Images are drawn in pixel coordinates; the selected channel only
+        # provides the colour (and the cursor value), never an axis.
+        x_name = "x"
+        y_name = "y"
+    else:
+        x_name = plot_dict.get("x")
+        y_name = (
+            plot_dict.get("y")
+            if _is_scatter_plot(plot_dict.get("type")) else "Count"
+        )
 
     name_size = max(6, int(plot_dict.get("axis_name_font_size", 11) or 11))
     index_size = max(6, int(plot_dict.get("index_font_size", 10) or 10))
@@ -1558,8 +1581,17 @@ def _figure_image_layer_settings(ctx, layout, plot_dict, columns, enabled, on_ch
             QColor(cur[0], cur[1], cur[2]), ctx.host, "Choose color"
         )
         if chosen.isValid():
-            layers[row]["color"] = (chosen.red(), chosen.green(), chosen.blue())
+            color = (chosen.red(), chosen.green(), chosen.blue())
+            layers[row]["color"] = color
             plot_dict["layers"] = layers
+            # The legend is redrawn by on_change(), but the settings table is
+            # not rebuilt (that would steal focus); update its swatch here.
+            button = table.cellWidget(row, 2)
+            if isinstance(button, QPushButton):
+                button.setStyleSheet(
+                    f"background-color: rgb({color[0]},{color[1]},"
+                    f"{color[2]}); border: 1px solid #555;"
+                )
             on_change()
 
     def on_item_changed(item):

@@ -215,6 +215,10 @@ def _gating_convert_geometry(gate, geometry, xmap, ymap) -> dict:
             out["points"] = [
                 [xmap(p[0]), ymap(p[1])] for p in geometry["points"]
             ]
+        if "mask_points" in geometry:
+            out["mask_points"] = [
+                [xmap(p[0]), ymap(p[1])] for p in geometry["mask_points"]
+            ]
     elif t in ("quadrant", "split"):
         if "vx" in geometry:
             out["vx"] = xmap(geometry["vx"])
@@ -675,6 +679,54 @@ def _gating_file_key(ctx, page):
 _GATE_ELLIPSE_SAMPLES = 48
 
 
+_GATE_POLYGON_STEPS = 24
+
+
+def _gating_polygon_outline(points, steps: int = _GATE_POLYGON_STEPS):
+    """Densely sample a polygon's display-space edges.
+
+    On a non-linear axis a straight edge on screen becomes a curve in data
+    space; sampling before the inverse transform keeps the mask boundary on
+    the curve the user actually drew.
+    """
+    if len(points) < 3:
+        return []
+    out = []
+    count = len(points)
+    for i in range(count):
+        x0, y0 = points[i]
+        x1, y1 = points[(i + 1) % count]
+        for k in range(steps):
+            t = k / float(steps)
+            out.append([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t])
+    return out
+
+
+def _gating_migrate_polygon_outlines(ctx, page) -> None:
+    """Add dense mask outlines to polygon gates saved without one."""
+    for gate in page._gating_gates:
+        if gate.get("type") != "polygon" or gate.get("mask_points"):
+            continue
+        points = gate.get("points") or []
+        if len(points) < 3:
+            continue
+        xcfg, ycfg = _gating_scale_axes(ctx, page, gate)
+        if not xcfg and not ycfg:
+            # Linear axes: the straight data-space polygon is exact.
+            continue
+        display = _gating_geometry_to_display(
+            ctx, page, gate, {"points": points}
+        ).get("points")
+        if not display:
+            continue
+        dense = _gating_polygon_outline(display)
+        real = _gating_geometry_to_real(
+            ctx, page, gate, {"points": dense}
+        ).get("points")
+        if real:
+            gate["mask_points"] = real
+
+
 def _gating_ellipse_points(pos, size, count: int = _GATE_ELLIPSE_SAMPLES):
     """Sample an ellipse (in plot units) into a polygon outline.
 
@@ -728,8 +780,12 @@ def _gating_sync_gate(ctx, gate: dict, roi):
     if t == "polygon":
         ox = roi.pos().x()
         oy = roi.pos().y()
+        points = [
+            [p.x() + ox, p.y() + oy] for p in roi.getState()["points"]
+        ]
         return {
-            "points": [[p.x() + ox, p.y() + oy] for p in roi.getState()["points"]]
+            "points": points,
+            "mask_points": _gating_polygon_outline(points),
         }
     return {}
 
@@ -1645,8 +1701,29 @@ def _gating_visible_ids(ctx, page):
     active = page._gating_active_gate_id
     if active:
         # Subset view: show only this gate's direct children (the gates
-        # you can draw inside it), not their deeper descendants.
-        return {g["id"] for g in page._gating_gates if g.get("parent") == active}
+        # you can draw inside it), not their deeper descendants. For a
+        # boolean gate also show the gates it combines, so a NOT/AND/OR
+        # subset keeps the originating shape(s) on screen.
+        visible = {
+            g["id"] for g in page._gating_gates if g.get("parent") == active
+        }
+        by_id = {g["id"]: g for g in page._gating_gates}
+        active_gate = by_id.get(active)
+        if active_gate is not None and active_gate.get("type") in (
+            "not", "and", "or",
+        ):
+            seen = set()
+            stack = list(_gate_source_ids(active_gate))
+            while stack:
+                source_id = stack.pop()
+                if source_id in seen:
+                    continue
+                seen.add(source_id)
+                source = by_id.get(source_id)
+                if source is not None:
+                    stack.extend(_gate_source_ids(source))
+            visible |= seen
+        return visible
     context = page._gating_context_gate_id
     if context:
         ctx = next((g for g in page._gating_gates if g["id"] == context), None)
@@ -1865,23 +1942,19 @@ def _gating_load_rois(ctx, page) -> None:
                 )
                 items = [roi]
             elif t == "ellipse":
-                if rgate.get("points"):
-                    # The stored outline is the exact shape the user drew on
-                    # this axis; an EllipseROI would only match its bounding
-                    # box and select a different set of points.
-                    roi = _GatePolygonROI(
-                        [tuple(p) for p in rgate["points"]],
-                        closed=True, **_gate_roi_pens(gate_color),
-                    )
-                else:
-                    roi = pg.EllipseROI(
-                        (rgate["pos"][0], rgate["pos"][1]),
-                        (
-                            max(float(rgate["size"][0]), _MIN_GATE_SPAN),
-                            max(float(rgate["size"][1]), _MIN_GATE_SPAN),
-                        ),
-                        **_gate_roi_pens(gate_color),
-                    )
+                # The stored `points` are the data-space mask outline (needed
+                # on non-linear axes). The editable ROI stays an ellipse: its
+                # display bounding box is exactly the shape the user drew, so
+                # reloading it must not turn the outline into dozens of
+                # polygon anchors.
+                roi = pg.EllipseROI(
+                    (rgate["pos"][0], rgate["pos"][1]),
+                    (
+                        max(float(rgate["size"][0]), _MIN_GATE_SPAN),
+                        max(float(rgate["size"][1]), _MIN_GATE_SPAN),
+                    ),
+                    **_gate_roi_pens(gate_color),
+                )
                 _gating_style_handles(ctx, roi)
                 roi.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
                 roi.setAcceptHoverEvents(True)
@@ -2800,6 +2873,10 @@ def _gating_stage_signature(stages) -> str:
             payload.append([
                 kind, sorted((stage.get("map") or {}).items()),
                 sorted(stage.get("files") or []),
+            ])
+        elif kind == "calculation":
+            payload.append([
+                kind, stage.get("task_id"), stage.get("signature"),
             ])
         else:
             payload.append([kind, repr(stage)[:500]])

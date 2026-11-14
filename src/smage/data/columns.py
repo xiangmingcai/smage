@@ -8,6 +8,10 @@ import hashlib
 import json
 
 from smage.data.files import _subset_visible_columns
+from smage.core.calculation import (
+    _calculation_outputs,
+    _calculation_stage,
+)
 from smage.core.pipeline import (
     _evaluate_stages,
     _pipeline_dependencies,
@@ -105,6 +109,15 @@ def _columns_for(ctx, parquet_path, task_id=None) -> list:
         for name in ctx._dc_applied_columns(task_id, parquet_path):
             if name not in columns:
                 columns.append(name)
+        # New channels produced by upstream Calculation modules.  Only rows
+        # marked "visible downstream" and scoped to this file are listed.
+        for task in ctx._task_chain(task_id):
+            if task.get("id") == task_id or task.get("type") != "calculation":
+                continue
+            stage = _calculation_stage(task.get("params") or {})
+            for name in _calculation_outputs(stage, parquet_path, True):
+                if name not in columns:
+                    columns.append(name)
         # An upstream Subset module whitelists column names for everything
         # below it (empty selection = no filtering).
         allowed = _subset_visible_columns(ctx, task_id)
@@ -473,6 +486,15 @@ def _map_stages(ctx, task_id, after=None, include_scale=False, parquet_path=None
             stage = _rename_stage(params)
             if stage is not None:
                 stages.append(("rename", stage))
+        elif task_type == "calculation":
+            stage = _calculation_stage(params)
+            if stage is not None:
+                # Skip the stage entirely for files no row applies to.
+                if parquet_path is None or any(
+                    parquet_path in row["files"] for row in stage["rows"]
+                ):
+                    stage["task_id"] = task.get("id")
+                    stages.append(("calculation", stage))
     cache[cache_key] = stages
     return list(stages)
 
@@ -519,6 +541,11 @@ def _map_stage_token(ctx, task_id) -> str:
             ])
         elif kind == "rename":
             parts.append(["rename", dict(stage.get("map") or {})])
+        elif kind == "calculation":
+            parts.append([
+                "calculation", stage.get("task_id"),
+                stage.get("signature"),
+            ])
     return hashlib.sha1(
         json.dumps(parts, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:12]

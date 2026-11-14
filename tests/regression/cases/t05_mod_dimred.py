@@ -38,7 +38,7 @@ def validate() -> None:
 
         page._dimred_params["files"] = [_parquet]
         ok, message = _dimred_page._dimred_validate(ctx, page)
-        harness.check("variable" in message, message)
+        harness.check("channel" in message, message)
 
         page._dimred_params["columns"] = ["FL1-A"]
         page._dimred_params["names"] = ["a", "a"]

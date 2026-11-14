@@ -100,6 +100,111 @@ def _mode_pool(arr2d, block):
     return _row_mode(blocks).reshape(nby, nbx)
 
 
+def _resize_axis_samples(in_size: int, out_size: int):
+    """Bilinear sample positions for one axis (pixel-centre aligned)."""
+    import numpy as np
+
+    coords = (
+        (np.arange(out_size, dtype="float64") + 0.5)
+        * (float(in_size) / float(out_size)) - 0.5
+    )
+    coords = np.clip(coords, 0.0, float(in_size - 1))
+    lower = np.floor(coords).astype(np.int64)
+    upper = np.minimum(lower + 1, in_size - 1)
+    weight = (coords - lower).astype("float32")
+    return lower, upper, weight
+
+
+def _resize_axis_indices(in_size: int, out_size: int):
+    """Nearest-neighbour sample positions for one axis."""
+    import numpy as np
+
+    coords = (
+        (np.arange(out_size, dtype="float64") + 0.5)
+        * (float(in_size) / float(out_size)) - 0.5
+    )
+    return np.clip(np.rint(coords).astype(np.int64), 0, in_size - 1)
+
+
+def _resize_plane(array, width: int, height: int, method: str = "smooth"):
+    """Resize one 2-D image plane, preserving its dtype.
+
+    ``smooth`` applies a Gaussian anti-alias filter scaled to the reduction
+    factor, then bilinear interpolation; ``nearest`` keeps exact source
+    pixels (appropriate for label images).  Non-finite pixels do not bleed
+    into their neighbours: the smoothing is weighted by a validity mask.
+    """
+    import numpy as np
+    from scipy import ndimage
+
+    arr = np.asarray(array)
+    if arr.ndim != 2:
+        raise ValueError("resize expects a 2-D image plane")
+    in_h, in_w = int(arr.shape[0]), int(arr.shape[1])
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if in_w <= 0 or in_h <= 0:
+        raise ValueError("cannot resize an empty image")
+    if width == in_w and height == in_h:
+        return arr
+
+    if str(method or "").lower() == "nearest":
+        ix = _resize_axis_indices(in_w, width)
+        iy = _resize_axis_indices(in_h, height)
+        return arr[np.ix_(iy, ix)]
+
+    dtype = np.float64 if arr.dtype == np.float64 else np.float32
+    work = arr.astype(dtype, copy=False)
+    finite = np.isfinite(work)
+    has_missing = not bool(finite.all())
+    sigma_x = max(0.0, 0.5 * (float(in_w) / width - 1.0))
+    sigma_y = max(0.0, 0.5 * (float(in_h) / height - 1.0))
+    if sigma_x > 0.0 or sigma_y > 0.0:
+        if has_missing:
+            weights = finite.astype(dtype)
+            values = np.where(finite, work, 0.0)
+            values = ndimage.gaussian_filter(
+                values, (sigma_y, sigma_x), mode="nearest"
+            )
+            weights = ndimage.gaussian_filter(
+                weights, (sigma_y, sigma_x), mode="nearest"
+            )
+        else:
+            values = ndimage.gaussian_filter(
+                work, (sigma_y, sigma_x), mode="nearest"
+            )
+            weights = None
+    else:
+        values = work
+        weights = finite.astype(dtype) if has_missing else None
+
+    x0, x1, wx = _resize_axis_samples(in_w, width)
+    y0, y1, wy = _resize_axis_samples(in_h, height)
+    wx = wx.astype(dtype)
+    wy = wy.astype(dtype)
+
+    def _interpolate(source):
+        rows = source[:, x0] * (1.0 - wx) + source[:, x1] * wx
+        return rows[y0, :] * (1.0 - wy)[:, None] + rows[y1, :] * wy[:, None]
+
+    out = _interpolate(values)
+    if weights is not None:
+        total = _interpolate(weights)
+        out = np.divide(
+            out, total,
+            out=np.full(out.shape, np.nan, dtype=dtype),
+            where=total > 1e-8,
+        )
+
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        out = np.clip(np.rint(out), info.min, info.max)
+        return out.astype(arr.dtype)
+    if arr.dtype == np.bool_:
+        return (out >= 0.5).astype(arr.dtype)
+    return out.astype(arr.dtype, copy=False)
+
+
 def _pool_mask(mask, target_blocks):
     """Pool a (H, W) uint8 mask into {block: (nby, nbx) float32 pass-fraction}."""
     import numpy as np

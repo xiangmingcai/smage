@@ -7,7 +7,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 412
+      "line": 420
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Browse…|0",
@@ -15,7 +15,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "button",
       "label": "Browse…",
-      "line": 371
+      "line": 379
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Create venv…|0",
@@ -23,7 +23,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "button",
       "label": "Create venv…",
-      "line": 390
+      "line": 398
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Detect installed Python…|0",
@@ -31,7 +31,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "button",
       "label": "Detect installed Python…",
-      "line": 356
+      "line": 364
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Detect library|0",
@@ -39,7 +39,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "button",
       "label": "Detect library",
-      "line": 398
+      "line": 406
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Download model|0",
@@ -47,7 +47,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "button",
       "label": "Download model",
-      "line": 460
+      "line": 468
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Install Python…|0",
@@ -55,7 +55,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "button",
       "label": "Install Python…",
-      "line": 388
+      "line": 396
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|button|Install dependencies|0",
@@ -63,7 +63,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "button",
       "label": "Install dependencies",
-      "line": 448
+      "line": 456
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|combo|<dynamic>|0",
@@ -71,7 +71,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "combo",
       "label": "<dynamic>",
-      "line": 364
+      "line": 372
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|combo|<dynamic>|1",
@@ -79,7 +79,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "combo",
       "label": "<dynamic>",
-      "line": 431
+      "line": 439
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._ext_detail_panel|text|<dynamic>|0",
@@ -87,7 +87,7 @@
       "function": "ExtensionsMixin._ext_detail_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 473
+      "line": 481
     },
     {
       "key": "src/smage/app/extensions.py|ExtensionsMixin._open_extension_manager|list|<dynamic>|0",
@@ -95,7 +95,7 @@
       "function": "ExtensionsMixin._open_extension_manager",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 264
+      "line": 272
     },
     {
       "key": "src/smage/app/module_host.py|ModuleHostMixin._build_generate_page|button|Close|0",
@@ -103,7 +103,7 @@
       "function": "ModuleHostMixin._build_generate_page",
       "kind": "button",
       "label": "Close",
-      "line": 180
+      "line": 209
     },
     {
       "key": "src/smage/app/module_host.py|ModuleHostMixin._build_generate_page|button|Run|0",
@@ -111,7 +111,7 @@
       "function": "ModuleHostMixin._build_generate_page",
       "kind": "button",
       "label": "Run",
-      "line": 179
+      "line": 208
     },
     {
       "key": "src/smage/app/module_host.py|ModuleHostMixin._build_generate_page|button|Save|0",
@@ -119,7 +119,7 @@
       "function": "ModuleHostMixin._build_generate_page",
       "kind": "button",
       "label": "Save",
-      "line": 178
+      "line": 207
     },
     {
       "key": "src/smage/app/module_host.py|ModuleHostMixin._build_module_toolbar|button|Close|0",
@@ -127,7 +127,7 @@
       "function": "ModuleHostMixin._build_module_toolbar",
       "kind": "button",
       "label": "Close",
-      "line": 123
+      "line": 152
     },
     {
       "key": "src/smage/app/module_host.py|ModuleHostMixin._build_module_toolbar|button|Save|0",
@@ -135,7 +135,7 @@
       "function": "ModuleHostMixin._build_module_toolbar",
       "kind": "button",
       "label": "Save",
-      "line": 118
+      "line": 147
     },
     {
       "key": "src/smage/app/module_host.py|ModuleHostMixin._build_module_toolbar|button|Settings|0",
@@ -143,7 +143,7 @@
       "function": "ModuleHostMixin._build_module_toolbar",
       "kind": "button",
       "label": "Settings",
-      "line": 122
+      "line": 151
     },
     {
       "key": "src/smage/app/module_host.py|ModuleHostMixin._install_unlock_button|button|Unlock|0",
@@ -151,7 +151,7 @@
       "function": "ModuleHostMixin._install_unlock_button",
       "kind": "button",
       "label": "Unlock",
-      "line": 318
+      "line": 347
     },
     {
       "key": "src/smage/app/module_host.py|ModuleHostMixin._open_module|tab|<dynamic>|0",
@@ -159,7 +159,7 @@
       "function": "ModuleHostMixin._open_module",
       "kind": "tab",
       "label": "<dynamic>",
-      "line": 580
+      "line": 731
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_main_area|tabs|<dynamic>|0",
@@ -167,7 +167,7 @@
       "function": "ProjectIOMixin._build_main_area",
       "kind": "tabs",
       "label": "<dynamic>",
-      "line": 264
+      "line": 292
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|0",
@@ -175,7 +175,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 109
+      "line": 116
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|1",
@@ -183,7 +183,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 113
+      "line": 120
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|2",
@@ -191,7 +191,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 117
+      "line": 124
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|3",
@@ -199,7 +199,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 122
+      "line": 129
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|4",
@@ -207,7 +207,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 127
+      "line": 134
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|action|<dynamic>|5",
@@ -215,7 +215,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 130
+      "line": 139
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|menu|&Extension|0",
@@ -223,7 +223,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "menu",
       "label": "&Extension",
-      "line": 119
+      "line": 126
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|menu|&File|0",
@@ -231,7 +231,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "menu",
       "label": "&File",
-      "line": 105
+      "line": 112
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|menu|&Help|0",
@@ -239,7 +239,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "menu",
       "label": "&Help",
-      "line": 129
+      "line": 136
     },
     {
       "key": "src/smage/app/project_io.py|ProjectIOMixin._build_menu_bar|menu|&Settings|0",
@@ -247,7 +247,7 @@
       "function": "ProjectIOMixin._build_menu_bar",
       "kind": "menu",
       "label": "&Settings",
-      "line": 124
+      "line": 131
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|0",
@@ -255,7 +255,7 @@
       "function": "WorkflowTreeMixin._build_actions_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 645
+      "line": 661
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|1",
@@ -263,7 +263,7 @@
       "function": "WorkflowTreeMixin._build_actions_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 649
+      "line": 667
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|2",
@@ -271,7 +271,7 @@
       "function": "WorkflowTreeMixin._build_actions_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 655
+      "line": 673
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|3",
@@ -279,7 +279,7 @@
       "function": "WorkflowTreeMixin._build_actions_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 659
+      "line": 679
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|4",
@@ -287,7 +287,7 @@
       "function": "WorkflowTreeMixin._build_actions_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 665
+      "line": 685
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|5",
@@ -295,7 +295,7 @@
       "function": "WorkflowTreeMixin._build_actions_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 676
+      "line": 696
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|6",
@@ -303,7 +303,7 @@
       "function": "WorkflowTreeMixin._build_actions_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 682
+      "line": 703
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_actions_menu|action|<dynamic>|7",
@@ -311,7 +311,7 @@
       "function": "WorkflowTreeMixin._build_actions_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 688
+      "line": 709
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_workflow_tab|tab|Workflow|0",
@@ -319,7 +319,7 @@
       "function": "WorkflowTreeMixin._build_workflow_tab",
       "kind": "tab",
       "label": "Workflow",
-      "line": 540
+      "line": 551
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._build_workflow_tab|tree|<dynamic>|0",
@@ -327,7 +327,7 @@
       "function": "WorkflowTreeMixin._build_workflow_tab",
       "kind": "tree",
       "label": "<dynamic>",
-      "line": 527
+      "line": 538
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._task_item_widget|button|+|0",
@@ -335,7 +335,7 @@
       "function": "WorkflowTreeMixin._task_item_widget",
       "kind": "button",
       "label": "+",
-      "line": 594
+      "line": 605
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._task_item_widget|button|Actions ▾|0",
@@ -343,7 +343,7 @@
       "function": "WorkflowTreeMixin._task_item_widget",
       "kind": "button",
       "label": "Actions ▾",
-      "line": 588
+      "line": 599
     },
     {
       "key": "src/smage/app/workflow_tree.py|WorkflowTreeMixin._task_item_widget|button|Open|0",
@@ -351,87 +351,15 @@
       "function": "WorkflowTreeMixin._task_item_widget",
       "kind": "button",
       "label": "Open",
-      "line": 581
+      "line": 592
     },
     {
-      "key": "src/smage/modules/area/page.py|_area_center_panel|button|Copy|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_area_center_panel",
-      "kind": "button",
-      "label": "Copy",
-      "line": 286
-    },
-    {
-      "key": "src/smage/modules/area/page.py|_area_center_panel|spin|<dynamic>|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_area_center_panel",
-      "kind": "spin",
-      "label": "<dynamic>",
-      "line": 240
-    },
-    {
-      "key": "src/smage/modules/area/page.py|_area_center_panel|table|<dynamic>|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_area_center_panel",
-      "kind": "table",
-      "label": "<dynamic>",
-      "line": 259
-    },
-    {
-      "key": "src/smage/modules/area/page.py|_area_left_panel|button|Apply to checked files|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_area_left_panel",
-      "kind": "button",
-      "label": "Apply to checked files",
-      "line": 221
-    },
-    {
-      "key": "src/smage/modules/area/page.py|_area_left_panel|button|Select files…|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_area_left_panel",
-      "kind": "button",
-      "label": "Select files…",
-      "line": 159
-    },
-    {
-      "key": "src/smage/modules/area/page.py|_area_left_panel|list|<dynamic>|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_area_left_panel",
-      "kind": "list",
-      "label": "<dynamic>",
-      "line": 164
-    },
-    {
-      "key": "src/smage/modules/area/page.py|_build_area_page|button|Close|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_build_area_page",
-      "kind": "button",
-      "label": "Close",
-      "line": 90
-    },
-    {
-      "key": "src/smage/modules/area/page.py|_build_area_page|button|Save|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_build_area_page",
-      "kind": "button",
-      "label": "Save",
-      "line": 87
-    },
-    {
-      "key": "src/smage/modules/area/page.py|_build_area_page|splitter|<dynamic>|0",
-      "file": "src/smage/modules/area/page.py",
-      "function": "_build_area_page",
-      "kind": "splitter",
-      "label": "<dynamic>",
-      "line": 136
-    },
-    {
-      "key": "src/smage/modules/batch_align/page.py|_ba_center_panel|button|Select variables…|0",
+      "key": "src/smage/modules/batch_align/page.py|_ba_center_panel|button|Select channels…|0",
       "file": "src/smage/modules/batch_align/page.py",
       "function": "_ba_center_panel",
       "kind": "button",
-      "label": "Select variables…",
-      "line": 356
+      "label": "Select channels…",
+      "line": 362
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_center_panel|list|<dynamic>|0",
@@ -439,7 +367,7 @@
       "function": "_ba_center_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 360
+      "line": 366
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_left_panel|button|Copy|0",
@@ -447,7 +375,7 @@
       "function": "_ba_left_panel",
       "kind": "button",
       "label": "Copy",
-      "line": 327
+      "line": 333
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_left_panel|button|Paste|0",
@@ -455,7 +383,7 @@
       "function": "_ba_left_panel",
       "kind": "button",
       "label": "Paste",
-      "line": 329
+      "line": 335
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_left_panel|button|Select files…|0",
@@ -463,7 +391,7 @@
       "function": "_ba_left_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 294
+      "line": 300
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_left_panel|table|<dynamic>|0",
@@ -471,7 +399,7 @@
       "function": "_ba_left_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 304
+      "line": 310
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_log_panel|text|<dynamic>|0",
@@ -479,7 +407,7 @@
       "function": "_ba_log_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 243
+      "line": 249
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_right_panel|button|Calculate|0",
@@ -487,7 +415,7 @@
       "function": "_ba_right_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 505
+      "line": 511
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_right_panel|button|Report|0",
@@ -495,7 +423,7 @@
       "function": "_ba_right_panel",
       "kind": "button",
       "label": "Report",
-      "line": 507
+      "line": 513
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_right_panel|checkbox|Adjust variance as well as location|0",
@@ -503,7 +431,7 @@
       "function": "_ba_right_panel",
       "kind": "checkbox",
       "label": "Adjust variance as well as location",
-      "line": 472
+      "line": 478
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_ba_right_panel|checkbox|Empirical Bayes shrinkage|0",
@@ -511,7 +439,7 @@
       "function": "_ba_right_panel",
       "kind": "checkbox",
       "label": "Empirical Bayes shrinkage",
-      "line": 465
+      "line": 471
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_build_ba_page|button|Close|0",
@@ -519,7 +447,7 @@
       "function": "_build_ba_page",
       "kind": "button",
       "label": "Close",
-      "line": 178
+      "line": 184
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_build_ba_page|button|Save|0",
@@ -527,7 +455,7 @@
       "function": "_build_ba_page",
       "kind": "button",
       "label": "Save",
-      "line": 175
+      "line": 181
     },
     {
       "key": "src/smage/modules/batch_align/page.py|_build_ba_page|splitter|<dynamic>|0",
@@ -535,7 +463,127 @@
       "function": "_build_ba_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 219
+      "line": 225
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_build_calculation_page|button|Close|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_build_calculation_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 630
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_build_calculation_page|button|Save|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_build_calculation_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 627
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_build_calculation_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_build_calculation_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 738
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_add_editor|button|Add channel|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_add_editor",
+      "kind": "button",
+      "label": "Add channel",
+      "line": 1221
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_add_editor|button|Delete|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_add_editor",
+      "kind": "button",
+      "label": "Delete",
+      "line": 1209
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_build_row|button|<dynamic>|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_build_row",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 994
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_build_row|checkbox|<dynamic>|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_build_row",
+      "kind": "checkbox",
+      "label": "<dynamic>",
+      "line": 1030
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_build_row|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_build_row",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 1017
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_contrast_editor|button|Recompute|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_contrast_editor",
+      "kind": "button",
+      "label": "Recompute",
+      "line": 1254
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_contrast_editor|button|Reset to identity|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_contrast_editor",
+      "kind": "button",
+      "label": "Reset to identity",
+      "line": 1288
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_contrast_editor|checkbox|Auto|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_contrast_editor",
+      "kind": "checkbox",
+      "label": "Auto",
+      "line": 1250
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_files_panel|button|Select files…|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_files_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 778
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_files_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_files_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 785
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_rows_panel|button|Add|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_rows_panel",
+      "kind": "button",
+      "label": "Add",
+      "line": 901
+    },
+    {
+      "key": "src/smage/modules/calculation/page.py|_calc_rows_panel|button|Delete|0",
+      "file": "src/smage/modules/calculation/page.py",
+      "function": "_calc_rows_panel",
+      "kind": "button",
+      "label": "Delete",
+      "line": 905
     },
     {
       "key": "src/smage/modules/cluster/page.py|_build_cluster_page|button|Close|0",
@@ -543,7 +591,7 @@
       "function": "_build_cluster_page",
       "kind": "button",
       "label": "Close",
-      "line": 129
+      "line": 137
     },
     {
       "key": "src/smage/modules/cluster/page.py|_build_cluster_page|button|Save|0",
@@ -551,7 +599,7 @@
       "function": "_build_cluster_page",
       "kind": "button",
       "label": "Save",
-      "line": 126
+      "line": 134
     },
     {
       "key": "src/smage/modules/cluster/page.py|_build_cluster_page|splitter|<dynamic>|0",
@@ -559,15 +607,15 @@
       "function": "_build_cluster_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 171
+      "line": 179
     },
     {
-      "key": "src/smage/modules/cluster/page.py|_cluster_center_panel|button|Select variables…|0",
+      "key": "src/smage/modules/cluster/page.py|_cluster_center_panel|button|Select channels…|0",
       "file": "src/smage/modules/cluster/page.py",
       "function": "_cluster_center_panel",
       "kind": "button",
-      "label": "Select variables…",
-      "line": 288
+      "label": "Select channels…",
+      "line": 296
     },
     {
       "key": "src/smage/modules/cluster/page.py|_cluster_center_panel|list|<dynamic>|0",
@@ -575,7 +623,7 @@
       "function": "_cluster_center_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 292
+      "line": 300
     },
     {
       "key": "src/smage/modules/cluster/page.py|_cluster_left_panel|button|Select files…|0",
@@ -583,7 +631,7 @@
       "function": "_cluster_left_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 255
+      "line": 263
     },
     {
       "key": "src/smage/modules/cluster/page.py|_cluster_left_panel|list|<dynamic>|0",
@@ -591,7 +639,7 @@
       "function": "_cluster_left_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 259
+      "line": 267
     },
     {
       "key": "src/smage/modules/cluster/page.py|_cluster_log_panel|text|<dynamic>|0",
@@ -599,7 +647,7 @@
       "function": "_cluster_log_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 195
+      "line": 203
     },
     {
       "key": "src/smage/modules/cluster/page.py|_cluster_right_panel|button|Calculate|0",
@@ -607,7 +655,7 @@
       "function": "_cluster_right_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 490
+      "line": 498
     },
     {
       "key": "src/smage/modules/cluster/page.py|_cluster_right_panel|checkbox|Normalize (z-score)|0",
@@ -615,7 +663,7 @@
       "function": "_cluster_right_panel",
       "kind": "checkbox",
       "label": "Normalize (z-score)",
-      "line": 455
+      "line": 463
     },
     {
       "key": "src/smage/modules/cluster/page.py|_cluster_right_panel|lineedit|<dynamic>|0",
@@ -623,7 +671,7 @@
       "function": "_cluster_right_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 469
+      "line": 477
     },
     {
       "key": "src/smage/modules/compensation/page.py|_build_compensation_page|button|Close|0",
@@ -631,7 +679,7 @@
       "function": "_build_compensation_page",
       "kind": "button",
       "label": "Close",
-      "line": 59
+      "line": 64
     },
     {
       "key": "src/smage/modules/compensation/page.py|_build_compensation_page|button|Save|0",
@@ -639,7 +687,7 @@
       "function": "_build_compensation_page",
       "kind": "button",
       "label": "Save",
-      "line": 56
+      "line": 61
     },
     {
       "key": "src/smage/modules/compensation/page.py|_build_compensation_page|splitter|<dynamic>|0",
@@ -647,7 +695,7 @@
       "function": "_build_compensation_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 94
+      "line": 99
     },
     {
       "key": "src/smage/modules/compensation/page.py|_comp_files_panel|button|Set Files|0",
@@ -655,7 +703,7 @@
       "function": "_comp_files_panel",
       "kind": "button",
       "label": "Set Files",
-      "line": 115
+      "line": 120
     },
     {
       "key": "src/smage/modules/compensation/page.py|_comp_files_panel|list|<dynamic>|0",
@@ -663,7 +711,7 @@
       "function": "_comp_files_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 120
+      "line": 125
     },
     {
       "key": "src/smage/modules/compensation/page.py|_comp_matrix_panel|button|Copy Matrix|0",
@@ -671,7 +719,7 @@
       "function": "_comp_matrix_panel",
       "kind": "button",
       "label": "Copy Matrix",
-      "line": 143
+      "line": 148
     },
     {
       "key": "src/smage/modules/compensation/page.py|_comp_matrix_panel|button|Paste Matrix|0",
@@ -679,7 +727,7 @@
       "function": "_comp_matrix_panel",
       "kind": "button",
       "label": "Paste Matrix",
-      "line": 144
+      "line": 149
     },
     {
       "key": "src/smage/modules/compensation/page.py|_comp_matrix_panel|button|Set Compensation Matrix|0",
@@ -687,7 +735,7 @@
       "function": "_comp_matrix_panel",
       "kind": "button",
       "label": "Set Compensation Matrix",
-      "line": 137
+      "line": 142
     },
     {
       "key": "src/smage/modules/compensation/page.py|_comp_matrix_panel|table|<dynamic>|0",
@@ -695,7 +743,7 @@
       "function": "_comp_matrix_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 153
+      "line": 158
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_build_dc_page|button|Close|0",
@@ -703,7 +751,7 @@
       "function": "_build_dc_page",
       "kind": "button",
       "label": "Close",
-      "line": 119
+      "line": 128
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_build_dc_page|button|Save|0",
@@ -711,7 +759,7 @@
       "function": "_build_dc_page",
       "kind": "button",
       "label": "Save",
-      "line": 116
+      "line": 125
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_build_dc_page|splitter|<dynamic>|0",
@@ -719,7 +767,7 @@
       "function": "_build_dc_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 160
+      "line": 169
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_dc_center_panel|button|Select variables…|0",
@@ -727,7 +775,7 @@
       "function": "_dc_center_panel",
       "kind": "button",
       "label": "Select variables…",
-      "line": 292
+      "line": 301
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_dc_center_panel|list|<dynamic>|0",
@@ -735,7 +783,7 @@
       "function": "_dc_center_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 296
+      "line": 305
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_dc_left_panel|button|Select files…|0",
@@ -743,7 +791,7 @@
       "function": "_dc_left_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 236
+      "line": 245
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_dc_left_panel|list|<dynamic>|0",
@@ -751,7 +799,7 @@
       "function": "_dc_left_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 240
+      "line": 249
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_dc_log_panel|text|<dynamic>|0",
@@ -759,7 +807,7 @@
       "function": "_dc_log_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 184
+      "line": 193
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_dc_right_panel|button|Calculate|0",
@@ -767,7 +815,7 @@
       "function": "_dc_right_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 415
+      "line": 424
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_dc_right_panel|checkbox|Remove zeros before peak detection|0",
@@ -775,7 +823,7 @@
       "function": "_dc_right_panel",
       "kind": "checkbox",
       "label": "Remove zeros before peak detection",
-      "line": 391
+      "line": 400
     },
     {
       "key": "src/smage/modules/data_clean/page.py|_dc_right_panel|lineedit|<dynamic>|0",
@@ -783,7 +831,7 @@
       "function": "_dc_right_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 405
+      "line": 414
     },
     {
       "key": "src/smage/modules/dimred/page.py|_build_dimred_page|button|Close|0",
@@ -791,7 +839,7 @@
       "function": "_build_dimred_page",
       "kind": "button",
       "label": "Close",
-      "line": 164
+      "line": 173
     },
     {
       "key": "src/smage/modules/dimred/page.py|_build_dimred_page|button|Save|0",
@@ -799,7 +847,7 @@
       "function": "_build_dimred_page",
       "kind": "button",
       "label": "Save",
-      "line": 161
+      "line": 170
     },
     {
       "key": "src/smage/modules/dimred/page.py|_build_dimred_page|splitter|<dynamic>|0",
@@ -807,15 +855,15 @@
       "function": "_build_dimred_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 204
+      "line": 213
     },
     {
-      "key": "src/smage/modules/dimred/page.py|_dimred_center_panel|button|Select variables…|0",
+      "key": "src/smage/modules/dimred/page.py|_dimred_center_panel|button|Select channels…|0",
       "file": "src/smage/modules/dimred/page.py",
       "function": "_dimred_center_panel",
       "kind": "button",
-      "label": "Select variables…",
-      "line": 359
+      "label": "Select channels…",
+      "line": 368
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_center_panel|list|<dynamic>|0",
@@ -823,7 +871,7 @@
       "function": "_dimred_center_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 363
+      "line": 372
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_left_panel|button|Select files…|0",
@@ -831,7 +879,7 @@
       "function": "_dimred_left_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 326
+      "line": 335
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_left_panel|list|<dynamic>|0",
@@ -839,7 +887,7 @@
       "function": "_dimred_left_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 330
+      "line": 339
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_log_panel|text|<dynamic>|0",
@@ -847,7 +895,7 @@
       "function": "_dimred_log_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 277
+      "line": 286
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|button|Calculate|0",
@@ -855,7 +903,7 @@
       "function": "_dimred_right_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 539
+      "line": 548
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|checkbox|Allow parallel (non-reproducible)|0",
@@ -863,7 +911,7 @@
       "function": "_dimred_right_panel",
       "kind": "checkbox",
       "label": "Allow parallel (non-reproducible)",
-      "line": 499
+      "line": 508
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|checkbox|Normalize (z-score)|0",
@@ -871,7 +919,7 @@
       "function": "_dimred_right_panel",
       "kind": "checkbox",
       "label": "Normalize (z-score)",
-      "line": 480
+      "line": 489
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|checkbox|PCA pre-reduction (faster)|0",
@@ -879,7 +927,7 @@
       "function": "_dimred_right_panel",
       "kind": "checkbox",
       "label": "PCA pre-reduction (faster)",
-      "line": 489
+      "line": 498
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|lineedit|<dynamic>|0",
@@ -887,7 +935,7 @@
       "function": "_dimred_right_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 514
+      "line": 523
     },
     {
       "key": "src/smage/modules/dimred/page.py|_dimred_right_panel|lineedit|<dynamic>|1",
@@ -895,7 +943,7 @@
       "function": "_dimred_right_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 521
+      "line": 530
     },
     {
       "key": "src/smage/modules/export/page.py|_build_export_page|button|Close|0",
@@ -903,7 +951,7 @@
       "function": "_build_export_page",
       "kind": "button",
       "label": "Close",
-      "line": 74
+      "line": 82
     },
     {
       "key": "src/smage/modules/export/page.py|_build_export_page|button|Save|0",
@@ -911,7 +959,7 @@
       "function": "_build_export_page",
       "kind": "button",
       "label": "Save",
-      "line": 71
+      "line": 79
     },
     {
       "key": "src/smage/modules/export/page.py|_build_export_page|tabs|<dynamic>|0",
@@ -919,7 +967,7 @@
       "function": "_build_export_page",
       "kind": "tabs",
       "label": "<dynamic>",
-      "line": 102
+      "line": 110
     },
     {
       "key": "src/smage/modules/export/page.py|_build_export_page|tab|Image Export|0",
@@ -927,7 +975,7 @@
       "function": "_build_export_page",
       "kind": "tab",
       "label": "Image Export",
-      "line": 104
+      "line": 112
     },
     {
       "key": "src/smage/modules/export/page.py|_build_export_page|tab|Table Export|0",
@@ -935,23 +983,15 @@
       "function": "_build_export_page",
       "kind": "tab",
       "label": "Table Export",
-      "line": 103
+      "line": 111
     },
     {
-      "key": "src/smage/modules/export/page.py|_export_columns_panel|button|<dynamic>|0",
+      "key": "src/smage/modules/export/page.py|_export_columns_panel|button|Select channels…|0",
       "file": "src/smage/modules/export/page.py",
       "function": "_export_columns_panel",
       "kind": "button",
-      "label": "<dynamic>",
-      "line": 212
-    },
-    {
-      "key": "src/smage/modules/export/page.py|_export_columns_panel|list|<dynamic>|0",
-      "file": "src/smage/modules/export/page.py",
-      "function": "_export_columns_panel",
-      "kind": "list",
-      "label": "<dynamic>",
-      "line": 219
+      "label": "Select channels…",
+      "line": 252
     },
     {
       "key": "src/smage/modules/export/page.py|_export_files_panel|button|Select files…|0",
@@ -959,7 +999,7 @@
       "function": "_export_files_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 167
+      "line": 175
     },
     {
       "key": "src/smage/modules/export/page.py|_export_files_panel|list|<dynamic>|0",
@@ -967,7 +1007,7 @@
       "function": "_export_files_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 172
+      "line": 180
     },
     {
       "key": "src/smage/modules/export/page.py|_export_settings_panel|button|Browse…|0",
@@ -975,7 +1015,7 @@
       "function": "_export_settings_panel",
       "kind": "button",
       "label": "Browse…",
-      "line": 266
+      "line": 307
     },
     {
       "key": "src/smage/modules/export/page.py|_export_settings_panel|button|Cancel|0",
@@ -983,7 +1023,7 @@
       "function": "_export_settings_panel",
       "kind": "button",
       "label": "Cancel",
-      "line": 290
+      "line": 331
     },
     {
       "key": "src/smage/modules/export/page.py|_export_settings_panel|button|Export|0",
@@ -991,7 +1031,7 @@
       "function": "_export_settings_panel",
       "kind": "button",
       "label": "Export",
-      "line": 287
+      "line": 328
     },
     {
       "key": "src/smage/modules/export/page.py|_export_settings_panel|lineedit|<dynamic>|0",
@@ -999,7 +1039,7 @@
       "function": "_export_settings_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 261
+      "line": 302
     },
     {
       "key": "src/smage/modules/export/page.py|_export_settings_panel|text|<dynamic>|0",
@@ -1007,7 +1047,7 @@
       "function": "_export_settings_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 309
+      "line": 350
     },
     {
       "key": "src/smage/modules/export/page.py|_export_subpage|splitter|<dynamic>|0",
@@ -1015,7 +1055,7 @@
       "function": "_export_subpage",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 127
+      "line": 135
     },
     {
       "key": "src/smage/modules/feature/page.py|_build_feature_page|button|Close|0",
@@ -1023,7 +1063,7 @@
       "function": "_build_feature_page",
       "kind": "button",
       "label": "Close",
-      "line": 85
+      "line": 94
     },
     {
       "key": "src/smage/modules/feature/page.py|_build_feature_page|button|Save|0",
@@ -1031,7 +1071,7 @@
       "function": "_build_feature_page",
       "kind": "button",
       "label": "Save",
-      "line": 82
+      "line": 91
     },
     {
       "key": "src/smage/modules/feature/page.py|_build_feature_page|splitter|<dynamic>|0",
@@ -1039,7 +1079,7 @@
       "function": "_build_feature_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 127
+      "line": 138
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_files_panel|button|Select files…|0",
@@ -1047,7 +1087,7 @@
       "function": "_feat_files_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 250
+      "line": 261
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_files_panel|table|<dynamic>|0",
@@ -1055,7 +1095,7 @@
       "function": "_feat_files_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 255
+      "line": 266
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_ignore_section|table|<dynamic>|0",
@@ -1063,7 +1103,7 @@
       "function": "_feat_ignore_section",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 312
+      "line": 325
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_log_panel|text|<dynamic>|0",
@@ -1071,7 +1111,7 @@
       "function": "_feat_log_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 151
+      "line": 162
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_rebuild_rules|lineedit|<dynamic>|0",
@@ -1079,7 +1119,7 @@
       "function": "_feat_rebuild_rules",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 1126
+      "line": 1214
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_rules_panel|button|Add|0",
@@ -1087,7 +1127,7 @@
       "function": "_feat_rules_panel",
       "kind": "button",
       "label": "Add",
-      "line": 936
+      "line": 1000
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_rules_panel|button|Calculate|0",
@@ -1095,7 +1135,7 @@
       "function": "_feat_rules_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 947
+      "line": 1011
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_rules_panel|button|Delete|0",
@@ -1103,7 +1143,7 @@
       "function": "_feat_rules_panel",
       "kind": "button",
       "label": "Delete",
-      "line": 939
+      "line": 1003
     },
     {
       "key": "src/smage/modules/feature/page.py|_feat_rules_panel|table|<dynamic>|0",
@@ -1111,7 +1151,7 @@
       "function": "_feat_rules_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 911
+      "line": 973
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_build_feature_up_page|button|Close|0",
@@ -1119,7 +1159,7 @@
       "function": "_build_feature_up_page",
       "kind": "button",
       "label": "Close",
-      "line": 71
+      "line": 79
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_build_feature_up_page|button|Save|0",
@@ -1127,7 +1167,7 @@
       "function": "_build_feature_up_page",
       "kind": "button",
       "label": "Save",
-      "line": 68
+      "line": 76
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_build_feature_up_page|splitter|<dynamic>|0",
@@ -1135,7 +1175,7 @@
       "function": "_build_feature_up_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 105
+      "line": 113
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|button|Calculate|0",
@@ -1143,7 +1183,7 @@
       "function": "_fup_features_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 305
+      "line": 313
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|button|Delete|0",
@@ -1151,15 +1191,15 @@
       "function": "_fup_features_panel",
       "kind": "button",
       "label": "Delete",
-      "line": 298
+      "line": 306
     },
     {
-      "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|button|Select features…|0",
+      "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|button|Select channels…|0",
       "file": "src/smage/modules/feature_up/page.py",
       "function": "_fup_features_panel",
       "kind": "button",
-      "label": "Select features…",
-      "line": 278
+      "label": "Select channels…",
+      "line": 286
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_features_panel|table|<dynamic>|0",
@@ -1167,7 +1207,7 @@
       "function": "_fup_features_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 283
+      "line": 291
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|button|Match|0",
@@ -1175,7 +1215,7 @@
       "function": "_fup_files_panel",
       "kind": "button",
       "label": "Match",
-      "line": 224
+      "line": 232
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|button|Select From files…|0",
@@ -1183,7 +1223,7 @@
       "function": "_fup_files_panel",
       "kind": "button",
       "label": "Select From files…",
-      "line": 176
+      "line": 184
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|button|Select To files…|0",
@@ -1191,7 +1231,7 @@
       "function": "_fup_files_panel",
       "kind": "button",
       "label": "Select To files…",
-      "line": 193
+      "line": 201
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|list|<dynamic>|0",
@@ -1199,7 +1239,7 @@
       "function": "_fup_files_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 180
+      "line": 188
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_files_panel|list|<dynamic>|1",
@@ -1207,7 +1247,7 @@
       "function": "_fup_files_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 197
+      "line": 205
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_log_panel|text|<dynamic>|0",
@@ -1215,7 +1255,7 @@
       "function": "_fup_log_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 130
+      "line": 138
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_match_panel|table|<dynamic>|0",
@@ -1223,7 +1263,7 @@
       "function": "_fup_match_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 246
+      "line": 254
     },
     {
       "key": "src/smage/modules/feature_up/page.py|_fup_rebuild_features|lineedit|<dynamic>|0",
@@ -1231,7 +1271,7 @@
       "function": "_fup_rebuild_features",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 457
+      "line": 465
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|button|Cancel|0",
@@ -1239,7 +1279,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "button",
       "label": "Cancel",
-      "line": 390
+      "line": 439
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|button|Clear|0",
@@ -1247,7 +1287,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "button",
       "label": "Clear",
-      "line": 367
+      "line": 416
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|button|Permute|0",
@@ -1255,7 +1295,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "button",
       "label": "Permute",
-      "line": 392
+      "line": 441
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|button|Select all|0",
@@ -1263,7 +1303,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "button",
       "label": "Select all",
-      "line": 365
+      "line": 414
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|lineedit|<dynamic>|0",
@@ -1271,7 +1311,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 351
+      "line": 400
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|list|<dynamic>|0",
@@ -1279,7 +1319,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 357
+      "line": 406
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|radio|<dynamic>|0",
@@ -1287,7 +1327,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "radio",
       "label": "<dynamic>",
-      "line": 342
+      "line": 391
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|radio|New row|0",
@@ -1295,7 +1335,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "radio",
       "label": "New row",
-      "line": 376
+      "line": 425
     },
     {
       "key": "src/smage/modules/figure/page.py|_FigurePermuteDialog.__init__|radio|Same row|0",
@@ -1303,7 +1343,7 @@
       "function": "_FigurePermuteDialog.__init__",
       "kind": "radio",
       "label": "Same row",
-      "line": 375
+      "line": 424
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add Histogram|0",
@@ -1311,7 +1351,7 @@
       "function": "_build_figure_page",
       "kind": "button",
       "label": "Add Histogram",
-      "line": 601
+      "line": 650
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add Image|0",
@@ -1319,7 +1359,7 @@
       "function": "_build_figure_page",
       "kind": "button",
       "label": "Add Image",
-      "line": 602
+      "line": 651
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add N×N Plot|0",
@@ -1327,7 +1367,7 @@
       "function": "_build_figure_page",
       "kind": "button",
       "label": "Add N×N Plot",
-      "line": 603
+      "line": 652
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add Overlay|0",
@@ -1335,7 +1375,7 @@
       "function": "_build_figure_page",
       "kind": "button",
       "label": "Add Overlay",
-      "line": 597
+      "line": 646
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Add Scatter|0",
@@ -1343,7 +1383,7 @@
       "function": "_build_figure_page",
       "kind": "button",
       "label": "Add Scatter",
-      "line": 596
+      "line": 645
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Cancel|0",
@@ -1351,7 +1391,7 @@
       "function": "_build_figure_page",
       "kind": "button",
       "label": "Cancel",
-      "line": 565
+      "line": 614
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Close|0",
@@ -1359,7 +1399,7 @@
       "function": "_build_figure_page",
       "kind": "button",
       "label": "Close",
-      "line": 575
+      "line": 624
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|button|Save|0",
@@ -1367,7 +1407,7 @@
       "function": "_build_figure_page",
       "kind": "button",
       "label": "Save",
-      "line": 573
+      "line": 622
     },
     {
       "key": "src/smage/modules/figure/page.py|_build_figure_page|splitter|<dynamic>|0",
@@ -1375,7 +1415,7 @@
       "function": "_build_figure_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 635
+      "line": 684
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_card_context_menu|action|Delete|0",
@@ -1383,7 +1423,7 @@
       "function": "_figure_card_context_menu",
       "kind": "action",
       "label": "Delete",
-      "line": 971
+      "line": 1030
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_card_context_menu|action|Duplicate|0",
@@ -1391,7 +1431,7 @@
       "function": "_figure_card_context_menu",
       "kind": "action",
       "label": "Duplicate",
-      "line": 970
+      "line": 1029
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_card_context_menu|action|Permute…|0",
@@ -1399,7 +1439,15 @@
       "function": "_figure_card_context_menu",
       "kind": "action",
       "label": "Permute…",
-      "line": 973
+      "line": 1032
+    },
+    {
+      "key": "src/smage/modules/figure/page.py|_figure_card_context_menu|action|Save as…|0",
+      "file": "src/smage/modules/figure/page.py",
+      "function": "_figure_card_context_menu",
+      "kind": "action",
+      "label": "Save as…",
+      "line": 1039
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_overlay_settings|button|<dynamic>|0",
@@ -1407,7 +1455,7 @@
       "function": "_figure_overlay_settings",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 3148
+      "line": 3267
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_overlay_settings|button|Select gates…|0",
@@ -1415,7 +1463,7 @@
       "function": "_figure_overlay_settings",
       "kind": "button",
       "label": "Select gates…",
-      "line": 3065
+      "line": 3184
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_point_size_settings|checkbox|Fixed|0",
@@ -1423,7 +1471,7 @@
       "function": "_figure_point_size_settings",
       "kind": "checkbox",
       "label": "Fixed",
-      "line": 2938
+      "line": 3057
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_multi.make_color_button|button|<dynamic>|0",
@@ -1431,7 +1479,7 @@
       "function": "_figure_rebuild_settings_multi.make_color_button",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 2479
+      "line": 2598
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_multi.make_range_row|checkbox|Auto|0",
@@ -1439,7 +1487,7 @@
       "function": "_figure_rebuild_settings_multi.make_range_row",
       "kind": "checkbox",
       "label": "Auto",
-      "line": 2516
+      "line": 2635
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_multi|checkbox|<dynamic>|0",
@@ -1447,7 +1495,7 @@
       "function": "_figure_rebuild_settings_multi",
       "kind": "checkbox",
       "label": "<dynamic>",
-      "line": 2875
+      "line": 2994
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_multi|checkbox|Fixed|0",
@@ -1455,7 +1503,7 @@
       "function": "_figure_rebuild_settings_multi",
       "kind": "checkbox",
       "label": "Fixed",
-      "line": 2761
+      "line": 2880
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_single.make_color_button|button|<dynamic>|0",
@@ -1463,7 +1511,7 @@
       "function": "_figure_rebuild_settings_single.make_color_button",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 2156
+      "line": 2271
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_single|button|Origin|0",
@@ -1471,7 +1519,7 @@
       "function": "_figure_rebuild_settings_single",
       "kind": "button",
       "label": "Origin",
-      "line": 2249
+      "line": 2368
     },
     {
       "key": "src/smage/modules/figure/page.py|_figure_rebuild_settings_single|button|Square|0",
@@ -1479,7 +1527,7 @@
       "function": "_figure_rebuild_settings_single",
       "kind": "button",
       "label": "Square",
-      "line": 2255
+      "line": 2374
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_build_gate2col_page|button|Close|0",
@@ -1487,7 +1535,7 @@
       "function": "_build_gate2col_page",
       "kind": "button",
       "label": "Close",
-      "line": 69
+      "line": 78
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_build_gate2col_page|button|Save|0",
@@ -1495,7 +1543,7 @@
       "function": "_build_gate2col_page",
       "kind": "button",
       "label": "Save",
-      "line": 66
+      "line": 75
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_build_gate2col_page|splitter|<dynamic>|0",
@@ -1503,7 +1551,7 @@
       "function": "_build_gate2col_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 99
+      "line": 108
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_g2c_files_panel|button|Select files…|0",
@@ -1511,7 +1559,7 @@
       "function": "_g2c_files_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 220
+      "line": 230
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_g2c_files_panel|table|<dynamic>|0",
@@ -1519,7 +1567,7 @@
       "function": "_g2c_files_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 229
+      "line": 239
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_g2c_log_panel|text|<dynamic>|0",
@@ -1527,7 +1575,7 @@
       "function": "_g2c_log_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 122
+      "line": 131
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_g2c_rebuild_rules|lineedit|<dynamic>|0",
@@ -1535,7 +1583,7 @@
       "function": "_g2c_rebuild_rules",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 485
+      "line": 495
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_g2c_rules_panel|button|Add|0",
@@ -1543,7 +1591,7 @@
       "function": "_g2c_rules_panel",
       "kind": "button",
       "label": "Add",
-      "line": 362
+      "line": 372
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_g2c_rules_panel|button|Convert|0",
@@ -1551,7 +1599,7 @@
       "function": "_g2c_rules_panel",
       "kind": "button",
       "label": "Convert",
-      "line": 373
+      "line": 383
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_g2c_rules_panel|button|Delete|0",
@@ -1559,7 +1607,7 @@
       "function": "_g2c_rules_panel",
       "kind": "button",
       "label": "Delete",
-      "line": 365
+      "line": 375
     },
     {
       "key": "src/smage/modules/gate2col/page.py|_g2c_rules_panel|table|<dynamic>|0",
@@ -1567,7 +1615,7 @@
       "function": "_g2c_rules_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 349
+      "line": 359
     },
     {
       "key": "src/smage/modules/gating/page.py|_build_gating_page|button|Close|0",
@@ -1575,7 +1623,7 @@
       "function": "_build_gating_page",
       "kind": "button",
       "label": "Close",
-      "line": 245
+      "line": 382
     },
     {
       "key": "src/smage/modules/gating/page.py|_build_gating_page|button|Save|0",
@@ -1583,7 +1631,7 @@
       "function": "_build_gating_page",
       "kind": "button",
       "label": "Save",
-      "line": 242
+      "line": 379
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_add_boolean_gate|button|Cancel|0",
@@ -1591,7 +1639,7 @@
       "function": "_gating_add_boolean_gate",
       "kind": "button",
       "label": "Cancel",
-      "line": 2253
+      "line": 2798
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_add_boolean_gate|button|OK|0",
@@ -1599,7 +1647,7 @@
       "function": "_gating_add_boolean_gate",
       "kind": "button",
       "label": "OK",
-      "line": 2252
+      "line": 2797
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_add_boolean_gate|checkbox|<dynamic>|0",
@@ -1607,7 +1655,7 @@
       "function": "_gating_add_boolean_gate",
       "kind": "checkbox",
       "label": "<dynamic>",
-      "line": 2247
+      "line": 2792
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_open_col2gate|button|Check|0",
@@ -1615,7 +1663,7 @@
       "function": "_gating_open_col2gate",
       "kind": "button",
       "label": "Check",
-      "line": 729
+      "line": 1101
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_open_col2gate|button|Set as gates|0",
@@ -1623,7 +1671,7 @@
       "function": "_gating_open_col2gate",
       "kind": "button",
       "label": "Set as gates",
-      "line": 750
+      "line": 1122
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_open_col2gate|lineedit|cate_|0",
@@ -1631,7 +1679,7 @@
       "function": "_gating_open_col2gate",
       "kind": "lineedit",
       "label": "cate_",
-      "line": 748
+      "line": 1120
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_open_col2gate|table|<dynamic>|0",
@@ -1639,7 +1687,7 @@
       "function": "_gating_open_col2gate",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 736
+      "line": 1108
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|0",
@@ -1647,7 +1695,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1847
+      "line": 2383
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|1",
@@ -1655,7 +1703,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1852
+      "line": 2388
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|10",
@@ -1663,7 +1711,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1931
+      "line": 2467
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|11",
@@ -1671,7 +1719,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1935
+      "line": 2471
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|2",
@@ -1679,7 +1727,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1858
+      "line": 2394
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|3",
@@ -1687,7 +1735,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1864
+      "line": 2400
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|4",
@@ -1695,7 +1743,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1872
+      "line": 2408
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|5",
@@ -1703,7 +1751,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1891
+      "line": 2427
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|6",
@@ -1711,7 +1759,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1900
+      "line": 2436
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|7",
@@ -1719,7 +1767,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1911
+      "line": 2447
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|8",
@@ -1727,7 +1775,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1916
+      "line": 2452
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|action|<dynamic>|9",
@@ -1735,7 +1783,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1921
+      "line": 2457
     },
     {
       "key": "src/smage/modules/gating/page.py|_gating_tree_context_menu|menu|<dynamic>|0",
@@ -1743,7 +1791,7 @@
       "function": "_gating_tree_context_menu",
       "kind": "menu",
       "label": "<dynamic>",
-      "line": 1922
+      "line": 2458
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_build_heatmap_page|button|Close|0",
@@ -1751,7 +1799,7 @@
       "function": "_build_heatmap_page",
       "kind": "button",
       "label": "Close",
-      "line": 682
+      "line": 692
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_build_heatmap_page|button|Save|0",
@@ -1759,7 +1807,7 @@
       "function": "_build_heatmap_page",
       "kind": "button",
       "label": "Save",
-      "line": 679
+      "line": 689
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_build_heatmap_page|splitter|<dynamic>|0",
@@ -1767,7 +1815,7 @@
       "function": "_build_heatmap_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 747
+      "line": 757
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_files_section|button|Select files…|0",
@@ -1775,7 +1823,7 @@
       "function": "_heatmap_files_section",
       "kind": "button",
       "label": "Select files…",
-      "line": 799
+      "line": 809
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_files_section|list|<dynamic>|0",
@@ -1783,7 +1831,7 @@
       "function": "_heatmap_files_section",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 804
+      "line": 814
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|button|<dynamic>|0",
@@ -1791,7 +1839,7 @@
       "function": "_heatmap_fill_params",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 1160
+      "line": 1170
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|button|Copy matrix|0",
@@ -1799,7 +1847,7 @@
       "function": "_heatmap_fill_params",
       "kind": "button",
       "label": "Copy matrix",
-      "line": 1237
+      "line": 1247
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Auto number color|0",
@@ -1807,7 +1855,7 @@
       "function": "_heatmap_fill_params",
       "kind": "checkbox",
       "label": "Auto number color",
-      "line": 1153
+      "line": 1163
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Auto value range|0",
@@ -1815,7 +1863,7 @@
       "function": "_heatmap_fill_params",
       "kind": "checkbox",
       "label": "Auto value range",
-      "line": 1174
+      "line": 1184
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Cluster columns|0",
@@ -1823,7 +1871,7 @@
       "function": "_heatmap_fill_params",
       "kind": "checkbox",
       "label": "Cluster columns",
-      "line": 1195
+      "line": 1205
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Cluster rows|0",
@@ -1831,7 +1879,7 @@
       "function": "_heatmap_fill_params",
       "kind": "checkbox",
       "label": "Cluster rows",
-      "line": 1192
+      "line": 1202
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|checkbox|Show numbers|0",
@@ -1839,7 +1887,7 @@
       "function": "_heatmap_fill_params",
       "kind": "checkbox",
       "label": "Show numbers",
-      "line": 1150
+      "line": 1160
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|spin|<dynamic>|0",
@@ -1847,7 +1895,7 @@
       "function": "_heatmap_fill_params",
       "kind": "spin",
       "label": "<dynamic>",
-      "line": 1178
+      "line": 1188
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_fill_params|spin|<dynamic>|1",
@@ -1855,7 +1903,7 @@
       "function": "_heatmap_fill_params",
       "kind": "spin",
       "label": "<dynamic>",
-      "line": 1179
+      "line": 1189
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_gates_panel|button|Select gates…|0",
@@ -1863,7 +1911,7 @@
       "function": "_heatmap_gates_panel",
       "kind": "button",
       "label": "Select gates…",
-      "line": 895
+      "line": 905
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_gates_panel|list|<dynamic>|0",
@@ -1871,7 +1919,7 @@
       "function": "_heatmap_gates_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 900
+      "line": 910
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_left_panel|splitter|<dynamic>|0",
@@ -1879,7 +1927,7 @@
       "function": "_heatmap_left_panel",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 775
+      "line": 785
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_log_panel|text|<dynamic>|0",
@@ -1887,7 +1935,7 @@
       "function": "_heatmap_log_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 1075
+      "line": 1085
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_middle_panel|button|Calculate|0",
@@ -1895,7 +1943,7 @@
       "function": "_heatmap_middle_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 976
+      "line": 986
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_middle_panel|button|Cancel|0",
@@ -1903,7 +1951,7 @@
       "function": "_heatmap_middle_panel",
       "kind": "button",
       "label": "Cancel",
-      "line": 979
+      "line": 989
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_middle_panel|splitter|<dynamic>|0",
@@ -1911,7 +1959,7 @@
       "function": "_heatmap_middle_panel",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 968
+      "line": 978
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_right_panel|splitter|<dynamic>|0",
@@ -1919,7 +1967,7 @@
       "function": "_heatmap_right_panel",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 1005
+      "line": 1015
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_right_panel|splitter|<dynamic>|1",
@@ -1927,15 +1975,15 @@
       "function": "_heatmap_right_panel",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 1008
+      "line": 1018
     },
     {
-      "key": "src/smage/modules/heatmap/page.py|_heatmap_variables_panel|button|Select variables…|0",
+      "key": "src/smage/modules/heatmap/page.py|_heatmap_variables_panel|button|Select channels…|0",
       "file": "src/smage/modules/heatmap/page.py",
       "function": "_heatmap_variables_panel",
       "kind": "button",
-      "label": "Select variables…",
-      "line": 934
+      "label": "Select channels…",
+      "line": 944
     },
     {
       "key": "src/smage/modules/heatmap/page.py|_heatmap_variables_panel|list|<dynamic>|0",
@@ -1943,7 +1991,7 @@
       "function": "_heatmap_variables_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 941
+      "line": 951
     },
     {
       "key": "src/smage/modules/illumination/page.py|_build_illumination_page|button|Close|0",
@@ -1951,7 +1999,7 @@
       "function": "_build_illumination_page",
       "kind": "button",
       "label": "Close",
-      "line": 76
+      "line": 89
     },
     {
       "key": "src/smage/modules/illumination/page.py|_build_illumination_page|button|Save|0",
@@ -1959,7 +2007,7 @@
       "function": "_build_illumination_page",
       "kind": "button",
       "label": "Save",
-      "line": 73
+      "line": 86
     },
     {
       "key": "src/smage/modules/illumination/page.py|_build_illumination_page|splitter|<dynamic>|0",
@@ -1967,7 +2015,7 @@
       "function": "_build_illumination_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 116
+      "line": 129
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_channel_panel|button|Set Files|0",
@@ -1975,7 +2023,7 @@
       "function": "_illum_channel_panel",
       "kind": "button",
       "label": "Set Files",
-      "line": 469
+      "line": 506
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_channel_panel|list|<dynamic>|0",
@@ -1983,7 +2031,7 @@
       "function": "_illum_channel_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 477
+      "line": 514
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_list_menu|action|<dynamic>|0",
@@ -1991,7 +2039,7 @@
       "function": "_illum_list_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 282
+      "line": 295
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_list_menu|action|<dynamic>|1",
@@ -1999,7 +2047,7 @@
       "function": "_illum_list_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 286
+      "line": 299
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_list_menu|action|<dynamic>|2",
@@ -2007,7 +2055,7 @@
       "function": "_illum_list_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 291
+      "line": 304
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_list_panel|button|Add Submodule|0",
@@ -2015,7 +2063,7 @@
       "function": "_illum_list_panel",
       "kind": "button",
       "label": "Add Submodule",
-      "line": 146
+      "line": 159
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_list_panel|list|<dynamic>|0",
@@ -2023,15 +2071,15 @@
       "function": "_illum_list_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 151
+      "line": 164
     },
     {
-      "key": "src/smage/modules/illumination/page.py|_illum_params_panel|button|Calculate Illumination|0",
+      "key": "src/smage/modules/illumination/page.py|_illum_params_panel|button|Recognize Illumination Pattern|0",
       "file": "src/smage/modules/illumination/page.py",
       "function": "_illum_params_panel",
       "kind": "button",
-      "label": "Calculate Illumination",
-      "line": 673
+      "label": "Recognize Illumination Pattern",
+      "line": 710
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_params_panel|list|<dynamic>|0",
@@ -2039,7 +2087,7 @@
       "function": "_illum_params_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 651
+      "line": 688
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_plot_settings|checkbox|Show tile grid|0",
@@ -2047,7 +2095,7 @@
       "function": "_illum_plot_settings",
       "kind": "checkbox",
       "label": "Show tile grid",
-      "line": 1007
+      "line": 1134
     },
     {
       "key": "src/smage/modules/illumination/page.py|_illum_rebuild_right|button|Sync view →|0",
@@ -2063,7 +2111,23 @@
       "function": "_illum_rebuild_right",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 403
+      "line": 416
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_image_resize_section|checkbox|Keep aspect ratio (Y follows X)|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_image_resize_section",
+      "kind": "checkbox",
+      "label": "Keep aspect ratio (Y follows X)",
+      "line": 1006
+    },
+    {
+      "key": "src/smage/modules/import_/page.py|_build_image_resize_section|checkbox|Resize on import|0",
+      "file": "src/smage/modules/import_/page.py",
+      "function": "_build_image_resize_section",
+      "kind": "checkbox",
+      "label": "Resize on import",
+      "line": 981
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_input_panel|button|Delete|0",
@@ -2071,7 +2135,7 @@
       "function": "_build_input_panel",
       "kind": "button",
       "label": "Delete",
-      "line": 228
+      "line": 251
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_input_panel|button|Import|0",
@@ -2079,7 +2143,7 @@
       "function": "_build_input_panel",
       "kind": "button",
       "label": "Import",
-      "line": 223
+      "line": 246
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_input_panel|button|Peek|0",
@@ -2087,7 +2151,7 @@
       "function": "_build_input_panel",
       "kind": "button",
       "label": "Peek",
-      "line": 218
+      "line": 241
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_input_panel|button|Select Files…|0",
@@ -2095,7 +2159,7 @@
       "function": "_build_input_panel",
       "kind": "button",
       "label": "Select Files…",
-      "line": 202
+      "line": 225
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_input_panel|checkbox|Select all|0",
@@ -2103,7 +2167,7 @@
       "function": "_build_input_panel",
       "kind": "checkbox",
       "label": "Select all",
-      "line": 208
+      "line": 231
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_input_panel|list|<dynamic>|0",
@@ -2111,7 +2175,7 @@
       "function": "_build_input_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 212
+      "line": 235
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_parameter_panel|button|Apply to|0",
@@ -2119,7 +2183,7 @@
       "function": "_build_parameter_panel",
       "kind": "button",
       "label": "Apply to",
-      "line": 609
+      "line": 665
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_parameter_panel|button|Copy|0",
@@ -2127,7 +2191,7 @@
       "function": "_build_parameter_panel",
       "kind": "button",
       "label": "Copy",
-      "line": 607
+      "line": 663
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_parameter_panel|button|Paste|0",
@@ -2135,7 +2199,7 @@
       "function": "_build_parameter_panel",
       "kind": "button",
       "label": "Paste",
-      "line": 608
+      "line": 664
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_processed_panel|list|<dynamic>|0",
@@ -2143,7 +2207,7 @@
       "function": "_build_processed_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 164
+      "line": 174
     },
     {
       "key": "src/smage/modules/import_/page.py|_build_sample_panel|button|Apply to|0",
@@ -2151,7 +2215,7 @@
       "function": "_build_sample_panel",
       "kind": "button",
       "label": "Apply to",
-      "line": 145
+      "line": 155
     },
     {
       "key": "src/smage/modules/import_/page.py|_show_apply_dialog|button|Cancel|0",
@@ -2159,7 +2223,7 @@
       "function": "_show_apply_dialog",
       "kind": "button",
       "label": "Cancel",
-      "line": 1027
+      "line": 1302
     },
     {
       "key": "src/smage/modules/import_/page.py|_show_apply_dialog|button|Confirm|0",
@@ -2167,7 +2231,7 @@
       "function": "_show_apply_dialog",
       "kind": "button",
       "label": "Confirm",
-      "line": 1026
+      "line": 1301
     },
     {
       "key": "src/smage/modules/import_/page.py|_show_apply_dialog|list|<dynamic>|0",
@@ -2175,7 +2239,7 @@
       "function": "_show_apply_dialog",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 1014
+      "line": 1289
     },
     {
       "key": "src/smage/modules/import_/page.py|_show_file_parameters|checkbox|<dynamic>|0",
@@ -2183,7 +2247,7 @@
       "function": "_show_file_parameters",
       "kind": "checkbox",
       "label": "<dynamic>",
-      "line": 825
+      "line": 885
     },
     {
       "key": "src/smage/modules/import_/page.py|_show_file_parameters|lineedit|<dynamic>|0",
@@ -2191,7 +2255,359 @@
       "function": "_show_file_parameters",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 831
+      "line": 891
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_build_region_page|button|Close|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_build_region_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 182
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_build_region_page|button|Save|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_build_region_page",
+      "kind": "button",
+      "label": "Save",
+      "line": 179
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_build_region_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_build_region_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 293
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_sam_params|spin|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_sam_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1913
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_sam_params|spin|<dynamic>|1",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_sam_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1917
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_signal_params|checkbox|Auto threshold|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_signal_params",
+      "kind": "checkbox",
+      "label": "Auto threshold",
+      "line": 1834
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_signal_params|checkbox|Fill holes|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_signal_params",
+      "kind": "checkbox",
+      "label": "Fill holes",
+      "line": 1857
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_signal_params|spin|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_signal_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1839
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_signal_params|spin|<dynamic>|1",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_signal_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1846
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_signal_params|spin|<dynamic>|2",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_signal_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1852
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_signal_params|spin|<dynamic>|3",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_signal_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1862
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_build_signal_params|spin|<dynamic>|4",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_build_signal_params",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 1868
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_gate_menu|action|Delete gate|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_gate_menu",
+      "kind": "action",
+      "label": "Delete gate",
+      "line": 913
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_gate_menu|action|Rename|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_gate_menu",
+      "kind": "action",
+      "label": "Rename",
+      "line": 912
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_left_panel|button|Add New Region|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_left_panel",
+      "kind": "button",
+      "label": "Add New Region",
+      "line": 410
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_left_panel|button|Select files…|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_left_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 328
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_left_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_left_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 334
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_left_panel|splitter|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_left_panel",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 352
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_left_panel|tree|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_left_panel",
+      "kind": "tree",
+      "label": "<dynamic>",
+      "line": 363
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_left_panel|tree|<dynamic>|1",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_left_panel",
+      "kind": "tree",
+      "label": "<dynamic>",
+      "line": 390
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_middle_panel|button|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_middle_panel",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 444
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_middle_panel|button|Cancel drawing|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_middle_panel",
+      "kind": "button",
+      "label": "Cancel drawing",
+      "line": 457
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_rebuild_detect_panel|button|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_rebuild_detect_panel",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 1746
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_rebuild_detect_panel|button|Detect Region|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_rebuild_detect_panel",
+      "kind": "button",
+      "label": "Detect Region",
+      "line": 1797
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_rebuild_detect_panel|button|Manage SAM…|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_rebuild_detect_panel",
+      "kind": "button",
+      "label": "Manage SAM…",
+      "line": 1803
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_region_menu|action|Add Sample…|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_region_menu",
+      "kind": "action",
+      "label": "Add Sample…",
+      "line": 1291
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_region_menu|action|Add Sub-region|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_region_menu",
+      "kind": "action",
+      "label": "Add Sub-region",
+      "line": 1292
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_region_menu|action|Copy Branch|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_region_menu",
+      "kind": "action",
+      "label": "Copy Branch",
+      "line": 1294
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_region_menu|action|Delete|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_region_menu",
+      "kind": "action",
+      "label": "Delete",
+      "line": 1297
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_region_menu|action|Paste Branch|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_region_menu",
+      "kind": "action",
+      "label": "Paste Branch",
+      "line": 1295
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_right_panel|button|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_right_panel",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 546
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_right_panel|button|<dynamic>|1",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_right_panel",
+      "kind": "button",
+      "label": "<dynamic>",
+      "line": 562
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_right_panel|button|Reset to default|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_right_panel",
+      "kind": "button",
+      "label": "Reset to default",
+      "line": 579
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_right_panel|slider|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_right_panel",
+      "kind": "slider",
+      "label": "<dynamic>",
+      "line": 552
+    },
+    {
+      "key": "src/smage/modules/region/page.py|_region_right_panel|spin|<dynamic>|0",
+      "file": "src/smage/modules/region/page.py",
+      "function": "_region_right_panel",
+      "kind": "spin",
+      "label": "<dynamic>",
+      "line": 568
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_build_region_size_page|button|Clear results|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_build_region_size_page",
+      "kind": "button",
+      "label": "Clear results",
+      "line": 121
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_build_region_size_page|button|Close|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_build_region_size_page",
+      "kind": "button",
+      "label": "Close",
+      "line": 124
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_build_region_size_page|splitter|<dynamic>|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_build_region_size_page",
+      "kind": "splitter",
+      "label": "<dynamic>",
+      "line": 166
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_rs_files_panel|button|Select files…|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_rs_files_panel",
+      "kind": "button",
+      "label": "Select files…",
+      "line": 195
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_rs_files_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_rs_files_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 200
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_rs_regions_panel|button|Calculate|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_rs_regions_panel",
+      "kind": "button",
+      "label": "Calculate",
+      "line": 238
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_rs_regions_panel|button|Select regions…|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_rs_regions_panel",
+      "kind": "button",
+      "label": "Select regions…",
+      "line": 223
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_rs_regions_panel|list|<dynamic>|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_rs_regions_panel",
+      "kind": "list",
+      "label": "<dynamic>",
+      "line": 228
+    },
+    {
+      "key": "src/smage/modules/region_size/page.py|_rs_table_panel|button|Copy TSV|0",
+      "file": "src/smage/modules/region_size/page.py",
+      "function": "_rs_table_panel",
+      "kind": "button",
+      "label": "Copy TSV",
+      "line": 268
     },
     {
       "key": "src/smage/modules/rename/page.py|_build_rename_page|button|Close|0",
@@ -2199,7 +2615,7 @@
       "function": "_build_rename_page",
       "kind": "button",
       "label": "Close",
-      "line": 68
+      "line": 73
     },
     {
       "key": "src/smage/modules/rename/page.py|_build_rename_page|button|Save|0",
@@ -2207,7 +2623,7 @@
       "function": "_build_rename_page",
       "kind": "button",
       "label": "Save",
-      "line": 65
+      "line": 70
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_column_panel|button|Select files…|0",
@@ -2215,7 +2631,7 @@
       "function": "_rename_column_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 160
+      "line": 165
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_column_panel|button|Select variables…|0",
@@ -2223,7 +2639,7 @@
       "function": "_rename_column_panel",
       "kind": "button",
       "label": "Select variables…",
-      "line": 182
+      "line": 187
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_column_panel|list|<dynamic>|0",
@@ -2231,7 +2647,7 @@
       "function": "_rename_column_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 164
+      "line": 169
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_column_panel|list|<dynamic>|1",
@@ -2239,7 +2655,7 @@
       "function": "_rename_column_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 186
+      "line": 191
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_column_panel|splitter|<dynamic>|0",
@@ -2247,7 +2663,7 @@
       "function": "_rename_column_panel",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 145
+      "line": 150
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_copy_paste|button|Copy|0",
@@ -2255,7 +2671,7 @@
       "function": "_rename_copy_paste",
       "kind": "button",
       "label": "Copy",
-      "line": 229
+      "line": 234
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_copy_paste|button|Paste|0",
@@ -2263,7 +2679,7 @@
       "function": "_rename_copy_paste",
       "kind": "button",
       "label": "Paste",
-      "line": 231
+      "line": 236
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_file_panel|button|Select files…|0",
@@ -2271,7 +2687,7 @@
       "function": "_rename_file_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 122
+      "line": 127
     },
     {
       "key": "src/smage/modules/rename/page.py|_rename_table|table|<dynamic>|0",
@@ -2279,7 +2695,7 @@
       "function": "_rename_table",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 208
+      "line": 213
     },
     {
       "key": "src/smage/modules/scale/page.py|_build_scaling_page|button|Close|0",
@@ -2287,7 +2703,7 @@
       "function": "_build_scaling_page",
       "kind": "button",
       "label": "Close",
-      "line": 372
+      "line": 380
     },
     {
       "key": "src/smage/modules/scale/page.py|_build_scaling_page|button|Save|0",
@@ -2295,7 +2711,7 @@
       "function": "_build_scaling_page",
       "kind": "button",
       "label": "Save",
-      "line": 369
+      "line": 377
     },
     {
       "key": "src/smage/modules/scale/page.py|_build_scaling_page|splitter|<dynamic>|0",
@@ -2303,7 +2719,7 @@
       "function": "_build_scaling_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 396
+      "line": 415
     },
     {
       "key": "src/smage/modules/scale/page.py|_build_scaling_page|splitter|<dynamic>|1",
@@ -2311,7 +2727,7 @@
       "function": "_build_scaling_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 517
+      "line": 536
     },
     {
       "key": "src/smage/modules/scale/page.py|_build_scaling_page|table|<dynamic>|0",
@@ -2319,7 +2735,7 @@
       "function": "_build_scaling_page",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 410
+      "line": 429
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|button|Apply|0",
@@ -2327,7 +2743,7 @@
       "function": "_scaling_apply_panel",
       "kind": "button",
       "label": "Apply",
-      "line": 247
+      "line": 255
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|button|Select variables…|0",
@@ -2335,7 +2751,7 @@
       "function": "_scaling_apply_panel",
       "kind": "button",
       "label": "Select variables…",
-      "line": 188
+      "line": 196
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|lineedit|<dynamic>|0",
@@ -2343,7 +2759,7 @@
       "function": "_scaling_apply_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 218
+      "line": 226
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|lineedit|<dynamic>|1",
@@ -2351,7 +2767,7 @@
       "function": "_scaling_apply_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 226
+      "line": 234
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|lineedit|<dynamic>|2",
@@ -2359,7 +2775,7 @@
       "function": "_scaling_apply_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 231
+      "line": 239
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_apply_panel|list|<dynamic>|0",
@@ -2367,7 +2783,7 @@
       "function": "_scaling_apply_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 197
+      "line": 205
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_files_panel|button|Select files…|0",
@@ -2375,7 +2791,7 @@
       "function": "_scaling_files_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 120
+      "line": 128
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_files_panel|list|<dynamic>|0",
@@ -2383,7 +2799,7 @@
       "function": "_scaling_files_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 127
+      "line": 135
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_populate_table|lineedit|<dynamic>|0",
@@ -2391,7 +2807,7 @@
       "function": "_scaling_populate_table",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 571
+      "line": 590
     },
     {
       "key": "src/smage/modules/scale/page.py|_scaling_populate_table|lineedit|<dynamic>|1",
@@ -2399,7 +2815,7 @@
       "function": "_scaling_populate_table",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 582
+      "line": 601
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_build_segmentation_page|button|Close|0",
@@ -2407,7 +2823,7 @@
       "function": "_build_segmentation_page",
       "kind": "button",
       "label": "Close",
-      "line": 229
+      "line": 238
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_build_segmentation_page|button|Save|0",
@@ -2415,7 +2831,7 @@
       "function": "_build_segmentation_page",
       "kind": "button",
       "label": "Save",
-      "line": 226
+      "line": 235
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_build_segmentation_page|splitter|<dynamic>|0",
@@ -2423,7 +2839,7 @@
       "function": "_build_segmentation_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 269
+      "line": 282
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_external_method_panel|button|Calculate|0",
@@ -2431,7 +2847,7 @@
       "function": "_seg_external_method_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 909
+      "line": 1004
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_external_method_panel|list|<dynamic>|0",
@@ -2439,23 +2855,15 @@
       "function": "_seg_external_method_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 806
+      "line": 901
     },
     {
-      "key": "src/smage/modules/segmentation/page.py|_seg_external_method_panel|text|<dynamic>|0",
-      "file": "src/smage/modules/segmentation/page.py",
-      "function": "_seg_external_method_panel",
-      "kind": "text",
-      "label": "<dynamic>",
-      "line": 917
-    },
-    {
-      "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|button|Set Files|0",
+      "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|button|Select Files|0",
       "file": "src/smage/modules/segmentation/page.py",
       "function": "_seg_files_panel",
       "kind": "button",
-      "label": "Set Files",
-      "line": 383
+      "label": "Select Files",
+      "line": 403
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|lineedit|<dynamic>|0",
@@ -2463,7 +2871,7 @@
       "function": "_seg_files_panel",
       "kind": "lineedit",
       "label": "<dynamic>",
-      "line": 410
+      "line": 430
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|splitter|<dynamic>|0",
@@ -2471,7 +2879,7 @@
       "function": "_seg_files_panel",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 425
+      "line": 445
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_files_panel|table|<dynamic>|0",
@@ -2479,7 +2887,7 @@
       "function": "_seg_files_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 390
+      "line": 410
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_mask_input_panel|button|Import|0",
@@ -2487,7 +2895,7 @@
       "function": "_seg_mask_input_panel",
       "kind": "button",
       "label": "Import",
-      "line": 983
+      "line": 1069
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_mask_input_panel|table|<dynamic>|0",
@@ -2495,7 +2903,7 @@
       "function": "_seg_mask_input_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 967
+      "line": 1053
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_method_params_panel|button|Calculate|0",
@@ -2503,7 +2911,15 @@
       "function": "_seg_method_params_panel",
       "kind": "button",
       "label": "Calculate",
-      "line": 702
+      "line": 786
+    },
+    {
+      "key": "src/smage/modules/segmentation/page.py|_seg_method_params_panel|checkbox|Split touching nuclei|0",
+      "file": "src/smage/modules/segmentation/page.py",
+      "function": "_seg_method_params_panel",
+      "kind": "checkbox",
+      "label": "Split touching nuclei",
+      "line": 756
     },
     {
       "key": "src/smage/modules/segmentation/page.py|_seg_refresh_input_table|button|<dynamic>|0",
@@ -2511,7 +2927,7 @@
       "function": "_seg_refresh_input_table",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 1029
+      "line": 1115
     },
     {
       "key": "src/smage/modules/subsample/page.py|_build_subsample_page|button|Close|0",
@@ -2519,7 +2935,7 @@
       "function": "_build_subsample_page",
       "kind": "button",
       "label": "Close",
-      "line": 188
+      "line": 194
     },
     {
       "key": "src/smage/modules/subsample/page.py|_build_subsample_page|button|Save|0",
@@ -2527,7 +2943,7 @@
       "function": "_build_subsample_page",
       "kind": "button",
       "label": "Save",
-      "line": 185
+      "line": 191
     },
     {
       "key": "src/smage/modules/subsample/page.py|_build_subsample_page|splitter|<dynamic>|0",
@@ -2535,7 +2951,7 @@
       "function": "_build_subsample_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 219
+      "line": 225
     },
     {
       "key": "src/smage/modules/subsample/page.py|_subs_settings_panel|button|Select files…|0",
@@ -2543,7 +2959,7 @@
       "function": "_subs_settings_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 248
+      "line": 254
     },
     {
       "key": "src/smage/modules/subsample/page.py|_subs_settings_panel|list|<dynamic>|0",
@@ -2551,7 +2967,7 @@
       "function": "_subs_settings_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 252
+      "line": 258
     },
     {
       "key": "src/smage/modules/subsample/page.py|_subs_table_panel|table|<dynamic>|0",
@@ -2559,7 +2975,7 @@
       "function": "_subs_table_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 324
+      "line": 330
     },
     {
       "key": "src/smage/modules/subset/page.py|_build_subset_page|button|Close|0",
@@ -2567,7 +2983,7 @@
       "function": "_build_subset_page",
       "kind": "button",
       "label": "Close",
-      "line": 40
+      "line": 45
     },
     {
       "key": "src/smage/modules/subset/page.py|_build_subset_page|button|Save|0",
@@ -2575,7 +2991,7 @@
       "function": "_build_subset_page",
       "kind": "button",
       "label": "Save",
-      "line": 37
+      "line": 42
     },
     {
       "key": "src/smage/modules/subset/page.py|_build_subset_page|splitter|<dynamic>|0",
@@ -2583,7 +2999,7 @@
       "function": "_build_subset_page",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 73
+      "line": 78
     },
     {
       "key": "src/smage/modules/subset/page.py|_subset_columns_panel|button|Select columns…|0",
@@ -2591,7 +3007,7 @@
       "function": "_subset_columns_panel",
       "kind": "button",
       "label": "Select columns…",
-      "line": 128
+      "line": 133
     },
     {
       "key": "src/smage/modules/subset/page.py|_subset_columns_panel|list|<dynamic>|0",
@@ -2599,7 +3015,7 @@
       "function": "_subset_columns_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 132
+      "line": 137
     },
     {
       "key": "src/smage/modules/subset/page.py|_subset_files_panel|button|Select files…|0",
@@ -2607,7 +3023,7 @@
       "function": "_subset_files_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 100
+      "line": 105
     },
     {
       "key": "src/smage/modules/subset/page.py|_subset_files_panel|list|<dynamic>|0",
@@ -2615,7 +3031,7 @@
       "function": "_subset_files_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 104
+      "line": 109
     },
     {
       "key": "src/smage/modules/unmix/page.py|_build_unmix_page|button|Close|0",
@@ -2623,7 +3039,7 @@
       "function": "_build_unmix_page",
       "kind": "button",
       "label": "Close",
-      "line": 217
+      "line": 226
     },
     {
       "key": "src/smage/modules/unmix/page.py|_build_unmix_page|button|Save|0",
@@ -2631,7 +3047,7 @@
       "function": "_build_unmix_page",
       "kind": "button",
       "label": "Save",
-      "line": 214
+      "line": 223
     },
     {
       "key": "src/smage/modules/unmix/page.py|_build_unmix_page|tabs|<dynamic>|0",
@@ -2639,7 +3055,7 @@
       "function": "_build_unmix_page",
       "kind": "tabs",
       "label": "<dynamic>",
-      "line": 270
+      "line": 283
     },
     {
       "key": "src/smage/modules/unmix/page.py|_build_unmix_page|tab|Matrix & Unmixing|0",
@@ -2647,7 +3063,7 @@
       "function": "_build_unmix_page",
       "kind": "tab",
       "label": "Matrix & Unmixing",
-      "line": 272
+      "line": 285
     },
     {
       "key": "src/smage/modules/unmix/page.py|_build_unmix_page|tab|Spectrum Extraction|0",
@@ -2655,7 +3071,7 @@
       "function": "_build_unmix_page",
       "kind": "tab",
       "label": "Spectrum Extraction",
-      "line": 271
+      "line": 284
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_curve_settings_content|button|<dynamic>|0",
@@ -2663,7 +3079,7 @@
       "function": "_unmix_curve_settings_content",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 1889
+      "line": 2075
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_curve_settings_content|button|Reset colours to defaults|0",
@@ -2671,7 +3087,7 @@
       "function": "_unmix_curve_settings_content",
       "kind": "button",
       "label": "Reset colours to defaults",
-      "line": 1913
+      "line": 2099
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_curve_settings_content|checkbox|<dynamic>|0",
@@ -2679,7 +3095,7 @@
       "function": "_unmix_curve_settings_content",
       "kind": "checkbox",
       "label": "<dynamic>",
-      "line": 1866
+      "line": 2052
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_extraction_subpage|splitter|<dynamic>|0",
@@ -2687,7 +3103,23 @@
       "function": "_unmix_extraction_subpage",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 296
+      "line": 309
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_fill_signature_row|checkbox|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_fill_signature_row",
+      "kind": "checkbox",
+      "label": "<dynamic>",
+      "line": 2430
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_fill_signature_row|lineedit|<dynamic>|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_fill_signature_row",
+      "kind": "lineedit",
+      "label": "<dynamic>",
+      "line": 2440
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_grid_settings_content|button|<dynamic>|0",
@@ -2695,7 +3127,7 @@
       "function": "_unmix_grid_settings_content",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 1758
+      "line": 1944
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_grid_settings_content|button|<dynamic>|1",
@@ -2703,7 +3135,7 @@
       "function": "_unmix_grid_settings_content",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 1764
+      "line": 1950
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_grid_settings_content|checkbox|Auto number color|0",
@@ -2711,7 +3143,7 @@
       "function": "_unmix_grid_settings_content",
       "kind": "checkbox",
       "label": "Auto number color",
-      "line": 1752
+      "line": 1938
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_grid_settings_content|checkbox|Show numbers|0",
@@ -2719,7 +3151,7 @@
       "function": "_unmix_grid_settings_content",
       "kind": "checkbox",
       "label": "Show numbers",
-      "line": 1747
+      "line": 1933
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_image_panel|button|Unmix for image|0",
@@ -2727,7 +3159,7 @@
       "function": "_unmix_image_panel",
       "kind": "button",
       "label": "Unmix for image",
-      "line": 2193
+      "line": 2374
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_image_panel|text|<dynamic>|0",
@@ -2735,7 +3167,7 @@
       "function": "_unmix_image_panel",
       "kind": "text",
       "label": "<dynamic>",
-      "line": 2204
+      "line": 2385
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tabs|<dynamic>|0",
@@ -2743,7 +3175,23 @@
       "function": "_unmix_matrix_panel",
       "kind": "tabs",
       "label": "<dynamic>",
-      "line": 1565
+      "line": 1751
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tab|Signature curves|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_panel",
+      "kind": "tab",
+      "label": "Signature curves",
+      "line": 1754
+    },
+    {
+      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tab|Signature matrix|0",
+      "file": "src/smage/modules/unmix/page.py",
+      "function": "_unmix_matrix_panel",
+      "kind": "tab",
+      "label": "Signature matrix",
+      "line": 1753
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tab|Similarity matrix|0",
@@ -2751,23 +3199,7 @@
       "function": "_unmix_matrix_panel",
       "kind": "tab",
       "label": "Similarity matrix",
-      "line": 1569
-    },
-    {
-      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tab|Spectral curve|0",
-      "file": "src/smage/modules/unmix/page.py",
-      "function": "_unmix_matrix_panel",
-      "kind": "tab",
-      "label": "Spectral curve",
-      "line": 1568
-    },
-    {
-      "key": "src/smage/modules/unmix/page.py|_unmix_matrix_panel|tab|Spectral matrix|0",
-      "file": "src/smage/modules/unmix/page.py",
-      "function": "_unmix_matrix_panel",
-      "kind": "tab",
-      "label": "Spectral matrix",
-      "line": 1567
+      "line": 1755
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_matrix_subpage|splitter|<dynamic>|0",
@@ -2775,7 +3207,7 @@
       "function": "_unmix_matrix_subpage",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 1524
+      "line": 1710
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_matrix_subpage|splitter|<dynamic>|1",
@@ -2783,7 +3215,7 @@
       "function": "_unmix_matrix_subpage",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 1532
+      "line": 1718
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_matrix_subpage|splitter|<dynamic>|2",
@@ -2791,7 +3223,7 @@
       "function": "_unmix_matrix_subpage",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 1535
+      "line": 1721
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_matrix_subpage|splitter|<dynamic>|3",
@@ -2799,23 +3231,7 @@
       "function": "_unmix_matrix_subpage",
       "kind": "splitter",
       "label": "<dynamic>",
-      "line": 1547
-    },
-    {
-      "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_signature_table|checkbox|<dynamic>|0",
-      "file": "src/smage/modules/unmix/page.py",
-      "function": "_unmix_rebuild_signature_table",
-      "kind": "checkbox",
-      "label": "<dynamic>",
-      "line": 2241
-    },
-    {
-      "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_signature_table|lineedit|<dynamic>|0",
-      "file": "src/smage/modules/unmix/page.py",
-      "function": "_unmix_rebuild_signature_table",
-      "kind": "lineedit",
-      "label": "<dynamic>",
-      "line": 2251
+      "line": 1733
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_spectrum_settings|button|<dynamic>|0",
@@ -2823,7 +3239,7 @@
       "function": "_unmix_rebuild_spectrum_settings",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 1443
+      "line": 1629
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_spectrum_settings|button|Set|0",
@@ -2831,7 +3247,7 @@
       "function": "_unmix_rebuild_spectrum_settings",
       "kind": "button",
       "label": "Set",
-      "line": 1387
+      "line": 1573
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_spectrum_settings|combo|<dynamic>|0",
@@ -2839,7 +3255,7 @@
       "function": "_unmix_rebuild_spectrum_settings",
       "kind": "combo",
       "label": "<dynamic>",
-      "line": 1363
+      "line": 1549
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_rebuild_spectrum_settings|list|<dynamic>|0",
@@ -2847,7 +3263,7 @@
       "function": "_unmix_rebuild_spectrum_settings",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 1406
+      "line": 1592
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_reset_spectrum_source|button|Cancel|0",
@@ -2855,7 +3271,7 @@
       "function": "_unmix_reset_spectrum_source",
       "kind": "button",
       "label": "Cancel",
-      "line": 1050
+      "line": 1081
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_reset_spectrum_source|button|OK|0",
@@ -2863,7 +3279,7 @@
       "function": "_unmix_reset_spectrum_source",
       "kind": "button",
       "label": "OK",
-      "line": 1049
+      "line": 1080
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_reset_spectrum_source|combo|<dynamic>|0",
@@ -2871,7 +3287,7 @@
       "function": "_unmix_reset_spectrum_source",
       "kind": "combo",
       "label": "<dynamic>",
-      "line": 1043
+      "line": 1074
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|button|Select files…|0",
@@ -2879,7 +3295,7 @@
       "function": "_unmix_sample_panel",
       "kind": "button",
       "label": "Select files…",
-      "line": 2154
+      "line": 2331
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_sample_panel|list|<dynamic>|0",
@@ -2887,7 +3303,7 @@
       "function": "_unmix_sample_panel",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 2157
+      "line": 2339
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_signature_header_menu|action|<dynamic>|0",
@@ -2895,7 +3311,7 @@
       "function": "_unmix_signature_header_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 2335
+      "line": 2522
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_signature_menu|action|<dynamic>|0",
@@ -2903,7 +3319,7 @@
       "function": "_unmix_signature_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 2319
+      "line": 2506
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_signature_panel|button|Add signature|0",
@@ -2911,7 +3327,7 @@
       "function": "_unmix_signature_panel",
       "kind": "button",
       "label": "Add signature",
-      "line": 2085
+      "line": 2271
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_signature_panel|table|<dynamic>|0",
@@ -2919,7 +3335,7 @@
       "function": "_unmix_signature_panel",
       "kind": "table",
       "label": "<dynamic>",
-      "line": 2094
+      "line": 2280
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_signature_widget_menu|action|<dynamic>|0",
@@ -2927,7 +3343,7 @@
       "function": "_unmix_signature_widget_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 2361
+      "line": 2548
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_area|button|New gate tree|0",
@@ -2935,7 +3351,7 @@
       "function": "_unmix_spectrum_area",
       "kind": "button",
       "label": "New gate tree",
-      "line": 373
+      "line": 386
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_area|list|<dynamic>|0",
@@ -2943,7 +3359,7 @@
       "function": "_unmix_spectrum_area",
       "kind": "list",
       "label": "<dynamic>",
-      "line": 342
+      "line": 355
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_context_menu|action|<dynamic>|0",
@@ -2951,7 +3367,7 @@
       "function": "_unmix_spectrum_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 957
+      "line": 988
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_context_menu|action|<dynamic>|1",
@@ -2959,7 +3375,7 @@
       "function": "_unmix_spectrum_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 961
+      "line": 992
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_context_menu|action|<dynamic>|2",
@@ -2967,7 +3383,7 @@
       "function": "_unmix_spectrum_context_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 966
+      "line": 997
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_menu|action|<dynamic>|0",
@@ -2975,7 +3391,7 @@
       "function": "_unmix_spectrum_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1082
+      "line": 1113
     },
     {
       "key": "src/smage/modules/unmix/page.py|_unmix_spectrum_menu|action|<dynamic>|1",
@@ -2983,7 +3399,7 @@
       "function": "_unmix_spectrum_menu",
       "kind": "action",
       "label": "<dynamic>",
-      "line": 1089
+      "line": 1120
     },
     {
       "key": "src/smage/widgets/colormap.py|_ColormapPicker.__init__|button|Delete custom|0",
@@ -3175,7 +3591,7 @@
       "function": "_file_nav_row",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 103
+      "line": 118
     },
     {
       "key": "src/smage/widgets/panels.py|_file_nav_row|button|<dynamic>|1",
@@ -3183,7 +3599,15 @@
       "function": "_file_nav_row",
       "kind": "button",
       "label": "<dynamic>",
-      "line": 105
+      "line": 120
+    },
+    {
+      "key": "src/smage/widgets/panels.py|_log_widget|text|<dynamic>|0",
+      "file": "src/smage/widgets/panels.py",
+      "function": "_log_widget",
+      "kind": "text",
+      "label": "<dynamic>",
+      "line": 27
     },
     {
       "key": "src/smage/widgets/picker.py|_pick_items_dialog|button|Cancel|0",

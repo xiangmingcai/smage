@@ -20,7 +20,7 @@ in plots and the coordinates used for gate shapes on screen.
 - Plots below the module are drawn in transformed coordinates, with axis
   labels converted back to original values.
 - **Min / Max are also the default axis range** for downstream scatter and
-  histogram plots (Figure, N×N cells, Gating, Area) when their axis is set to
+  histogram plots (Figure, N×N cells, Gating, Region Size) when their axis is set to
   **Auto**: the nearest upstream Scale that configures the channel wins, one
   configured side is combined with the data extent on the other side, and
   Overlay plots are excluded. A range saved in a plot's settings always wins;

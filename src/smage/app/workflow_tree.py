@@ -324,9 +324,11 @@ TASK_TYPES = {
     "figure": ("Figure", "#34a853"),
     "heatmap": ("Heatmap", "#00838f"),
     "scale": ("Scale", "#4285f4"),
+    "calculation": ("Calculation", "#6d4c41"),
     "rename": ("Rename", "#8e9aab"),
     "unmix": ("Unmix", "#7b61ff"),
     "segmentation": ("Segmentation", "#00acc1"),
+    "region": ("Region", "#00897b"),
     "compensation": ("Compensation", "#fb8c00"),
     "illumination": ("Illumination Correction", "#8d6e63"),
     "feature": ("Feature Down", "#ec407a"),
@@ -336,7 +338,7 @@ TASK_TYPES = {
     "subsample": ("Subsample", "#78909c"),
     "dimred": ("Dimension Reduction", "#ab47bc"),
     "cluster": ("Cluster", "#ef5350"),
-    "area": ("Area", "#26a69a"),
+    "region_size": ("Region Size", "#26a69a"),
     "data_clean": ("Data Clean", "#ff7043"),
     "batch_align": ("Batch Alignment", "#7e57c2"),
     "export": ("Export", "#66bb6a"),
@@ -349,6 +351,7 @@ ADD_MODULE_GROUPS = [
         "scale",
         "compensation",
         "rename",
+        "calculation",
         "illumination",
         "data_clean",
         "batch_align",
@@ -361,13 +364,14 @@ ADD_MODULE_GROUPS = [
     ]),
     ("Gate & select", [
         "gating",
+        "region",
         "subset",
         "subsample",
     ]),
     ("Analyse", [
         "dimred",
         "cluster",
-        "area",
+        "region_size",
     ]),
     ("Present & export", [
         "figure",
@@ -380,7 +384,7 @@ ADD_MODULE_GROUPS = [
 ADD_MODULE_MAP_ROWS = {
     "Correct & transform": [
         ["unmix", "scale", "compensation", "rename"],
-        ["illumination", "data_clean", "batch_align"],
+        ["calculation", "illumination", "data_clean", "batch_align"],
     ],
 }
 
@@ -425,6 +429,7 @@ def _task_color(task_type: str) -> str:
 MODULE_KINDS = {
     "gating": "map",
     "scale": "map",
+    "calculation": "map",
     "rename": "map",
     "compensation": "map",
     "illumination": "map",
@@ -432,6 +437,7 @@ MODULE_KINDS = {
     # its upstream modules; the parameter-only behaviour still works.
     "unmix": "generate",
     "segmentation": "generate",
+    "region": "map",
     "figure": "visualize",
     "heatmap": "visualize",
     "feature": "generate",
@@ -442,9 +448,9 @@ MODULE_KINDS = {
     "subsample": "map",
     "dimred": "generate",
     "cluster": "generate",
-    # Area only computes and displays a result; it never changes the data that
-    # flows downstream, so it must not lock its upstream modules.
-    "area": "visualize",
+    # Region Size stores a report table; Calculate marks it as generated so
+    # the upstream Region/data modules lock until the results are cleared.
+    "region_size": "generate",
     "data_clean": "generate",
     "batch_align": "map",
     # Export only reads the data and writes copies outside the project; it
@@ -795,7 +801,8 @@ class WorkflowTreeMixin:
             rules = (node.get("params") or {}).get("rules") or []
             chain = _data_files._task_chain(self._ctx, node.get("id"))
             gating_tasks = [
-                t for t in chain[:-1] if t.get("type") == "gating"
+                t for t in chain[:-1]
+                if t.get("type") in ("gating", "region")
             ]
             known = {t.get("id") for t in gating_tasks}
             gate_owner = {}

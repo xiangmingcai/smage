@@ -586,7 +586,8 @@ def _heatmap_gate_options(ctx, page) -> list:
     task_id = page._heatmap_task_id
     gating_tasks = [
         task for task in _data_files._task_chain(ctx, task_id)
-        if task.get("id") != task_id and task.get("type") == "gating"
+        if task.get("id") != task_id
+        and task.get("type") in ("gating", "region")
     ]
     multi = len(gating_tasks) > 1
     options = []

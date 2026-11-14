@@ -75,6 +75,10 @@ def _read_image(path: Path) -> dict:
         "axes": axes,
         "channels": channels,
         "channel_names": channel_names,
+        # Pixel dimensions, so the import page can offer a resize without
+        # decoding the image again.
+        "height": int(shape[-2]) if len(shape) >= 2 else 0,
+        "width": int(shape[-1]) if len(shape) >= 2 else 0,
     }
 
 

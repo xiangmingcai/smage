@@ -2120,8 +2120,11 @@ def _seg_split_touching_nuclei(labels, min_area: int, separation: int = 0):
     if not binary.any():
         return labels
     distance = ndimage.distance_transform_edt(binary)
-    # Candidate maxima (3×3 neighbourhood); plateaus merge when labeled.
-    peaks = (distance == ndimage.maximum_filter(distance, size=3)) & binary
+    # Candidate maxima (3×3 neighbourhood); plateaus merge when labeled. A
+    # light smoothing removes the distance-map ridge that runs along the
+    # touching neck, which would otherwise register as a third "peak".
+    smooth = ndimage.gaussian_filter(distance, 0.8)
+    peaks = (smooth == ndimage.maximum_filter(smooth, size=3)) & binary
     sep = (
         float(separation) if separation > 0
         else math.sqrt(max(int(min_area), 1) / math.pi)

@@ -25,6 +25,7 @@ This folder is the copy the app loads (`_module_icon_dir()` checks it first).
 | gating.svg | Gating |
 | figure.svg | Figure |
 | scale.svg | Scale |
+| calculation.svg | Calculation |
 | rename.svg | Rename |
 | unmix.svg | Unmix |
 | segmentation.svg | Segmentation |
@@ -37,6 +38,7 @@ This folder is the copy the app loads (`_module_icon_dir()` checks it first).
 | subsample.svg | Subsample |
 | dimred.svg | Dimension Reduction |
 | cluster.svg | Cluster |
-| area.svg | Area |
+| region.svg | Region |
+| region_size.svg | Region Size |
 | data_clean.svg | Data Clean |
 | batch_align.svg | Batch Alignment |

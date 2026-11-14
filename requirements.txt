@@ -8,6 +8,7 @@ scipy
 # Data storage & image import
 pyarrow
 tifffile
+contourpy  # polygon outlines for the Region module (also via matplotlib)
 
 # Flow-cytometry data
 flowio

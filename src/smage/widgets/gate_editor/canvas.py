@@ -495,15 +495,21 @@ class _GatePolygonROI(pg.PolyLineROI):
         # Don't insert a vertex when a segment is clicked; don't show the
         # per-handle "remove" button. Both are handled by the context menu.
         # Instead, an edge click selects the polygon.
+        import warnings
+
         for seg in self.segments:
-            try:
-                seg.sigClicked.disconnect(self.segmentClicked)
-            except (TypeError, RuntimeError):
-                pass
-            try:
-                seg.sigClicked.disconnect(self._edge_clicked)
-            except (TypeError, RuntimeError):
-                pass
+            # Shiboken emits a RuntimeWarning (not an exception) when a
+            # connection does not exist; silence it while replacing handlers.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                try:
+                    seg.sigClicked.disconnect(self.segmentClicked)
+                except (TypeError, RuntimeError):
+                    pass
+                try:
+                    seg.sigClicked.disconnect(self._edge_clicked)
+                except (TypeError, RuntimeError):
+                    pass
             seg.sigClicked.connect(self._edge_clicked)
         for h in self.handles:
             h["item"].setDeletable(False)
