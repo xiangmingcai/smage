@@ -165,14 +165,14 @@ E:\smage_test\samge_batch_test\   # 不纳入 git，运行工作区
 | **Gating** | 矩形/椭圆/多边形/象限/分割/范围/偏斜/布尔 AND-OR-NOT/Col2Gate/图像门；绘制-拖动-缩放-删除；树层级；统计 | 越界钳制、零跨度、标签拖动、颜色、handles、复制/粘贴 gate 与 branch、per-file、Unify、级联删除、统计 worker 取消、`gates.json`、锁定时草稿只读 |
 | **Scale** | 方法/参数/Min/Max、按列应用、预览、保存、下游传递 | 空列、非法参数、重置、原值/变换值刻度切换 |
 | **Compensation** | Set Files、Set Matrix、Copy/Paste、应用、保存 | 单/多文件矩阵、缺列、矩阵格式错误、CytoNorm 扩展缺失 |
-| **Unmix** | 矩阵页签、通道匹配、自发荧光、光谱曲线、图片 Unmix、保存 | Skip 通道、重名、颜色选择、金字塔输出、无匹配通道 |
+| **Unmix** | 矩阵页签、通道匹配、自发荧光、光谱曲线、图片 Unmix、保存、右键 Save as、签名来源（从光谱/手动） | Skip 通道、重名、颜色选择、金字塔输出、无匹配通道、矩阵/相似度热图与曲线图的 PNG/JPG/矢量 PDF 导出、曲线图例随图导出、粘贴矩阵校验（列集合/空值/非数字/重名/列数）、单元格编辑、行拖动排序、两种模式数据独立保存、通道变化后的警告与禁止 unmix |
 | **Rename** | 规则增删/排序、预览、应用、保存 | 重名、非法字符、空名、只作用于部分文件 |
 | **Subset** | 行过滤条件、列选择、文件选择、图像矩形子集 | 空结果、多条件 AND、按文件过滤、重置、可见文件/列 |
 | **Subsample** | 计数依据、分配方式、手动覆盖、seed、覆盖 mask | 0 文件、极小文件、比例边界、图像栅格 |
 | **Feature Up** | From/To 文件、Key 选择、Match、特征选择、Calculate | Key 无匹配、背景忽略、按文件缓存、gate 列、applied columns |
 | **Gate2Col** | gate→列映射、前缀、背景 0 处理、应用 | 无 gate、列名重复、门标签列、刷新 |
 | **Feature** | 变量选择、聚合规则、计数列、背景忽略、Calculate | 自动命名/安全文件名、空规则、signature 失效、缓存 |
-| **Heatmap** | 文件/门/变量选择、抽样、Calculate、归一化、行列聚类、显示设置 | NaN 填充、数字文本/颜色、聚类参数、矩阵复制、导出文本 |
+| **Heatmap** | 文件/门/变量选择、抽样、Calculate、归一化、行列聚类、显示设置、legend 标题、右键 Save as | NaN 填充、数字文本/颜色、聚类参数、矩阵复制、导出文本、legend 标题随 Normalize/自定义/隐藏、PNG/JPG/矢量 PDF 导出、空热图禁存、新模块不预选文件、跨模块门重名时才加模块名 |
 | **Illumination** | 子模块增删、mask 绘制/导入、应用、图像级别 | mask 的 npy 外置/回读、通道切换、尺寸不匹配 |
 | **Data Clean** | 模式/参数、时间列、变量选择、Calculate | 无时间列、MAD/IT 边界、去除零值、结果列、取消 |
 | **Batch Align** | 批次表、Copy/Paste、变量、参数、Calculate、Report | 单批次、缺参考、扩展缺失、`alignment.npz`、HTML/PDF/PNG/SVG 报告、失败路径 |

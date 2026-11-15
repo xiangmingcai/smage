@@ -42,6 +42,14 @@ The spectra and their gates feed the second tab. After running the unmixing
 (see [Matrix Unmixing](unmix-matrix.md)), the module exposes one unmixed
 channel per signature to downstream modules.
 
+## Saving plots
+
+Right-click the spectrum plot (this tab) or the signature curves plot and
+choose **Save as…** to write the plot as currently shown, zoom included:
+**PDF** keeps axes, tick labels and titles as editable text with the plotted
+content as a high-resolution bitmap; **PNG/JPEG** are written at three times
+the screen resolution.
+
 ## Notes
 
 - Unmixing is the most expensive stage; the matrix is cached per file and

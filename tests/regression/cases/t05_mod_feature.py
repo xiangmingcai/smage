@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QDialog, QLabel, QMessageBox
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
@@ -80,12 +80,143 @@ def calculate() -> None:
         _close(window)
 
 
+@harness.case("mod.feature.mode", "L3", "feature", tags=("fast",))
+def mode_rule() -> None:
+    """Mode returns the most frequent value; ties use the smallest value."""
+    from smage.core.feature import (
+        _feature_aggregate_frame,
+        _feature_auto_name,
+    )
+
+    frame = pd.DataFrame({
+        "group": [1, 1, 1, 2, 2, 2, 2, 3, 3],
+        "v": [5.0, 5.0, 7.0, 3.0, 4.0, 4.0, 3.0, 9.0, 9.0],
+    })
+    rules = [{
+        "source": "v", "method": "mode", "name": "v_mode",
+        "lo": 0.0, "hi": 100.0,
+    }]
+    out, columns, _warnings = _feature_aggregate_frame(
+        frame, "group", rules, "n", key_name="group",
+    )
+    harness.eq(columns, ["group", "n", "v_mode"])
+    values = dict(zip(out["group"], out["v_mode"]))
+    harness.eq(float(values[1]), 5.0)
+    harness.eq(
+        float(values[2]), 3.0,
+        "a tie between 3 and 4 takes the smaller value",
+    )
+    harness.eq(float(values[3]), 9.0)
+    harness.eq(
+        _feature_auto_name({"source": "v", "method": "mode"}), "v_mode"
+    )
+    harness.check(("Mode", "mode") in feature_page.FEATURE_METHODS)
+
+    # The per-class range filter is applied before the mode.
+    ranged = [{
+        "source": "v", "method": "mode", "name": "v_mode",
+        "lo": 50.0, "hi": 100.0,
+    }]
+    out, _columns, _warnings = _feature_aggregate_frame(
+        frame, "group", ranged, "n", key_name="group",
+    )
+    values = dict(zip(out["group"], out["v_mode"]))
+    harness.eq(float(values[2]), 4.0,
+               "the upper half of group 2 is 4, 4")
+
+
+@harness.case("mod.feature.batch", "L3", "feature", tags=("fast",))
+def batch_rules() -> None:
+    """Add batch: pick channels, share method/range/suffix, unique names."""
+    from unittest.mock import patch
+
+    window, _project, page, _parquet = _open("feature_batch", ignore=[])
+    try:
+        ctx = window._ctx
+        dialog = feature_page._FeatureBatchDialog(
+            None, ["v", "group"], {"v_mode"}
+        )
+        harness.eq(dialog.method.currentData(), "mean")
+        harness.eq(dialog.suffix.text(), "mean")
+        dialog.method.setCurrentIndex(dialog.method.findData("mode"))
+        harness.eq(dialog.suffix.text(), "mode",
+                   "the default suffix follows the method")
+        dialog.method.setCurrentIndex(
+            dialog.method.findData("percentile")
+        )
+        harness.check(dialog.perc.isEnabled())
+        harness.eq(dialog.suffix.text(), "p50")
+        dialog.perc.setValue(90)
+        harness.eq(dialog.suffix.text(), "p90")
+        dialog.suffix.setText("custom")
+        dialog._suffix_edited("custom")
+        dialog.method.setCurrentIndex(dialog.method.findData("mean"))
+        harness.eq(dialog.suffix.text(), "custom",
+                   "a user suffix is not overwritten")
+        dialog.lo.setValue(10)
+        dialog.hi.setValue(90)
+        values = dialog.values()
+        harness.eq(values["method"], "mean")
+        harness.eq(values["lo"], 10)
+        harness.eq(values["hi"], 90)
+        harness.eq(values["suffix"], "custom")
+        harness.check("v_custom" in dialog.preview.text())
+        dialog.reject()
+
+        settings = {
+            "method": "mode", "lo": 10, "hi": 90,
+            "perc": 50, "suffix": "mm",
+        }
+        with patch.object(
+            feature_page._widgets_picker, "_pick_items_dialog",
+            return_value=["v", "group"],
+        ), patch.object(
+            feature_page._FeatureBatchDialog, "exec",
+            return_value=QDialog.DialogCode.Accepted,
+        ), patch.object(
+            feature_page._FeatureBatchDialog, "values",
+            return_value=settings,
+        ):
+            feature_page._feat_add_batch_rules(ctx, page)
+        rules = page._feat_params["rules"]
+        added = rules[-2:]
+        harness.eq([r["source"] for r in added], ["v", "group"])
+        harness.eq([r["method"] for r in added], ["mode", "mode"])
+        harness.eq([r["name"] for r in added], ["v_mm", "group_mm"])
+        harness.eq([r["lo"] for r in added], [10, 10])
+        harness.eq([r["hi"] for r in added], [90, 90])
+        harness.check(all(r.get("perc") is None for r in added))
+
+        # Running the same batch again gets unique column names.
+        with patch.object(
+            feature_page._widgets_picker, "_pick_items_dialog",
+            return_value=["v"],
+        ), patch.object(
+            feature_page._FeatureBatchDialog, "exec",
+            return_value=QDialog.DialogCode.Accepted,
+        ), patch.object(
+            feature_page._FeatureBatchDialog, "values",
+            return_value=settings,
+        ):
+            feature_page._feat_add_batch_rules(ctx, page)
+        harness.eq(page._feat_params["rules"][-1]["name"], "v_mm_1")
+    finally:
+        _close(window)
+
+
 @harness.case("mod.feature.feature_row", "L4", "feature", tags=("fast",))
 def feature_row() -> None:
     """The feature variable has its own (deletable) row in the rules table."""
     window, _project, page, parquet = _open("feature_row", ignore=[])
     try:
         ctx = window._ctx
+        texts = " ".join(
+            label.text() for label in page.findChildren(QLabel)
+        )
+        harness.check(
+            "Mode:" in texts and "most frequent" in texts,
+            "the rules panel explains Mode next to Range",
+        )
         rules = page._feat_params["rules"]
         harness.eq([r.get("method") for r in rules], ["count", "feature", "mean"],
                    "the group-key row is added by default")

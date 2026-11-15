@@ -40,6 +40,54 @@ def _two_file_project(case_id: str):
     return project, region_task, rsize, first, second
 
 
+def _write_channels(ctx, task, store):
+    """Write the converted masks that downstream Region Size now reads.
+
+    The project is reloaded when the test window opens, so the task object
+    captured before that is stale; always mutate the live task.
+    """
+    from smage.core.region_detection import _region_parts_raster
+
+    from smage.data.image_index import _build_image_index_files
+
+    live = ctx._find_task_by_id(task.get("id")) or task
+    params = live.setdefault("params", {})
+    for region in store.get("regions") or []:
+        entry = _regions._region_channel_entry(
+            params, region.get("id"), create=True
+        )
+        entry["downstream_visible"] = True
+        for path, sample in (region.get("samples") or {}).items():
+            man = ctx._image_load_manifest(path)
+            if man is None:
+                _build_image_index_files(path)
+                man = ctx._image_load_manifest(path)
+            if man is None:
+                continue
+            xmin = int(round(float(man["xmin"])))
+            ymin = int(round(float(man["ymin"])))
+            width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
+            height = int(round(float(man["ymax"]) - float(man["ymin"]))) + 1
+            parts = [
+                {"in": sub.get("in") or [], "out": sub.get("out") or []}
+                for sub in sample.get("sub_regions") or []
+            ]
+            mask = _region_parts_raster(parts, width, height, xmin, ymin)
+            rel, pixels, signature = _regions._region_write_channel(
+                ctx, task.get("id"), path, mask, region.get("id")
+            )
+            entry["files"][str(path)] = {
+                "path": rel,
+                "signature": signature,
+                "region_signature": _regions._region_geometry_signature(
+                    region, path
+                ),
+                "pixels": int(pixels),
+            }
+    ctx.project.save()
+    return live
+
+
 def _write_store(ctx, task, first, second):
     store = {
         "version": 1,
@@ -81,6 +129,35 @@ def _write_store(ctx, task, first, second):
         ],
     }
     _regions._region_store_save(ctx, task, store)
+    return _write_channels(ctx, task, store)
+
+
+@harness.case("mod.region_size.visibility", "L4", "region_size",
+              tags=("fast",))
+def visibility_only() -> None:
+    """Region Size lists only converted channels marked downstream-visible."""
+    project, region_task, _rs_task, first, second = _two_file_project(
+        "region_size_visibility"
+    )
+    window = e2e.open_window(project)
+    try:
+        ctx = window._ctx
+        region_task = _write_store(ctx, region_task, first, second)
+        channels = region_task["params"]["channels"]
+        channels["r2"]["downstream_visible"] = False
+        project.save()
+        e2e.open_page(window, "rs-1", "region_size", "Region Size")
+        options = _rs_page._rs_region_options(ctx, "rs-1")
+        harness.eq([item["label"] for item in options], ["A"],
+                   "a Region with Downstream visible off is not listed")
+        channels["r2"]["downstream_visible"] = True
+        project.save()
+        options = _rs_page._rs_region_options(ctx, "rs-1")
+        harness.eq(
+            sorted(item["label"] for item in options), ["A", "B"]
+        )
+    finally:
+        e2e.close_window(window)
 
 
 @harness.case("mod.region_size.calculate", "L4", "region_size",
@@ -92,7 +169,7 @@ def calculate_table() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
-        _write_store(ctx, region_task, first, second)
+        region_task = _write_store(ctx, region_task, first, second)
         page = e2e.open_page(window, "rs-1", "region_size", "Region Size")
         page._rs_options = _rs_page._rs_region_options(ctx, "rs-1")
         page._rs_selected = [item["key"] for item in page._rs_options]
@@ -113,8 +190,13 @@ def calculate_table() -> None:
         }
         by_label = {label: key for key, label in labels.items()}
         a_key, b_key = by_label["A"], by_label["B"]
-        harness.eq(values[first][a_key], 63, "overlapping sub-regions union")
-        harness.eq(values[first][b_key], 25)
+        channels = region_task["params"]["channels"]
+        a_first = int(channels["r1"]["files"][first]["pixels"])
+        b_first = int(channels["r2"]["files"][first]["pixels"])
+        harness.check(a_first > 0 and b_first > 0)
+        harness.eq(values[first][a_key], a_first,
+                   "area comes from the converted mask")
+        harness.eq(values[first][b_key], b_first)
         harness.eq(values[second][a_key], 0, "empty Sample is 0")
         harness.check(
             values[second][b_key] is None, "missing Sample is NA"
@@ -129,13 +211,13 @@ def calculate_table() -> None:
         order = list(page._rs_file_order)
         first_row = order.index(first)
         second_row = order.index(second)
-        harness.eq(table.item(first_row, 2).text(), "63")
+        harness.eq(table.item(first_row, 2).text(), str(a_first))
         harness.eq(table.item(second_row, 2).text(), "0")
         harness.eq(table.item(second_row, 3).text(), "NA")
         _rs_page._rs_copy(ctx, page)
         tsv = QApplication.clipboard().text()
         harness.check(tsv.startswith("File name\t"))
-        harness.check("NA" in tsv and "63" in tsv)
+        harness.check("NA" in tsv and str(a_first) in tsv)
 
         # Clear results unlocks upstream and empties the saved table.
         with harness.patch_dialogs(
@@ -159,7 +241,7 @@ def reorder_table() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
-        _write_store(ctx, region_task, first, second)
+        region_task = _write_store(ctx, region_task, first, second)
         page = e2e.open_page(window, "rs-1", "region_size", "Region Size")
         page._rs_options = _rs_page._rs_region_options(ctx, "rs-1")
         page._rs_selected = [item["key"] for item in page._rs_options]
@@ -231,7 +313,9 @@ def _write_named_store(ctx, task, first, second, region_id, name, points):
             },
         }],
     }
-    _regions._region_store_save(ctx, task, store)
+    live = ctx._find_task_by_id(task.get("id")) or task
+    _regions._region_store_save(ctx, live, store)
+    return _write_channels(ctx, live, store)
 
 
 @harness.case("mod.region_size.multi_module", "L4", "region_size",
@@ -246,11 +330,11 @@ def multi_module() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
-        _write_named_store(
+        region1 = _write_named_store(
             ctx, region1, first, second, "a1", "A",
             [[0, 0], [6, 0], [6, 6], [0, 6]],
         )
-        _write_named_store(
+        region2 = _write_named_store(
             ctx, region2, first, second, "a2", "A",
             [[10, 10], [16, 10], [16, 16], [10, 16]],
         )
@@ -270,7 +354,15 @@ def multi_module() -> None:
         outputs = page._rs_params["outputs"]
         harness.eq(len(outputs["regions"]), 2)
         values = outputs["values"][first]
-        harness.eq(sorted(values.values()), [36, 36])
+        expected = sorted([
+            int(region1["params"]["channels"]["a1"]["files"][first][
+                "pixels"
+            ]),
+            int(region2["params"]["channels"]["a2"]["files"][first][
+                "pixels"
+            ]),
+        ])
+        harness.eq(sorted(values.values()), expected)
         harness.check(
             all(value is None for value in outputs["values"][second].values()),
             "a missing Sample is NA for both modules",
@@ -391,7 +483,7 @@ def clear_cancel() -> None:
     window = e2e.open_window(project)
     try:
         ctx = window._ctx
-        _write_store(ctx, region_task, first, second)
+        region_task = _write_store(ctx, region_task, first, second)
         page = e2e.open_page(window, "rs-1", "region_size", "Region Size")
         page._rs_options = _rs_page._rs_region_options(ctx, "rs-1")
         page._rs_selected = [item["key"] for item in page._rs_options]

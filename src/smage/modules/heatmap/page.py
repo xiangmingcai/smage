@@ -4,6 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import (
     QPointF,
     QRect,
+    QRectF,
     QSize,
     QTimer,
     Qt,
@@ -27,8 +28,10 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -79,12 +82,33 @@ from smage.data import files as _data_files
 from smage.data import naming as _data_naming
 from smage.data import sampling as _data_sampling
 from smage.data import stores as _data_stores
+from smage.widgets import canvas_export as _widgets_canvas_export
 from smage.widgets import colormap as _widgets_colormap
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
 
 
 _HEATMAP_STORE_NAME = "heatmap.json"
+
+# Colour-legend titles that follow the Normalize setting until the user
+# edits the title field.
+_LEGEND_TITLES = {
+    "raw": "Raw value",
+    "row": "Row z-score",
+    "column": "Column z-score",
+}
+
+
+def _heatmap_legend_title(normalize) -> str:
+    """The automatic colour-legend title for one Normalize mode."""
+    return _LEGEND_TITLES.get(str(normalize or "raw"), _LEGEND_TITLES["raw"])
+
+
+def _heatmap_legend_title_text(cfg: dict) -> str:
+    """The title to draw; an explicit (possibly empty) text wins."""
+    if "legend_title" in cfg:
+        return str(cfg.get("legend_title") or "")
+    return _heatmap_legend_title(cfg.get("normalize") or "raw")
 
 class _HeatmapCanvas(QWidget):
     """Paints the heatmap matrix with optional dendrograms and axis labels."""
@@ -169,9 +193,12 @@ class _HeatmapCanvas(QWidget):
         grid_h = len(self._rows) * cell_h
         dendro_x = grid_x + grid_w
         colorbar_x = dendro_x + row_dendro_w + self.COLORBAR_GAP
+        legend_title = _heatmap_legend_title_text(cfg)
+        title_gap = 4 if legend_title else 0
+        title_w = (metrics.height() + 6) if legend_title else 0
         width = (
             colorbar_x + self.COLORBAR_WIDTH + self.COLORBAR_LABEL_WIDTH
-            + self.MARGIN
+            + title_gap + title_w + self.MARGIN
         )
         height = (
             grid_y + grid_h + self.COL_LABEL_HEIGHT + self.MARGIN
@@ -184,6 +211,12 @@ class _HeatmapCanvas(QWidget):
             "grid_x": grid_x, "grid_y": grid_y,
             "grid_w": grid_w, "grid_h": grid_h,
             "dendro_x": dendro_x, "colorbar_x": colorbar_x,
+            "legend_title": legend_title,
+            "legend_title_x": (
+                colorbar_x + self.COLORBAR_WIDTH
+                + self.COLORBAR_LABEL_WIDTH + title_gap
+            ),
+            "legend_title_w": title_w,
             "width": width, "height": height,
             "vmin": vmin, "vmax": vmax,
         }
@@ -344,12 +377,28 @@ class _HeatmapCanvas(QWidget):
             color.name(),
         )
         dpr = float(self.devicePixelRatioF() or 1.0)
+        vector = bool(getattr(self, "_export_vector_text", False))
         for c, name in enumerate(self._cols):
             center_x = layout["grid_x"] + c * layout["cell_w"] + layout["cell_w"] / 2
             text = metrics.elidedText(
                 str(name), Qt.TextElideMode.ElideRight,
                 self.COL_LABEL_HEIGHT - 10,
             )
+            if vector:
+                # Export: paint the rotated text directly so a PDF keeps it
+                # editable instead of embedding the screen pixmap.
+                advance = metrics.horizontalAdvance(text) + 2
+                box_w = metrics.height() + 2
+                painter.save()
+                try:
+                    painter.setFont(font)
+                    painter.setPen(color)
+                    painter.translate(center_x - box_w / 2.0, top + advance)
+                    painter.rotate(-90)
+                    painter.drawText(1, metrics.ascent() + 1, text)
+                finally:
+                    painter.restore()
+                continue
             key = (base_key, round(dpr, 2), text)
             pixmap = cache.get(key)
             if pixmap is None:
@@ -439,6 +488,33 @@ class _HeatmapCanvas(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             _heatmap_cell_text(vmin),
         )
+        title = str(layout.get("legend_title") or "")
+        if not title:
+            return
+        # Rotated beside the bar, bottom-to-top, like a colourbar axis label.
+        metrics = QFontMetrics(self.font())
+        title_w = float(layout.get("legend_title_w") or 0.0) or float(
+            metrics.height() + 6
+        )
+        center_x = layout["legend_title_x"] + title_w / 2.0
+        center_y = bar_y + bar_h / 2.0
+        text = metrics.elidedText(
+            title, Qt.TextElideMode.ElideRight, max(10, int(bar_h)),
+        )
+        painter.save()
+        try:
+            painter.setFont(self.font())
+            painter.setPen(QColor("#2c3a48"))
+            painter.translate(center_x, center_y)
+            painter.rotate(-90)
+            painter.drawText(
+                QRectF(-bar_h / 2.0, -metrics.height() / 2.0,
+                       float(bar_h), float(metrics.height())),
+                Qt.AlignmentFlag.AlignCenter,
+                text,
+            )
+        finally:
+            painter.restore()
 
     # -- zoom --------------------------------------------------------------
     MIN_ZOOM = 0.25
@@ -589,9 +665,7 @@ def _heatmap_gate_options(ctx, page) -> list:
         if task.get("id") != task_id
         and task.get("type") in ("gating", "region")
     ]
-    multi = len(gating_tasks) > 1
-    options = []
-    used_labels = set()
+    entries = []
     for task in gating_tasks:
         per_file = [
             {g["id"]: g for g in _data_stores._gating_gates_for(ctx, task, path)}
@@ -608,19 +682,29 @@ def _heatmap_gate_options(ctx, page) -> list:
         for gate in gates:
             if gate["id"] not in common:
                 continue
-            label = str(gate.get("name", gate["id"]))
-            if multi:
-                # Only distinguish the same gate name across modules.
-                label += f" ({task.get('name', '')})"
-            if label in used_labels:
-                label = f"{label} [{gate['id']}]"
-            used_labels.add(label)
-            options.append({
-                "task": task["id"],
-                "id": gate["id"],
-                "label": label,
-                "name": gate.get("name", gate["id"]),
-            })
+            entries.append((task, gate, str(gate.get("name", gate["id"]))))
+    # A module name is only needed to tell apart gates that share a name in
+    # different modules; unique names stay short.
+    counts = {}
+    for _task, _gate, name in entries:
+        counts[name] = counts.get(name, 0) + 1
+    options = []
+    used_labels = set()
+    for task, gate, name in entries:
+        label = name
+        if counts.get(name, 0) > 1:
+            module_name = str(task.get("name") or "").strip()
+            if module_name:
+                label = f"{name} ({module_name})"
+        if label in used_labels:
+            label = f"{label} [{gate['id']}]"
+        used_labels.add(label)
+        options.append({
+            "task": task["id"],
+            "id": gate["id"],
+            "label": label,
+            "name": gate.get("name", gate["id"]),
+        })
     return options
 
 
@@ -723,12 +807,6 @@ def _build_heatmap_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     plot_cfg.setdefault("auto_range", True)
     plot_cfg.setdefault("vmin", None)
     plot_cfg.setdefault("vmax", None)
-
-    if not params["files"]:
-        params["files"] = [
-            rec.get("parquet")
-            for rec in _data_files._available_files(ctx, task_def.get("id"))
-        ]
 
     page._heatmap_task_def = task_def
     page._heatmap_task_id = task_def.get("id")
@@ -1068,12 +1146,60 @@ def _heatmap_plot_panel(ctx, page) -> QWidget:
     scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
     scroll.setStyleSheet("background: #ffffff; border: none;")
     canvas = _HeatmapCanvas()
+    canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    canvas.customContextMenuRequested.connect(
+        lambda pos: _heatmap_canvas_menu(ctx, page, pos)
+    )
     scroll.setWidget(canvas)
     lay.addWidget(scroll, 1)
     page._heatmap_canvas = canvas
     page._heatmap_canvas_scroll = scroll
     page._heatmap_stale_label = stale
     return panel
+
+
+def _heatmap_canvas_menu(ctx, page, pos) -> None:
+    """Right-click menu of the heatmap canvas: Save as… only."""
+    canvas = getattr(page, "_heatmap_canvas", None)
+    if canvas is None or canvas._values is None:
+        return
+    menu = QMenu(ctx.host)
+    save_as = menu.addAction("Save as…")
+    save_as.setToolTip(
+        "Save the heatmap as currently shown: an editable PDF with vector "
+        "shapes and text, or a PNG/JPEG image"
+    )
+    chosen = menu.exec(canvas.mapToGlobal(pos))
+    if chosen is save_as:
+        _heatmap_save_heatmap_as(ctx, page)
+
+
+def _heatmap_export_name(page) -> str:
+    """A readable default filename for the heatmap."""
+    task_def = getattr(page, "_heatmap_task_def", None) or {}
+    return str(task_def.get("name") or "Heatmap")
+
+
+def _heatmap_save_heatmap_as(ctx, page) -> None:
+    """Save the displayed heatmap exactly as it is shown."""
+    canvas = getattr(page, "_heatmap_canvas", None)
+    if canvas is None or canvas._values is None:
+        return
+    try:
+        path = _widgets_canvas_export._canvas_export_save(
+            canvas, ctx.host, _heatmap_export_name(page),
+            "Save Heatmap As",
+        )
+    except Exception as exc:  # noqa: BLE001 - report, never break the page
+        runlog.info("heatmap.export_failed", error=str(exc))
+        QMessageBox.critical(
+            ctx.host, "Save Heatmap As",
+            f"Could not save the heatmap:\n{exc}",
+        )
+        return
+    if path:
+        runlog.info("heatmap.export", path=str(path))
+        ctx.statusBar().showMessage(f"Heatmap saved to {path}", 4000)
 
 
 def _heatmap_log_panel(ctx, page) -> QWidget:
@@ -1157,34 +1283,49 @@ def _heatmap_fill_params(ctx, page, form) -> None:
     norm_combo.setEnabled(editable)
     grid.addWidget(norm_combo, 2, 1, 1, 3)
 
+    # A new module (or an older project) starts with the automatic title;
+    # afterwards the field follows Normalize until the user edits it.
+    if "legend_title" not in cfg:
+        cfg["legend_title"] = _heatmap_legend_title(
+            cfg.get("normalize") or "raw"
+        )
+    grid.addWidget(QLabel("Legend title"), 3, 0)
+    title_edit = QLineEdit(str(cfg.get("legend_title") or ""))
+    title_edit.setEnabled(editable)
+    title_edit.setToolTip(
+        "Title of the colour legend. It follows Normalize until you edit it; "
+        "clear the box to hide the title."
+    )
+    grid.addWidget(title_edit, 3, 1, 1, 3)
+
     show_numbers = QCheckBox("Show numbers")
     show_numbers.setChecked(bool(cfg.get("show_numbers", True)))
     show_numbers.setEnabled(editable)
     auto_color = QCheckBox("Auto number color")
     auto_color.setChecked(bool(cfg.get("auto_text_color", True)))
     auto_color.setEnabled(editable)
-    grid.addWidget(show_numbers, 3, 0, 1, 2)
-    grid.addWidget(auto_color, 3, 2, 1, 2)
+    grid.addWidget(show_numbers, 4, 0, 1, 2)
+    grid.addWidget(auto_color, 4, 2, 1, 2)
 
-    grid.addWidget(QLabel("Number color"), 4, 0)
+    grid.addWidget(QLabel("Number color"), 5, 0)
     color_btn = QPushButton()
     color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     color_btn.setFixedHeight(24)
     color_btn.setEnabled(editable and not auto_color.isChecked())
-    grid.addWidget(color_btn, 4, 1)
+    grid.addWidget(color_btn, 5, 1)
 
-    grid.addWidget(QLabel("Decimals"), 4, 2)
+    grid.addWidget(QLabel("Decimals"), 5, 2)
     decimals_spin = _NoWheelSpinBox()
     decimals_spin.setRange(0, 6)
     decimals_spin.setValue(int(cfg.get("decimals", 1)))
     decimals_spin.setEnabled(editable)
     decimals_spin.setToolTip("Number of decimals shown in the cells")
-    grid.addWidget(decimals_spin, 4, 3)
+    grid.addWidget(decimals_spin, 5, 3)
 
     auto_range = QCheckBox("Auto value range")
     auto_range.setChecked(bool(cfg.get("auto_range", True)))
     auto_range.setEnabled(editable)
-    grid.addWidget(auto_range, 5, 0, 1, 2)
+    grid.addWidget(auto_range, 6, 0, 1, 2)
     vmin_spin = QDoubleSpinBox()
     vmax_spin = QDoubleSpinBox()
     for spin, key in ((vmin_spin, "vmin"), (vmax_spin, "vmax")):
@@ -1194,10 +1335,10 @@ def _heatmap_fill_params(ctx, page, form) -> None:
         value = cfg.get(key)
         if isinstance(value, (int, float)):
             spin.setValue(float(value))
-    grid.addWidget(QLabel("Min"), 6, 0)
-    grid.addWidget(vmin_spin, 6, 1)
-    grid.addWidget(QLabel("Max"), 6, 2)
-    grid.addWidget(vmax_spin, 6, 3)
+    grid.addWidget(QLabel("Min"), 7, 0)
+    grid.addWidget(vmin_spin, 7, 1)
+    grid.addWidget(QLabel("Max"), 7, 2)
+    grid.addWidget(vmax_spin, 7, 3)
 
     cluster_rows = QCheckBox("Cluster rows")
     cluster_rows.setChecked(bool(cfg.get("cluster_rows")))
@@ -1205,25 +1346,25 @@ def _heatmap_fill_params(ctx, page, form) -> None:
     cluster_cols = QCheckBox("Cluster columns")
     cluster_cols.setChecked(bool(cfg.get("cluster_cols")))
     cluster_cols.setEnabled(editable)
-    grid.addWidget(cluster_rows, 7, 0, 1, 2)
-    grid.addWidget(cluster_cols, 7, 2, 1, 2)
+    grid.addWidget(cluster_rows, 8, 0, 1, 2)
+    grid.addWidget(cluster_cols, 8, 2, 1, 2)
 
-    grid.addWidget(QLabel("Dendro width"), 8, 0)
+    grid.addWidget(QLabel("Dendro width"), 9, 0)
     dendro_width = _NoWheelSpinBox()
     dendro_width.setRange(20, 300)
     dendro_width.setValue(int(cfg.get("dendro_width", 90)))
     dendro_width.setEnabled(editable)
     dendro_width.setToolTip("Width of the row dendrogram (right side)")
-    grid.addWidget(dendro_width, 8, 1)
-    grid.addWidget(QLabel("Dendro height"), 8, 2)
+    grid.addWidget(dendro_width, 9, 1)
+    grid.addWidget(QLabel("Dendro height"), 9, 2)
     dendro_height = _NoWheelSpinBox()
     dendro_height.setRange(20, 300)
     dendro_height.setValue(int(cfg.get("dendro_height", 70)))
     dendro_height.setEnabled(editable)
     dendro_height.setToolTip("Height of the column dendrogram (top)")
-    grid.addWidget(dendro_height, 8, 3)
+    grid.addWidget(dendro_height, 9, 3)
 
-    grid.addWidget(QLabel("Distance"), 9, 0)
+    grid.addWidget(QLabel("Distance"), 10, 0)
     metric_combo = _NoWheelComboBox()
     metric_combo.addItem("Euclidean", "euclidean")
     metric_combo.addItem("Correlation", "correlation")
@@ -1231,8 +1372,8 @@ def _heatmap_fill_params(ctx, page, form) -> None:
         max(0, metric_combo.findData(cfg.get("metric", "euclidean")))
     )
     metric_combo.setEnabled(editable)
-    grid.addWidget(metric_combo, 9, 1)
-    grid.addWidget(QLabel("Linkage"), 9, 2)
+    grid.addWidget(metric_combo, 10, 1)
+    grid.addWidget(QLabel("Linkage"), 10, 2)
     linkage_combo = _NoWheelComboBox()
     linkage_combo.addItem("Average", "average")
     linkage_combo.addItem("Complete", "complete")
@@ -1242,13 +1383,13 @@ def _heatmap_fill_params(ctx, page, form) -> None:
         max(0, linkage_combo.findData(cfg.get("linkage", "average")))
     )
     linkage_combo.setEnabled(editable)
-    grid.addWidget(linkage_combo, 9, 3)
+    grid.addWidget(linkage_combo, 10, 3)
 
     copy_btn = QPushButton("Copy matrix")
     copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     copy_btn.setToolTip("Copy the displayed matrix to the clipboard (TSV)")
     copy_btn.clicked.connect(lambda _=False: _heatmap_copy_matrix(ctx, page))
-    grid.addWidget(copy_btn, 10, 0, 1, 4)
+    grid.addWidget(copy_btn, 11, 0, 1, 4)
     form.addLayout(grid)
 
     def update_color_button():
@@ -1277,7 +1418,23 @@ def _heatmap_fill_params(ctx, page, form) -> None:
         changed()
 
     def on_normalize():
-        cfg["normalize"] = norm_combo.currentData() or "raw"
+        previous = cfg.get("normalize") or "raw"
+        new = norm_combo.currentData() or "raw"
+        if new == previous:
+            return
+        # Follow the normalize mode only while the title is still the
+        # automatic one; a title the user typed (or cleared) is kept.
+        if str(cfg.get("legend_title") or "") == _heatmap_legend_title(previous):
+            auto = _heatmap_legend_title(new)
+            cfg["legend_title"] = auto
+            title_edit.blockSignals(True)
+            title_edit.setText(auto)
+            title_edit.blockSignals(False)
+        cfg["normalize"] = new
+        changed()
+
+    def on_legend_title(text):
+        cfg["legend_title"] = str(text)
         changed()
 
     def on_show_numbers(checked):
@@ -1355,7 +1512,10 @@ def _heatmap_fill_params(ctx, page, form) -> None:
     metric_combo.currentIndexChanged.connect(lambda _=0: on_metric())
     linkage_combo.currentIndexChanged.connect(lambda _=0: on_linkage())
     color_btn.clicked.connect(lambda _=False: pick_color())
+    title_edit.textChanged.connect(on_legend_title)
     update_color_button()
+    page._heatmap_title_edit = title_edit
+    page._heatmap_norm_combo = norm_combo
 
 
 def _heatmap_select_files(ctx, page) -> None:

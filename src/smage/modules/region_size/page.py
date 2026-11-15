@@ -29,7 +29,6 @@ from smage.core.constants import (
     MODULE_STATE_MODIFIED,
     MODULE_STATE_UNMODIFIED,
 )
-from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import naming as _data_naming
 from smage.data import outputs as _data_outputs
@@ -59,30 +58,30 @@ def _rs_region_key(task_id, region_id) -> str:
 
 
 def _rs_region_options(ctx, task_id) -> list:
-    """Descriptors with display labels (duplicates get a module prefix)."""
-    raw = _data_regions._region_task_regions(ctx, task_id)
+    """Converted, downstream-visible Region channels upstream of this module.
+
+    A Region that was not converted, or whose Downstream visible box is off,
+    is not listed: downstream modules no longer see Regions as gates.
+    """
+    raw = _data_regions._region_channel_options(ctx, task_id)
     counts = {}
     for item in raw:
-        name = str(item["region"].get("name") or "")
+        name = str(item.get("name") or "")
         counts[name] = counts.get(name, 0) + 1
     out = []
     for item in raw:
-        region = item["region"]
-        name = str(region.get("name") or region.get("id"))
+        name = str(item.get("name") or item.get("region_id"))
         label = name
         if counts.get(name, 0) > 1:
             label = f"{item['module_name']}/{name}"
         out.append({
-            "key": _rs_region_key(item["task_id"], region.get("id")),
+            "key": item["key"],
             "label": label,
             "task_id": item["task_id"],
             "module_name": item["module_name"],
-            "region": region,
-            "files": list(
-                _data_regions._region_store_load(
-                    ctx, ctx._find_task_by_id(item["task_id"])
-                ).get("files") or []
-            ),
+            "region": item["region"],
+            "files": list((item.get("files") or {}).keys()),
+            "channels": dict(item.get("files") or {}),
         })
     return out
 
@@ -406,7 +405,7 @@ def _rs_start_calculate(ctx, page) -> None:
     page._rs_progress.setRange(0, len(page._rs_files))
     page._rs_progress.setValue(0)
     page._rs_progress.show()
-    page._rs_status.setText("Reading pixel coordinates…")
+    page._rs_status.setText("Reading Region channels…")
     page._rs_calculate_btn.setEnabled(False)
     page._rs_worker.request(
         token,
@@ -881,33 +880,30 @@ class _RegionSizeWorker:
 
     @staticmethod
     def _file_values(ctx, task_id, path, regions):
-        from smage.data import regions as _regions
+        """Area of each selected Region channel on one file.
 
-        columns = _data_columns._column_data(
-            ctx, task_id, path, ["x", "y"]
-        )
-        x = columns.get("x")
-        y = columns.get("y")
-        if x is None or y is None:
-            return {}, "x/y coordinates are unavailable"
+        The converted channel record stores the number of inside pixels, so
+        no coordinates are read.  A file without a conversion record is NA.
+        """
+        import numpy as np
+
         values = {}
         for item in regions:
-            if path not in set(item.get("files") or []):
+            rec = (item.get("channels") or {}).get(str(path))
+            if not isinstance(rec, dict):
                 values[item["key"]] = None
                 continue
-            parts = _regions._region_parts(
-                item.get("region") or {}, path
-            )
-            if parts is None:
-                values[item["key"]] = None
-            elif not parts:
-                values[item["key"]] = 0
-            else:
-                from smage.core.region_detection import (
-                    region_parts_pixel_count,
-                )
+            pixels = rec.get("pixels")
+            if pixels is None:
+                from smage.modules.segmentation.page import _seg_load_mask
 
-                values[item["key"]] = region_parts_pixel_count(
-                    parts, x, y
+                mask = _seg_load_mask(
+                    ctx, rec.get("abs_path") or rec.get("path")
                 )
+                pixels = (
+                    int(np.count_nonzero(mask)) if mask is not None else None
+                )
+            values[item["key"]] = (
+                None if pixels is None else int(pixels)
+            )
         return values, None

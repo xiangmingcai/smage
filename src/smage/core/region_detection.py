@@ -14,12 +14,16 @@ from smage.core.gates import _point_in_polygon
 from smage.core.image_ops import _otsu_threshold
 
 
-def _report_step(progress, step: str, seconds: float, detail: str = "") -> None:
-    """Send one timed step to an optional progress callback."""
+def _report_step(progress, step: str, seconds, detail: str = "") -> None:
+    """Send one timed step to an optional progress callback.
+
+    ``seconds=None`` sends a message without an elapsed time (warnings).
+    """
     if progress is None:
         return
     try:
-        progress(str(step), float(seconds), str(detail))
+        value = None if seconds is None else float(seconds)
+        progress(str(step), value, str(detail))
     except Exception:  # noqa: BLE001 - logging must not break detection
         pass
 
@@ -116,6 +120,12 @@ def _rings_from_mask(mask, x_origin: float, y_origin: float,
     binary = np.asarray(mask, dtype=bool)
     if not binary.any():
         return [], []
+    # contourpy clips a shape that touches the array border into open
+    # polylines.  Those cannot be classified against an enclosing ring, so a
+    # border-touching component loses its holes (every line looks like an
+    # `in` ring and the even-odd fill is inverted).  A one-pixel empty frame
+    # makes every contour closed; the coordinates are shifted back below.
+    binary = np.pad(binary, 1, mode="constant", constant_values=False)
     try:
         import contourpy
     except Exception:  # noqa: BLE001 - contourpy ships with matplotlib
@@ -132,8 +142,8 @@ def _rings_from_mask(mask, x_origin: float, y_origin: float,
         if len(line) < 3:
             continue
         points = [
-            [float(x_origin) + float(point[0]),
-             float(y_origin) + float(point[1])]
+            [float(x_origin) + float(point[0]) - 1.0,
+             float(y_origin) + float(point[1]) - 1.0]
             for point in line
         ]
         if _shoelace_area(points) > 0:
@@ -194,12 +204,23 @@ def _mask_region_parts(mask, x_origin: float, y_origin: float,
     if count == 0:
         return []
     parts = []
-    for label_id in range(1, count + 1):
-        component = labels == label_id
+    # Trace each component inside its own bounding box.  Running contourpy
+    # over the whole image for every component made a detection with 2000
+    # parts take over two minutes.
+    for label_id, region in enumerate(
+        ndimage.find_objects(labels), start=1
+    ):
+        if region is None:
+            continue
+        ys, xs = region
+        component = labels[ys, xs] == label_id
         if not component.any():
             continue
         part = _mask_region(
-            component, x_origin, y_origin, tolerance
+            component,
+            float(x_origin) + xs.start,
+            float(y_origin) + ys.start,
+            tolerance,
         )
         if part is not None:
             parts.append(part)
@@ -221,6 +242,52 @@ def region_parts_mask(parts, x, y):
             part_inside ^= _point_in_polygon(x, y, ring)
         inside |= part_inside
     return inside
+
+
+def _region_parts_raster(parts, width, height, xmin: float = 0.0,
+                         ymin: float = 0.0):
+    """Rasterise region parts into a ``(height, width)`` boolean mask.
+
+    Image filters evaluate a Region on every pixel of a 2040x2040 image; the
+    per-point ray casting in :func:`region_parts_mask` is much slower than
+    filling the rings with Pillow's C polygon rasteriser.  Each part is the
+    XOR (even-odd fill) of its rings, and parts are OR-ed.
+    """
+    import numpy as np
+
+    width = max(0, int(width))
+    height = max(0, int(height))
+    out = np.zeros((height, width), dtype=bool)
+    if width == 0 or height == 0 or not parts:
+        return out
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:  # noqa: BLE001 - Pillow is a normal dependency
+        yy, xx = np.mgrid[0:height, 0:width]
+        x = xx.ravel().astype("float64") + float(xmin)
+        y = yy.ravel().astype("float64") + float(ymin)
+        return region_parts_mask(parts, x, y).reshape(height, width)
+    for part in parts or ():
+        part_mask = np.zeros((height, width), dtype=bool)
+        rings = list(part.get("in") or []) + list(part.get("out") or [])
+        for ring in rings:
+            if len(ring) < 3:
+                continue
+            image = Image.new("L", (width, height), 0)
+            # Pixel (i, j) is sampled at its integer coordinate by the gate
+            # masks; Pillow fills around pixel centres, so shift by half a
+            # pixel to keep the filtered edges in the same place.
+            ImageDraw.Draw(image).polygon(
+                [
+                    (float(point[0]) - float(xmin) - 0.5,
+                     float(point[1]) - float(ymin) - 0.5)
+                    for point in ring
+                ],
+                fill=1,
+            )
+            part_mask ^= np.asarray(image, dtype=bool)
+        out |= part_mask
+    return out
 
 
 def region_parts_pixel_count(parts, x, y) -> int:
@@ -280,17 +347,21 @@ def _fill_holes(binary, max_area: int = 0):
     return np.asarray(binary, dtype=bool) | fill[labels]
 
 
-def signal_expansion(image, gate_mask=None, threshold=None, smooth: float = 1.0,
+def signal_expansion(image, gate_mask=None, threshold=None,
+                     percentile=None, smooth: float = 1.0,
                      expand: int = 2, fill_holes: bool = True,
                      min_area: int = 50, tolerance: float = 1.0,
                      x_origin: float = 0.0, y_origin: float = 0.0,
                      fill_max_area: int = 0, progress=None):
     """Detect signal regions in one channel image.
 
-    Returns ``(polygons, used_threshold, binary_mask)``.  Auto threshold uses
-    Otsu's method over the smoothed values inside the detection gate.
-    ``progress(step, seconds, detail)`` is called after each stage so the
-    module can log where the time goes.
+    Returns ``(parts, used_threshold, binary_mask)``.  With neither
+    ``threshold`` nor ``percentile`` set, Otsu's method is applied to the
+    smoothed values inside the detection gate.  ``percentile`` uses that
+    value of this image's own pixel distribution (30 -> about 70% of the
+    pixels are above it).  Both are evaluated per image, never shared
+    between files.  ``progress(step, seconds, detail)`` is called after each
+    stage so the module can log where the time goes.
     """
     import numpy as np
     from scipy import ndimage
@@ -328,18 +399,40 @@ def signal_expansion(image, gate_mask=None, threshold=None, smooth: float = 1.0,
     started = time.perf_counter()
     sample_mask = finite if gate is None else (finite & gate)
     sample = work[sample_mask]
-    auto = threshold is None
+    auto = threshold is None and percentile is None
+    used_percentile = None
     if auto:
         used_threshold = _otsu_threshold(sample) if sample.size else 0.0
+    elif percentile is not None:
+        try:
+            used_percentile = min(
+                100.0, max(0.0, float(percentile))
+            )
+        except (TypeError, ValueError):
+            used_percentile = None
+        if used_percentile is None:
+            auto = True
+            used_threshold = _otsu_threshold(sample) if sample.size else 0.0
+        else:
+            used_threshold = (
+                float(np.percentile(sample, used_percentile))
+                if sample.size else 0.0
+            )
     else:
         try:
             used_threshold = float(threshold)
         except (TypeError, ValueError):
             auto = True
             used_threshold = _otsu_threshold(sample) if sample.size else 0.0
+    if auto:
+        mode_label = "Otsu"
+    elif used_percentile is not None:
+        mode_label = f"P{used_percentile:g}"
+    else:
+        mode_label = "manual"
     _report_step(
         progress, "threshold", time.perf_counter() - started,
-        f"{'Otsu' if auto else 'manual'}={used_threshold:.6g}",
+        f"{mode_label}={used_threshold:.6g}",
     )
 
     started = time.perf_counter()
@@ -384,6 +477,16 @@ def signal_expansion(image, gate_mask=None, threshold=None, smooth: float = 1.0,
         progress, "filter components", time.perf_counter() - started,
         f"min area={int(min_area)}",
     )
+    coverage = (
+        float(np.count_nonzero(binary)) / float(binary.size)
+        if binary.size else 0.0
+    )
+    if coverage >= 0.8:
+        _report_step(
+            progress, "warning", None,
+            f"foreground covers {coverage * 100:.0f}% of the image; reduce "
+            "Expand, raise the threshold or use a cleaner channel",
+        )
 
     started = time.perf_counter()
     parts = _mask_region_parts(

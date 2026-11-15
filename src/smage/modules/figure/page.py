@@ -1580,7 +1580,7 @@ def _figure_filter_options(ctx, figure_task_id):
     for task in _data_files._task_chain(ctx, figure_task_id):
         if task.get("id") == figure_task_id:
             continue
-        if task.get("type") not in ("gating", "region"):
+        if task.get("type") != "gating":
             continue
         module_name = task.get("name", "Gating")
         for gate in _data_stores._gating_gates_for(ctx, task):
@@ -1660,6 +1660,10 @@ def _figure_image_filter_error(ctx, f, parquet_path):
         cur = by_id.get(cur.get("parent"))
     if not chain:
         return "Filter gate not found"
+    if len(chain) == 1 and chain[0].get("type") == "region":
+        # A Region filter is purely spatial; the worker rasterises its rings
+        # and no data column has to be read on the UI thread.
+        return None
     needed = set()
     for g in chain:
         needed |= _gate_needed_columns(g, by_id)
@@ -3091,7 +3095,7 @@ def _figure_overlay_gate_options(ctx, page, plot_dict) -> list:
     for task in _data_files._task_chain(ctx, page._fig_task_id):
         if task.get("id") == page._fig_task_id:
             continue
-        if task.get("type") not in ("gating", "region"):
+        if task.get("type") != "gating":
             continue
         for gate in _data_stores._gating_gates_for(ctx, task, path):
             options.append({

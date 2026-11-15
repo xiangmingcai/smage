@@ -130,9 +130,9 @@ def _gating_gates_for(ctx, task_def, parquet_path=None) -> list:
     module exposes each of its Regions as one spatial gate.
     """
     if (task_def or {}).get("type") == "region":
-        from smage.data import regions as _regions
-
-        return _regions._region_gates_for(ctx, task_def, parquet_path)
+        # Regions are exposed downstream as converted 0/1 channels, never as
+        # gates or filters.  Their internal detection gates stay private.
+        return []
     if (task_def.get("params") or {}).get("gates") and not ctx._gating_store_path(task_def):
         # A legacy task without a store yet — fall back to inline gates.
         return list(task_def.get("params", {}).get("gates") or [])

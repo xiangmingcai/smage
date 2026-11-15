@@ -1700,30 +1700,13 @@ def _gating_visible_ids(ctx, page):
     """Return the set of gate ids to show for the current view mode."""
     active = page._gating_active_gate_id
     if active:
-        # Subset view: show only this gate's direct children (the gates
-        # you can draw inside it), not their deeper descendants. For a
-        # boolean gate also show the gates it combines, so a NOT/AND/OR
-        # subset keeps the originating shape(s) on screen.
-        visible = {
+        # Subset view: show only this gate's direct children (the gates you
+        # can draw inside it), not their deeper descendants. Boolean gates
+        # have no shape of their own, and their sources belong to the level
+        # above the subset, so they are not drawn here either.
+        return {
             g["id"] for g in page._gating_gates if g.get("parent") == active
         }
-        by_id = {g["id"]: g for g in page._gating_gates}
-        active_gate = by_id.get(active)
-        if active_gate is not None and active_gate.get("type") in (
-            "not", "and", "or",
-        ):
-            seen = set()
-            stack = list(_gate_source_ids(active_gate))
-            while stack:
-                source_id = stack.pop()
-                if source_id in seen:
-                    continue
-                seen.add(source_id)
-                source = by_id.get(source_id)
-                if source is not None:
-                    stack.extend(_gate_source_ids(source))
-            visible |= seen
-        return visible
     context = page._gating_context_gate_id
     if context:
         ctx = next((g for g in page._gating_gates if g["id"] == context), None)

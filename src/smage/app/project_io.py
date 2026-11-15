@@ -144,14 +144,19 @@ class ProjectIOMixin:
             self,
             f"About {APP_NAME}",
             f"<h3>{APP_NAME} {APP_VERSION}</h3>"
-            "<p>Image and flow-cytometry analysis.</p>"
+            "<p>Spectral image analysis.</p>"
+            "<p>Research use only. Not a medical device and not for clinical "
+            "decision-making. You are responsible for your analysis and its "
+            "results. Provided without warranty.</p>"
             "<p>Copyright (C) 2026 Amsterdam UMC, the Netherlands.<br>"
             "Author: Xiangming Cai<br>"
             "Advisor: Juan J. Garcia Vallejo</p>"
             "<p>This program is free software under the GNU General Public "
             "License, version 3. It comes with ABSOLUTELY NO WARRANTY.<br>"
             "See the LICENSE file for details.</p>"
-            "<p><a href='https://github.com/xiangmingcai/smage'>"
+            "<p><a href='https://github.com/xiangmingcai/smage/blob/main/"
+            "DISCLAIMER.md'>Full disclaimer</a> · "
+            "<a href='https://github.com/xiangmingcai/smage'>"
             "github.com/xiangmingcai/smage</a></p>",
         )
 

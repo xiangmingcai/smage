@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 
 from smage.core.gates import (
     _compute_gate_filter_mask,
@@ -499,10 +500,10 @@ class _ImageFilterWorker:
         self._thread.start()
 
     def request(self, key, parquet_path, gates, gate_id, stages, base_columns,
-                height, width, blocks):
+                height, width, blocks, origin=None):
         self._req_q.put((
             key, parquet_path, gates, gate_id, stages, set(base_columns),
-            height, width, blocks,
+            height, width, blocks, origin,
         ))
 
     def poll(self):
@@ -530,9 +531,35 @@ class _ImageFilterWorker:
             self._res_q.put(res)
 
     def _compute(self, key, parquet_path, gates, gate_id, stages, base_columns,
-                 height, width, blocks):
+                 height, width, blocks, origin=None):
         import numpy as np
         import pandas as pd
+        started = time.perf_counter()
+        # A Region gate is purely spatial: rasterise its rings instead of
+        # testing every image pixel against every ring.  This avoids reading
+        # millions of x/y rows and is several times faster.
+        from smage.core.gates import _gate_chain
+        chain = _gate_chain(gates, gate_id)
+        if (
+            len(chain) == 1
+            and chain[0].get("type") == "region"
+            and origin is not None
+        ):
+            from smage.core.region_detection import _region_parts_raster
+            mask_2d = _region_parts_raster(
+                chain[0].get("parts") or [],
+                int(width), int(height),
+                float(origin[0]), float(origin[1]),
+            ).astype(np.uint8)
+            levels = _pool_mask(mask_2d, blocks)
+            runlog.info(
+                "image.filter",
+                mode="region",
+                file=str(key[0]),
+                seconds=round(time.perf_counter() - started, 3),
+                pixels=int(mask_2d.sum()),
+            )
+            return (key, {"mask_2d": mask_2d, "levels": levels})
         by_id = {g["id"]: g for g in gates}
         needed = set()
         for g in gates:
@@ -567,6 +594,13 @@ class _ImageFilterWorker:
             return (key, f"Filter mask size mismatch ({mask.size} vs {total})")
         mask_2d = mask.reshape(int(height), int(width))
         levels = _pool_mask(mask_2d, blocks)
+        runlog.info(
+            "image.filter",
+            mode="gate",
+            file=str(key[0]),
+            seconds=round(time.perf_counter() - started, 3),
+            pixels=int(mask_2d.sum()),
+        )
         return (key, {"mask_2d": mask_2d, "levels": levels})
 
 

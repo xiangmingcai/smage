@@ -94,6 +94,9 @@ def _columns_for(ctx, parquet_path, task_id=None) -> list:
         for name in ctx._seg_applied_columns(task_id, parquet_path):
             if name not in columns:
                 columns.append(name)
+        for name in ctx._region_applied_columns(task_id, parquet_path):
+            if name not in columns:
+                columns.append(name)
         for name in ctx._gate2col_applied_columns(task_id, parquet_path):
             if name not in columns:
                 columns.append(name)
@@ -278,6 +281,14 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
         ).items():
             if name in needed and name not in values:
                 arr = ctx._seg_mask_values(parquet_path, mask_path)
+                if arr is not None:
+                    values[name] = arr
+        # Converted Region channels (0 outside, 1 inside).
+        for name, rec in ctx._region_applied_columns(
+            task_id, parquet_path
+        ).items():
+            if name in needed and name not in values:
+                arr = ctx._region_channel_values(parquet_path, rec, name)
                 if arr is not None:
                     values[name] = arr
         # Gate2Col 0/1 columns from upstream Gate2Col modules.

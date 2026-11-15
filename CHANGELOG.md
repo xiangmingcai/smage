@@ -8,6 +8,12 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Added
 
+- **DISCLAIMER.md** at the repository root, plus a short statement in
+  **Help ▸ About Smage** with a link to it: Smage is research software and
+  not a medical device, must not be used for clinical decisions, comes
+  without warranty, and the user is responsible for the analysis and its
+  results. The document also states how AI-assisted development works and
+  which human review, testing and accountability steps apply.
 - **Region** (new map module): detects image regions and exposes each one to
   downstream modules as a spatial gate. It provides an internal detection-gate
   tree, **Signal Expansion** and **SAM 3** (external environment) detection,
@@ -35,6 +41,37 @@ All notable changes to Smage are recorded here. The format follows
   module writes no data: saved rows become a map stage evaluated on demand,
   so every module below it sees the new channels; unsaved edits appear only
   in the live preview.
+- Unmix: **Signature source** under Signatures can now be **From spectra**
+  (unchanged) or **Manual input**. Manual input replaces the signature editor
+  with **Paste matrix**, which accepts the TSV written by **Copy matrix** from
+  another Unmix module, checks that the channels match the Spectrum
+  Extraction selection, and shows the matrix as an editable table whose rows
+  can be dragged into a new order. Columns start compact (20 characters for
+  the Signature column, 5 for each value column) and every divider can be
+  dragged to widen it. Both sources are saved with the module, so switching
+  between them loses nothing. **Copy matrix** now writes one decimal.
+- Unmix: the matrix heatmaps (**Signature matrix**, **Similarity matrix**) and
+  the **Signature curves** / spectrum plots have a right-click **Save as…**
+  menu. Heatmaps export as a PDF with vector cells and editable numbers and
+  names, or as PNG/JPEG at three times the screen resolution; plots use the
+  same editable-axes PDF / high-resolution image pair as Figure, and the
+  signature legend above the curves is included.
+- Heatmap: the colour legend now has a **Legend title**. It defaults to the
+  Normalize mode (`Raw value`, `Row z-score`, `Column z-score`) and follows
+  that setting until the title is edited; clearing the box hides it. The
+  title is drawn rotated beside the color scale and is included in exports.
+- Heatmap: right-click the heatmap and choose **Save as…** to write it as
+  currently shown — a **PDF** with vector cells, grid, dendrograms, color
+  scale and editable text, or a **PNG/JPEG** at three times the screen
+  resolution.
+- Feature Down: **Add batch** next to the rules table. It opens the shared
+  multi-select dialog to pick several channels, then one dialog sets the
+  Method, Range, Percentile and new-column name suffix for all of them.
+  Names are `<channel>_<suffix>` with automatic `_1`, `_2` de-duplication.
+- Feature Down: a new **Mode** aggregation rule returns the most frequent
+  value in each class (after the range filter). Ties take the smallest
+  value, so the result is deterministic. The rules panel explains Mode next
+  to the existing Range note.
 - Data Import: image files can be **resized while importing**. The Parameter
   panel gains an **Image resize** group with Width/Height (the height follows
   the width when **Keep aspect ratio** is on), and a **Smooth
@@ -68,11 +105,34 @@ All notable changes to Smage are recorded here. The format follows
   sampled outline in data space, so the mask matches the edges drawn on
   screen. Previously only the corner vertices were stored, and the straight
   data-space polygon selected a different set of points.
-- Gating: opening a NOT/AND/OR gate subset keeps the source gate shapes
-  visible, so the selected points can be compared with the polygon or
-  ellipse that defines them. Image gate subsets are rasterised at full pixel
-  resolution, so block-mean pooling can no longer show pixels from inside a
-  polygon in a NOT subset.
+- Figure: an image plot filtered by a Region kept the filter only on normal
+  image channels. Switching to an Unmix, Segmentation, Gate2Col, Feature Up,
+  Dimension Reduction, Cluster or Data Clean channel rastered that channel
+  from its own saved pyramid and never applied the filter mask, so the full
+  image appeared. The shared image renderer now derives the mask coverage
+  for those rasters too.
+- Figure: applying a Region filter to an image is much faster. The filter
+  worker no longer reads x/y for every pixel and tests each ring with ray
+  casting; it rasterises the Region rings directly with Pillow. The UI
+  thread also skips the x/y column load that was only used to validate a
+  purely spatial Region filter, and the filter computation time is written
+  to the project log (`image.filter`).
+- Region: saving the Region tree now invalidates the cached copy, so
+  downstream Region channel lists and Region Size options see the new names
+  and conversions immediately instead of the previously loaded tree.
+- Region detection: a detected component that touches the image border no
+  longer loses its holes. contourpy clips such a mask into open polylines,
+  which were all classified as `in` rings, so the even-odd fill showed the
+  holes — the empty areas between cells — as Regions and left the real
+  foreground unpainted. The mask is padded by one pixel before tracing, so
+  the outer contour is closed and holes stay `out` rings.
+- Region detection: every component is traced inside its own bounding box
+  instead of re-tracing the whole image per component. A detection with
+  2053 components spent 129–155 s in the contours stage; it now takes about
+  one second.
+- Gating: image gate subsets are rasterised at full pixel resolution, so
+  block-mean pooling can no longer show pixels from inside a polygon in a
+  NOT subset.
 - Segmentation: the distance-map peaks used by **Split touching nuclei**
   are smoothed first, so the ridge along a touching neck is no longer
   detected as an extra nucleus.
@@ -111,17 +171,25 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Changed
 
+- **Heatmap gate labels**: a gate (row) name no longer carries its module name
+  when the name is unique. The module is added only when several upstream
+  Gating modules contain a gate with the same name, so those rows stay
+  distinguishable without cluttering every label.
+- **Gating subset view**: double-clicking a **NOT / AND / OR** gate shows only
+  the gates drawn inside it. The gates the boolean gate combines belong to the
+  level above and are no longer drawn over the subset, where the outline
+  marked points that the boolean gate excludes.
 - Region sub-regions now use the `in`/`out` ring representation. Projects
   created with the earlier keyhole-polygon Region format are not migrated.
-- Calculation, Region and Region Size: a new module starts with **no data
-  files selected**; choose the files explicitly instead of the module
-  defaulting to every imported file.
+- Calculation, Region, Region Size and Heatmap: a new module starts with
+  **no data files selected**; choose the files explicitly instead of the
+  module defaulting to every imported file.
 - **Add module**: **Region** now sits in the **Gate & select** group,
   directly after **Gating** (it is a spatial gate producer).
 - **Region layout**: seven independent panels — Data files, Detection gates
   and Regions on the left; image and Detect Region in the middle; Image
   settings, Region setting and Log on the right. The columns default to
-  2:3:2, the left stack to 1:2:3, the middle to 3:1 and the right to 3:1:1;
+  2:2:1, the left stack to 1:1:3, the middle to 3:1 and the right to 3:1:1;
   every divider is draggable. **Region drawing** is renamed **Region
   setting**. The Regions tree gives **Region : Show** a default 4:1 width.
 - **Region in/out tools**: Sub-regions are now stored as `in` (filled) and
@@ -132,6 +200,15 @@ All notable changes to Smage are recorded here. The format follows
   clicking the active tool again, or switching tools. Drawing a Region in
   inside an existing hole creates an island without deleting the out ring.
   Anchors are re-traced through a pixel mask after each edit.
+- **Region detection threshold**: the **Auto threshold** checkbox is now a
+  **Threshold mode** choice — **Auto (Otsu)**, **Percentile** (each file's
+  own percentile; 30% leaves about 70% of that file's pixels above the
+  cut-off) or **Manual** (one fixed value). Auto and Percentile are computed
+  separately for every file, and the threshold actually used is written to
+  the log for each file, both on the threshold stage line and on the
+  per-file result line. A warning is logged when the foreground covers 80%
+  or more of the image, which points at a threshold below the background
+  noise or an over-large **Expand**.
 - **Region detection**: Signal Expansion and SAM now emit the same
   `in/out` region parts instead of keyhole polygons; Detect Region's spin
   boxes and combos ignore the mouse wheel so a scroll cannot change a
@@ -147,6 +224,39 @@ All notable changes to Smage are recorded here. The format follows
   overlay items, so Regions no longer accumulate on the image when browsing
   Samples (PlotItem.clear() does not remove arbitrary QGraphicsItems).
   Clicking a filled Sub-region directly in the image selects it in the tree.
+- **Region tree**: a **Sample** node can now be copied as a branch and
+  pasted into another Region, copying all of its Sub-regions with new ids.
+  Pasting checks whether that Region already has the Sample and refuses with
+  a message instead of creating a duplicate.
+- **Region channels**: every Region row now has **Convert as channel**,
+  **Status** and **Downstream visible** columns. Converting writes a
+  0/1 `[x, y, mask]` parquet plus an index pyramid for every file that has a
+  Sample, and the channel becomes available to downstream modules only when
+  the visibility box is ticked. Region names are checked against every
+  channel name in the data files selected by all modules (rename and
+  convert). This is the **only** downstream representation: Regions are no
+  longer exposed as gates or filters, so Figure filter options, Gate2Col,
+  Heatmap annotations and Figure overlay gates no longer list them. Region
+  Size now lists converted + visible Region channels and reads their pixel
+  counts from the mask.
+- **Region tree**: **Rename** is now available in the context menu for
+  Region and Sub-region nodes (Sample still cannot be renamed); the inline
+  editor can still be opened by double-clicking the name.
+- **Region image**: the right-click menu is removed — pyqtgraph's built-in
+  View All / Mouse Mode / Export actions are no longer offered, since the
+  Region page has no image context actions yet.
+- **Region tree multi-selection**: **Shift** selects a range and **Ctrl**
+  toggles individual rows, so several Sub-regions can be selected at once.
+  All selected Sub-regions on the displayed file are highlighted together,
+  and **Copy Branch** / **Delete** apply to the whole selection. A copied
+  group pastes as several Sub-regions with new ids.
+- **Sub-region selection**: selecting a Sub-region in the tree or clicking it
+  in the image now only highlights its boundary and selects it in the tree.
+  The anchor handles are no longer rebuilt on every selection, which made
+  complex boundaries freeze the window. **Edit boundary…** in the Sub-region
+  context menu shows the anchors; when the boundary has more than 100
+  anchors, Smage first warns with the count and asks for confirmation,
+  because displaying that many handles can freeze or crash the app.
 - **Region setting**: the edge Width spin box ignores the mouse wheel, and
   widths below 3 px are no longer clamped to 3 px when the Region is
   selected.

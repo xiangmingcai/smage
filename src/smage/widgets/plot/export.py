@@ -56,16 +56,28 @@ def _plot_export_legend(plot_widget):
     return legend
 
 
+def _plot_export_top_widget(plot_widget):
+    """An optional widget drawn above the plot (e.g. a wrapped legend row)."""
+    top = getattr(plot_widget, "_export_top_widget", None)
+    if top is None or not top.isVisible():
+        return None
+    if top.width() <= 0 or top.height() <= 0:
+        return None
+    return top
+
+
 def _plot_export_layout(plot_widget):
     """Return (scene rect, legend, total width, total height, legend gap)."""
     scene_rect = QRectF(plot_widget.sceneRect())
     legend = _plot_export_legend(plot_widget)
+    top = _plot_export_top_widget(plot_widget)
+    head = (float(top.height()) + 4.0) if top is not None else 0.0
     gap = 4.0 if legend is not None else 0.0
-    total_w = scene_rect.width()
-    total_h = scene_rect.height()
+    total_w = max(scene_rect.width(), float(top.width()) if top else 0.0)
+    total_h = scene_rect.height() + head
     if legend is not None:
         total_w += legend.width() + gap
-        total_h = max(total_h, float(legend.height()))
+        total_h = max(total_h, float(legend.height()) + head)
     return scene_rect, legend, max(1.0, total_w), max(1.0, total_h), gap
 
 
@@ -163,6 +175,8 @@ def _plot_export_paint(plot_widget, painter, width: float, height: float) -> Non
         )
         item = plot_widget.getPlotItem()
         viewbox = item.getViewBox()
+        top = _plot_export_top_widget(plot_widget)
+        head = (float(top.height()) + 4.0) if top is not None else 0.0
         hidden, reserved = _plot_export_hide_chrome(plot_widget)
         axes = []
         viewbox_visible = viewbox.isVisible()
@@ -172,7 +186,7 @@ def _plot_export_paint(plot_widget, painter, width: float, height: float) -> Non
             )
             factor = min(width / total_w, height / total_h)
             plot_rect = QRectF(
-                0.0, 0.0,
+                0.0, head * factor,
                 scene_rect.width() * factor,
                 scene_rect.height() * factor,
             )
@@ -183,7 +197,7 @@ def _plot_export_paint(plot_widget, painter, width: float, height: float) -> Non
             vb_rect = viewbox.sceneBoundingRect()
             target = QRectF(
                 (vb_rect.x() - scene_rect.x()) * factor,
-                (vb_rect.y() - scene_rect.y()) * factor,
+                head * factor + (vb_rect.y() - scene_rect.y()) * factor,
                 vb_rect.width() * factor,
                 vb_rect.height() * factor,
             )
@@ -203,12 +217,22 @@ def _plot_export_paint(plot_widget, painter, width: float, height: float) -> Non
             finally:
                 viewbox.setVisible(viewbox_visible)
 
-            # 3. The image colour legend lives beside the plot in a widget of
-            #    its own, outside the plot scene.
+            # 3. A wrapped legend row (if any) is a widget above the plot;
+            #    the image colour legend lives beside it in a widget of its
+            #    own, outside the plot scene.
+            if top is not None:
+                painter.save()
+                try:
+                    painter.scale(factor, factor)
+                    top.render(painter, QPoint(0, 0))
+                finally:
+                    painter.restore()
             if legend is not None:
                 painter.save()
                 try:
-                    painter.translate(plot_rect.width() + gap * factor, 0.0)
+                    painter.translate(
+                        plot_rect.width() + gap * factor, head * factor
+                    )
                     painter.scale(factor, factor)
                     legend.render(painter, QPoint(0, 0))
                 finally:

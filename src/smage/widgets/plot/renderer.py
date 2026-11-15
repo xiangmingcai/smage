@@ -380,6 +380,53 @@ def _figure_update_cursor_readout(plot_widget, scene_pos) -> None:
     setter("  ".join(parts))
 
 
+def _image_filter_fraction_for_rect(mask_ent, manifest, rect, shape):
+    """Filter-mask coverage for a raster that has no pooled `frac` yet.
+
+    Most image channels come from the normal pyramid path, which already
+    returns a pooled mask fraction.  Unmixed, segmentation, Gate2Col,
+    Feature Up, dimension-reduction, cluster and data-clean rasters come from
+    their own saved pyramids, so they need the filter mask here — otherwise
+    switching to such a channel silently draws the unfiltered image.
+    """
+    import numpy as np
+
+    if mask_ent is None or not shape:
+        return None
+    height, width = int(shape[0]), int(shape[1])
+    if height <= 0 or width <= 0:
+        return None
+    xmin = float(manifest["xmin"])
+    ymin = float(manifest["ymin"])
+    levels = mask_ent.get("levels") or {}
+    if levels:
+        cell = float(rect.width()) / float(width)
+        block = int(round(cell))
+        if block >= 1 and abs(cell - block) < 1e-6 and block in levels:
+            level = levels[block]
+            i0 = max(0, int(round((float(rect.left()) - xmin) / block)))
+            j0 = max(0, int(round((float(rect.top()) - ymin) / block)))
+            crop = level[j0:j0 + height, i0:i0 + width]
+            if crop.shape == (height, width):
+                return crop
+    mask2d = mask_ent.get("mask_2d")
+    if mask2d is None:
+        return None
+    xs = float(rect.left()) + (
+        np.arange(width, dtype="float64") + 0.5
+    ) * float(rect.width()) / width
+    ys = float(rect.top()) + (
+        np.arange(height, dtype="float64") + 0.5
+    ) * float(rect.height()) / height
+    qi = np.clip(
+        np.floor(xs - xmin).astype(np.int64), 0, mask2d.shape[1] - 1
+    )
+    qj = np.clip(
+        np.floor(ys - ymin).astype(np.int64), 0, mask2d.shape[0] - 1
+    )
+    return mask2d[np.ix_(qj, qi)].astype("float64")
+
+
 def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, row_mask=None) -> None:
     """Render an Image plot as a raster (LOD pyramid), ImageJ-style.
 
@@ -501,6 +548,7 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                 worker.request(
                     key, parquet_path, gates, f.get("gate_id"),
                     stages, base_columns, height, width, blocks,
+                    origin=(manifest["xmin"], manifest["ymin"]),
                 )
             plot_widget.setTitle("Applying filter…", color="#b58900", size="10pt")
             return
@@ -564,6 +612,10 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
     # Mask columns exposed by an upstream Segmentation module are not part
     # of the image index; they are rasterised straight from the mask file.
     seg_cols = ctx._seg_applied_columns(task_id, parquet_path) if task_id else {}
+    # Converted Region channels come from their own 0/1 mask parquet.
+    region_cols = (
+        ctx._region_applied_columns(task_id, parquet_path) if task_id else {}
+    )
     # Gate2Col 0/1 columns likewise come from their own image parquet.
     g2c_cols = ctx._gate2col_applied_columns(task_id, parquet_path) if task_id else {}
     # Feature Up mapped columns likewise come from their own image parquet.
@@ -600,6 +652,19 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
             hi = float(chan.max()) if chan.size else 1.0
             if hi <= lo:
                 hi = lo + 1.0
+            frac = None
+            raster_stages = None
+            cname = None
+        elif channel in region_cols:
+            rec = region_cols[channel]
+            chan, rect = ctx._region_channel_raster(
+                rec, (x0, x1, y0, y1), spacing
+            )
+            if chan is None:
+                unavailable.append(channel)
+                continue
+            lo = 0.0
+            hi = 1.0
             frac = None
             raster_stages = None
             cname = None
@@ -766,6 +831,14 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
             if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
                 lo = float(np.nanmin(chan))
                 hi = float(np.nanmax(chan))
+        if frac is None and mask_ent is not None:
+            # Channels rastered from another saved pyramid (Unmix,
+            # Segmentation, Gate2Col, Feature Up, DimRed, Cluster, Data
+            # Clean) do not return a mask fraction; sample the filter here so
+            # a channel switch cannot turn a filtered image into a full one.
+            frac = _image_filter_fraction_for_rect(
+                mask_ent, manifest, rect, getattr(chan, "shape", None)
+            )
         # Scale is a display transform: apply it to the raster (and to the
         # automatic range) without touching the stored data.
         configs = display_configs(channel)

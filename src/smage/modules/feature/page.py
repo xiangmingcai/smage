@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -962,6 +963,225 @@ def _feat_sync_feature_rule(ctx, page) -> None:
         rule["name"] = feature or ""
 
 
+def _feat_unique_rule_name(base: str, used: set) -> str:
+    """A new-column name that does not collide with an existing one."""
+    base = (base or "value").strip() or "value"
+    if base not in used:
+        return base
+    index = 1
+    while f"{base}_{index}" in used:
+        index += 1
+    return f"{base}_{index}"
+
+
+class _FeatureBatchDialog(QDialog):
+    """Method, range and name suffix shared by a batch of new rules."""
+
+    def __init__(self, parent, channels, existing_names) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add batch rules")
+        self.resize(440, 300)
+        self._channels = list(channels)
+        self._existing = set(existing_names)
+        self._auto_suffix = True
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        lay.addWidget(QLabel(
+            f"<b>{len(self._channels)} channel(s)</b> will get one rule each."
+        ))
+
+        method_row = QHBoxLayout()
+        method_row.addWidget(QLabel("Method"))
+        self.method = _NoWheelComboBox()
+        for label, key in FEATURE_METHODS:
+            if key in ("count", "feature"):
+                continue
+            self.method.addItem(label, key)
+        idx = self.method.findData("mean")
+        self.method.setCurrentIndex(max(0, idx))
+        method_row.addWidget(self.method, 1)
+        lay.addLayout(method_row)
+
+        perc_row = QHBoxLayout()
+        perc_row.addWidget(QLabel("Percentile"))
+        self.perc = _NoWheelSpinBox()
+        self.perc.setRange(0, 100)
+        self.perc.setValue(50)
+        self.perc.setFixedWidth(90)
+        self.perc.setToolTip(
+            "Used only when Method is Percentile."
+        )
+        self.perc.setEnabled(False)
+        perc_row.addWidget(self.perc)
+        perc_row.addStretch()
+        lay.addLayout(perc_row)
+
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("Range (% per class)"))
+        self.lo = _NoWheelSpinBox()
+        self.lo.setRange(0, 100)
+        self.lo.setValue(0)
+        self.hi = _NoWheelSpinBox()
+        self.hi.setRange(0, 100)
+        self.hi.setValue(100)
+        range_row.addWidget(self.lo)
+        range_row.addWidget(QLabel("–"))
+        range_row.addWidget(self.hi)
+        range_row.addStretch()
+        lay.addLayout(range_row)
+
+        suffix_row = QHBoxLayout()
+        suffix_row.addWidget(QLabel("Name suffix"))
+        self.suffix = QLineEdit()
+        self.suffix.setPlaceholderText("mean")
+        suffix_row.addWidget(self.suffix, 1)
+        lay.addLayout(suffix_row)
+        hint = QLabel(
+            "Each new column is named <channel>_<suffix>. Leave the suffix "
+            "empty to use the channel name itself; collisions get _1, _2, …"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785; font-size: 8pt;")
+        lay.addWidget(hint)
+
+        self.preview = QLabel("")
+        self.preview.setWordWrap(True)
+        self.preview.setStyleSheet("color: #5a6673;")
+        lay.addWidget(self.preview, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        add = QPushButton("Add")
+        add.setDefault(True)
+        add.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(add)
+        lay.addLayout(buttons)
+
+        self.method.currentIndexChanged.connect(lambda _=0: self._refresh())
+        self.perc.valueChanged.connect(lambda _=0: self._refresh())
+        self.suffix.textEdited.connect(self._suffix_edited)
+        self._refresh()
+
+    def _default_suffix(self) -> str:
+        method = self.method.currentData() or "mean"
+        if method == "percentile":
+            return f"p{int(self.perc.value())}"
+        return str(method)
+
+    def _suffix_edited(self, _text) -> None:
+        self._auto_suffix = False
+        self._update_preview()
+
+    def _clean_suffix(self) -> str:
+        return self.suffix.text().strip().lstrip("_")
+
+    def _refresh(self) -> None:
+        self.perc.setEnabled(
+            self.method.currentData() == "percentile"
+        )
+        if self._auto_suffix:
+            self.suffix.setText(self._default_suffix())
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        suffix = self._clean_suffix()
+        names = [
+            f"{channel}_{suffix}" if suffix else str(channel)
+            for channel in self._channels
+        ]
+        used = set(self._existing)
+        unique = []
+        for name in names:
+            name = _feat_unique_rule_name(name, used)
+            used.add(name)
+            unique.append(name)
+        shown = ", ".join(unique[:4])
+        if len(unique) > 4:
+            shown += f", … (+{len(unique) - 4})"
+        self.preview.setText("New columns: " + (shown or "—"))
+
+    def accept(self) -> None:
+        lo = int(self.lo.value())
+        hi = int(self.hi.value())
+        if not (0 <= lo < hi <= 100):
+            QMessageBox.information(
+                self, "Add batch rules",
+                "The range must satisfy 0 ≤ from < to ≤ 100.",
+            )
+            return
+        method = self.method.currentData() or "mean"
+        if method == "percentile" and not (
+            0 <= int(self.perc.value()) <= 100
+        ):
+            QMessageBox.information(
+                self, "Add batch rules",
+                "The percentile must be 0–100.",
+            )
+            return
+        super().accept()
+
+    def values(self) -> dict:
+        return {
+            "method": self.method.currentData() or "mean",
+            "lo": int(self.lo.value()),
+            "hi": int(self.hi.value()),
+            "perc": int(self.perc.value()),
+            "suffix": self._clean_suffix(),
+        }
+
+
+def _feat_add_batch_rules(ctx, page) -> None:
+    """Pick several channels, then add one identical rule for each."""
+    columns = sorted(
+        str(column)
+        for column in _feat_common_columns(ctx, page)
+    )
+    if not columns:
+        QMessageBox.information(
+            ctx.host, "Add batch rules",
+            "Choose the Feature channel and data files first.",
+        )
+        return
+    chosen = _widgets_picker._pick_items_dialog(
+        ctx, "Add batch rules", columns, [], "Filter channels…"
+    )
+    if not chosen:
+        return
+    rules = page._feat_params.setdefault("rules", [])
+    used = {
+        (rule.get("name") or "").strip()
+        for rule in rules
+    }
+    used.add(str(page._feat_params.get("feature") or ""))
+    dialog = _FeatureBatchDialog(ctx.host, chosen, used)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return
+    settings = dialog.values()
+    for channel in chosen:
+        suffix = settings["suffix"]
+        base = f"{channel}_{suffix}" if suffix else str(channel)
+        name = _feat_unique_rule_name(base, used)
+        used.add(name)
+        rules.append({
+            "source": channel,
+            "method": settings["method"],
+            "lo": settings["lo"],
+            "hi": settings["hi"],
+            "perc": (
+                settings["perc"]
+                if settings["method"] == "percentile" else None
+            ),
+            "name": name,
+        })
+    _feat_refresh_rules(ctx, page)
+    _feat_mark_dirty(ctx, page)
+
+
 def _feat_rules_panel(ctx, page) -> QWidget:
     """Right panel: the 4-column aggregation rules table."""
     panel = _widgets_panels._build_panel_frame(ctx)
@@ -990,7 +1210,10 @@ def _feat_rules_panel(ctx, page) -> QWidget:
         "0–100 means all points (e.g. 0–30 = dimmest 30%, 90–100 = "
         "brightest 10%). The Count row always uses all points. The Feature "
         "row keeps the feature channel as the identifier column; delete "
-        "it to leave that column out."
+        "it to leave that column out.\n\n"
+        "Mode: the most frequent value in each class, after the range "
+        "filter. When several values occur equally often, the smallest "
+        "value is used."
     )
     note.setWordWrap(True)
     note.setStyleSheet("color: #6b7785;")
@@ -1000,11 +1223,20 @@ def _feat_rules_panel(ctx, page) -> QWidget:
     add_btn = QPushButton("Add")
     add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     add_btn.setEnabled(not page._feat_locked)
+    batch_btn = QPushButton("Add batch")
+    batch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    batch_btn.setEnabled(not page._feat_locked)
+    batch_btn.setToolTip(
+        "Add rules for several channels with the same method, range and "
+        "name suffix."
+    )
     del_btn = QPushButton("Delete")
     del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     del_btn.setEnabled(not page._feat_locked)
     btns.addWidget(add_btn)
+    btns.addWidget(batch_btn)
     btns.addWidget(del_btn)
+    page._feat_add_batch_btn = batch_btn
     btns.addStretch()
     lay.addLayout(btns)
 
@@ -1045,6 +1277,9 @@ def _feat_rules_panel(ctx, page) -> QWidget:
         _feat_mark_dirty(ctx, page)
 
     add_btn.clicked.connect(lambda _=False: on_add())
+    batch_btn.clicked.connect(
+        lambda _=False: _feat_add_batch_rules(ctx, page)
+    )
     del_btn.clicked.connect(lambda _=False: on_delete())
     calc_btn.clicked.connect(lambda _=False: _feat_calculate(ctx, page))
     return panel
@@ -1626,6 +1861,7 @@ FEATURE_METHODS = [
     ("Min", "min"),
     ("Mean", "mean"),
     ("Median", "median"),
+    ("Mode", "mode"),
     ("Percentile", "percentile"),
 ]
 

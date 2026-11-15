@@ -13,6 +13,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QColor,
     QFont,
     QFontMetrics,
@@ -62,6 +63,7 @@ from smage.core.settings import (
     _plot_background,
 )
 from smage.data.image_index import _build_image_index_files
+from smage.runlog import runlog
 from smage.widgets.colormap import _figure_colormap
 from smage.widgets.controls import (
     _NoWheelComboBox,
@@ -81,6 +83,7 @@ from uuid import uuid4
 import copy
 import hashlib
 import json
+import math
 import pyqtgraph as pg
 import threading
 from functools import partial
@@ -88,10 +91,12 @@ from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
+from smage.widgets import canvas_export as _widgets_canvas_export
 from smage.widgets import colormap as _widgets_colormap
 from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
+from smage.widgets.plot import export as _widgets_plot_export
 
 
 def _unmix_output_names(ctx, task_id, parquet_path) -> list:
@@ -129,6 +134,42 @@ def _unmix_flow_config(ctx, task_def) -> dict | None:
     enabled = set(settings.get("enabled") or [])
     columns = [p for p in settings.get("params", []) if p in enabled]
     stat = settings.get("stat", "median")
+    if (params.get("signature_source") or "spectra") == "manual":
+        # A pasted matrix replaces the spectra-built one.  Its column order
+        # is kept; only the channel set must match the spectrum selection.
+        manual = params.get("manual_matrix") or {}
+        pasted_columns = [str(c) for c in manual.get("columns") or []]
+        if not pasted_columns or set(pasted_columns) != set(columns):
+            ctx._unmix_flow_cache[task_id] = False
+            return None
+        names = []
+        rows = []
+        for row in manual.get("rows") or []:
+            values = list(row.get("values") or [])
+            if len(values) != len(pasted_columns):
+                continue
+            array = np.asarray(values, dtype="float64")
+            if not np.all(np.isfinite(array)):
+                continue
+            name = str(row.get("name") or "").strip()
+            if not name or name in names:
+                ctx._unmix_flow_cache[task_id] = False
+                return None
+            names.append(name)
+            rows.append(array.tolist())
+        if not rows:
+            ctx._unmix_flow_cache[task_id] = False
+            return None
+        config = {
+            "task_id": task_id,
+            "names": names,
+            "columns": pasted_columns,
+            "matrix": np.asarray(rows, dtype="float64"),
+            "method": params.get("method", "ols"),
+            "samples": set(params.get("samples") or []),
+        }
+        ctx._unmix_flow_cache[task_id] = config
+        return config
     spectra = {s["id"]: s for s in params.get("spectra", [])}
     names = []
     rows = []
@@ -238,6 +279,14 @@ def _build_unmix_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._unmix_params.setdefault("method", "ols")
     page._unmix_params.setdefault("trees", [])
     page._unmix_params.setdefault("next_spectrum_no", 1)
+    # Both signature sources are kept, so switching modes loses nothing.
+    page._unmix_params.setdefault("signature_source", "spectra")
+    manual = page._unmix_params.setdefault("manual_matrix", {})
+    if not isinstance(manual, dict):
+        manual = {}
+        page._unmix_params["manual_matrix"] = manual
+    manual.setdefault("columns", [])
+    manual.setdefault("rows", [])
     spectrum_cfg = page._unmix_params.setdefault("spectrum_settings", {})
     spectrum_cfg.setdefault("params", [])
     spectrum_cfg.setdefault("enabled", None)
@@ -268,6 +317,14 @@ def _build_unmix_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._unmix_sig_order_timer.timeout.connect(
         lambda: _unmix_signature_reordered(ctx, page)
     )
+    page._unmix_manual_order_timer = QTimer(ctx.host)
+    page._unmix_manual_order_timer.setSingleShot(True)
+    page._unmix_manual_order_timer.setInterval(200)
+    page._unmix_manual_order_timer.timeout.connect(
+        lambda: _unmix_manual_reordered(ctx, page)
+    )
+    page._unmix_manual_editing = False
+    page._unmix_manual_bad_cells = set()
     page._unmix_matrix = page._unmix_params["matrix"]
     if "samples" not in page._unmix_params:
         page._unmix_params["samples"] = [
@@ -289,7 +346,7 @@ def _build_unmix_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     _unmix_restore_trees(ctx, page)
     _unmix_rebuild_spectrum_list(ctx, page)
     _unmix_rebuild_spectrum_settings(ctx, page)
-    _unmix_rebuild_signature_table(ctx, page)
+    _unmix_rebuild_signature_tables(ctx, page)
     _unmix_rebuild_sample_list(ctx, page)
     _unmix_refresh_matrix_views(ctx, page)
     active_spectrum = page._unmix_params.get("active_spectrum")
@@ -406,6 +463,7 @@ def _unmix_spectrum_area(ctx, page) -> QWidget:
     })
     plot_lay.addWidget(spectrum_plot, 1)
     page._unmix_spectrum_plot = spectrum_plot
+    _unmix_plot_export_setup(ctx, page, spectrum_plot, "Unmix spectrum")
 
     row.addWidget(settings_panel, 1)
     row.addWidget(list_panel, 1)
@@ -617,6 +675,7 @@ def _unmix_apply_parameter_order(ctx, page, new_order) -> None:
         current[slot] = name
     cfg["params"] = current
     _unmix_render_spectrum_plot(ctx, page)
+    _unmix_update_manual_summary(ctx, page)
     _unmix_mark_dirty(ctx, page)
 
 
@@ -788,13 +847,18 @@ def _unmix_start_image(ctx, page) -> None:
             "Select at least one sample under “Samples to be unmixed”.",
         )
         return
+    problem = _unmix_manual_problem(ctx, page)
+    if problem:
+        QMessageBox.information(ctx.host, "Unmix for image", problem)
+        return
     # The matrix that gets applied is the saved one.
     _unmix_save_now(ctx, page)
     config = _unmix_flow_config(ctx, page._unmix_task_def)
     if config is None:
         QMessageBox.information(
             ctx.host, "Unmix for image",
-            "Add at least one complete signature to the matrix first.",
+            _unmix_manual_problem(ctx, page)
+            or "Add at least one complete signature to the matrix first.",
         )
         return
     page._unmix_running = True
@@ -1696,6 +1760,7 @@ def _unmix_edit_spectrum_parameters(ctx, page) -> None:
     cfg["enabled"] = [p for p in cfg.get("params", []) if p in chosen_set]
     _unmix_rebuild_spectrum_settings(ctx, page)
     _unmix_render_spectrum_plot(ctx, page)
+    _unmix_update_manual_summary(ctx, page)
     _unmix_mark_dirty(ctx, page)
 
 
@@ -1779,7 +1844,15 @@ def _unmix_matrix_tab_page(ctx, page) -> QWidget:
     )
     label.setAlignment(Qt.AlignmentFlag.AlignCenter)
     label.setStyleSheet("background: #ffffff; color: #888888;")
-    label.setText("Add a signature to build the matrix.")
+    label.setText(_unmix_empty_matrix_text(
+        page,
+        "Add a signature to build the matrix.",
+        "Paste a matrix to build the matrix.",
+    ))
+    label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    label.customContextMenuRequested.connect(
+        lambda pos: _unmix_heatmap_menu(ctx, page, "matrix", pos)
+    )
     scroll.setWidget(label)
     page._unmix_matrix_label = label
     page._unmix_matrix_image = None
@@ -1818,6 +1891,9 @@ def _unmix_curve_tab_page(ctx, page) -> QWidget:
     page._unmix_curve_legend = legend
     page._unmix_curve_legend_lay = legend_lay
     page._unmix_curve_plot = plot
+    # The signature names sit in a widget above the plot; keep them in exports.
+    plot._export_top_widget = legend
+    _unmix_plot_export_setup(ctx, page, plot, "Unmix signature curves")
     return host
 
 
@@ -1832,7 +1908,15 @@ def _unmix_similarity_tab_page(ctx, page) -> QWidget:
     )
     label.setAlignment(Qt.AlignmentFlag.AlignCenter)
     label.setStyleSheet("background: #ffffff; color: #888888;")
-    label.setText("Add at least two signatures to compare them.")
+    label.setText(_unmix_empty_matrix_text(
+        page,
+        "Add at least two signatures to compare them.",
+        "Paste at least two signatures to compare them.",
+    ))
+    label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    label.customContextMenuRequested.connect(
+        lambda pos: _unmix_heatmap_menu(ctx, page, "similarity", pos)
+    )
     scroll.setWidget(label)
     page._unmix_similarity_label = label
     page._unmix_similarity_image = None
@@ -2037,7 +2121,7 @@ def _unmix_curve_settings_content(ctx, page, lay) -> None:
     lay.addLayout(row)
 
     lay.addWidget(QLabel("Signatures (tick to draw)"))
-    rows = list(getattr(page, "_unmix_matrix", []) or [])
+    rows = _unmix_active_rows(page)
     if not rows:
         hint = QLabel("Add a signature to give it a colour.")
         hint.setStyleSheet("color: #6b7785;")
@@ -2253,7 +2337,7 @@ def _unmix_copy_matrix(ctx, page) -> None:
     for row, values in rows:
         cells = [str(row.get("name", ""))]
         cells += [
-            f"{v:.4f}" if np.isfinite(v) else "" for v in values
+            f"{v:.1f}" if np.isfinite(v) else "" for v in values
         ]
         lines.append("\t".join(cells))
     QApplication.clipboard().setText("\n".join(lines))
@@ -2267,6 +2351,39 @@ def _unmix_signature_panel(ctx, page) -> QWidget:
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
     lay.addWidget(QLabel("<b>Signatures</b>"))
+
+    mode_row = QHBoxLayout()
+    mode_row.addWidget(QLabel("Signature source"))
+    mode_combo = _NoWheelComboBox()
+    mode_combo.addItem("From spectra", "spectra")
+    mode_combo.addItem("Manual input", "manual")
+    source = page._unmix_params.get("signature_source") or "spectra"
+    index = mode_combo.findData(source)
+    mode_combo.setCurrentIndex(max(0, index))
+    mode_combo.setEnabled(not page._unmix_locked)
+    mode_row.addWidget(mode_combo, 1)
+    lay.addLayout(mode_row)
+
+    stack = QStackedWidget()
+    stack.addWidget(_unmix_spectra_signature_page(ctx, page))
+    stack.addWidget(_unmix_manual_signature_page(ctx, page))
+    stack.setCurrentIndex(1 if source == "manual" else 0)
+    lay.addWidget(stack, 1)
+
+    page._unmix_signature_mode_combo = mode_combo
+    page._unmix_signature_stack = stack
+    mode_combo.currentIndexChanged.connect(
+        lambda _=0: _unmix_on_signature_source(ctx, page)
+    )
+    return panel
+
+
+def _unmix_spectra_signature_page(ctx, page) -> QWidget:
+    """Add signature + the four-column spectra editor."""
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
 
     add_btn = QPushButton("Add signature")
     add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2313,7 +2430,56 @@ def _unmix_signature_panel(ctx, page) -> QWidget:
     )
     page._unmix_signature_table = table
     lay.addWidget(table, 1)
-    return panel
+    return host
+
+
+def _unmix_manual_signature_page(ctx, page) -> QWidget:
+    """Paste a matrix copied from another Unmix module; cells stay editable."""
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
+
+    top = QHBoxLayout()
+    paste_btn = QPushButton("Paste matrix")
+    paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    paste_btn.setEnabled(not page._unmix_locked)
+    paste_btn.clicked.connect(
+        lambda _=False: _unmix_paste_manual_matrix(ctx, page)
+    )
+    top.addWidget(paste_btn)
+    top.addStretch()
+    info = QLabel("")
+    info.setStyleSheet("color: #6b7785; font-size: 8pt;")
+    top.addWidget(info)
+    lay.addLayout(top)
+
+    hint = QLabel(
+        "Copy a matrix with Copy matrix in another Unmix module, then paste "
+        "it here. Every cell stays editable."
+    )
+    hint.setWordWrap(True)
+    hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+    lay.addWidget(hint)
+
+    table = QTableWidget()
+    table.setStyleSheet(
+        "QTableWidget { background: #ffffff; border: none; }"
+    )
+    table.verticalHeader().setDefaultSectionSize(28)
+    table.verticalHeader().setSectionsMovable(True)
+    table.verticalHeader().sectionMoved.connect(
+        lambda *_: page._unmix_manual_order_timer.start()
+    )
+    table.itemChanged.connect(
+        lambda item: _unmix_on_manual_cell(ctx, page, item)
+    )
+    page._unmix_manual_table = table
+    page._unmix_manual_info = info
+    page._unmix_manual_hint = hint
+    page._unmix_paste_btn = paste_btn
+    lay.addWidget(table, 1)
+    return host
 
 
 def _unmix_sample_panel(ctx, page) -> QWidget:
@@ -2596,6 +2762,395 @@ def _unmix_remove_signature(ctx, page, index: int) -> None:
         _unmix_mark_dirty(ctx, page, data=False)
 
 
+def _unmix_empty_matrix_text(page, spectra_text: str,
+                             manual_text: str) -> str:
+    """Empty-state wording for the active signature source."""
+    return manual_text if _unmix_signature_source(page) == "manual" else spectra_text
+
+
+def _unmix_manual_data(page) -> dict:
+    """The stored manual matrix (``columns`` + ``rows``)."""
+    manual = page._unmix_params.get("manual_matrix")
+    if not isinstance(manual, dict):
+        manual = {}
+        page._unmix_params["manual_matrix"] = manual
+    manual.setdefault("columns", [])
+    manual.setdefault("rows", [])
+    return manual
+
+
+def _unmix_signature_source(page) -> str:
+    source = str(page._unmix_params.get("signature_source") or "spectra")
+    return "manual" if source == "manual" else "spectra"
+
+
+def _unmix_active_rows(page) -> list:
+    """Signature rows of the active source (spectra or pasted manual)."""
+    if _unmix_signature_source(page) == "manual":
+        return list(_unmix_manual_data(page).get("rows") or [])
+    return list(getattr(page, "_unmix_matrix", []) or [])
+
+
+def _unmix_manual_cell_text(value) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(number):
+        return ""
+    return f"{number:.10g}"
+
+
+def _unmix_rebuild_signature_tables(ctx, page) -> None:
+    """Rebuild both editors; only the active one is shown."""
+    _unmix_rebuild_signature_table(ctx, page)
+    _unmix_rebuild_manual_table(ctx, page)
+
+
+def _unmix_rebuild_manual_table(ctx, page) -> None:
+    """(Re)build the editable paste table from ``manual_matrix``."""
+    table = getattr(page, "_unmix_manual_table", None)
+    if table is None:
+        return
+    manual = _unmix_manual_data(page)
+    columns = [str(c) for c in manual.get("columns") or []]
+    rows = list(manual.get("rows") or [])
+    editable = not page._unmix_locked
+    flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+    if editable:
+        flags |= Qt.ItemFlag.ItemIsEditable
+    page._unmix_manual_editing = True
+    page._unmix_manual_bad_cells = set()
+    try:
+        table.clear()
+        table.setColumnCount(len(columns) + 1)
+        table.setHorizontalHeaderLabels(["Signature"] + columns)
+        table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            texts = [str(row.get("name") or "")]
+            texts += [
+                _unmix_manual_cell_text(value)
+                for value in (row.get("values") or [])
+            ]
+            for c, text in enumerate(texts):
+                item = QTableWidgetItem(text)
+                item.setFlags(flags)
+                item.setTextAlignment(
+                    (Qt.AlignmentFlag.AlignLeft if c == 0
+                     else Qt.AlignmentFlag.AlignRight)
+                    | Qt.AlignmentFlag.AlignVCenter
+                )
+                table.setItem(r, c, item)
+        header = table.horizontalHeader()
+        metrics = QFontMetrics(table.font())
+        space = max(1, metrics.horizontalAdvance(" "))
+        header.setStretchLastSection(False)
+        for c in range(len(columns) + 1):
+            # Interactive: the user can drag any divider to widen a column.
+            header.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(0, space * 20)
+        for c in range(1, len(columns) + 1):
+            table.setColumnWidth(c, space * 5)
+        table.setVerticalHeaderLabels([str(i + 1) for i in range(len(rows))])
+        table.resizeRowsToContents()
+    finally:
+        page._unmix_manual_editing = False
+    _unmix_update_manual_summary(ctx, page)
+
+
+def _unmix_manual_channel_mismatch(ctx, page) -> tuple[list, list]:
+    """(missing, extra) channels between the pasted matrix and the selection."""
+    columns = [str(c) for c in _unmix_manual_data(page).get("columns") or []]
+    current = _unmix_selected_parameters(ctx, page)
+    column_set = set(columns)
+    current_set = set(current)
+    missing = [c for c in current if c not in column_set]
+    extra = [c for c in columns if c not in current_set]
+    return missing, extra
+
+
+def _unmix_update_manual_summary(ctx, page) -> None:
+    info = getattr(page, "_unmix_manual_info", None)
+    if info is None:
+        return
+    manual = _unmix_manual_data(page)
+    columns = list(manual.get("columns") or [])
+    rows = list(manual.get("rows") or [])
+    if not rows:
+        info.setText("No matrix pasted")
+        info.setStyleSheet("color: #6b7785; font-size: 8pt;")
+        return
+    problems = []
+    missing, extra = _unmix_manual_channel_mismatch(ctx, page)
+    if missing:
+        problems.append("missing: " + ", ".join(missing))
+    if extra:
+        problems.append("not selected: " + ", ".join(extra))
+    names = [str(r.get("name") or "") for r in rows]
+    if any(not name.strip() for name in names):
+        problems.append("empty signature name")
+    if len(set(names)) != len(names):
+        problems.append("duplicate signature name")
+    if getattr(page, "_unmix_manual_bad_cells", None):
+        problems.append("invalid number")
+    if problems:
+        info.setText(
+            f"{len(rows)} × {len(columns)} · " + "; ".join(problems)
+        )
+        info.setStyleSheet("color: #b58900; font-size: 8pt;")
+    else:
+        info.setText(f"{len(rows)} signatures × {len(columns)} channels")
+        info.setStyleSheet("color: #6b7785; font-size: 8pt;")
+
+
+def _unmix_manual_problem(ctx, page) -> str:
+    """A user-facing reason the manual matrix cannot be used, or ""."""
+    if _unmix_signature_source(page) != "manual":
+        return ""
+    manual = _unmix_manual_data(page)
+    columns = list(manual.get("columns") or [])
+    rows = list(manual.get("rows") or [])
+    if not rows or not columns:
+        return "Paste a matrix copied with Copy matrix first."
+    missing, extra = _unmix_manual_channel_mismatch(ctx, page)
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("missing: " + ", ".join(missing))
+        if extra:
+            parts.append("not selected: " + ", ".join(extra))
+        return (
+            "The pasted matrix does not match the selected channels ("
+            + "; ".join(parts) + ")."
+        )
+    names = [str(row.get("name") or "").strip() for row in rows]
+    if any(not name for name in names):
+        return "Every pasted signature needs a name."
+    if len(set(names)) != len(names):
+        return "Signature names must be unique."
+    if getattr(page, "_unmix_manual_bad_cells", None):
+        return "Fix the highlighted cells before unmixing."
+    for number, row in enumerate(rows, start=2):
+        values = list(row.get("values") or [])
+        if len(values) != len(columns):
+            return f"Row {number} does not match the pasted columns."
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(value)
+            for value in values
+        ):
+            return f"Row {number} has a missing or invalid value."
+    return ""
+
+
+def _unmix_on_signature_source(ctx, page) -> None:
+    """Switch between spectra-built signatures and a pasted matrix."""
+    combo = getattr(page, "_unmix_signature_mode_combo", None)
+    if combo is None:
+        return
+    if page._unmix_locked:
+        combo.blockSignals(True)
+        combo.setCurrentIndex(max(
+            0, combo.findData(
+                page._unmix_params.get("signature_source") or "spectra"
+            )
+        ))
+        combo.blockSignals(False)
+        return
+    source = combo.currentData() or "spectra"
+    if source not in ("spectra", "manual"):
+        source = "spectra"
+    page._unmix_params["signature_source"] = source
+    stack = getattr(page, "_unmix_signature_stack", None)
+    if stack is not None:
+        stack.setCurrentIndex(1 if source == "manual" else 0)
+    if source == "manual":
+        _unmix_rebuild_manual_table(ctx, page)
+    else:
+        _unmix_rebuild_signature_table(ctx, page)
+    _unmix_rebuild_matrix_settings(ctx, page)
+    _unmix_refresh_matrix_views(ctx, page)
+    _unmix_mark_dirty(ctx, page, data=False)
+
+
+def _unmix_parse_matrix_text(ctx, page, text) -> tuple[dict | None, str]:
+    """Parse a TSV matrix copied with Copy matrix.
+
+    Returns ``(manual_matrix, "")`` or ``(None, reason)``.  The pasted
+    channel order is kept; only the channel *set* must match the spectrum
+    selection.
+    """
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = raw.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return None, "There is nothing on the clipboard."
+    table = [line.split("\t") for line in lines]
+    header = [cell.strip() for cell in table[0]]
+    if not header or header[0].strip().lower() != "signature":
+        return None, 'The first header cell must be "Signature".'
+    columns = header[1:]
+    if not columns:
+        return None, "The header has no channels."
+    repeated = sorted({c for c in columns if columns.count(c) > 1})
+    if repeated:
+        return None, (
+            "The header repeats channel(s): " + ", ".join(repeated)
+        )
+    expected = _unmix_selected_parameters(ctx, page)
+    if not expected:
+        return None, (
+            "Select the spectrum channels in Spectrum Extraction first."
+        )
+    expected_set = set(expected)
+    column_set = set(columns)
+    missing = [c for c in expected if c not in column_set]
+    extra = [c for c in columns if c not in expected_set]
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("missing: " + ", ".join(missing))
+        if extra:
+            parts.append("not selected: " + ", ".join(extra))
+        return None, (
+            "The matrix columns do not match the selected channels ("
+            + "; ".join(parts) + ")."
+        )
+    if len(table) < 2:
+        return None, "The matrix has no signature rows."
+    names = set()
+    rows = []
+    for number, cells in enumerate(table[1:], start=2):
+        if len(cells) != len(header):
+            return None, (
+                f"Row {number} has {len(cells)} column(s); "
+                f"expected {len(header)}."
+            )
+        name = cells[0].strip()
+        if not name:
+            return None, f"Row {number} has no signature name."
+        if name in names:
+            return None, f'The signature name "{name}" appears twice.'
+        names.add(name)
+        values = []
+        for index, cell in enumerate(cells[1:], start=1):
+            text_value = cell.strip()
+            if text_value == "":
+                return None, (
+                    f'Row {number}, channel "{header[index]}" is empty.'
+                )
+            try:
+                value = float(text_value)
+            except ValueError:
+                return None, (
+                    f'Row {number}, channel "{header[index]}" is not a '
+                    f'number: "{text_value}".'
+                )
+            if not math.isfinite(value):
+                return None, (
+                    f'Row {number}, channel "{header[index]}" is not a '
+                    "finite number."
+                )
+            values.append(value)
+        rows.append({
+            "id": f"manual-{uuid4().hex[:8]}",
+            "name": name,
+            "values": values,
+        })
+    return {"columns": list(columns), "rows": rows}, ""
+
+
+def _unmix_paste_manual_matrix(ctx, page) -> None:
+    """Replace the manual matrix with the clipboard's TSV matrix."""
+    if page._unmix_locked:
+        return
+    data, error = _unmix_parse_matrix_text(
+        ctx, page, QApplication.clipboard().text()
+    )
+    if error:
+        QMessageBox.warning(ctx.host, "Paste matrix", error)
+        return
+    page._unmix_params["manual_matrix"] = data
+    page._unmix_manual_bad_cells = set()
+    _unmix_rebuild_manual_table(ctx, page)
+    _unmix_rebuild_matrix_settings(ctx, page)
+    _unmix_refresh_matrix_views(ctx, page)
+    _unmix_mark_dirty(ctx, page, data=False)
+    ctx.statusBar().showMessage(
+        f"Pasted {len(data['rows'])} signature(s) × "
+        f"{len(data['columns'])} channel(s)"
+    )
+
+
+def _unmix_on_manual_cell(ctx, page, item) -> None:
+    """Write one edited cell back into the manual matrix."""
+    if getattr(page, "_unmix_manual_editing", False):
+        return
+    if page._unmix_locked or item is None:
+        return
+    manual = _unmix_manual_data(page)
+    rows = list(manual.get("rows") or [])
+    row_index = item.row()
+    column = item.column()
+    if not (0 <= row_index < len(rows)):
+        return
+    row = rows[row_index]
+    text = str(item.text() or "").strip()
+    bad = getattr(page, "_unmix_manual_bad_cells", None)
+    if bad is None:
+        bad = set()
+        page._unmix_manual_bad_cells = bad
+    if column == 0:
+        row["name"] = text
+        bad.discard((row_index, column))
+        item.setData(Qt.ItemDataRole.BackgroundRole, None)
+        # The curve settings list shows signature names.
+        _unmix_rebuild_matrix_settings(ctx, page)
+    else:
+        value_index = column - 1
+        try:
+            value = float(text)
+            if not math.isfinite(value):
+                raise ValueError
+        except ValueError:
+            bad.add((row_index, column))
+            item.setBackground(QBrush(QColor("#fde2e2")))
+            item.setToolTip("Enter a number")
+            _unmix_update_manual_summary(ctx, page)
+            return
+        values = row.setdefault("values", [])
+        while len(values) <= value_index:
+            values.append(float("nan"))
+        values[value_index] = value
+        bad.discard((row_index, column))
+        item.setData(Qt.ItemDataRole.BackgroundRole, None)
+        item.setToolTip("")
+    _unmix_update_manual_summary(ctx, page)
+    _unmix_refresh_matrix_views(ctx, page)
+    _unmix_mark_dirty(ctx, page, data=False)
+
+
+def _unmix_manual_reordered(ctx, page) -> None:
+    """Apply the visual row order of the pasted matrix to the model."""
+    if page._unmix_locked:
+        return
+    table = getattr(page, "_unmix_manual_table", None)
+    if table is None:
+        return
+    manual = _unmix_manual_data(page)
+    rows = list(manual.get("rows") or [])
+    count = len(rows)
+    order = sorted(
+        range(count), key=lambda i: table.verticalHeader().visualIndex(i)
+    )
+    if order == list(range(count)):
+        return
+    manual["rows"][:] = [rows[i] for i in order]
+    _unmix_rebuild_manual_table(ctx, page)
+    _unmix_refresh_matrix_views(ctx, page)
+    _unmix_mark_dirty(ctx, page, data=False)
+
+
 def _unmix_unique_signature_name(ctx, page, base: str) -> str:
     """A name that avoids other signatures and every data parameter name."""
     taken = {r.get("name") for r in page._unmix_matrix}
@@ -2708,6 +3263,16 @@ def _unmix_matrix_table_values(ctx, page):
     """Return (columns, [(row, values)]) for the signature matrix."""
     import numpy as np
 
+    if _unmix_signature_source(page) == "manual":
+        manual = _unmix_manual_data(page)
+        columns = [str(c) for c in manual.get("columns") or []]
+        rows = []
+        for row in manual.get("rows") or []:
+            values = list(row.get("values") or [])
+            if len(values) < len(columns):
+                values += [float("nan")] * (len(columns) - len(values))
+            rows.append((row, values[:len(columns)]))
+        return columns, rows
     columns = _unmix_selected_parameters(ctx, page)
     by_id = {s["id"]: s for s in page._unmix_spectra}
     result = []
@@ -2740,10 +3305,8 @@ def _unmix_matrix_table_values(ctx, page):
     return columns, result
 
 
-def _unmix_paint_matrix_image(ctx, page, row_names, columns, values_rows, cfg, lo, hi, decimals):
-    """Paint a labelled cell grid: row names left, channel names rotated below."""
-    import numpy as np
-
+def _unmix_matrix_paint_spec(page, row_names, columns, cfg) -> dict:
+    """Font and geometry shared by the on-screen image and the exports."""
     label = getattr(page, "_unmix_matrix_label", None)
     base_font = label.font() if label is not None else QFont()
     cell_w = max(12, int(cfg["cell_width"]))
@@ -2751,19 +3314,32 @@ def _unmix_paint_matrix_image(ctx, page, row_names, columns, values_rows, cfg, l
     font = QFont(base_font)
     font.setPixelSize(max(9, min(13, cell_h // 2 + 2)))
     metrics = QFontMetrics(font)
-
     left = max((metrics.horizontalAdvance(n) for n in row_names), default=0)
     bottom = max((metrics.horizontalAdvance(c) for c in columns), default=0)
     left += 12
     bottom += 12
     top = 8
     right = 8
-    width = left + cell_w * len(columns) + right
-    height = top + cell_h * len(values_rows) + bottom
+    return {
+        "cell_w": cell_w, "cell_h": cell_h,
+        "font": font, "metrics": metrics,
+        "left": left, "top": top, "right": right,
+        "width": left + cell_w * len(columns) + right,
+        "height": top + cell_h * len(row_names) + bottom,
+    }
 
-    image = QImage(width, height, QImage.Format.Format_ARGB32)
-    image.fill(QColor("#ffffff"))
-    painter = QPainter(image)
+
+def _unmix_paint_matrix(painter, row_names, columns, values_rows, cfg,
+                        lo, hi, decimals, spec) -> None:
+    """Paint a labelled cell grid: row names left, channel names rotated below."""
+    import numpy as np
+
+    cell_w = spec["cell_w"]
+    cell_h = spec["cell_h"]
+    left = spec["left"]
+    top = spec["top"]
+    font = spec["font"]
+    metrics = spec["metrics"]
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
     painter.setFont(font)
 
@@ -2818,7 +3394,21 @@ def _unmix_paint_matrix_image(ctx, page, row_names, columns, values_rows, cfg, l
         painter.setPen(QColor("#333333"))
         painter.drawText(0, 0, name)
         painter.restore()
-    painter.end()
+
+
+def _unmix_paint_matrix_image(ctx, page, row_names, columns, values_rows, cfg, lo, hi, decimals):
+    """Render the matrix grid into a QImage for the on-screen label."""
+    spec = _unmix_matrix_paint_spec(page, row_names, columns, cfg)
+    image = QImage(spec["width"], spec["height"], QImage.Format.Format_ARGB32)
+    image.fill(QColor("#ffffff"))
+    painter = QPainter(image)
+    try:
+        _unmix_paint_matrix(
+            painter, row_names, columns, values_rows, cfg, lo, hi, decimals,
+            spec,
+        )
+    finally:
+        painter.end()
     return image
 
 
@@ -2832,7 +3422,11 @@ def _unmix_render_matrix(ctx, page) -> None:
         page._unmix_matrix_image = None
         label.clear()
         label.setText(
-            "Add a signature to build the matrix."
+            _unmix_empty_matrix_text(
+                page,
+                "Add a signature to build the matrix.",
+                "Paste a matrix to build the matrix.",
+            )
             if not rows
             else "No parameters selected."
         )
@@ -2878,7 +3472,11 @@ def _unmix_render_curve(ctx, page) -> None:
     columns, rows = _unmix_matrix_table_values(ctx, page)
     if not rows or not columns:
         item.setTitle(
-            "Add a signature to build the curves.",
+            _unmix_empty_matrix_text(
+                page,
+                "Add a signature to build the curves.",
+                "Paste a matrix to build the curves.",
+            ),
             color="#888888", size="10pt",
         )
         return
@@ -2940,8 +3538,16 @@ def _unmix_render_similarity(ctx, page) -> None:
         page._unmix_similarity_image = None
         label.clear()
         label.setText(
-            "Add at least two signatures to compare them."
-            if names else "Add a signature to build the matrix."
+            _unmix_empty_matrix_text(
+                page,
+                "Add at least two signatures to compare them.",
+                "Paste at least two signatures to compare them.",
+            )
+            if names else _unmix_empty_matrix_text(
+                page,
+                "Add a signature to build the matrix.",
+                "Paste a matrix to build the matrix.",
+            )
         )
         return
     cfg = dict(_unmix_matrix_cfg(ctx, page, "similarity"))
@@ -2957,6 +3563,148 @@ def _unmix_render_similarity(ctx, page) -> None:
     label.setText("")
     label.setPixmap(QPixmap.fromImage(image))
     label.resize(image.size())
+
+
+def _unmix_heatmap_export_payload(ctx, page, key) -> dict | None:
+    """Everything needed to repaint one matrix heatmap for export."""
+    import numpy as np
+
+    zoom = float(getattr(page, "_unmix_matrix_zoom", 1.0) or 1.0)
+
+    def prepared(cfg):
+        cfg = dict(cfg)
+        cfg["cell_width"] = max(8, int(round(cfg["cell_width"] * zoom)))
+        cfg["cell_height"] = max(8, int(round(cfg["cell_height"] * zoom)))
+        return cfg
+
+    if key == "similarity":
+        names, matrix = _unmix_similarity_values(ctx, page)
+        if len(names) < 2:
+            return None
+        return {
+            "row_names": list(names),
+            "columns": list(names),
+            "values_rows": [list(row) for row in matrix],
+            "cfg": prepared(_unmix_matrix_cfg(ctx, page, "similarity")),
+            "lo": -1.0, "hi": 1.0, "decimals": 2,
+        }
+    columns, rows = _unmix_matrix_table_values(ctx, page)
+    if not rows or not columns:
+        return None
+    finite = [v for _row, values in rows for v in values if np.isfinite(v)]
+    return {
+        "row_names": [row.get("name", "") for row, _values in rows],
+        "columns": list(columns),
+        "values_rows": [values for _row, values in rows],
+        "cfg": prepared(_unmix_matrix_cfg(ctx, page, "matrix")),
+        "lo": min(finite) if finite else 0.0,
+        "hi": max(finite) if finite else 0.0,
+        "decimals": int(page._unmix_spectrum_cfg.get("decimals", 2)),
+    }
+
+
+def _unmix_heatmap_export_name(key: str) -> str:
+    return (
+        "Unmix similarity matrix" if key == "similarity"
+        else "Unmix signature matrix"
+    )
+
+
+def _unmix_save_heatmap_as(ctx, page, key: str) -> None:
+    """Save one matrix heatmap as currently shown."""
+    payload = _unmix_heatmap_export_payload(ctx, page, key)
+    if payload is None:
+        return
+    spec = _unmix_matrix_paint_spec(
+        page, payload["row_names"], payload["columns"], payload["cfg"]
+    )
+
+    def paint(painter):
+        _unmix_paint_matrix(
+            painter, payload["row_names"], payload["columns"],
+            payload["values_rows"], payload["cfg"],
+            payload["lo"], payload["hi"], payload["decimals"], spec,
+        )
+
+    try:
+        path = _widgets_canvas_export._painter_export_save(
+            paint, spec["width"], spec["height"], ctx.host,
+            _unmix_heatmap_export_name(key), "Save Heatmap As",
+        )
+    except Exception as exc:  # noqa: BLE001 - report, never break the page
+        runlog.info("unmix.export_failed", error=str(exc))
+        QMessageBox.critical(
+            ctx.host, "Save Heatmap As",
+            f"Could not save the heatmap:\n{exc}",
+        )
+        return
+    if path:
+        runlog.info("unmix.export", path=str(path))
+        ctx.statusBar().showMessage(f"Heatmap saved to {path}", 4000)
+
+
+def _unmix_heatmap_menu(ctx, page, key: str, pos) -> None:
+    """Right-click menu of the matrix / similarity heatmap: Save as… only."""
+    label = (
+        page._unmix_similarity_label if key == "similarity"
+        else page._unmix_matrix_label
+    )
+    image = (
+        page._unmix_similarity_image if key == "similarity"
+        else page._unmix_matrix_image
+    )
+    if label is None or image is None:
+        return
+    menu = QMenu(ctx.host)
+    save_as = menu.addAction("Save as…")
+    save_as.setToolTip(
+        "Save the heatmap as currently shown: a PDF with editable text and "
+        "vector cells, or a PNG/JPEG image"
+    )
+    chosen = menu.exec(label.mapToGlobal(pos))
+    if chosen is save_as:
+        _unmix_save_heatmap_as(ctx, page, key)
+
+
+def _unmix_plot_export_setup(ctx, page, plot, suggested_name: str) -> None:
+    """Give a pyqtgraph plot a right-click Save as… menu."""
+    item = plot.getPlotItem()
+    item.setMenuEnabled(False)
+    try:
+        item.getViewBox().setMenuEnabled(False)
+    except Exception:  # noqa: BLE001 - older pyqtgraph lacks the setter
+        pass
+    plot.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    plot.customContextMenuRequested.connect(
+        lambda pos: _unmix_plot_menu(ctx, page, plot, pos, suggested_name)
+    )
+
+
+def _unmix_plot_menu(ctx, page, plot, pos, suggested_name: str) -> None:
+    """Right-click menu of the spectrum / curve plot: Save as… only."""
+    menu = QMenu(ctx.host)
+    save_as = menu.addAction("Save as…")
+    save_as.setToolTip(
+        "Save the plot as currently shown: an editable PDF with vector axes "
+        "and text, or a PNG/JPEG image"
+    )
+    chosen = menu.exec(plot.mapToGlobal(pos))
+    if chosen is not save_as:
+        return
+    try:
+        path = _widgets_plot_export._plot_export_save(
+            plot, ctx.host, suggested_name
+        )
+    except Exception as exc:  # noqa: BLE001 - report, never break the page
+        runlog.info("unmix.export_failed", error=str(exc))
+        QMessageBox.critical(
+            ctx.host, "Save Plot As",
+            f"Could not save the plot:\n{exc}",
+        )
+        return
+    if path:
+        runlog.info("unmix.export", path=str(path))
+        ctx.statusBar().showMessage(f"Plot saved to {path}", 4000)
 
 
 def _unmix_zoom_matrix(ctx, page, factor, pos=None) -> None:

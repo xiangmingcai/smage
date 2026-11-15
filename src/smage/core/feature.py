@@ -99,7 +99,31 @@ def _feature_aggregate_frame(df, feature, rules, count_name, key_name=None):
             keep = (series >= q_lo) & (series <= q_hi)
             values_in_range = series.where(keep)
         sub = values_in_range.groupby(df[feature], sort=True)
-        if method == "percentile":
+        if method == "mode":
+            # Most frequent value per class.  Ties take the smallest value,
+            # matching the Background ignore ordering.
+            valid = values_in_range.dropna()
+            if valid.empty:
+                agg = pd.Series(index=out.index, dtype="float64")
+            else:
+                counts = (
+                    pd.DataFrame({
+                        feature: df.loc[valid.index, feature],
+                        "__value": valid,
+                    })
+                    .groupby([feature, "__value"], sort=True)
+                    .size()
+                    .reset_index(name="__count")
+                )
+                counts = counts.sort_values(
+                    [feature, "__count", "__value"],
+                    ascending=[True, False, True],
+                )
+                chosen = counts.drop_duplicates(
+                    subset=[feature], keep="first"
+                )
+                agg = chosen.set_index(feature)["__value"]
+        elif method == "percentile":
             agg = sub.quantile(float(rule.get("perc") or 50.0) / 100.0)
         elif method == "sum":
             agg = sub.sum(min_count=1)

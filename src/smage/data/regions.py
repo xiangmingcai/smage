@@ -1,12 +1,19 @@
-"""Region module state and Region → gate adapters (Qt-free).
+"""Region module state and Region channel adapters (Qt-free).
 
 A Region module keeps its internal detection gates and the Region tree in
-``Module/<id>/regions.json``.  Downstream modules treat every Region as a
-spatial gate: the union of its sub-region polygons on the current file.
+``Module/<id>/regions.json``.  A Region can be converted to a 0/1 channel:
+one ``[x, y, mask]`` parquet plus an index pyramid per file, exposed to
+downstream modules as a normal channel.  Regions are no longer exposed as
+spatial gates downstream.
+
+The earlier per-Region spatial-gate helpers remain for the module's own
+detection code and tests, but ``_gating_gates_for`` no longer returns them.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from pathlib import Path
 
 from smage.core.region_detection import region_parts_pixel_count
@@ -78,6 +85,9 @@ def _region_store_save(ctx, task_def, store: dict) -> None:
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
+    # Downstream adapters must see the file that was just written, not a
+    # cached copy from before this save.
+    ctx._region_store_cache = {}
     cache = getattr(ctx, "_region_store_cache", None)
     if cache is not None:
         cache.pop(str(path), None)
@@ -305,6 +315,178 @@ def _region_image_gate_mask(ctx, task_id, parquet_path, gates, gate_id,
     if mask is None:
         return None
     return np.asarray(mask, dtype=bool).reshape(height, width)
+
+
+# ---------------------------------------------------------------------------
+# Region channels (converted 0/1 masks exposed downstream as normal channels)
+# ---------------------------------------------------------------------------
+
+def _region_channel_entry(params: dict, region_id, create: bool = False):
+    """The channel record of one Region inside a task's params."""
+    channels = params.get("channels")
+    if not isinstance(channels, dict):
+        if not create:
+            return None
+        channels = {}
+        params["channels"] = channels
+    key = str(region_id)
+    entry = channels.get(key)
+    if not isinstance(entry, dict):
+        if not create:
+            return None
+        entry = {"downstream_visible": False, "files": {}}
+        channels[key] = entry
+    entry.setdefault("downstream_visible", False)
+    files = entry.get("files")
+    if not isinstance(files, dict):
+        entry["files"] = {}
+    return entry
+
+
+def _region_channel_file(ctx, rec) -> Path | None:
+    """Absolute path of a converted channel record, or None if missing."""
+    if not isinstance(rec, dict) or ctx.project is None:
+        return None
+    rel = rec.get("path")
+    if not rel:
+        return None
+    path = ctx.project.path / rel
+    return path if path.is_file() else None
+
+
+def _region_channel_signature(path) -> str:
+    """Cheap change signature (size + nanosecond mtime) for a channel file."""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return ""
+    return f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+
+
+def _region_geometry_signature(region, parquet_path) -> str:
+    """Hash of one Region's sub-regions on one file.
+
+    A change means the converted mask no longer matches the polygons.  The
+    mask and downstream visibility are kept until the user converts again;
+    this signature only drives the Status column.
+    """
+    sample = (region.get("samples") or {}).get(str(parquet_path)) or {}
+    # Only the rings affect the mask.  Show flags and Sub-region names do not,
+    # so renaming or hiding one must not mark the channel stale.
+    geometry = [
+        {"in": sub.get("in") or [], "out": sub.get("out") or []}
+        for sub in sample.get("sub_regions") or []
+    ]
+    payload = json.dumps(
+        geometry, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _region_write_channel(ctx, task_id, parquet_path, mask_2d,
+                          region_id) -> tuple[str, int, str]:
+    """Write one binary Region mask as a ``[x, y, mask]`` channel + pyramid.
+
+    Returns ``(relative_path, inside_pixels, file_signature)``.  The mask is
+    stored with 1 inside the Region and 0 outside, using the same label-index
+    format as Segmentation mask channels.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from smage.data import files as _data_files
+    from smage.data import image_index as _image_index
+
+    if ctx.project is None:
+        raise RuntimeError("no project")
+    ent = _image_index._ensure_image_index(ctx, parquet_path)
+    if ent is None or ent.get("manifest") is None:
+        raise RuntimeError("source image has no index")
+    man = ent["manifest"]
+    xmin = int(round(float(man["xmin"])))
+    ymin = int(round(float(man["ymin"])))
+    width = int(round(float(man["xmax"]) - float(man["xmin"]))) + 1
+    height = int(round(float(man["ymax"]) - float(man["ymin"]))) + 1
+    arr = np.asarray(mask_2d, dtype=np.uint8)
+    if arr.shape != (height, width):
+        raise RuntimeError(
+            f"mask shape {arr.shape} does not match the image ({height}, {width})"
+        )
+    stem = Path(str(parquet_path)).stem
+    stamp = str(time.time_ns())
+    rel = _data_files._module_rel(
+        ctx, task_id,
+        f"channels/{stem}_{str(region_id)[:8]}_{stamp}.parquet",
+    )
+    path = ctx.project.path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
+    yy = np.repeat(np.arange(height, dtype=np.int32), width) + ymin
+    pd.DataFrame({"x": xx, "y": yy, "mask": arr.ravel()}).to_parquet(
+        path, index=False
+    )
+    _image_index._build_label_index(
+        path, arr, xmin, xmin + width - 1, ymin, ymin + height - 1
+    )
+    return rel, int(arr.sum()), _region_channel_signature(path)
+
+
+def _region_channel_options(ctx, task_id) -> list:
+    """Converted + downstream-visible Regions upstream of ``task_id``.
+
+    Each entry holds the converted files and their per-file records; an
+    unconverted file is simply absent, so it becomes NA downstream.
+    """
+    out = []
+    if not task_id or ctx.project is None:
+        return out
+    from smage.data import files as _data_files
+
+    for task in _data_files._task_chain(ctx, task_id):
+        if task.get("id") == task_id or task.get("type") != "region":
+            continue
+        params = task.get("params") or {}
+        channels = params.get("channels") or {}
+        if not channels:
+            continue
+        store = _region_store_load(ctx, task)
+        by_id = {
+            str(region.get("id")): region
+            for region in store.get("regions") or []
+        }
+        module_name = str(task.get("name") or "Region")
+        for region_id, entry in channels.items():
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("downstream_visible"):
+                continue
+            region = by_id.get(str(region_id))
+            if region is None:
+                continue
+            files = {}
+            for file_key, rec in (entry.get("files") or {}).items():
+                if not isinstance(rec, dict):
+                    continue
+                path = _region_channel_file(ctx, rec)
+                if path is None:
+                    continue
+                if rec.get("signature") != _region_channel_signature(path):
+                    continue
+                files[str(file_key)] = {
+                    **rec, "abs_path": str(path),
+                }
+            if not files:
+                continue
+            out.append({
+                "key": f"{task.get('id')}|{region_id}",
+                "task_id": str(task.get("id")),
+                "module_name": module_name,
+                "region_id": str(region_id),
+                "name": str(region.get("name") or region_id),
+                "region": region,
+                "files": files,
+            })
+    return out
 
 
 def _clear_region_cache(ctx) -> None:

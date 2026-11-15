@@ -9,27 +9,30 @@ change the data that flows downstream.
 | Side | Contents |
 |---|---|
 | Left | Image files. |
-| Middle | Regions from every upstream [Region](region.md) module; **Calculate** at the bottom. |
+| Middle | Converted, downstream-visible Region channels from every upstream [Region](region.md) module; **Calculate** at the bottom. |
 | Right | The file × Region area table. |
 
-Regions from several upstream Region modules can be combined. If two
-selected Regions share a name, the column label is prefixed with the module
-name (`Module/Region`).
+Only Regions that were converted to a channel and ticked **Downstream
+visible** are listed. An unconverted Region, or one whose visibility is off,
+does not appear. Regions from several upstream Region modules can be
+combined. If two selected Regions share a name, the column label is prefixed
+with the module name (`Module/Region`).
 
 A new Region Size module starts with **no image files selected**. Use
 **Select files…** to choose them before pressing **Calculate**.
 
 ## Results
 
-- One row per selected file, one column per selected Region.
-- The value is the number of pixels inside the union of the Region's
-  sub-regions, after subtracting each sub-region's own `out` holes.
-  Overlapping sub-regions are counted once; a hole in one sub-region does not
-  subtract pixels belonging to another.
-- A file **without** a Sample for a Region shows **NA** (not 0).
-- A Sample with **no sub-regions** shows **0**.
-- Upstream row filtering (for example a Subsample module) is respected: only
-  rows visible at this module are counted.
+- One row per selected file, one column per selected Region channel.
+- The value is the number of pixels with mask value **1** in the Region's
+  converted channel. The mask is produced when the Region is converted, so
+  the table reflects the mask and not an on-the-fly polygon test.
+- A file **without** a converted mask for that Region shows **NA** (not 0).
+  This includes files on which the Region has no Sample.
+- A Sample with **no sub-regions** was converted to an all-zero mask and
+  shows **0**.
+- Region Size no longer reads pixel coordinates; the mask's stored inside
+  pixel count is used, so large files calculate quickly.
 
 The table is sorted by file name and Region name by default. Drag the row
 handle or a Region column header to change the order.

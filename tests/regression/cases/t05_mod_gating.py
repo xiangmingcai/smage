@@ -253,7 +253,7 @@ def image_polygon_not() -> None:
 
 @harness.case("mod.gating.polygon_not", "L4", "gating", tags=("fast",))
 def polygon_not_subset() -> None:
-    """A polygon NOT gate selects exactly the complement and keeps its shape."""
+    """A polygon NOT gate selects exactly the complement of the polygon."""
     window, _project, page = _open("gating_polygon_not")
     try:
         ctx = window._ctx
@@ -299,8 +299,12 @@ def polygon_not_subset() -> None:
         gating_page._gating_open_gate_subset(ctx, page, not_gate["id"])
         visible = gating_page._gating_visible_ids(ctx, page)
         harness.check(
-            polygon["id"] in visible,
-            "the source polygon stays visible in the NOT subset",
+            polygon["id"] not in visible,
+            "the source polygon is not drawn inside the NOT subset",
+        )
+        harness.check(
+            not visible,
+            "an empty NOT subset shows no gate outlines",
         )
     finally:
         _close(window)

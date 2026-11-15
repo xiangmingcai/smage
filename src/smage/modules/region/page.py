@@ -1,9 +1,10 @@
-"""Region module: detect and manage image regions (spatial gates)."""
+"""Region module: detect, edit and convert image regions to channels."""
 from __future__ import annotations
 
 import copy
 import math
 import queue
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QGraphicsPathItem,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QMessageBox,
@@ -85,6 +87,8 @@ _REGION_COLORS = [
 _GATE_PEN = "#2b6cb0"
 _GATE_SELECTED_PEN = "#e53935"
 _REGION_LOG_LIMIT = 2000
+# Above this many vertices, Edit boundary asks before building the handles.
+_REGION_ANCHOR_WARN_LIMIT = 100
 _REGION_DISPLAY_KEYS = (
     "show_axes",
     "show_axis_names",
@@ -211,8 +215,9 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     layout.addWidget(bar)
 
     notice = QLabel(
-        "Regions are spatial gates: their polygons live on the full image and "
-        "are available to modules below this one. Eyes only change the image."
+        "Regions can be converted to 0/1 channels for downstream modules. "
+        "Click Convert, then tick Downstream visible. Show only changes the "
+        "image overlay."
     )
     notice.setWordWrap(True)
     notice.setStyleSheet(
@@ -249,16 +254,21 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._region_detect.setdefault("method", "signal")
     page._region_detect.setdefault("files", list(page._region_detect_files))
     page._region_detect.setdefault("channel", None)
-    page._region_detect.setdefault("signal", {
-        "auto_threshold": True,
-        "threshold": 0.0,
-        "smooth": 1.0,
-        "expand": 2,
-        "fill_holes": True,
-        "fill_max_area": 0,
-        "min_area": 50,
-        "tolerance": 1.0,
-    })
+    signal_params = page._region_detect.setdefault("signal", {})
+    signal_params.setdefault("smooth", 1.0)
+    signal_params.setdefault("expand", 2)
+    signal_params.setdefault("fill_holes", True)
+    signal_params.setdefault("fill_max_area", 0)
+    signal_params.setdefault("min_area", 50)
+    signal_params.setdefault("tolerance", 1.0)
+    signal_params.setdefault("threshold", 0.0)
+    signal_params.setdefault("percentile", 30.0)
+    if "threshold_mode" not in signal_params:
+        # Projects saved before percentile mode stored a plain Auto flag.
+        signal_params["threshold_mode"] = (
+            "otsu" if signal_params.get("auto_threshold", True)
+            else "manual"
+        )
     page._region_detect.setdefault("sam", {
         "points_per_side": 32,
         "points_per_batch": 64,
@@ -275,12 +285,31 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._region_selected_region_id = None
     page._region_selected_sample = None
     page._region_selected_sub_id = None
+    # Every selected Sub-region: {"region": id, "sample": path, "sub": id}.
+    page._region_selected_subs = []
     page._region_gate_tool = None
     page._region_region_tool = None
     page._region_region_target = None
     page._region_gate_rois = {}
     page._region_overlay_items = []
     page._region_edit_rois = []
+    # Set only by the Region tree's "Edit boundary" action.  Selecting a
+    # Sub-region otherwise just highlights it; building anchor handles for a
+    # complex boundary is expensive and can freeze the window.
+    page._region_edit_boundary = None
+    page._region_channel_buttons = {}
+    page._region_channel_checks = {}
+    page._region_channel_state = None
+    page._region_channel_token = 0
+    # Records whose files are deleted only after the next successful save, so
+    # closing a module without saving cannot destroy a still-referenced mask.
+    page._region_channel_orphans = []
+    page._region_channel_worker = _RegionChannelWorker()
+    page._region_channel_timer = QTimer(page)
+    page._region_channel_timer.setInterval(120)
+    page._region_channel_timer.timeout.connect(
+        lambda: _region_poll_channel(ctx, page)
+    )
     page._region_overlay_file = None
     page._region_updating = False
     page._region_clipboard = None
@@ -337,9 +366,10 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     split.addWidget(middle)
     split.addWidget(right)
     split.setStretchFactor(0, 2)
-    split.setStretchFactor(1, 3)
-    split.setStretchFactor(2, 2)
-    split.setSizes([320, 480, 320])
+    split.setStretchFactor(1, 2)
+    split.setStretchFactor(2, 1)
+    split.setSizes([400, 400, 200])
+    page._region_main_ratio = (2, 2, 1)
     page._region_main_split = split
     cl.addWidget(split, 1)
     layout.addWidget(content, 1)
@@ -432,12 +462,31 @@ def _region_left_panel(ctx, page) -> QWidget:
     rl.setSpacing(4)
     rl.addWidget(QLabel("<b>Regions</b>"))
     region_tree = QTreeWidget()
-    region_tree.setColumnCount(2)
-    region_tree.setHeaderLabels(["Region", "Show"])
-    # Default 4:1 split between the name and its visibility checkbox.
-    region_tree.setColumnWidth(0, 240)
-    region_tree.setColumnWidth(1, 60)
-    region_tree.header().setStretchLastSection(False)
+    region_tree.setColumnCount(5)
+    region_tree.setHeaderLabels([
+        "Region", "Show", "Convert as channel", "Status",
+        "Downstream visible",
+    ])
+    # Shift and Ctrl select several Sub-regions for a combined highlight,
+    # copy or delete.
+    region_tree.setSelectionMode(
+        QAbstractItemView.SelectionMode.ExtendedSelection
+    )
+    region_tree.setSelectionBehavior(
+        QAbstractItemView.SelectionBehavior.SelectRows
+    )
+    region_tree.setColumnWidth(0, 190)
+    region_tree.setColumnWidth(1, 44)
+    region_tree.setColumnWidth(2, 118)
+    region_tree.setColumnWidth(3, 92)
+    region_tree.setColumnWidth(4, 112)
+    header = region_tree.header()
+    header.setStretchLastSection(False)
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    for _column in (1, 2, 3, 4):
+        header.setSectionResizeMode(
+            _column, QHeaderView.ResizeMode.Fixed
+        )
     region_tree.setStyleSheet(
         "QTreeWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
     )
@@ -461,9 +510,10 @@ def _region_left_panel(ctx, page) -> QWidget:
     page._region_add_btn = add_region
     left_split.addWidget(regions_panel)
     left_split.setStretchFactor(0, 1)
-    left_split.setStretchFactor(1, 2)
+    left_split.setStretchFactor(1, 1)
     left_split.setStretchFactor(2, 3)
-    left_split.setSizes([120, 240, 360])
+    left_split.setSizes([120, 120, 360])
+    page._region_left_ratio = (1, 1, 3)
     lay.addWidget(left_split, 1)
     return panel
 
@@ -551,6 +601,10 @@ def _region_middle_panel(ctx, page) -> QWidget:
         "left": _make_sci_axis("left"),
     })
     viewbox.setMouseEnabled(True, True)
+    # The Region image has no context-menu actions yet; remove pyqtgraph's
+    # built-in View All / Mouse Mode / Export menu from a right-click.
+    viewbox.setMenuEnabled(False)
+    plot_item.setMenuEnabled(False)
     plot_widget._gate_cache_data = True
     plot_item._on_fit = lambda: _region_fit_image(page)
     try:
@@ -1329,6 +1383,9 @@ def _region_clear_region_tool(page) -> None:
 
 
 def _region_set_gate_tool(ctx, page, key) -> None:
+    if getattr(page, "_region_edit_boundary", None):
+        page._region_edit_boundary = None
+        _region_clear_edit_rois(page)
     _region_clear_region_tool(page)
     active = page._region_gate_tool == key
     page._region_gate_tool = None if active else key
@@ -1345,6 +1402,10 @@ def _region_cancel_drawing(ctx, page) -> None:
     page._region_viewbox.set_gate_tool(None)
     for button in page._region_tool_buttons.values():
         button.setChecked(False)
+    if getattr(page, "_region_edit_boundary", None):
+        # Esc (or switching tools) also leaves boundary editing.
+        page._region_edit_boundary = None
+        _region_clear_edit_rois(page)
     _region_set_status(page, "")
 
 
@@ -1444,6 +1505,9 @@ def _region_set_region_tool(ctx, page, key) -> None:
     target = _region_region_tool_target(ctx, page, key)
     if target is None:
         return
+    if getattr(page, "_region_edit_boundary", None):
+        page._region_edit_boundary = None
+        _region_clear_edit_rois(page)
     _region_clear_region_tool(page)
     page._region_gate_tool = None
     page._region_region_tool = key
@@ -1747,8 +1811,12 @@ def _region_rebuild_region_tree(ctx, page) -> None:
     tree = page._region_tree
     tree.blockSignals(True)
     tree.clear()
+    page._region_channel_buttons = {}
+    page._region_channel_checks = {}
     for region in page._region_store.get("regions") or []:
-        item = QTreeWidgetItem([str(region.get("name") or "Region"), ""])
+        item = QTreeWidgetItem([
+            str(region.get("name") or "Region"), "", "", "", "",
+        ])
         item.setData(
             0, Qt.ItemDataRole.UserRole,
             ("region", str(region.get("id")), None, None),
@@ -1763,9 +1831,11 @@ def _region_rebuild_region_tree(ctx, page) -> None:
             else Qt.CheckState.Unchecked,
         )
         tree.addTopLevelItem(item)
+        _region_build_channel_cells(ctx, page, item, region)
         for sample_path, sample in (region.get("samples") or {}).items():
             sample_item = QTreeWidgetItem([
-                _region_file_name(ctx, sample_path, page._region_task_id), "",
+                _region_file_name(ctx, sample_path, page._region_task_id),
+                "", "", "", "",
             ])
             sample_item.setData(
                 0, Qt.ItemDataRole.UserRole,
@@ -1783,7 +1853,7 @@ def _region_rebuild_region_tree(ctx, page) -> None:
             item.addChild(sample_item)
             for sub in sample.get("sub_regions") or []:
                 sub_item = QTreeWidgetItem([
-                    str(sub.get("name") or "Sub-region"), "",
+                    str(sub.get("name") or "Sub-region"), "", "", "", "",
                 ])
                 sub_item.setData(
                     0, Qt.ItemDataRole.UserRole,
@@ -1835,8 +1905,434 @@ def _region_select_tree_item(ctx, page) -> None:
                         return
 
 
+def _region_channels_locked(ctx, page) -> bool:
+    """Conversion/visibility is off for a locked module or its draft copy."""
+    return bool(
+        page._region_locked
+        or str(page._region_task_id)
+        in getattr(ctx, "_draft_task_ids", ())
+    )
+
+
+def _region_channel_status(ctx, page, region) -> dict:
+    """Derive the Convert/Status/checkbox state of one Region."""
+    region_id = str(region.get("id"))
+    samples = [str(path) for path in (region.get("samples") or {})]
+    total = len(samples)
+    entry = (
+        ((page._region_params.get("channels") or {}).get(region_id))
+        or {}
+    )
+    records = entry.get("files") or {}
+    valid = 0
+    stale = 0
+    details = []
+    for path in samples:
+        rec = records.get(path)
+        channel_file = _data_regions._region_channel_file(ctx, rec)
+        name = _region_file_name(ctx, path, page._region_task_id)
+        if channel_file is None:
+            details.append(f"{name}: not converted")
+            continue
+        if rec.get("signature") != _data_regions._region_channel_signature(
+            channel_file
+        ):
+            details.append(f"{name}: channel file changed")
+            continue
+        valid += 1
+        if rec.get("region_signature") != (
+            _data_regions._region_geometry_signature(region, path)
+        ):
+            stale += 1
+            details.append(f"{name}: boundary changed")
+        else:
+            details.append(
+                f"{name}: {int(rec.get('pixels') or 0):,} px inside"
+            )
+    state = getattr(page, "_region_channel_state", None)
+    converting = bool(
+        state and str(state.get("region_id")) == region_id
+    )
+    error = str(entry.get("last_error") or "")
+    if converting:
+        text = (
+            f"Converting {int(state.get('done') or 0)}/"
+            f"{int(state.get('total') or total)}"
+        )
+        color = "#2b6cb0"
+    elif total == 0:
+        text, color = "No Samples", "#6b7785"
+    elif valid == 0 and error:
+        text, color = "Failed", "#c0392b"
+    elif valid == 0:
+        text, color = "Not converted", "#6b7785"
+    elif valid < total:
+        text, color = f"Partial ({valid}/{total})", "#b58900"
+    elif stale:
+        text, color = "Needs update", "#b58900"
+    else:
+        text, color = "Converted", "#2f855a"
+    if error:
+        details.append(error)
+    locked = _region_channels_locked(ctx, page)
+    can_convert = bool(not locked and total > 0 and not converting)
+    checkbox_enabled = bool(
+        not locked and total > 0 and valid == total and not converting
+    )
+    return {
+        "text": text,
+        "color": color,
+        "tooltip": "\n".join(details) or "No Samples",
+        "button_text": "Reconvert" if valid else "Convert",
+        "button_enabled": can_convert,
+        "checkbox_enabled": checkbox_enabled,
+        "visible": bool(entry.get("downstream_visible")),
+        "valid": valid,
+        "total": total,
+        "stale": stale,
+    }
+
+
+def _region_build_channel_cells(ctx, page, item, region) -> None:
+    """Add the Convert button, Status and Downstream visible controls."""
+    status = _region_channel_status(ctx, page, region)
+    region_id = str(region.get("id"))
+    button = QPushButton(status["button_text"])
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    button.setEnabled(status["button_enabled"])
+    button.setToolTip(
+        "Write this Region as a 0/1 channel for every file that has a Sample."
+    )
+    button.clicked.connect(
+        lambda _=False, rid=region_id: _region_convert_channel(
+            ctx, page, rid
+        )
+    )
+    page._region_tree.setItemWidget(item, 2, button)
+    page._region_channel_buttons[region_id] = button
+
+    item.setText(3, status["text"])
+    item.setToolTip(3, status["tooltip"])
+    item.setForeground(3, QBrush(QColor(status["color"])))
+
+    check = QCheckBox()
+    check.setChecked(status["visible"])
+    check.setEnabled(status["checkbox_enabled"])
+    check.setToolTip(
+        "Expose this converted Region to downstream modules as a channel."
+    )
+    check.setStyleSheet("margin-left: 14px;")
+    check.toggled.connect(
+        lambda checked, rid=region_id: _region_set_downstream_visible(
+            ctx, page, rid, checked
+        )
+    )
+    page._region_tree.setItemWidget(item, 4, check)
+    page._region_channel_checks[region_id] = check
+
+
+def _region_set_downstream_visible(ctx, page, region_id, checked) -> None:
+    if _region_channels_locked(ctx, page):
+        return
+    region = _region_region_by_id(page, region_id)
+    if region is None:
+        return
+    status = _region_channel_status(ctx, page, region)
+    if checked and not status["checkbox_enabled"]:
+        check = page._region_channel_checks.get(str(region_id))
+        if check is not None:
+            check.blockSignals(True)
+            check.setChecked(not checked)
+            check.blockSignals(False)
+        return
+    entry = _data_regions._region_channel_entry(
+        page._region_params, region_id, create=True
+    )
+    if entry is None:
+        return
+    entry["downstream_visible"] = bool(checked)
+    _region_save_now(ctx, page)
+    _region_log(
+        ctx, page,
+        f"Region '{region.get('name')}' downstream visible = "
+        f"{'yes' if checked else 'no'}.",
+    )
+
+
+def _region_delete_channel_record(ctx, rec) -> None:
+    """Delete one converted channel parquet and its index pyramid."""
+    if not isinstance(rec, dict) or ctx.project is None:
+        return
+    rel = rec.get("path")
+    if not rel:
+        return
+    path = ctx.project.path / rel
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    shutil.rmtree(Path(str(path) + ".imgidx"), ignore_errors=True)
+
+
+def _region_delete_channel_entry(ctx, entry) -> None:
+    if not isinstance(entry, dict):
+        return
+    for rec in (entry.get("files") or {}).values():
+        _region_delete_channel_record(ctx, rec)
+
+
+def _region_walk_tasks(tasks):
+    for task in tasks:
+        yield task
+        yield from _region_walk_tasks(task.get("children") or [])
+
+
+def _region_channel_names_in_use(ctx) -> set:
+    """Every channel name visible in any module's data files.
+
+    Also includes the names of converted Region channels, so two Regions in
+    different modules cannot publish the same downstream channel name.
+    """
+    names = set()
+    if ctx.project is None:
+        return names
+    tasks = list(_region_walk_tasks(ctx.project.workflow.get("tasks") or []))
+    for task in tasks:
+        task_id = task.get("id")
+        try:
+            records = ctx._available_files(task_id)
+        except Exception:  # noqa: BLE001
+            records = []
+        for rec in records:
+            path = rec.get("parquet")
+            if not path:
+                continue
+            try:
+                names.update(
+                    str(column)
+                    for column in ctx._columns_for(path, task_id)
+                )
+            except Exception:  # noqa: BLE001
+                continue
+    for task in tasks:
+        if task.get("type") != "region":
+            continue
+        channels = (task.get("params") or {}).get("channels") or {}
+        if not channels:
+            continue
+        store = _data_regions._region_store_load(ctx, task)
+        by_id = {
+            str(region.get("id")): region
+            for region in store.get("regions") or []
+        }
+        for region_id, entry in channels.items():
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("downstream_visible"):
+                continue
+            region = by_id.get(str(region_id))
+            if region is not None:
+                names.add(str(region.get("name") or region_id))
+    return names
+
+
+def _region_channel_name_conflict(ctx, page, name) -> bool:
+    name = str(name or "").strip()
+    if not name:
+        return False
+    return name in _region_channel_names_in_use(ctx)
+
+
+def _region_free_region_name(ctx, page, base, exclude_id=None) -> str:
+    """A Region name that collides with no Region or channel name."""
+    base = str(base or "Region").strip() or "Region"
+    used = _region_channel_names_in_use(ctx)
+    region_names = {
+        str(region.get("name") or "")
+        for region in page._region_store.get("regions") or []
+        if str(region.get("id")) != str(exclude_id or "")
+    }
+    candidate = base
+    index = 1
+    while candidate in used or candidate in region_names:
+        index += 1
+        candidate = f"{base} {index}"
+    return candidate
+
+
+def _region_convert_channel(ctx, page, region_id) -> None:
+    """Convert one Region to 0/1 channels on all files it has a Sample on."""
+    if _region_channels_locked(ctx, page):
+        return
+    if getattr(page, "_region_channel_state", None):
+        QMessageBox.information(
+            ctx.host, "Convert Region",
+            "A Region conversion is already running.",
+        )
+        return
+    region = _region_region_by_id(page, region_id)
+    if region is None:
+        return
+    samples = [str(path) for path in (region.get("samples") or {})]
+    name = str(region.get("name") or region_id)
+    if not samples:
+        QMessageBox.information(
+            ctx.host, "Convert Region",
+            "This Region has no Samples to convert.",
+        )
+        return
+    entry = _data_regions._region_channel_entry(
+        page._region_params, region_id
+    )
+    already_visible = bool(entry and entry.get("downstream_visible"))
+    if not already_visible and _region_channel_name_conflict(
+        ctx, page, name
+    ):
+        QMessageBox.warning(
+            ctx.host, "Convert Region",
+            f"'{name}' is already a channel name in one of the data files. "
+            "Rename the Region first.",
+        )
+        _region_log(
+            ctx, page,
+            f"✗ Region '{name}' was not converted: its name is already a "
+            "channel in a data file.",
+        )
+        return
+    # Persist the tree first so the geometry signatures match what is drawn.
+    _region_save_now(ctx, page)
+    jobs = []
+    for path in samples:
+        parts = _data_regions._region_parts(region, path)
+        jobs.append({
+            "path": path,
+            "parts": list(parts or []),
+            "region_signature": (
+                _data_regions._region_geometry_signature(region, path)
+            ),
+        })
+    page._region_channel_token += 1
+    token = page._region_channel_token
+    page._region_channel_state = {
+        "token": token,
+        "region_id": str(region_id),
+        "name": name,
+        "total": len(jobs),
+        "done": 0,
+        "records": {},
+        "errors": {},
+    }
+    _region_log(
+        ctx, page,
+        f"===== Convert Region '{name}' as channel — {len(jobs)} file(s) =====",
+    )
+    page._region_channel_worker.request(
+        token, ctx, page._region_task_id, str(region_id), jobs
+    )
+    page._region_channel_timer.start()
+    # Do not rebuild the tree from inside the Convert button's click signal:
+    # the rebuild deletes that button.  Refresh on the next event-loop turn.
+    QTimer.singleShot(
+        0, lambda: _region_rebuild_region_tree(ctx, page)
+    )
+
+
+def _region_poll_channel(ctx, page) -> None:
+    state = getattr(page, "_region_channel_state", None)
+    if not state:
+        page._region_channel_timer.stop()
+        return
+    finished = False
+    for message in page._region_channel_worker.poll():
+        if not message:
+            continue
+        kind = message[0]
+        token = message[1] if len(message) > 1 else None
+        if token != state["token"]:
+            continue
+        if kind == "file":
+            _, _token, path, record, error, seconds = message[:6]
+            name = _region_file_name(
+                ctx, path, page._region_task_id
+            )
+            state["done"] = int(state.get("done") or 0) + 1
+            if error:
+                state["errors"][str(path)] = str(error)
+                _region_log(ctx, page, f"✗ {name}: {error}")
+            else:
+                state["records"][str(path)] = record
+                pixels = int((record or {}).get("pixels") or 0)
+                _region_log(
+                    ctx, page,
+                    f"{name}: {pixels:,} px inside — "
+                    f"{float(seconds):.2f} s",
+                )
+            _region_rebuild_region_tree(ctx, page)
+        elif kind == "done":
+            finished = True
+    if finished:
+        page._region_channel_timer.stop()
+        _region_finish_channel(ctx, page)
+
+
+def _region_finish_channel(ctx, page) -> None:
+    state = page._region_channel_state
+    page._region_channel_state = None
+    if not state:
+        return
+    region_id = str(state.get("region_id"))
+    entry = _data_regions._region_channel_entry(
+        page._region_params, region_id, create=True
+    )
+    if entry is not None:
+        old_files = dict(entry.get("files") or {})
+        files = dict(old_files)
+        files.update(state.get("records") or {})
+        region = _region_region_by_id(page, region_id)
+        samples = (
+            {str(path) for path in (region.get("samples") or {})}
+            if region is not None else set()
+        )
+        entry["files"] = {
+            path: record for path, record in files.items()
+            if path in samples
+        }
+        for path, old_record in old_files.items():
+            new_record = entry["files"].get(path)
+            if (
+                isinstance(new_record, dict)
+                and new_record.get("path") == old_record.get("path")
+            ):
+                continue
+            if isinstance(old_record, dict):
+                page._region_channel_orphans.append(old_record)
+        errors = state.get("errors") or {}
+        entry["last_error"] = (
+            "; ".join(
+                f"{Path(str(path)).name}: {message}"
+                for path, message in list(errors.items())[:3]
+            ) if errors else ""
+        )
+    errors = state.get("errors") or {}
+    if errors:
+        _region_log(
+            ctx, page,
+            f"✗ Region '{state.get('name')}' conversion finished with "
+            f"{len(errors)} error(s).",
+        )
+    else:
+        _region_log(
+            ctx, page,
+            f"✓ Region '{state.get('name')}' converted "
+            f"({len(state.get('records') or {})} file(s)).",
+        )
+    _region_save_now(ctx, page)
+    _region_rebuild_region_tree(ctx, page)
+
+
 def _region_on_region_selection(ctx, page) -> None:
-    item = page._region_tree.currentItem()
+    tree = page._region_tree
+    item = tree.currentItem()
     key = _region_item_key(item)
     if not key:
         return
@@ -1846,6 +2342,21 @@ def _region_on_region_selection(ctx, page) -> None:
     page._region_selected_region_id = region_id
     page._region_selected_sample = sample_path
     page._region_selected_sub_id = sub_id
+    selected_subs = {}
+    for selected in tree.selectedItems():
+        skey = _region_item_key(selected)
+        if not skey or skey[0] != "sub":
+            continue
+        entry = (str(skey[1]), str(skey[2]), str(skey[3]))
+        selected_subs[entry] = {
+            "region": entry[0], "sample": entry[1], "sub": entry[2],
+        }
+    if kind == "sub":
+        entry = (str(region_id), str(sample_path), str(sub_id))
+        selected_subs.setdefault(entry, {
+            "region": entry[0], "sample": entry[1], "sub": entry[2],
+        })
+    page._region_selected_subs = list(selected_subs.values())
     if sample_path:
         _region_switch_file(ctx, page, sample_path)
     _region_style_panel_from_selection(ctx, page)
@@ -1883,6 +2394,13 @@ def _region_on_region_item_changed(ctx, page, item, column) -> None:
             page._region_selected_sub_id = (
                 sub_id if kind == "sub" else None
             )
+            page._region_selected_subs = (
+                [{
+                    "region": str(region_id),
+                    "sample": str(sample_path),
+                    "sub": str(sub_id),
+                }] if kind == "sub" else []
+            )
             if page._region_preview.get("file") != sample_path:
                 _region_switch_file(ctx, page, sample_path)
             _region_style_panel_from_selection(ctx, page)
@@ -1892,8 +2410,26 @@ def _region_on_region_item_changed(ctx, page, item, column) -> None:
     if column == 0:
         name = item.text(0).strip()
         if kind == "region":
+            old_name = str(region.get("name") or "Region")
             name = name or "Region"
-            name = _region_unique_name(page._region_store, name, region_id)
+            other_names = {
+                str(other.get("name") or "")
+                for other in page._region_store.get("regions") or []
+                if str(other.get("id")) != str(region_id)
+            }
+            if name != old_name and (
+                name in other_names
+                or _region_channel_name_conflict(ctx, page, name)
+            ):
+                QMessageBox.warning(
+                    ctx.host, "Rename Region",
+                    f"'{name}' is already used as a Region or channel name. "
+                    "Choose another name.",
+                )
+                page._region_tree.blockSignals(True)
+                item.setText(0, old_name)
+                page._region_tree.blockSignals(False)
+                return
             region["name"] = name
             item.setText(0, name)
         elif kind == "sub":
@@ -1923,50 +2459,179 @@ def _region_selected_region(page):
     return _region_region_by_id(page, page._region_selected_region_id)
 
 
+def _region_prune_edit_boundary(page, path=None) -> None:
+    """Drop the edit state when the selection or preview file moved away."""
+    edit = getattr(page, "_region_edit_boundary", None)
+    if not edit:
+        return
+    current_file = (
+        path if path is not None else page._region_preview.get("file")
+    )
+    if (
+        str(edit.get("region")) != str(page._region_selected_region_id or "")
+        or str(edit.get("sample")) != str(page._region_selected_sample or "")
+        or str(edit.get("sub")) != str(page._region_selected_sub_id or "")
+        or str(edit.get("sample")) != str(current_file or "")
+        or len(getattr(page, "_region_selected_subs", None) or []) > 1
+    ):
+        page._region_edit_boundary = None
+
+
+def _region_editing_sub(page, path):
+    """The Sub-region whose anchors are shown, if Edit boundary was used."""
+    edit = getattr(page, "_region_edit_boundary", None)
+    if not edit or str(edit.get("sample")) != str(path or ""):
+        return None
+    region = _region_selected_region(page)
+    if region is None or not region.get("visible", True):
+        return None
+    sample = (region.get("samples") or {}).get(path)
+    if sample is None or not sample.get("visible", True):
+        return None
+    sub = _region_sub_by_id(region, path, edit.get("sub"))
+    if sub is None or not sub.get("visible", True):
+        return None
+    return sub
+
+
+def _region_start_edit_boundary(ctx, page, key) -> None:
+    """Show anchor handles for one Sub-region, after an Edit boundary menu."""
+    kind, region_id, sample_path, sub_id = key
+    if kind != "sub":
+        return
+    region = _region_region_by_id(page, region_id)
+    sub = _region_sub_by_id(region, sample_path, sub_id)
+    if sub is None:
+        return
+    if page._region_gate_tool or page._region_region_tool:
+        _region_cancel_drawing(ctx, page)
+    # Select and show the Sub-region first, so the handles appear on the
+    # right file.  Selecting it alone only highlights the boundary.
+    page._region_selected_region_id = str(region_id)
+    page._region_selected_sample = str(sample_path)
+    page._region_selected_sub_id = str(sub_id)
+    page._region_edit_boundary = None
+    if page._region_preview.get("file") != sample_path:
+        _region_switch_file(ctx, page, sample_path)
+    _region_rebuild_region_tree(ctx, page)
+    _region_style_panel_from_selection(ctx, page)
+
+    anchors = sum(
+        len(ring)
+        for kind_name in ("in", "out")
+        for ring in (sub.get(kind_name) or [])
+    )
+    if anchors > _REGION_ANCHOR_WARN_LIMIT:
+        answer = QMessageBox.warning(
+            ctx.host,
+            "Edit boundary",
+            f"This Sub-region has {anchors} anchor points. Showing them can "
+            "freeze or crash Smage. Show the anchors anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            _region_render_overlays(ctx, page)
+            return
+    page._region_edit_boundary = {
+        "region": str(region_id),
+        "sample": str(sample_path),
+        "sub": str(sub_id),
+    }
+    _region_set_status(
+        page,
+        "Drag the anchors to edit this Sub-region; press Esc to finish.",
+    )
+    _region_render_overlays(ctx, page)
+
+
+def _region_start_rename(page, item) -> None:
+    """Start inline editing of a Region or Sub-region name."""
+    if item is None:
+        return
+    tree = page._region_tree
+    tree.clearSelection()
+    tree.setCurrentItem(item)
+    tree.editItem(item, 0)
+
+
 def _region_region_menu(ctx, page, pos) -> None:
     from PySide6.QtWidgets import QMenu
-    item = page._region_tree.itemAt(pos)
+    tree = page._region_tree
+    item = tree.itemAt(pos)
     key = _region_item_key(item)
+    selected_keys = [
+        selected for selected in (
+            _region_item_key(sel) for sel in tree.selectedItems()
+        ) if selected
+    ]
+    if key is None:
+        multi_keys = []
+    elif key in selected_keys:
+        multi_keys = selected_keys
+    else:
+        multi_keys = [key]
+    sub_keys = [selected for selected in multi_keys if selected[0] == "sub"]
+    multi_subs = (
+        key is not None and key[0] == "sub" and len(sub_keys) > 1
+    )
     menu = QMenu(ctx.host)
+    rename = menu.addAction("Rename")
+    menu.addSeparator()
     add_sample = menu.addAction("Add Sample…")
     add_sub = menu.addAction("Add Sub-region")
+    edit_boundary = menu.addAction("Edit boundary…")
     menu.addSeparator()
     copy = menu.addAction("Copy Branch")
     paste = menu.addAction("Paste Branch")
     menu.addSeparator()
     delete = menu.addAction("Delete")
     kind = key[0] if key else None
+    rename.setEnabled(
+        kind in ("region", "sub") and not page._region_locked
+    )
     add_sample.setEnabled(kind == "region" and not page._region_locked)
     add_sub.setEnabled(kind == "sample" and not page._region_locked)
-    copy.setEnabled(kind in ("region", "sub"))
+    edit_boundary.setEnabled(kind == "sub" and not page._region_locked)
+    copy.setEnabled(kind in ("region", "sample", "sub"))
+    clip_kind = (page._region_clipboard or {}).get("kind")
     paste.setEnabled(
         page._region_clipboard is not None and not page._region_locked
         and (
-            (page._region_clipboard or {}).get("kind") == "region"
-            and kind in (None, "region")
-            or (page._region_clipboard or {}).get("kind") == "sub"
-            and kind in ("sample", "sub")
+            clip_kind == "region" and kind in (None, "region")
+            or clip_kind in ("sub", "subs") and kind in ("sample", "sub")
+            or clip_kind == "sample" and kind in ("region", "sample", "sub")
         )
     )
     delete.setEnabled(kind is not None and not page._region_locked)
-    chosen = menu.exec(page._region_tree.viewport().mapToGlobal(pos))
-    if chosen is add_sample and kind == "region":
+    chosen = menu.exec(tree.viewport().mapToGlobal(pos))
+    if chosen is rename and kind in ("region", "sub"):
+        _region_start_rename(page, item)
+    elif chosen is add_sample and kind == "region":
         _region_add_sample(ctx, page, key[1])
     elif chosen is add_sub and kind == "sample":
         _region_arm_subregion(ctx, page, key[1], key[2])
+    elif chosen is edit_boundary and kind == "sub":
+        _region_start_edit_boundary(ctx, page, key)
     elif chosen is copy:
-        _region_copy(ctx, page, key)
+        if multi_subs:
+            _region_copy_subs(page, sub_keys)
+        else:
+            _region_copy(ctx, page, key)
     elif chosen is paste:
         _region_paste(ctx, page, key)
     elif chosen is delete:
-        _region_delete(ctx, page, key)
+        if multi_subs:
+            _region_delete_subs(ctx, page, sub_keys)
+        else:
+            _region_delete(ctx, page, key)
 
 
 def _region_add_region(ctx, page) -> None:
     region = {
         "id": uuid4().hex,
-        "name": _region_unique_name(
-            page._region_store, _region_next_name(page._region_store)
+        "name": _region_free_region_name(
+            ctx, page, _region_next_name(page._region_store)
         ),
         "visible": True,
         "style": _region_default_style(
@@ -2021,6 +2686,7 @@ def _region_arm_subregion(ctx, page, region_id, sample_path) -> None:
     page._region_selected_region_id = str(region_id)
     page._region_selected_sample = str(sample_path)
     page._region_selected_sub_id = None
+    page._region_selected_subs = []
     _region_set_region_tool(ctx, page, "region_in")
 
 
@@ -2042,12 +2708,34 @@ def _region_copy(ctx, page, key) -> None:
             "kind": "region",
             "region": copy.deepcopy(region),
         }
+    elif kind == "sample":
+        sample = (region.get("samples") or {}).get(key[2])
+        if sample is not None:
+            page._region_clipboard = {
+                "kind": "sample",
+                "sample": str(key[2]),
+                "data": copy.deepcopy(sample),
+            }
     elif kind == "sub":
         sub = _region_sub_by_id(region, key[2], key[3])
         if sub is not None:
             page._region_clipboard = {
                 "kind": "sub", "sub": copy.deepcopy(sub),
             }
+
+
+def _region_copy_subs(page, keys) -> None:
+    """Copy several selected Sub-regions as one clipboard branch."""
+    subs = []
+    for key in keys:
+        region = _region_region_by_id(page, key[1])
+        if region is None:
+            continue
+        sub = _region_sub_by_id(region, key[2], key[3])
+        if sub is not None:
+            subs.append(copy.deepcopy(sub))
+    if subs:
+        page._region_clipboard = {"kind": "subs", "subs": subs}
 
 
 def _region_paste(ctx, page, key) -> None:
@@ -2058,8 +2746,8 @@ def _region_paste(ctx, page, key) -> None:
         source = clip.get("region") or {}
         region = copy.deepcopy(source)
         region["id"] = uuid4().hex
-        region["name"] = _region_unique_name(
-            page._region_store, f"{source.get('name', 'Region')} copy"
+        region["name"] = _region_free_region_name(
+            ctx, page, f"{source.get('name', 'Region')} copy"
         )
         for sample in (region.get("samples") or {}).values():
             for sub in sample.get("sub_regions") or []:
@@ -2072,7 +2760,50 @@ def _region_paste(ctx, page, key) -> None:
         _region_mark_dirty(ctx, page)
         _region_render_overlays(ctx, page)
         return
-    if clip.get("kind") == "sub":
+    if clip.get("kind") == "sample":
+        if not key or key[0] not in ("region", "sample", "sub"):
+            return
+        region = _region_region_by_id(page, key[1])
+        if region is None:
+            return
+        sample_path = str(clip.get("sample") or "")
+        if not sample_path:
+            return
+        samples = region.get("samples")
+        if samples is None:
+            samples = {}
+            region["samples"] = samples
+        if sample_path in samples:
+            name = _region_file_name(
+                ctx, sample_path, page._region_task_id
+            )
+            QMessageBox.information(
+                ctx.host, "Paste Branch",
+                f"Region '{region.get('name') or 'Region'}' already contains "
+                f"Sample '{name}'.",
+            )
+            return
+        if sample_path not in page._region_files:
+            QMessageBox.information(
+                ctx.host, "Paste Branch",
+                "The file of this Sample is not one of this Region module's "
+                "image files.",
+            )
+            return
+        sample = copy.deepcopy(clip.get("data") or {})
+        sub_regions = list(sample.get("sub_regions") or [])
+        for sub in sub_regions:
+            sub["id"] = uuid4().hex
+        sample["sub_regions"] = sub_regions
+        samples[sample_path] = sample
+        page._region_selected_region_id = str(key[1])
+        page._region_selected_sample = sample_path
+        page._region_selected_sub_id = None
+        _region_rebuild_region_tree(ctx, page)
+        _region_mark_dirty(ctx, page)
+        _region_render_overlays(ctx, page)
+        return
+    if clip.get("kind") in ("sub", "subs"):
         if not key or key[0] not in ("sample", "sub"):
             return
         region = _region_region_by_id(page, key[1])
@@ -2081,13 +2812,23 @@ def _region_paste(ctx, page, key) -> None:
         sample = (region.get("samples") or {}).get(key[2])
         if sample is None:
             return
-        sub = copy.deepcopy(clip.get("sub") or {})
-        sub["id"] = uuid4().hex
-        sub["name"] = _region_next_sub_name(sample)
-        sample.setdefault("sub_regions", []).append(sub)
+        sources = (
+            [clip.get("sub") or {}]
+            if clip.get("kind") == "sub"
+            else list(clip.get("subs") or [])
+        )
+        pasted = []
+        for source in sources:
+            sub = copy.deepcopy(source or {})
+            sub["id"] = uuid4().hex
+            sub["name"] = _region_next_sub_name(sample)
+            sample.setdefault("sub_regions", []).append(sub)
+            pasted.append(sub)
+        if not pasted:
+            return
         page._region_selected_region_id = key[1]
         page._region_selected_sample = key[2]
-        page._region_selected_sub_id = sub["id"]
+        page._region_selected_sub_id = pasted[-1]["id"]
         _region_rebuild_region_tree(ctx, page)
         _region_mark_dirty(ctx, page)
         _region_render_overlays(ctx, page)
@@ -2099,6 +2840,12 @@ def _region_delete(ctx, page, key) -> None:
     if region is None:
         return
     if kind == "region":
+        channels = page._region_params.get("channels") or {}
+        channel_entry = channels.pop(str(region_id), None)
+        if isinstance(channel_entry, dict):
+            page._region_channel_orphans.extend(
+                (channel_entry.get("files") or {}).values()
+            )
         page._region_store["regions"] = [
             item for item in page._region_store.get("regions") or []
             if str(item.get("id")) != str(region_id)
@@ -2108,6 +2855,15 @@ def _region_delete(ctx, page, key) -> None:
         page._region_selected_sub_id = None
     elif kind == "sample":
         (region.get("samples") or {}).pop(sample_path, None)
+        entry = (page._region_params.get("channels") or {}).get(
+            str(region_id)
+        )
+        if isinstance(entry, dict):
+            record = (entry.get("files") or {}).pop(
+                str(sample_path), None
+            )
+            if isinstance(record, dict):
+                page._region_channel_orphans.append(record)
         page._region_selected_sample = None
         page._region_selected_sub_id = None
     elif kind == "sub":
@@ -2117,6 +2873,33 @@ def _region_delete(ctx, page, key) -> None:
             if str(item.get("id")) != str(sub_id)
         ]
         page._region_selected_sub_id = None
+    page._region_selected_subs = []
+    _region_rebuild_region_tree(ctx, page)
+    _region_style_panel_from_selection(ctx, page)
+    _region_mark_dirty(ctx, page)
+    _region_render_overlays(ctx, page)
+
+
+def _region_delete_subs(ctx, page, keys) -> None:
+    """Delete several selected Sub-regions in one step."""
+    groups = {}
+    for key in keys:
+        groups.setdefault((str(key[1]), str(key[2])), set()).add(
+            str(key[3])
+        )
+    for (region_id, sample_path), ids in groups.items():
+        region = _region_region_by_id(page, region_id)
+        if region is None:
+            continue
+        sample = (region.get("samples") or {}).get(sample_path)
+        if sample is None:
+            continue
+        sample["sub_regions"] = [
+            sub for sub in sample.get("sub_regions") or []
+            if str(sub.get("id")) not in ids
+        ]
+    page._region_selected_sub_id = None
+    page._region_selected_subs = []
     _region_rebuild_region_tree(ctx, page)
     _region_style_panel_from_selection(ctx, page)
     _region_mark_dirty(ctx, page)
@@ -2127,6 +2910,15 @@ def _region_delete(ctx, page, key) -> None:
 # Region drawing
 # ---------------------------------------------------------------------------
 
+def _region_clear_edit_rois(page) -> None:
+    for entry in list(getattr(page, "_region_edit_rois", []) or []):
+        try:
+            page._region_viewbox.removeItem(entry["roi"])
+        except Exception:  # noqa: BLE001
+            pass
+    page._region_edit_rois = []
+
+
 def _region_clear_overlays(page) -> None:
     for item in page._region_overlay_items:
         try:
@@ -2134,12 +2926,7 @@ def _region_clear_overlays(page) -> None:
         except Exception:  # noqa: BLE001
             pass
     page._region_overlay_items = []
-    for entry in list(getattr(page, "_region_edit_rois", []) or []):
-        try:
-            page._region_viewbox.removeItem(entry["roi"])
-        except Exception:  # noqa: BLE001
-            pass
-    page._region_edit_rois = []
+    _region_clear_edit_rois(page)
 
 
 def _region_on_image_click(ctx, page, event) -> None:
@@ -2185,6 +2972,11 @@ def _region_on_image_click(ctx, page, event) -> None:
             page._region_selected_region_id = str(region.get("id"))
             page._region_selected_sample = str(path)
             page._region_selected_sub_id = str(sub.get("id"))
+            page._region_selected_subs = [{
+                "region": str(region.get("id")),
+                "sample": str(path),
+                "sub": str(sub.get("id")),
+            }]
             _region_rebuild_region_tree(ctx, page)
             _region_style_panel_from_selection(ctx, page)
             item = page._region_tree.currentItem()
@@ -2199,6 +2991,7 @@ def _region_render_overlays(ctx, page) -> None:
         return
     _region_clear_overlays(page)
     path = page._region_preview.get("file")
+    _region_prune_edit_boundary(page, path)
     if not path:
         return
     regions = page._region_store.get("regions") or []
@@ -2210,12 +3003,26 @@ def _region_render_overlays(ctx, page) -> None:
         if sample is None or not sample.get("visible", True):
             continue
         style = _region_style_for(region)
+        selected_subs = {
+            str(entry.get("sub"))
+            for entry in (getattr(page, "_region_selected_subs", None) or [])
+            if str(entry.get("sample")) == str(path)
+            and str(entry.get("region")) == str(region.get("id"))
+        }
+        if (
+            page._region_selected_sub_id
+            and page._region_selected_sample == path
+            and str(region.get("id"))
+            == str(page._region_selected_region_id or "")
+        ):
+            selected_subs.add(str(page._region_selected_sub_id))
         for sub in sample.get("sub_regions") or []:
             if not sub.get("visible", True):
                 continue
             rings = list(sub.get("in") or []) + list(sub.get("out") or [])
             if not any(len(ring) >= 3 for ring in rings):
                 continue
+            is_selected = str(sub.get("id")) in selected_subs
             # One path per sub-region: even-odd makes every nested ring a
             # hole/island correctly, including a new in inside an old out.
             path_item = QPainterPath()
@@ -2238,23 +3045,30 @@ def _region_render_overlays(ctx, page) -> None:
             # Use the chosen width exactly; selecting a Region must not
             # silently clamp widths 0–2 to 3 px.
             width = max(0.0, float(style["edge_width"]))
-            if width > 0:
+            if is_selected:
+                # Selection only highlights the boundary; anchors are built
+                # by Edit boundary, so a complex Sub-region stays cheap.
+                item.setPen(QPen(
+                    QColor("#ffd166"), max(2.5, width + 1.5)
+                ))
+            elif width > 0:
                 item.setPen(QPen(
                     QColor(int(edge[0]), int(edge[1]), int(edge[2])),
                     width,
                 ))
             else:
                 item.setPen(QPen(Qt.PenStyle.NoPen))
-            item.setZValue(10 + (total - index) * 0.01)
+            item.setZValue(
+                10 + (total - index) * 0.01 + (0.5 if is_selected else 0.0)
+            )
             item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             page._region_viewbox.addItem(item, ignoreBounds=True)
             page._region_overlay_items.append(item)
 
-    sub_id = page._region_selected_sub_id
-    if sub_id and page._region_selected_sample == path:
+    sub = _region_editing_sub(page, path)
+    if sub is not None:
         region = _region_selected_region(page)
-        sub = _region_sub_by_id(region, path, sub_id) if region else None
-        if sub is not None:
+        if region is not None:
             for kind in ("in", "out"):
                 for ring_index, ring in enumerate(sub.get(kind) or []):
                     if len(ring) < 3:
@@ -2553,14 +3367,28 @@ def _region_build_signal_params(ctx, page, host, enabled) -> None:
     grid.setSpacing(2)
     grid.setColumnStretch(1, 1)
 
-    auto = QCheckBox("Auto threshold")
-    auto.setChecked(bool(detect.get("auto_threshold", True)))
-    auto.setEnabled(enabled)
+    mode = _NoWheelComboBox()
+    mode.addItem("Auto (Otsu)", "otsu")
+    mode.addItem("Percentile", "percentile")
+    mode.addItem("Manual", "manual")
+    current_mode = detect.get("threshold_mode")
+    if current_mode is None:
+        current_mode = (
+            "manual" if not detect.get("auto_threshold", True) else "otsu"
+        )
+    mode.setCurrentIndex(max(0, mode.findData(current_mode)))
+    mode.setEnabled(enabled)
     threshold = _NoWheelDoubleSpinBox()
     threshold.setDecimals(3)
     threshold.setRange(-1e12, 1e12)
     threshold.setValue(float(detect.get("threshold") or 0.0))
-    threshold.setEnabled(enabled and not auto.isChecked())
+    threshold.setEnabled(enabled and current_mode == "manual")
+    percentile = _NoWheelDoubleSpinBox()
+    percentile.setDecimals(1)
+    percentile.setRange(0.0, 100.0)
+    percentile.setValue(float(detect.get("percentile", 30.0)))
+    percentile.setSuffix(" %")
+    percentile.setEnabled(enabled and current_mode == "percentile")
     smooth = _NoWheelDoubleSpinBox()
     smooth.setRange(0.0, 20.0)
     smooth.setValue(float(detect.get("smooth") or 0.0))
@@ -2599,12 +3427,17 @@ def _region_build_signal_params(ctx, page, host, enabled) -> None:
         grid.addWidget(hint(text), row, 0, 1, 2)
         row += 1
 
-    add_param(None, auto,
-              "Let Otsu choose the cut-off from pixels inside the detection "
-              "gate. Untick to enter a fixed threshold.")
+    add_param("Threshold mode", mode,
+              "Auto uses Otsu on each file separately; Percentile uses each "
+              "file's own percentile; Manual uses one fixed value for every "
+              "file.")
     add_param("Threshold", threshold,
-              "Only used when Auto is off. Pixels above this value become "
+              "Only used in Manual mode. Pixels above this value become "
               "signal.")
+    add_param("Percentile", percentile,
+              "Only used in Percentile mode. 30% makes the 30th percentile "
+              "of each file the cut-off, so about 70% of that file's pixels "
+              "are above it.")
     add_param("Smooth", smooth,
               "Gaussian blur radius in pixels before thresholding. Larger "
               "values join noisy signal; 0 disables smoothing.")
@@ -2624,22 +3457,29 @@ def _region_build_signal_params(ctx, page, host, enabled) -> None:
               "vertices and smaller sub-regions.")
 
     def store(*_args):
-        detect["auto_threshold"] = bool(auto.isChecked())
+        selected_mode = mode.currentData() or "otsu"
+        detect["threshold_mode"] = selected_mode
         detect["threshold"] = float(threshold.value())
+        detect["percentile"] = float(percentile.value())
         detect["smooth"] = float(smooth.value())
         detect["expand"] = int(expand.value())
         detect["fill_holes"] = bool(fill.isChecked())
         detect["fill_max_area"] = int(fill_area.value())
         detect["min_area"] = int(min_area.value())
         detect["tolerance"] = float(tolerance.value())
-        threshold.setEnabled(enabled and not auto.isChecked())
+        threshold.setEnabled(enabled and selected_mode == "manual")
+        percentile.setEnabled(enabled and selected_mode == "percentile")
         fill_area.setEnabled(enabled and fill.isChecked())
         _region_mark_dirty(ctx, page)
 
     for widget in (
-        auto, threshold, smooth, expand, fill, fill_area, min_area, tolerance
+        mode, threshold, percentile, smooth, expand, fill, fill_area,
+        min_area, tolerance,
     ):
         signal = getattr(widget, "valueChanged", None)
+        if signal is not None:
+            signal.connect(store)
+        signal = getattr(widget, "currentIndexChanged", None)
         if signal is not None:
             signal.connect(store)
         toggle = getattr(widget, "toggled", None)
@@ -2876,7 +3716,26 @@ def _region_start_detect(ctx, page) -> None:
         "done": 0,
     }
     _region_set_status(page, "Detection started; see the log below.")
-    method_label = "SAM 3" if method == "sam" else "Signal Expansion"
+    if method == "sam":
+        method_label = "SAM 3"
+    else:
+        params = detect.get("signal") or {}
+        mode = params.get("threshold_mode")
+        if mode is None:
+            mode = (
+                "manual" if not params.get("auto_threshold", True)
+                else "otsu"
+            )
+        if mode == "manual":
+            cut = f"manual threshold {float(params.get('threshold') or 0.0):g}"
+        elif mode == "percentile":
+            cut = (
+                f"P{float(params.get('percentile') or 0.0):g} "
+                "threshold per file"
+            )
+        else:
+            cut = "Otsu threshold per file"
+        method_label = f"Signal Expansion, {cut}"
     _region_log(
         ctx, page,
         f"===== Region detection — {method_label}, {len(files)} file(s), "
@@ -2923,7 +3782,10 @@ def _region_poll_detect(ctx, page) -> None:
                 ctx, page, f"{name}: {text}", timestamp=stamp
             )
         elif kind == "file":
-            _, _token, path, parts, error = message
+            _, _token, path, parts, error = message[:5]
+            used_threshold = (
+                message[5] if len(message) > 5 else None
+            )
             state["results"][path] = parts or []
             if error:
                 state["errors"][path] = error
@@ -2934,9 +3796,13 @@ def _region_poll_detect(ctx, page) -> None:
             if error:
                 _region_log(ctx, page, f"✗ {name}: {error}")
             else:
+                detail = f"{len(parts or [])} sub-region(s)"
+                if used_threshold is not None:
+                    detail += (
+                        f", threshold {float(used_threshold):.6g}"
+                    )
                 _region_log(
-                    ctx, page,
-                    f"✓ {name}: {len(parts or [])} sub-region(s)",
+                    ctx, page, f"✓ {name}: {detail}",
                 )
         elif kind == "done":
             finished = True
@@ -2974,8 +3840,8 @@ def _region_finish_detect(ctx, page) -> None:
     index = len(store.get("regions") or [])
     region = {
         "id": uuid4().hex,
-        "name": _region_unique_name(
-            store, _region_next_name(store)
+        "name": _region_free_region_name(
+            ctx, page, _region_next_name(store)
         ),
         "visible": True,
         "style": _region_default_style(index),
@@ -3020,6 +3886,98 @@ def _region_finish_detect(ctx, page) -> None:
     _region_mark_dirty(ctx, page)
     _region_render_overlays(ctx, page)
     _region_rebuild_detect_panel(ctx, page)
+
+
+class _RegionChannelWorker:
+    """Background conversion of Regions to 0/1 mask channels."""
+
+    def __init__(self) -> None:
+        self._jobs = queue.Queue()
+        self._results = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def request(self, token, ctx, task_id, region_id, jobs) -> None:
+        self._jobs.put((
+            token, ctx, task_id, region_id, list(jobs),
+        ))
+
+    def poll(self):
+        out = []
+        while True:
+            try:
+                out.append(self._results.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                token, ctx, task_id, region_id, jobs = self._jobs.get(
+                    timeout=0.2
+                )
+            except queue.Empty:
+                continue
+            try:
+                for job in jobs:
+                    if self._stop.is_set():
+                        return
+                    started = time.perf_counter()
+                    path = str(job.get("path"))
+                    try:
+                        from smage.core.region_detection import (
+                            _region_parts_raster,
+                        )
+                        from smage.data import image_index as _image_index
+
+                        ent = _image_index._ensure_image_index(ctx, path)
+                        if ent is None or ent.get("manifest") is None:
+                            raise RuntimeError(
+                                "source image has no image index"
+                            )
+                        manifest = ent["manifest"]
+                        xmin = int(round(float(manifest["xmin"])))
+                        ymin = int(round(float(manifest["ymin"])))
+                        width = int(round(
+                            float(manifest["xmax"]) - float(manifest["xmin"])
+                        )) + 1
+                        height = int(round(
+                            float(manifest["ymax"]) - float(manifest["ymin"])
+                        )) + 1
+                        mask = _region_parts_raster(
+                            job.get("parts") or [],
+                            width, height, xmin, ymin,
+                        )
+                        rel, pixels, signature = (
+                            _data_regions._region_write_channel(
+                                ctx, task_id, path, mask, region_id,
+                            )
+                        )
+                        record = {
+                            "path": rel,
+                            "signature": signature,
+                            "region_signature": job.get(
+                                "region_signature"
+                            ),
+                            "pixels": int(pixels),
+                        }
+                        self._results.put((
+                            "file", token, path, record, None,
+                            time.perf_counter() - started,
+                        ))
+                    except Exception as exc:  # noqa: BLE001
+                        self._results.put((
+                            "file", token, path, None, str(exc),
+                            time.perf_counter() - started,
+                        ))
+                self._results.put(("done", token))
+            except Exception:  # noqa: BLE001
+                self._results.put(("done", token))
 
 
 class _RegionDetectWorker:
@@ -3080,8 +4038,9 @@ class _RegionDetectWorker:
                         ))
 
                     started_file = time.perf_counter()
+                    used_threshold = None
                     try:
-                        parts, error = self._detect_file(
+                        parts, error, used_threshold = self._detect_file(
                             job, path, report
                         )
                     except Exception as exc:  # noqa: BLE001
@@ -3091,6 +4050,7 @@ class _RegionDetectWorker:
                     )
                     self._results.put((
                         "file", token, str(path), parts, error,
+                        used_threshold,
                     ))
                 self._results.put(("done", token))
             except Exception as exc:  # noqa: BLE001
@@ -3132,17 +4092,26 @@ class _RegionDetectWorker:
             "none" if gate is None else "clipped",
         )
         if job.get("method") == "sam":
-            return _RegionDetectWorker._detect_sam(
+            parts, error = _RegionDetectWorker._detect_sam(
                 job, path, image, gate, x0, y0, report
             )
+            return parts, error, None
         params = job.get("signal") or {}
-        threshold = (
-            None if params.get("auto_threshold", True)
-            else float(params.get("threshold") or 0.0)
-        )
-        parts, _used, _mask = signal_expansion(
+        threshold_mode = params.get("threshold_mode")
+        if threshold_mode is None:
+            threshold_mode = (
+                "manual" if not params.get("auto_threshold", True) else "otsu"
+            )
+        threshold = None
+        percentile = None
+        if threshold_mode == "manual":
+            threshold = float(params.get("threshold") or 0.0)
+        elif threshold_mode == "percentile":
+            percentile = float(params.get("percentile") or 0.0)
+        parts, used_threshold, _mask = signal_expansion(
             image, gate,
             threshold=threshold,
+            percentile=percentile,
             smooth=float(params.get("smooth") or 0.0),
             expand=int(params.get("expand") or 0),
             fill_holes=bool(params.get("fill_holes", True)),
@@ -3153,7 +4122,7 @@ class _RegionDetectWorker:
             y_origin=float(y0 or 0.0),
             progress=report,
         )
-        return parts, None
+        return parts, None, float(used_threshold)
 
     @staticmethod
     def _detect_sam(job, path, image, gate, x0, y0, report):
@@ -3285,6 +4254,10 @@ def _region_save_now(ctx, page) -> None:
     }
     if ctx.project is not None:
         ctx.project.save()
+    # The project now references only the new records; old masks can go.
+    for record in page._region_channel_orphans:
+        _region_delete_channel_record(ctx, record)
+    page._region_channel_orphans = []
     page._region_snapshot = copy.deepcopy(params)
     page._region_store_snapshot = copy.deepcopy(store)
     page._region_dirty = False
@@ -3310,7 +4283,7 @@ def _region_close(ctx, page) -> None:
 
 
 def _region_cleanup(ctx, page) -> None:
-    for name in ("_region_detect_timer",):
+    for name in ("_region_detect_timer", "_region_channel_timer"):
         timer = getattr(page, name, None)
         if timer is not None:
             try:
@@ -3323,9 +4296,10 @@ def _region_cleanup(ctx, page) -> None:
             timer.stop()
         except RuntimeError:
             pass
-    worker = getattr(page, "_region_detect_worker", None)
-    if worker is not None:
-        worker.stop()
+    for name in ("_region_detect_worker", "_region_channel_worker"):
+        worker = getattr(page, name, None)
+        if worker is not None:
+            worker.stop()
 
 
 def _region_refresh(ctx, page) -> None:

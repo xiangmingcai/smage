@@ -53,6 +53,10 @@ also has a name, color and per-file shape overrides.
 
 - Gates are stored in original data units; a [Scale](scale.md) module above
   only changes how they are drawn.
+- Double-clicking a gate opens its subset view, which draws only the gates
+  created inside it. The gates that make up a **NOT / AND / OR** gate belong
+  to the level above the subset, so opening a boolean gate shows its subset
+  without those outlines.
 - An ellipse drawn on a log or arcsinh axis is stored as a sampled outline of
   that ellipse, so the selected events are exactly the ones inside the shape
   you drew. (A mathematical ellipse in data units would not match the drawn

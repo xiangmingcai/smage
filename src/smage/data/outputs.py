@@ -35,6 +35,45 @@ def _seg_applied_columns(ctx, task_id, parquet_path) -> dict:
     return out
 
 
+def _region_applied_columns(ctx, task_id, parquet_path) -> dict:
+    """{column_name: record} exposed by converted upstream Regions.
+
+    Only Regions whose channel is converted for this file and marked
+    downstream-visible are listed.  The record points at the mask parquet
+    written by the Region module.
+    """
+    if not task_id or not parquet_path or ctx.project is None:
+        return {}
+    from smage.data import regions as _regions
+
+    out = {}
+    for item in _regions._region_channel_options(ctx, task_id):
+        rec = item["files"].get(str(parquet_path))
+        if not isinstance(rec, dict):
+            continue
+        out.setdefault(item["name"], {
+            "path": rec.get("abs_path"),
+            "region_id": item["region_id"],
+            "pixels": rec.get("pixels"),
+            "kind": "region",
+        })
+    return out
+
+
+def _region_channel_values(ctx, parquet_path, rec, name=None):
+    """Per-row values of a converted Region channel (0 outside, 1 inside)."""
+    if not isinstance(rec, dict):
+        return None
+    return _seg_mask_values(ctx, parquet_path, rec.get("path"))
+
+
+def _region_channel_raster(ctx, rec, bbox, spacing):
+    """One converted Region channel as (mask_2d, data_rect)."""
+    if not isinstance(rec, dict):
+        return None, None
+    return _seg_mask_raster(ctx, rec.get("path"), bbox, spacing)
+
+
 def _seg_mask_values(ctx, parquet_path, mask_path):
     """Mask labels aligned to a parquet's rows (float64, 0 where unknown)."""
     import numpy as np
