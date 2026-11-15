@@ -6,6 +6,11 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-11-16
+
+Second packaged release. Smage is now released under GPL-3.0 with the
+approval of Amsterdam UMC, the Netherlands.
+
 ### Added
 
 - **DISCLAIMER.md** at the repository root, plus a short statement in
@@ -14,25 +19,22 @@ All notable changes to Smage are recorded here. The format follows
   without warranty, and the user is responsible for the analysis and its
   results. The document also states how AI-assisted development works and
   which human review, testing and accountability steps apply.
-- **Region** (new map module): detects image regions and exposes each one to
-  downstream modules as a spatial gate. It provides an internal detection-gate
-  tree, **Signal Expansion** and **SAM 3** (external environment) detection,
-  a Region → Sample → Sub-region tree with per-item visibility, rename,
-  delete and branch copy/paste, and per-Region fill/edge drawing styles.
-  Sub-region polygons live on the full image and are available to Figure
-  filters/image overlays, Gate2Col 0/1 columns, Heatmap annotations and
+- **Region** (new map module): detects image regions and converts them to
+  0/1 channels for downstream modules. It provides an internal detection-gate
+  tree and **Signal Expansion** detection, a Region → Sample → Sub-region
+  tree with per-item visibility, rename, delete and branch copy/paste, and
+  per-Region fill/edge drawing styles.
+  Converted Regions are ordinary channels in Figure, Heatmap, Gate2Col and
   Region Size. Internal detection gates support **boolean gates** (NOT /
   AND / OR) and **per-file geometry** (adjust a gate separately on each
   file, or copy one file's shape to all).
 - **Region Size** (new module, replaces Area): calculates the pixel area of
   each selected Region in each selected image file as a file × Region table.
   Missing Samples are **NA**, empty Samples are **0**, and overlapping
-  sub-regions are counted once. Rows and columns can be reordered, the table
-  is copied as TSV, and **Calculate** saves the result and locks upstream
-  modules until **Clear results** is used.
-- Extension Manager: **SAM 3** entry. It installs torch/transformers into a
-  separate environment and downloads the gated `facebook/sam3` weights; Smage
-  never bundles them.
+  sub-regions are counted once. Rows and columns can be reordered and the
+  table is copied with **Copy table**. A new module starts with no Regions
+  selected; **Calculate** shows the table and **Save** stores it and locks
+  the upstream modules. A log box under the table reports progress.
 - **Calculation** (new map module): builds new channels from existing ones
   with an ordered list of calculation rows — **Clip**, real-value **Scale**
   (Log/Asinh), weighted **Add**, and a custom **Contrast** curve. A row may
@@ -209,8 +211,8 @@ All notable changes to Smage are recorded here. The format follows
   per-file result line. A warning is logged when the foreground covers 80%
   or more of the image, which points at a threshold below the background
   noise or an over-large **Expand**.
-- **Region detection**: Signal Expansion and SAM now emit the same
-  `in/out` region parts instead of keyhole polygons; Detect Region's spin
+- **Region detection**: Signal Expansion now emits `in/out` region parts
+  instead of keyhole polygons; Detect Region's spin
   boxes and combos ignore the mouse wheel so a scroll cannot change a
   parameter.
 - **Region detection log**: the progress bar under Detect Region is gone;
@@ -262,8 +264,8 @@ All notable changes to Smage are recorded here. The format follows
   selected.
 - **Detect Region panel**: changing the method or a parameter keeps the
   panel's scroll position instead of pulling it to the bottom. Every signal
-  and SAM option now has a short explanation underneath it, using the same
-  hint style as the other modules.
+  option now has a short explanation underneath it, using the same hint
+  style as the other modules.
 - **Region fill holes**: a new **Max hole area** setting fills only holes up
   to a given pixel area (0 keeps the old behaviour of filling every enclosed
   hole), so large lumens between cells can stay open. Region polygons also

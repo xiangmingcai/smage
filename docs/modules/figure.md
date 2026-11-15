@@ -42,6 +42,8 @@ exactly as it currently looks, including the current zoom and pan:
 The A/F corner buttons and the cursor readout are not part of the saved
 figure.
 
+![Save a plot](../assets/screenshots/figure-save-as.png)
+
 To write plot data or a whole batch of files, use [Export](export.md).
 
 ## Notes

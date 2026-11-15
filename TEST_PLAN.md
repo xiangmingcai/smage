@@ -157,7 +157,7 @@ E:\smage_test\samge_batch_test\   # 不纳入 git，运行工作区
 
 合计约 650 个检查点。
 
-## 11. 模块测试矩阵（21 个）
+## 11. 模块测试矩阵（23 个）
 
 | 模块 | 核心用例 | 边界 / 小功能 |
 |---|---|---|
@@ -178,7 +178,9 @@ E:\smage_test\samge_batch_test\   # 不纳入 git，运行工作区
 | **Batch Align** | 批次表、Copy/Paste、变量、参数、Calculate、Report | 单批次、缺参考、扩展缺失、`alignment.npz`、HTML/PDF/PNG/SVG 报告、失败路径 |
 | **Dimred** | PCA/UMAP/tSNE、参数、变量、Max events、Normalize/PCA/parallel、Calculate | 列名冲突、样本不足、取消、后端切换 |
 | **Cluster** | kmeans/leiden/louvain/phenograph/FlowSOM/PARC、参数、变量、Calculate | 扩展缺失、聚类列重名、栅格显示、取消 |
-| **Area** | 文件/列/网格/阈值/信号、Apply、Preview | 空文件、网格=1、低/高阈值、Density 边界、复制参数 |
+| **Calculation** | 规则增删/排序、Clip/Scale/Add/Contrast、按文件作用域、隐藏行、实时预览、保存 | 空规则、非法参数、隐藏通道下游不可见、预览 scatter/image 切换、新模块不预选文件、锁定只读 |
+| **Region** | Signal Expansion 检测、检测门树、Region/Sample/Sub-region 树、in/out 边界、Convert as channel、五列显示、复制/多选/改名、图像点击选中 | 每文件 Otsu/Percentile 阈值、边界锚点>100 警告、空 Sample、重名拒绝、锁定禁止转换、检测日志持久化、孔洞面积上限、旧 SAM 项目回退到 Signal Expansion |
+| **Region Size** | 文件/Region 选择、Calculate→Save、表格行列排序、Copy table、日志框 | 无文件/无 Region、NA/0 语义、跨模块 Region 重名、通道不匹配保留数据、未 Save 关闭提示、Save 后锁定上游 |
 | **Segmentation** | Cellpose/StarDist/Nuclear Expansion/Mask Input、通道/阈值/面积/半径、Calculate、预览 | 扩展缺失、mask 缓存、mask 列、图像/表格文件判断、取消、尺寸不匹配 |
 | **Figure** | Add Scatter/Overlay/Histogram/Image/N×N、卡片拖拽与换行、单/多选设置、Duplicate/Delete/Permute、Overlay 图层、颜色/刻度/图例 | 空页面、框选、缩放/平移、点数上限、锁定时只读、原值刻度、拖拽图层排序 |
 | **Export** | 文件/列选择、格式、输出目录、Export/Cancel | 覆盖确认、非法目录、FCS 列名安全化、部分失败、日志 |

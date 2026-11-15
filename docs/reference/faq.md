@@ -29,6 +29,42 @@ workflow tree.
 Check that the upstream module was **saved**. Downstream modules only see the
 saved state; the Save button is enabled while there are unsaved changes.
 
+## Can I use Smage for clinical decisions?
+
+No. Smage is research software, not a medical device, and it must not be used
+for clinical diagnosis, treatment selection or any other clinical decision.
+It comes without warranty, and you are responsible for the analysis and its
+results. See
+[DISCLAIMER.md](https://github.com/xiangmingcai/smage/blob/main/DISCLAIMER.md).
+
+## A converted Region is not visible downstream
+
+Check two things in the Region tree:
+
+1. the Region row shows **Converted** in the **Status** column (press
+   **Convert as channel** if it says *Not converted* or *Needs update*);
+2. **Downstream visible** is ticked.
+
+If the boundary was edited after converting, the status becomes *Needs
+update* but the old mask stays in use until you convert again. When the
+selected channels change, the converted mask columns may not match them; the
+Region Size module then shows **NA**. See [Region](../modules/region.md).
+
+## How do I reuse an Unmix matrix in another module?
+
+In the source module press **Copy matrix to clipboard** (in the matrix
+settings), then in the target module choose **Signature source → Manual
+input** and press **Paste matrix**. The channels must match the target's
+Spectrum Extraction selection; the pasted values are written with one
+decimal, so results are close to, but not bit-identical with, the source.
+See [Unmix — Matrix Unmixing](../modules/unmix-matrix.md).
+
+## How do I save a heatmap or a plot as a file?
+
+Right-click the heatmap or plot and choose **Save as…**. PDF keeps vector
+shapes and editable text; PNG/JPEG are rendered at three times the screen
+resolution. In Figure the same action is in the plot card's right-click menu.
+
 ## Gate counts do not change when I move a gate
 
 Counts refresh when the drag is released. Until then only the gate label

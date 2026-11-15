@@ -4,6 +4,8 @@ Calculates the **pixel area of every Region** in every selected image file.
 It replaces the old Area module and produces a report table only; it does not
 change the data that flows downstream.
 
+![Region Size](../assets/screenshots/region-size.png)
+
 ## Inputs
 
 | Side | Contents |
@@ -18,8 +20,13 @@ does not appear. Regions from several upstream Region modules can be
 combined. If two selected Regions share a name, the column label is prefixed
 with the module name (`Module/Region`).
 
-A new Region Size module starts with **no image files selected**. Use
-**Select files…** to choose them before pressing **Calculate**.
+A new Region Size module starts with **no image files and no Regions
+selected**. Use **Select files…** and **Select regions…** to choose them
+before pressing **Calculate**.
+
+The right-hand **Area** panel is split into the table (top) and a log
+(bottom); drag the divider to change the 4:1 default. The log reports each
+file while Calculate runs.
 
 ## Results
 
@@ -37,19 +44,21 @@ A new Region Size module starts with **no image files selected**. Use
 The table is sorted by file name and Region name by default. Drag the row
 handle or a Region column header to change the order.
 
-**Copy TSV** copies the current visual order with a `File name` first header,
-ready to paste into Excel.
+**Copy table** copies the current visual order with a `File name` first
+header, ready to paste into Excel.
 
-## Calculate and locking
+## Calculate, Save and locking
 
-Press **Calculate** to run the area calculation in the background. The
-results are saved with the module, and the upstream modules are **locked**
-until:
+Press **Calculate** to run the area calculation in the background. The log
+below the table reports progress file by file and is kept with the module;
+another Calculate appends to it instead of clearing it.
 
-- **Clear results** is pressed, which removes the table and unlocks upstream
-  modules; or
-- the module is deleted.
+The calculated table is **pending**: it is shown in the window but not yet
+stored. Press **Save** to write it with the module and lock the upstream
+modules. Closing the page with an unsaved table asks for confirmation first.
 
-Editing the file or Region selection does not change the table until
-Calculate is pressed again; the column labels (including source prefixes)
-also update only on Calculate.
+The table and column labels update on Calculate; changing the file or Region
+selection keeps the previous table visible with a hint until Calculate is
+pressed again. A Region Size module has no automatic result removal: delete
+the module, or unlock the upstream modules for the session, to change inputs
+after saving.

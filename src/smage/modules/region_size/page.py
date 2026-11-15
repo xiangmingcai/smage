@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import queue
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QMimeData, Qt, QTimer, Signal
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
 from smage.core.constants import (
     MODULE_STATE_MODIFIED,
     MODULE_STATE_UNMODIFIED,
+    _FEATURE_LOG_LIMIT,
 )
 from smage.data import files as _data_files
 from smage.data import naming as _data_naming
@@ -89,6 +91,45 @@ def _rs_region_options(ctx, task_id) -> list:
 def _rs_mark_dirty(ctx, page) -> None:
     page._rs_dirty = True
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
+    _rs_update_save_btn(ctx, page)
+
+
+def _rs_update_save_btn(ctx, page) -> None:
+    """Save stores calculated results; without pending results it is off."""
+    button = getattr(page, "_rs_save_btn", None)
+    if button is None:
+        return
+    button.setEnabled(
+        not page._rs_locked and getattr(page, "_rs_pending", None) is not None
+    )
+
+
+def _rs_log(ctx, page, text) -> None:
+    """Append a timestamped line to the Region Size log (saved with params)."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    lines = getattr(page, "_rs_log_lines", None)
+    if lines is None:
+        lines = []
+        page._rs_log_lines = lines
+    for line in str(text).splitlines():
+        if not line.strip():
+            continue
+        entry = f"[{ts}] {line}"
+        lines.append(entry)
+        box = getattr(page, "_rs_log", None)
+        if box is not None:
+            box.appendPlainText(entry)
+    if len(lines) > _FEATURE_LOG_LIMIT:
+        del lines[:-_FEATURE_LOG_LIMIT]
+    page._rs_params["log"] = list(lines)
+
+
+def _rs_current_outputs(page) -> dict:
+    """Results shown in the table: pending (unsaved) first, then saved."""
+    pending = getattr(page, "_rs_pending", None)
+    if pending is not None:
+        return pending
+    return page._rs_params.get("outputs") or {}
 
 
 # ---------------------------------------------------------------------------
@@ -117,18 +158,19 @@ def _build_region_size_page(ctx, name: str, task_def: dict,
         icon.setToolTip("Locked — a downstream generate module saved data")
         tl.addWidget(icon)
     tl.addStretch()
-    clear_btn = QPushButton("Clear results")
-    clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    clear_btn.setEnabled(not locked)
+    save_btn = QPushButton("Save")
+    save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    save_btn.setEnabled(False)
     close_btn = QPushButton("Close")
     close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    tl.addWidget(clear_btn)
+    tl.addWidget(save_btn)
     tl.addWidget(close_btn)
     layout.addWidget(bar)
 
     params = task_def.setdefault("params", {})
     if "outputs" not in params:
         params["outputs"] = {}
+    params.setdefault("log", [])
     page._rs_task_def = task_def
     page._rs_task_id = task_def.get("id")
     page._rs_params = params
@@ -143,9 +185,12 @@ def _build_region_size_page(ctx, name: str, task_def: dict,
     page._rs_files = [str(p) for p in stored_files or []]
     stored_regions = params.get("regions")
     if stored_regions is None:
-        stored_regions = [item["key"] for item in page._rs_options]
+        # A new module starts with no Regions selected; the user chooses them.
+        stored_regions = []
         params["regions"] = stored_regions
     page._rs_selected = [str(key) for key in stored_regions or []]
+    page._rs_pending = None
+    page._rs_log_lines = list(params.get("log") or [])
     page._rs_token = 0
     page._rs_state = None
     page._rs_worker = _RegionSizeWorker()
@@ -173,11 +218,12 @@ def _build_region_size_page(ctx, name: str, task_def: dict,
     cl.addWidget(split, 1)
     layout.addWidget(content, 1)
 
-    clear_btn.clicked.connect(lambda _=False: _rs_clear_results(ctx, page))
+    save_btn.clicked.connect(lambda _=False: _rs_save(ctx, page))
     close_btn.clicked.connect(lambda _=False: _rs_close(ctx, page))
-    page._rs_clear_btn = clear_btn
+    page._rs_save_btn = save_btn
     _rs_rebuild_panels(ctx, page)
     _rs_rebuild_table(ctx, page)
+    _rs_update_save_btn(ctx, page)
     return page
 
 
@@ -260,14 +306,21 @@ def _rs_table_panel(ctx, page) -> QWidget:
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
+
+    split = QSplitter(Qt.Orientation.Vertical)
+    split.setChildrenCollapsible(False)
+    top = QWidget()
+    top_lay = QVBoxLayout(top)
+    top_lay.setContentsMargins(0, 0, 0, 0)
+    top_lay.setSpacing(6)
     header = QHBoxLayout()
     header.addWidget(QLabel("<b>Area (pixels)</b>"))
     header.addStretch()
-    copy = QPushButton("Copy TSV")
+    copy = QPushButton("Copy table")
     copy.setCursor(Qt.CursorShape.PointingHandCursor)
     copy.clicked.connect(lambda _=False: _rs_copy(ctx, page))
     header.addWidget(copy)
-    lay.addLayout(header)
+    top_lay.addLayout(header)
     table = _RegionSizeTable()
     table.setColumnCount(2)
     table.setHorizontalHeaderLabels(["", "File name"])
@@ -286,9 +339,28 @@ def _rs_table_panel(ctx, page) -> QWidget:
     table.horizontalHeader().sectionMoved.connect(
         lambda logical, old, new: _rs_column_moved(ctx, page, logical, old, new)
     )
-    lay.addWidget(table, 1)
+    top_lay.addWidget(table, 1)
+
+    bottom = QWidget()
+    bottom_lay = QVBoxLayout(bottom)
+    bottom_lay.setContentsMargins(0, 0, 0, 0)
+    bottom_lay.setSpacing(4)
+    bottom_lay.addWidget(QLabel("<b>Log</b>"))
+    log = _widgets_panels._log_widget()
+    for line in getattr(page, "_rs_log_lines", []):
+        log.appendPlainText(line)
+    bottom_lay.addWidget(log, 1)
+
+    split.addWidget(top)
+    split.addWidget(bottom)
+    split.setStretchFactor(0, 4)
+    split.setStretchFactor(1, 1)
+    split.setSizes([520, 130])
+    lay.addWidget(split, 1)
     page._rs_table = table
     page._rs_copy_btn = copy
+    page._rs_log = log
+    page._rs_split = split
     return panel
 
 
@@ -337,6 +409,7 @@ def _rs_select_files(ctx, page) -> None:
         return
     page._rs_files = [str(by_name[name]) for name in chosen if by_name.get(name)]
     page._rs_params["files"] = list(page._rs_files)
+    page._rs_pending = None
     _rs_mark_dirty(ctx, page)
     _rs_rebuild_panels(ctx, page)
     _rs_stale_hint(page)
@@ -357,6 +430,7 @@ def _rs_select_regions(ctx, page) -> None:
         return
     page._rs_selected = [by_label[name] for name in chosen if by_label.get(name)]
     page._rs_params["regions"] = list(page._rs_selected)
+    page._rs_pending = None
     _rs_mark_dirty(ctx, page)
     _rs_rebuild_panels(ctx, page)
     _rs_stale_hint(page)
@@ -407,6 +481,11 @@ def _rs_start_calculate(ctx, page) -> None:
     page._rs_progress.show()
     page._rs_status.setText("Reading Region channels…")
     page._rs_calculate_btn.setEnabled(False)
+    _rs_log(
+        ctx, page,
+        f"===== Calculate: {len(page._rs_files)} file(s) × "
+        f"{len(descriptors)} Region(s) =====",
+    )
     page._rs_worker.request(
         token,
         ctx,
@@ -430,10 +509,16 @@ def _rs_poll(ctx, page) -> None:
         if len(message) < 2 or message[1] != state["token"]:
             continue
         if kind == "progress":
-            _, _token, done, total, text = message
+            _, _token, done, total, _text = message
+            index = max(0, min(int(done), len(state["files"]) - 1))
+            name = _rs_file_name(
+                ctx, state["files"][index], page._rs_task_id
+            )
+            text = f"Reading {name} ({index + 1}/{total})…"
             page._rs_progress.setRange(0, total)
             page._rs_progress.setValue(done)
             page._rs_status.setText(text)
+            _rs_log(ctx, page, text)
         elif kind == "file":
             _, _token, path, values, error = message
             state["values"][str(path)] = values
@@ -441,6 +526,10 @@ def _rs_poll(ctx, page) -> None:
             page._rs_progress.setValue(state["done"])
             if error:
                 page._rs_status.setText(error)
+                _rs_log(
+                    ctx, page,
+                    f"✗ {_rs_file_name(ctx, path, page._rs_task_id)}: {error}",
+                )
         elif kind == "done":
             finished = True
     if finished:
@@ -463,7 +552,13 @@ def _rs_finish(ctx, page) -> None:
         page._rs_status.setText(
             "Calculation failed. Check that x/y coordinates are available."
         )
+        _rs_log(
+            ctx, page,
+            "✗ Calculation failed. Check that the selected image files "
+            "have converted Region channels.",
+        )
         _rs_rebuild_panels(ctx, page)
+        _rs_update_save_btn(ctx, page)
         return
     files.sort(key=lambda path: _rs_file_name(
         ctx, path, page._rs_task_id
@@ -488,41 +583,53 @@ def _rs_finish(ctx, page) -> None:
             path: values.get(path, {}) for path in files
         },
     }
+    # Keep the result in memory until Save; Calculate no longer writes it.
+    page._rs_pending = outputs
+    _rs_mark_dirty(ctx, page)
+    page._rs_status.setText(
+        f"Calculated {len(files)} file(s) × {len(regions)} region(s). "
+        "Press Save to store the table and lock upstream modules."
+    )
+    _rs_log(
+        ctx, page,
+        f"Calculated {len(files)} file(s) × {len(regions)} Region(s). "
+        "Press Save to store the table.",
+    )
+    _rs_rebuild_panels(ctx, page)
+    _rs_rebuild_table(ctx, page)
+    _rs_update_save_btn(ctx, page)
+
+
+def _rs_save(ctx, page) -> None:
+    """Store the calculated table and lock the upstream modules."""
+    if page._rs_locked:
+        return
+    outputs = getattr(page, "_rs_pending", None)
+    if not outputs:
+        return
     page._rs_params["outputs"] = outputs
     page._rs_params["files"] = list(page._rs_files)
     page._rs_params["regions"] = list(page._rs_selected)
     page._rs_task_def["output"] = {"saved": True}
+    page._rs_pending = None
     page._rs_dirty = False
     if ctx.project is not None:
         ctx.project.save()
     ctx._refresh_workflow_tree()
     ctx._module_set_state(page, MODULE_STATE_UNMODIFIED)
+    files = len(outputs.get("files") or [])
+    regions = len(outputs.get("regions") or [])
     page._rs_status.setText(
-        f"Calculated {len(files)} file(s) × {len(regions)} region(s). "
+        f"Saved {files} file(s) × {regions} Region(s). "
         "Upstream modules are now locked."
     )
-    _rs_rebuild_panels(ctx, page)
-    _rs_rebuild_table(ctx, page)
-
-
-def _rs_clear_results(ctx, page) -> None:
-    if page._rs_locked:
-        return
-    reply = QMessageBox.question(
-        ctx.host, "Clear results",
-        "Clear the saved area table and unlock upstream modules?",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+    _rs_log(
+        ctx, page,
+        f"===== Saved {files} file(s) × {regions} Region(s); "
+        "upstream modules are locked =====",
     )
-    if reply != QMessageBox.StandardButton.Yes:
-        return
-    page._rs_params["outputs"] = {}
-    page._rs_task_def["output"] = {"saved": False}
-    page._rs_dirty = False
-    if ctx.project is not None:
-        ctx.project.save()
-    ctx._refresh_workflow_tree()
-    page._rs_status.setText("Results cleared; upstream modules are unlocked.")
-    _rs_rebuild_table(ctx, page)
+    _rs_update_save_btn(ctx, page)
+    _rs_rebuild_panels(ctx, page)
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +750,7 @@ def _rs_rebuild_table(ctx, page) -> None:
 
 def _rs_rebuild_table_inner(ctx, page) -> None:
     table = page._rs_table
-    outputs = page._rs_params.get("outputs") or {}
+    outputs = _rs_current_outputs(page)
     files = list(outputs.get("files") or [])
     file_labels = list(outputs.get("file_labels") or [])
     regions = list(outputs.get("regions") or [])
@@ -722,6 +829,21 @@ def _rs_reorder_rows(ctx, page, source: int, target: int) -> None:
     target = max(0, min(target, len(order)))
     order.insert(target, value)
     page._rs_file_order = order
+    pending = getattr(page, "_rs_pending", None)
+    if pending is not None:
+        labels = {
+            path: name for path, name in zip(
+                pending.get("files") or [],
+                pending.get("file_labels") or [],
+            )
+        }
+        pending["files"] = order
+        pending["file_labels"] = [
+            labels.get(path, Path(path).name) for path in order
+        ]
+        _rs_mark_dirty(ctx, page)
+        _rs_rebuild_table(ctx, page)
+        return
     outputs = page._rs_params.get("outputs") or {}
     if outputs:
         labels = {
@@ -754,6 +876,14 @@ def _rs_column_moved(ctx, page, logical, old, new) -> None:
         header.logicalIndex(visual)
         for visual in range(2, header.count())
     ]
+    pending = getattr(page, "_rs_pending", None)
+    if pending is not None:
+        regions = list(pending.get("regions") or [])
+        if regions and len(order) == len(regions):
+            pending["regions"] = [regions[index - 2] for index in order]
+            _rs_mark_dirty(ctx, page)
+        _rs_rebuild_table(ctx, page)
+        return
     regions = list((page._rs_params.get("outputs") or {}).get("regions") or [])
     if regions and len(order) == len(regions):
         outputs = page._rs_params.get("outputs") or {}
@@ -766,14 +896,14 @@ def _rs_column_moved(ctx, page, logical, old, new) -> None:
 
 def _rs_copy(ctx, page) -> None:
     table = page._rs_table
-    if not page._rs_params.get("outputs"):
+    if not _rs_current_outputs(page).get("files"):
         QMessageBox.information(
-            ctx.host, "Copy", "Calculate the area table first."
+            ctx.host, "Copy table", "Calculate the area table first."
         )
         return
     if table.rowCount() == 0 or table.columnCount() <= 2:
         QMessageBox.information(
-            ctx.host, "Copy", "The area table is empty."
+            ctx.host, "Copy table", "The area table is empty."
         )
         return
     header = table.horizontalHeader()
@@ -794,10 +924,20 @@ def _rs_copy(ctx, page) -> None:
         lines.append((name.text() if name is not None else "") + "\t"
                      + "\t".join(values))
     QApplication.clipboard().setText("\n".join(lines))
-    page._rs_status.setText("Copied the table as TSV.")
+    page._rs_status.setText("Copied the table.")
 
 
 def _rs_close(ctx, page) -> None:
+    if getattr(page, "_rs_pending", None) is not None:
+        reply = QMessageBox.question(
+            ctx.host, "Close Region Size",
+            "The calculated table has not been saved.\n"
+            "Close and discard it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
     _rs_cleanup(ctx, page)
     ctx._close_module_page(page)
 
@@ -821,8 +961,11 @@ def _rs_refresh(ctx, page) -> None:
         path for path in page._rs_files if path in available
     ]
     page._rs_options = _rs_region_options(ctx, page._rs_task_id)
+    # Upstream data changed; an unsaved table no longer matches it.
+    page._rs_pending = None
     _rs_rebuild_panels(ctx, page)
     _rs_rebuild_table(ctx, page)
+    _rs_update_save_btn(ctx, page)
 
 
 class _RegionSizeWorker:

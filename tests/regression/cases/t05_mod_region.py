@@ -376,101 +376,30 @@ def parts_raster() -> None:
     harness.check(bool(frac[2, 2] < 0.5), "the hole stays hidden")
 
 
-@harness.case("mod.region.sam_mask_polygons", "L3", "region",
-              tags=("fast",))
-def sam_mask_polygons() -> None:
-    """SAM masks become region parts, with origin, gate and min-area handling."""
-    from smage.core.region_detection import sam_mask_polygons
+@harness.case("mod.region.sam_removed", "L4", "region", tags=("fast",))
+def sam_removed() -> None:
+    """SAM 3 is removed; an old project opens with Signal Expansion."""
+    from smage.extensions_registry import EXTENSION_DEFS
 
-    mask = np.zeros((20, 20), dtype=bool)
-    mask[2:6, 2:6] = True
-    mask[10:14, 10:14] = True
-    parts = sam_mask_polygons(
-        mask, x_origin=100.0, y_origin=200.0, tolerance=0.0
+    harness.check(
+        not any(entry.get("id") == "sam3" for entry in EXTENSION_DEFS),
+        "SAM 3 is no longer an extension",
     )
-    harness.eq(len(parts), 2)
-    xs = [point[0] for part in parts for ring in part["in"] for point in ring]
-    ys = [point[1] for part in parts for ring in part["in"] for point in ring]
-    harness.check(min(xs) >= 100.0 and max(xs) <= 114.0)
-    harness.check(min(ys) >= 200.0 and max(ys) <= 214.0)
-
-    gate = np.zeros((20, 20), dtype=bool)
-    gate[:, :10] = True
-    harness.eq(
-        len(sam_mask_polygons(mask, gate_mask=gate)), 1,
-        "the second SAM mask is clipped by the gate",
-    )
-    harness.eq(
-        sam_mask_polygons(mask, min_area=20), [],
-        "min area removes both 16-pixel masks",
-    )
-    harness.eq(sam_mask_polygons(np.zeros((8, 8), dtype=bool)), [])
-
-
-@harness.case("mod.region.sam_runner", "L4", "region", tags=("fast",))
-def sam_runner_plumbing() -> None:
-    """A configured SAM runner is called, packed masks are decoded."""
-    from unittest.mock import patch
-
-    project, parquet, _task, _figure = _region_project("region_sam_runner")
-    harness.ensure_work_dir()
-    stub = harness.RUN_DIR / "fake_sam_runner.py"
-    stub.write_text(
-        "import argparse, numpy as np\n"
-        "p = argparse.ArgumentParser()\n"
-        "sub = p.add_subparsers(dest='mode', required=True)\n"
-        "run = sub.add_parser('run')\n"
-        "run.add_argument('--input', required=True)\n"
-        "run.add_argument('--output', required=True)\n"
-        "for name in ('--model', '--device', '--points-per-side',\n"
-        "             '--points-per-batch', '--pred-iou', '--stability',\n"
-        "             '--crop-layers', '--min-area'):\n"
-        "    run.add_argument(name)\n"
-        "args = p.parse_args()\n"
-        "left = np.zeros((32, 32), dtype=bool)\n"
-        "left[5:10, 5:10] = True\n"
-        "right = np.zeros((32, 32), dtype=bool)\n"
-        "right[20:25, 20:25] = True\n"
-        "packed = np.packbits(np.stack([left, right]), axis=-1)\n"
-        "np.savez_compressed(args.output, count=np.array(2, dtype=np.int64),\n"
-        "                    shape=np.array([32, 32], dtype=np.int64),\n"
-        "                    masks=packed,\n"
-        "                    scores=np.ones(2, dtype='float32'))\n",
-        encoding="utf-8",
-    )
+    project, parquet, task, _figure = _region_project("region_sam_removed")
+    task["params"]["detect"] = {
+        "method": "sam",
+        "signal": {"threshold_mode": "otsu"},
+        "sam": {"points_per_side": 32},
+    }
+    project.save()
     window = e2e.open_window(project)
     try:
-        ctx = window._ctx
         page = e2e.open_page(window, "reg-1", "region", "Region")
-        page._region_store["gates"] = [{
-            "id": "g1", "name": "Left", "type": "rect", "parent": None,
-            "pos": [0, 0], "size": [16, 32],
-        }]
-        page._region_selected_gate_id = "g1"
-        _region_page._region_rebuild_gate_tree(ctx, page)
-        _region_page._region_sync_gate_rois(ctx, page)
-        page._region_detect["method"] = "sam"
-        page._region_detect_files = [parquet]
-        page._region_detect["files"] = [parquet]
-        with patch.object(window, "_ext_ready", return_value=True), \
-                patch.object(
-                    window, "_ext_python", return_value=sys.executable
-                ), \
-                patch.object(
-                    window, "_ext_runner_path", return_value=str(stub)
-                ):
-            _region_page._region_start_detect(ctx, page)
-            harness.wait_for(
-                lambda: not _region_page._region_detect_running(page),
-                timeout=30, message="SAM detection",
-            )
-        harness.pump(300)
-        harness.eq(len(page._region_store["regions"]), 1)
-        region = page._region_store["regions"][0]
-        subs = region["samples"][parquet]["sub_regions"]
-        harness.eq(len(subs), 1, "the gate clips the second SAM mask")
-        xs = [point[0] for ring in subs[0]["in"] for point in ring]
-        harness.check(max(xs) <= 16.0 + 1e-6)
+        harness.eq(page._region_detect.get("method"), "signal")
+        harness.check("sam" not in page._region_detect)
+        combo = page._region_method_combo
+        harness.eq(combo.count(), 1)
+        harness.eq(combo.itemData(0), "signal")
     finally:
         e2e.close_window(window)
 
@@ -1498,29 +1427,6 @@ def sample_switch() -> None:
         harness.check(
             abs(rect.x() - 2.0) < 1e-6 and abs(rect.y() - 2.0) < 1e-6,
             f"only the lower file's polygon is drawn: {rect}",
-        )
-    finally:
-        e2e.close_window(window)
-
-
-@harness.case("mod.region.sam_requires_extension", "L4", "region",
-              tags=("fast",))
-def sam_requires_extension() -> None:
-    project, _parquet, _task, _figure = _region_project("region_sam")
-    window = e2e.open_window(project)
-    try:
-        ctx = window._ctx
-        page = e2e.open_page(window, "reg-1", "region", "Region")
-        page._region_detect["method"] = "sam"
-        with harness.patch_dialogs(
-            _region_page, question=QMessageBox.StandardButton.Ok,
-            information=QMessageBox.StandardButton.Ok,
-        ):
-            _region_page._region_start_detect(ctx, page)
-        harness.eq(len(page._region_store.get("regions") or []), 0)
-        harness.check(
-            not getattr(page, "_region_detect_state", None),
-            "SAM does not start without an extension environment",
         )
     finally:
         e2e.close_window(window)

@@ -14,6 +14,8 @@ A new Region module starts with **no image files selected**. Use
 **Select files…** to choose them; the preview and detection stay empty until
 you do.
 
+![Region](../assets/screenshots/region.png)
+
 ## The page
 
 | Area | Contents |
@@ -90,7 +92,7 @@ Per-file gates are shown in italics in the tree.
 selected file and turns per-file mode off. The gate type never changes; a
 boolean gate uses per-file geometry through its source gates.
 
-## Detection methods
+## Detection
 
 ### Signal Expansion
 
@@ -121,28 +123,6 @@ explaining what it changes.
 If the final foreground covers 80% or more of the image, the log prints a
 warning. That usually means the threshold is below the background noise or
 **Expand** is too large, and the parameters or the channel should be changed.
-
-### SAM 3
-
-SAM 3 runs in a separate Python environment configured in
-**Extension Manager → SAM 3**; Smage does not bundle torch or the model
-weights. The user accepts the model license and downloads `facebook/sam3`
-through the extension. The selected channel is normalized to an 8-bit RGB
-image and passed to SAM's automatic mask generator; the resulting masks are
-clipped to the detection gate and converted to sub-regions with the same
-minimum-area and tolerance settings.
-
-Use **Manage SAM…** in the detection panel to configure it. SAM parameters:
-points per side, points per batch, predicted IoU threshold, stability
-threshold, crop layers and minimum mask area.
-
-SAM 3 is released by Meta under the **SAM License** (2025-11-19), not an
-open-source license. It allows research and commercial use, but forbids
-military, nuclear, espionage and weapons use, requires a copy of the license
-when the materials are redistributed, and requires research publications to
-acknowledge SAM. Smage never bundles or redistributes the SAM code or
-weights, so the license is accepted by the user who downloads them and does
-not change Smage's GPL-3.0 terms.
 
 Detection runs in the background and reports progress per file in the
 **Log** panel at the bottom right. Each line has a timestamp, and every

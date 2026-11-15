@@ -22,6 +22,21 @@ Bug reports, feature requests and pull requests are welcome.
 The full guidelines live in
 [CONTRIBUTING.md](https://github.com/xiangmingcai/smage/blob/main/CONTRIBUTING.md).
 
+## AI-assisted contributions
+
+AI coding tools may be used when preparing a contribution. If you use one:
+
+- say so in the pull request;
+- make sure you understand the change well enough to maintain it;
+- keep the same test, documentation and review requirements as any other
+  contribution — AI-generated code is never merged unreviewed;
+- do not include generated text or code whose license is incompatible with
+  GPL-3.0.
+
+The maintainer remains accountable for everything that is released. See
+[DISCLAIMER.md](https://github.com/xiangmingcai/smage/blob/main/DISCLAIMER.md)
+for the full statement on AI-assisted development and human review.
+
 ## License
 
 Contributions are licensed under GPL-3.0, the license of the project.

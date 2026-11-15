@@ -1,6 +1,7 @@
 # Smage
 
-**Free, open-source desktop analysis for image and flow-cytometry data.**
+**Free, open-source desktop analysis for spectral image and flow-cytometry
+data.**
 
 Smage imports FCS files and microscopy images into one tabular model and
 lets you build analysis pipelines from interactive modules — gating,
@@ -12,7 +13,7 @@ compensation, unmixing, segmentation, clustering, feature tables and export.
 ![Smage workflow](assets/screenshots/workflow.png)
 
 !!! info "Status"
-    Smage is in early development (`0.1.0`). Modules, file formats and
+    Smage is in early development (`0.2.0`). Modules, file formats and
     settings may still change between releases. Windows 10/11 (64-bit) only.
 
 ## What you can do
@@ -37,8 +38,9 @@ compensation, unmixing, segmentation, clustering, feature tables and export.
 
     ---
 
-    Cellpose, StarDist and classical segmentation, area and density
-    measurements, then per-class feature aggregation.
+    Cellpose, StarDist and Nuclear Expansion segmentation; Region detection
+    with Signal Expansion; per-Region pixel area; and per-class feature
+    aggregation.
 
 -   :material-chart-scatter-plot: **Explore**
 
@@ -88,5 +90,13 @@ flowchart LR
 
 ## License
 
-Smage is free software under **GPL-3.0**. Copyright (C) 2026 Amsterdam UMC.
-The source code is on [GitHub](https://github.com/xiangmingcai/smage).
+Smage is free software under **GPL-3.0**, released with the approval of
+Amsterdam UMC, the Netherlands. Copyright (C) 2026 Amsterdam UMC. The source
+code is on [GitHub](https://github.com/xiangmingcai/smage).
+
+!!! warning "Research use only"
+    Smage is research software, not a medical device, and must not be used
+    for clinical diagnosis or decision-making. It comes without warranty, and
+    you are responsible for the analysis and its results. See
+    [DISCLAIMER.md](https://github.com/xiangmingcai/smage/blob/main/DISCLAIMER.md)
+    for the full statement.

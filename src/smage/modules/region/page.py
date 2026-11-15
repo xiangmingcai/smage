@@ -5,8 +5,6 @@ import copy
 import math
 import queue
 import shutil
-import subprocess
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -28,7 +26,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QDialog,
-    QDoubleSpinBox,
     QFrame,
     QGraphicsPathItem,
     QGridLayout,
@@ -58,7 +55,6 @@ from smage.core.gates import (
 from smage.core.region_detection import (
     _mask_region,
     region_parts_mask,
-    sam_mask_polygons,
     signal_expansion,
 )
 from smage.data import columns as _data_columns
@@ -252,6 +248,9 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     ] or list(page._region_files)
     page._region_detect = copy.deepcopy(params.get("detect") or {})
     page._region_detect.setdefault("method", "signal")
+    # SAM 3 was removed; old projects fall back to Signal Expansion.
+    page._region_detect["method"] = "signal"
+    page._region_detect.pop("sam", None)
     page._region_detect.setdefault("files", list(page._region_detect_files))
     page._region_detect.setdefault("channel", None)
     signal_params = page._region_detect.setdefault("signal", {})
@@ -269,15 +268,6 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
             "otsu" if signal_params.get("auto_threshold", True)
             else "manual"
         )
-    page._region_detect.setdefault("sam", {
-        "points_per_side": 32,
-        "points_per_batch": 64,
-        "pred_iou": 0.88,
-        "stability": 0.95,
-        "crop_layers": 0,
-        "min_area": 0,
-        "tolerance": 1.0,
-    })
     page._region_snapshot = copy.deepcopy(params)
     page._region_store_snapshot = copy.deepcopy(store)
     page._region_log_lines = list(params.get("log") or [])
@@ -3272,7 +3262,6 @@ def _region_rebuild_detect_panel(ctx, page) -> None:
     row.addWidget(files_btn)
     method = _NoWheelComboBox()
     method.addItem("Signal Expansion", "signal")
-    method.addItem("SAM 3 (external)", "sam")
     method.setCurrentIndex(
         max(0, method.findData(detect.get("method", "signal")))
     )
@@ -3281,8 +3270,8 @@ def _region_rebuild_detect_panel(ctx, page) -> None:
     layout.addLayout(row)
     layout.addWidget(_widgets_panels._param_hint(
         ctx,
-        "Signal Expansion thresholds this channel; SAM 3 runs the external "
-        "model configured in Extension Manager.",
+        "Signal Expansion thresholds this channel and traces the resulting "
+        "foreground into Region parts.",
     ))
 
     channel_row = QHBoxLayout()
@@ -3305,15 +3294,9 @@ def _region_rebuild_detect_panel(ctx, page) -> None:
         ctx, "Image channel whose intensity is used to find Regions."
     ))
 
-    is_sam = detect.get("method") == "sam"
     signal_host = QWidget()
-    sam_host = QWidget()
-    if is_sam:
-        _region_build_sam_params(ctx, page, sam_host, enabled)
-        layout.addWidget(sam_host)
-    else:
-        _region_build_signal_params(ctx, page, signal_host, enabled)
-        layout.addWidget(signal_host)
+    _region_build_signal_params(ctx, page, signal_host, enabled)
+    layout.addWidget(signal_host)
 
     buttons = QHBoxLayout()
     buttons.setSpacing(6)
@@ -3322,13 +3305,6 @@ def _region_rebuild_detect_panel(ctx, page) -> None:
     detect_btn.setEnabled(enabled and bool(columns))
     detect_btn.clicked.connect(lambda _=False: _region_start_detect(ctx, page))
     buttons.addWidget(detect_btn)
-    if is_sam:
-        manage = QPushButton("Manage SAM…")
-        manage.setCursor(Qt.CursorShape.PointingHandCursor)
-        manage.clicked.connect(
-            lambda _=False: _region_manage_sam(ctx, page)
-        )
-        buttons.addWidget(manage)
     buttons.addStretch()
     layout.addLayout(buttons)
 
@@ -3487,80 +3463,6 @@ def _region_build_signal_params(ctx, page, host, enabled) -> None:
             toggle.connect(store)
 
 
-def _region_build_sam_params(ctx, page, host, enabled) -> None:
-    detect = page._region_detect.setdefault("sam", {})
-    grid = QGridLayout(host)
-    grid.setContentsMargins(0, 0, 0, 0)
-    grid.setSpacing(4)
-    specs = [
-        ("Points / side", "points_per_side", 1, 200, 1,
-         "Grid of prompt points per image side. Higher values find smaller "
-         "objects but run slower."),
-        ("Points / batch", "points_per_batch", 1, 256, 1,
-         "Prompt points processed at once. Lower this if GPU memory is "
-         "tight."),
-        ("IoU threshold", "pred_iou", 0.0, 1.0, 0.01,
-         "Minimum predicted mask quality. Higher values keep fewer, cleaner "
-         "masks."),
-        ("Stability", "stability", 0.0, 1.0, 0.01,
-         "Minimum mask stability. Higher values keep fewer, more confident "
-         "masks."),
-        ("Crop layers", "crop_layers", 0, 10, 1,
-         "Extra image crops SAM analyses. More layers find small objects at "
-         "extra cost."),
-        ("Min area", "min_area", 0, 10_000_000, 1,
-         "Masks smaller than this many pixels are discarded."),
-        ("Tolerance", "tolerance", 0.0, 100.0, 0.01,
-         "Polygon simplification in pixels. Larger values give fewer "
-         "vertices and smaller sub-regions."),
-    ]
-    widgets = {}
-    row = 0
-    for label, key, low, high, step, text in specs:
-        grid.addWidget(QLabel(label), row, 0)
-        if isinstance(step, int):
-            widget = _NoWheelSpinBox()
-            widget.setRange(int(low), int(high))
-            widget.setValue(int(detect.get(key) or low))
-        else:
-            widget = _NoWheelDoubleSpinBox()
-            widget.setDecimals(3)
-            widget.setRange(float(low), float(high))
-            widget.setSingleStep(float(step))
-            widget.setValue(float(detect.get(key) or low))
-        widget.setEnabled(enabled)
-        grid.addWidget(widget, row, 1)
-        widgets[key] = widget
-        row += 1
-        grid.addWidget(
-            _widgets_panels._param_hint(ctx, text), row, 0, 1, 2
-        )
-        row += 1
-
-    ready = ctx._ext_ready("sam3")
-    hint = QLabel(
-        "SAM 3 is configured. It runs in its external environment."
-        if ready else
-        "SAM 3 is not configured. Use Manage SAM… to install its "
-        "environment and model."
-    )
-    hint.setWordWrap(True)
-    hint.setStyleSheet(
-        "color: #8a94a6; font-size: 8pt;"
-        if ready else "color: #b58900; font-size: 8pt;"
-    )
-    grid.addWidget(hint, row, 0, 1, 2)
-
-    def store(*_args):
-        for key, widget in widgets.items():
-            value = widget.value()
-            detect[key] = float(value) if isinstance(widget, QDoubleSpinBox) else int(value)
-        _region_mark_dirty(ctx, page)
-
-    for widget in widgets.values():
-        widget.valueChanged.connect(store)
-
-
 def _region_choose_detect_files(ctx, page) -> None:
     names = [
         _region_file_name(ctx, path, page._region_task_id)
@@ -3584,14 +3486,6 @@ def _region_choose_detect_files(ctx, page) -> None:
     ]
     page._region_detect["files"] = list(page._region_detect_files)
     _region_mark_dirty(ctx, page)
-    _region_rebuild_detect_panel(ctx, page)
-
-
-def _region_manage_sam(ctx, page) -> None:
-    try:
-        ctx._open_extension_manager(select="sam3")
-    except Exception as exc:  # noqa: BLE001
-        QMessageBox.warning(ctx.host, "SAM 3", str(exc))
     _region_rebuild_detect_panel(ctx, page)
 
 
@@ -3666,45 +3560,17 @@ def _region_start_detect(ctx, page) -> None:
         return
     gates = copy.deepcopy(page._region_store.get("gates") or [])
     per_file = copy.deepcopy(page._region_store.get("per_file") or {})
-    method = detect.get("method", "signal")
-    if method == "sam":
-        if not ctx._ext_ready("sam3"):
-            QMessageBox.information(
-                ctx.host, "Detect Region",
-                "SAM 3 is not configured. Use Manage SAM… to set it up.",
-            )
-            return
-        python = ctx._ext_python("sam3")
-        runner = ctx._ext_runner_path("sam3")
-        from smage.extensions_registry import _extension_def
-        entry = _extension_def("sam3") or {}
-        model = str(entry.get("model") or "facebook/sam3")
-        job = {
-            "ctx": ctx,
-            "task_id": page._region_task_id,
-            "method": "sam",
-            "files": files,
-            "channel": channel,
-            "gates": gates,
-            "per_file": per_file,
-            "gate_id": page._region_selected_gate_id,
-            "sam": copy.deepcopy(detect.get("sam") or {}),
-            "python": python,
-            "runner": str(runner),
-            "model": model,
-        }
-    else:
-        job = {
-            "ctx": ctx,
-            "task_id": page._region_task_id,
-            "method": "signal",
-            "files": files,
-            "channel": channel,
-            "gates": gates,
-            "per_file": per_file,
-            "gate_id": page._region_selected_gate_id,
-            "signal": copy.deepcopy(detect.get("signal") or {}),
-        }
+    job = {
+        "ctx": ctx,
+        "task_id": page._region_task_id,
+        "method": "signal",
+        "files": files,
+        "channel": channel,
+        "gates": gates,
+        "per_file": per_file,
+        "gate_id": page._region_selected_gate_id,
+        "signal": copy.deepcopy(detect.get("signal") or {}),
+    }
     page._region_detect_token += 1
     token = page._region_detect_token
     page._region_detect_state = {
@@ -3716,26 +3582,23 @@ def _region_start_detect(ctx, page) -> None:
         "done": 0,
     }
     _region_set_status(page, "Detection started; see the log below.")
-    if method == "sam":
-        method_label = "SAM 3"
+    params = detect.get("signal") or {}
+    mode = params.get("threshold_mode")
+    if mode is None:
+        mode = (
+            "manual" if not params.get("auto_threshold", True)
+            else "otsu"
+        )
+    if mode == "manual":
+        cut = f"manual threshold {float(params.get('threshold') or 0.0):g}"
+    elif mode == "percentile":
+        cut = (
+            f"P{float(params.get('percentile') or 0.0):g} "
+            "threshold per file"
+        )
     else:
-        params = detect.get("signal") or {}
-        mode = params.get("threshold_mode")
-        if mode is None:
-            mode = (
-                "manual" if not params.get("auto_threshold", True)
-                else "otsu"
-            )
-        if mode == "manual":
-            cut = f"manual threshold {float(params.get('threshold') or 0.0):g}"
-        elif mode == "percentile":
-            cut = (
-                f"P{float(params.get('percentile') or 0.0):g} "
-                "threshold per file"
-            )
-        else:
-            cut = "Otsu threshold per file"
-        method_label = f"Signal Expansion, {cut}"
+        cut = "Otsu threshold per file"
+    method_label = f"Signal Expansion, {cut}"
     _region_log(
         ctx, page,
         f"===== Region detection — {method_label}, {len(files)} file(s), "
@@ -3981,7 +3844,7 @@ class _RegionChannelWorker:
 
 
 class _RegionDetectWorker:
-    """Background Signal Expansion / SAM detection for the Region module."""
+    """Background Signal Expansion detection for the Region module."""
 
     def __init__(self) -> None:
         self._jobs = queue.Queue()
@@ -4091,11 +3954,6 @@ class _RegionDetectWorker:
             "detection gate", time.perf_counter() - started,
             "none" if gate is None else "clipped",
         )
-        if job.get("method") == "sam":
-            parts, error = _RegionDetectWorker._detect_sam(
-                job, path, image, gate, x0, y0, report
-            )
-            return parts, error, None
         params = job.get("signal") or {}
         threshold_mode = params.get("threshold_mode")
         if threshold_mode is None:
@@ -4123,113 +3981,6 @@ class _RegionDetectWorker:
             progress=report,
         )
         return parts, None, float(used_threshold)
-
-    @staticmethod
-    def _detect_sam(job, path, image, gate, x0, y0, report):
-        import numpy as np
-
-        config = job.get("sam") or {}
-        started = time.perf_counter()
-        finite = np.isfinite(image)
-        if not finite.any():
-            return [], "no finite pixels in this channel"
-        values = image[finite]
-        low, high = np.percentile(values, [1.0, 99.0])
-        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
-            low = float(values.min())
-            high = float(values.max())
-        if high <= low:
-            high = low + 1.0
-        scaled = np.clip((image - low) / (high - low), 0.0, 1.0)
-        scaled[~finite] = 0.0
-        gray = (scaled * 255.0).astype("uint8")
-        report(
-            "sam prepare", time.perf_counter() - started,
-            f"range {low:.4g}..{high:.4g}",
-        )
-        try:
-            from PIL import Image
-        except Exception:  # noqa: BLE001
-            return [], "Pillow is missing in the Smage environment"
-        with tempfile.TemporaryDirectory(prefix="smage-sam-") as folder:
-            png = str(Path(folder) / "image.png")
-            out = str(Path(folder) / "masks.npz")
-            started = time.perf_counter()
-            Image.fromarray(gray, mode="L").convert("RGB").save(png)
-            report(
-                "sam write image", time.perf_counter() - started
-            )
-            command = [
-                str(job["python"]), str(job["runner"]), "run",
-                "--input", png, "--output", out,
-                "--model", str(job.get("model") or "facebook/sam3"),
-                "--device", str(config.get("device") or "auto"),
-                "--points-per-side", str(int(config.get("points_per_side") or 32)),
-                "--points-per-batch", str(int(config.get("points_per_batch") or 64)),
-                "--pred-iou", str(float(config.get("pred_iou") or 0.88)),
-                "--stability", str(float(config.get("stability") or 0.95)),
-                "--crop-layers", str(int(config.get("crop_layers") or 0)),
-                "--min-area", str(int(config.get("min_area") or 0)),
-            ]
-            started = time.perf_counter()
-            try:
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=3600,
-                    creationflags=getattr(
-                        subprocess, "CREATE_NO_WINDOW", 0
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001
-                return [], f"SAM could not start: {exc}"
-            report(
-                "sam inference", time.perf_counter() - started,
-                "external process",
-            )
-            if completed.returncode != 0 or not Path(out).is_file():
-                detail = (completed.stderr or completed.stdout or "").strip()
-                return [], "SAM failed" + (f": {detail[-500:]}" if detail else "")
-            started = time.perf_counter()
-            try:
-                # Closing the archive matters on Windows: the temporary
-                # folder cannot be removed while masks.npz is still open.
-                with np.load(out) as data:
-                    count = int(data["count"])
-                    height, width = (int(v) for v in data["shape"])
-                    packed = np.array(data["masks"])
-            except Exception as exc:  # noqa: BLE001
-                return [], f"Could not read SAM output: {exc}"
-            report(
-                "sam read masks", time.perf_counter() - started,
-                f"{count} mask(s)",
-            )
-            started = time.perf_counter()
-            parts = []
-            for index in range(count):
-                if count == 0:
-                    continue
-                row = np.unpackbits(packed[index], axis=-1)
-                mask = row[:width].astype(bool)
-                if mask.size != height * width:
-                    continue
-                mask = mask.reshape(height, width)
-                parts.extend(
-                    sam_mask_polygons(
-                        mask, gate,
-                        min_area=int(config.get("min_area") or 0),
-                        tolerance=float(config.get("tolerance") or 0.0),
-                        x_origin=float(x0 or 0.0),
-                        y_origin=float(y0 or 0.0),
-                    )
-                )
-            report(
-                "sam regions", time.perf_counter() - started,
-                f"{len(parts)} region part(s)",
-            )
-            return parts, None
-
 
 # ---------------------------------------------------------------------------
 # Save / close / refresh / cleanup

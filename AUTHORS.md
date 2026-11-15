@@ -14,4 +14,5 @@ contributions can additionally be listed here.
 ## Copyright
 
 Copyright (C) 2026 Amsterdam UMC, the Netherlands. Smage is distributed
-under GPL-3.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+under GPL-3.0 with the approval of Amsterdam UMC; see [LICENSE](LICENSE) and
+[NOTICE](NOTICE).

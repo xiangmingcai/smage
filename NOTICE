@@ -1,6 +1,6 @@
-Smage — image and flow-cytometry analysis application
+Smage — spectral image and flow-cytometry analysis application
 
-Copyright (C) 2026 Amsterdam UMC, the Netherlands. All rights reserved.
+Copyright (C) 2026 Amsterdam UMC, the Netherlands.
 
 Author: Xiangming Cai
 Advisor: Juan J. Garcia Vallejo
@@ -10,6 +10,9 @@ Developed at Amsterdam UMC, the Netherlands.
 Smage is free software: you can redistribute it and/or modify it under the
 terms of the GNU General Public License, version 3 (GPL-3.0), as published
 by the Free Software Foundation. See LICENSE for the full text.
+
+Smage is released under GPL-3.0 with the approval of Amsterdam UMC, the
+Netherlands.
 
 Smage is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS

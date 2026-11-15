@@ -1,13 +1,11 @@
 """Region detection and polygon/area helpers (Qt-free).
 
-Signal Expansion turns one intensity channel into connected signal regions;
-SAM masks are converted with the same polygon/area code.  All polygons are
-stored in image data coordinates (x right, y down), exactly like gate
-geometry, so they can be reused by downstream gate masks.
+Signal Expansion turns one intensity channel into connected signal regions.
+All polygons are stored in image data coordinates (x right, y down), exactly
+like gate geometry, so they can be reused by downstream gate masks.
 """
 from __future__ import annotations
 
-import math
 import time
 
 from smage.core.gates import _point_in_polygon
@@ -497,24 +495,6 @@ def signal_expansion(image, gate_mask=None, threshold=None,
         f"{len(parts)} region part(s), tolerance={float(tolerance):g}",
     )
     return parts, float(used_threshold), binary
-
-
-def sam_mask_polygons(mask, gate_mask=None, min_area: int = 0,
-                      tolerance: float = 1.0,
-                      x_origin: float = 0.0, y_origin: float = 0.0):
-    """Convert one SAM mask to region parts, with the same filters."""
-    import numpy as np
-
-    binary = np.asarray(mask, dtype=bool)
-    if gate_mask is not None:
-        gate = np.asarray(gate_mask, dtype=bool)
-        if gate.shape == binary.shape:
-            binary = binary & gate
-    if min_area and int(min_area) > 0:
-        binary = _filter_components(binary, int(min_area))
-    if not binary.any():
-        return []
-    return _mask_region_parts(binary, x_origin, y_origin, tolerance)
 
 
 def polygon_union_mask(polygons, x, y):

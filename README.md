@@ -1,13 +1,17 @@
 # Smage
 
-Smage is a free, open-source desktop application for analyzing **image and
-flow-cytometry data**. It imports FCS files and microscopy images into a
-common tabular representation and lets you compose analysis pipelines from
-interactive modules — gating, compensation, unmixing, segmentation, feature
-aggregation, clustering, dimensionality reduction and export.
+Smage is a free, open-source desktop application for analyzing **spectral
+image and flow-cytometry data**. It imports FCS files and microscopy images
+into a common tabular representation and lets you compose analysis pipelines
+from interactive modules — gating, compensation, unmixing, segmentation,
+feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.1.0`; modules and
+> **Status:** early development. The current release is `0.2.0`; modules and
 > file formats may still change between releases.
+
+> **Intended use:** research software, not a medical device. Not for clinical
+> diagnosis or decision-making. Provided without warranty; you are responsible
+> for the analysis and its results. See [DISCLAIMER.md](DISCLAIMER.md).
 
 **Documentation:** <https://xiangmingcai.github.io/smage/> ·
 **Releases:** <https://github.com/xiangmingcai/smage/releases> ·
@@ -25,7 +29,7 @@ see the data produced by the ones above them.
 | Display only | Scale (changes how values are drawn, never the data) |
 | Sampling | Subsample, Subset |
 | Gating | Gating (rect / ellipse / polygon / quadrant / split / range gates, boolean gates) |
-| Image analysis | Segmentation (Cellpose, StarDist, classical thresholding), Region (Signal Expansion / SAM 3) |
+| Image analysis | Segmentation (Cellpose, StarDist, classical thresholding), Region (Signal Expansion) |
 | Analyse | Region Size (pixel area per Region) |
 | Features | Feature Down (aggregate per class), Feature Up, Gate2Col |
 | Computation | Cluster, Dimensionality Reduction, Data Clean |
@@ -112,6 +116,9 @@ copyright statement.
 Smage is free software: you can redistribute it and/or modify it under the
 terms of the **GNU General Public License, version 3** (GPL-3.0).
 See [LICENSE](LICENSE) for the full text.
+
+Smage is released under GPL-3.0 with the approval of Amsterdam UMC, the
+Netherlands.
 
 Copyright (C) 2026 Amsterdam UMC, the Netherlands.
 

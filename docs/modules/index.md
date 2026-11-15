@@ -16,9 +16,10 @@ own settings, and passes the result down.
   be changed until the output is removed or the module is unlocked. Smage
   shows a lock badge in the workflow tree.
 - **Generated files.** Only some modules write files: Data Import writes the
-  normalized table, Segmentation writes masks, Feature Down/Up and Gate2Col
-  write new tables. Other modules compute on demand and are always up to
-  date with the saved settings above them.
+  normalized table, Segmentation writes masks, Unmix writes unmixed image
+  channels, Region writes converted 0/1 channels, and Feature Down/Up and
+  Gate2Col write new tables. Other modules compute on demand and are always
+  up to date with the saved settings above them.
 - **Display-only steps.** The Scale module never changes values — it only
   changes how they are drawn.
 
@@ -39,7 +40,7 @@ own settings, and passes the result down.
 | Display | [Scale](scale.md) | log10 / arcsinh / linear display transform |
 | Gating | [Gating](gating.md) | Create gates and per-gate statistics |
 | Image | [Segmentation](segmentation.md) | Cellpose, StarDist or threshold masks |
-| Image | [Region](region.md) | Detect and manage image regions as spatial gates |
+| Image | [Region](region.md) | Detect Regions and expose them downstream as 0/1 image channels |
 | Analyse | [Region Size](region-size.md) | Pixel area of each Region in each image file |
 | Features | [Feature Down](feature-down.md) | Aggregate values per class into a feature table |
 | Features | [Feature Up](feature-up.md) | Map feature-table columns back to events |

@@ -13,6 +13,8 @@ Select the data files on the left before adding rows. A new Calculation
 module starts with **no files selected**, so it never processes a file you
 did not choose.
 
+![Calculation](../assets/screenshots/calculation.png)
+
 ## Rows
 
 | Column | Meaning |

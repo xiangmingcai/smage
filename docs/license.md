@@ -3,6 +3,9 @@
 Smage is free software: you can redistribute it and/or modify it under the
 terms of the **GNU General Public License, version 3** (GPL-3.0).
 
+Smage is released under GPL-3.0 with the approval of Amsterdam UMC, the
+Netherlands.
+
 Copyright (C) 2026 Amsterdam UMC, the Netherlands.
 
 - Full license text:
@@ -16,6 +19,16 @@ Copyright (C) 2026 Amsterdam UMC, the Netherlands.
 The corresponding source code of every release is available in the
 [GitHub repository](https://github.com/xiangmingcai/smage) and in the source
 archive attached to each release.
+
+## Research use and no warranty
+
+Smage is research software for spectral image and flow-cytometry data
+analysis. It is **not a medical device** and must not be used for clinical
+diagnosis, treatment selection or any other clinical decision. It is
+provided without warranty; you are responsible for the analysis and its
+results. The full statement, including how AI-assisted development is
+reviewed by human maintainers, is in
+[DISCLAIMER.md](https://github.com/xiangmingcai/smage/blob/main/DISCLAIMER.md).
 
 ## Third-party components
 

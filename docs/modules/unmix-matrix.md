@@ -45,9 +45,15 @@ the current matrix is left untouched.
 Every pasted cell can be edited, and the rows can be dragged into a new order
 by their header. Columns start compact (the Signature column is 20 characters
 wide, value columns 5) and any divider can be dragged to widen them; long
-channel names are elided until you do. If the channel selection changes after pasting, the matrix
-is kept but marked with a warning, and **Unmix for image** refuses to run
-until the paste matches the selection again (a channel reorder is fine).
+channel names are elided until you do.
+
+If the channel selection changes after pasting, the matrix is kept but marked
+with a warning, and **Unmix for image** refuses to run until the paste matches
+the selection again (a channel reorder is fine).
+
+**Copy matrix to clipboard** writes the values with one decimal. A matrix
+copied to another module is therefore close to, but not bit-identical with,
+the source when that source was built from full-precision spectra.
 
 ## Matrix views
 

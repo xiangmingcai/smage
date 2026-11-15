@@ -180,7 +180,10 @@ def calculate_table() -> None:
             message="Region Size calculation",
         )
         harness.pump(300)
-        outputs = page._rs_params["outputs"]
+        outputs = page._rs_pending
+        harness.check(outputs is not None, "the result is pending save")
+        harness.eq(page._rs_params.get("outputs"), {},
+                   "Calculate no longer writes the result")
         harness.eq(len(outputs["files"]), 2)
         harness.eq(len(outputs["regions"]), 2)
         values = outputs["values"]
@@ -203,8 +206,8 @@ def calculate_table() -> None:
         )
         live_region = window._find_task_by_id("reg-1")
         harness.check(
-            window._task_locked(live_region),
-            "Calculate locks upstream modules",
+            not window._task_locked(live_region),
+            "Calculate does not lock upstream modules before Save",
         )
         # The table mirrors the same values.
         table = page._rs_table
@@ -219,15 +222,16 @@ def calculate_table() -> None:
         harness.check(tsv.startswith("File name\t"))
         harness.check("NA" in tsv and str(a_first) in tsv)
 
-        # Clear results unlocks upstream and empties the saved table.
-        with harness.patch_dialogs(
-            _rs_page, question=QMessageBox.StandardButton.Yes
-        ):
-            _rs_page._rs_clear_results(ctx, page)
-        harness.eq(page._rs_params["outputs"], {})
-        harness.check(not window._task_locked(
+        # Save stores the pending result and locks upstream modules.
+        harness.check(page._rs_save_btn.isEnabled(), "Save is enabled")
+        _rs_page._rs_save(ctx, page)
+        harness.eq(page._rs_pending, None)
+        harness.eq(page._rs_params["outputs"], outputs)
+        harness.check(window._task_locked(
             window._find_task_by_id("reg-1")
-        ))
+        ), "Save locks upstream modules")
+        harness.check(not page._rs_save_btn.isEnabled(),
+                      "Save is disabled after saving")
     finally:
         e2e.close_window(window)
 
@@ -252,15 +256,22 @@ def reorder_table() -> None:
             message="Region Size calculation",
         )
         harness.pump(300)
+        outputs = page._rs_pending
+        harness.check(outputs is not None)
         original = list(page._rs_file_order)
         _rs_page._rs_reorder_rows(ctx, page, 0, len(original))
         harness.eq(
             page._rs_file_order, [original[1], original[0]]
         )
-        # The row order is stored in the result.
+        harness.eq(
+            page._rs_pending["files"], [original[1], original[0]],
+            "the row order is stored in the pending result",
+        )
+        _rs_page._rs_save(ctx, page)
         harness.eq(
             page._rs_params["outputs"]["files"],
             [original[1], original[0]],
+            "Save stores the reordered result",
         )
     finally:
         e2e.close_window(window)
@@ -351,7 +362,8 @@ def multi_module() -> None:
             message="multi-module Region Size",
         )
         harness.pump(300)
-        outputs = page._rs_params["outputs"]
+        outputs = page._rs_pending
+        harness.check(outputs is not None)
         harness.eq(len(outputs["regions"]), 2)
         values = outputs["values"][first]
         expected = sorted([
@@ -373,9 +385,10 @@ def multi_module() -> None:
         harness.pump(200)
         reordered = [
             item["key"]
-            for item in page._rs_params["outputs"]["regions"]
+            for item in page._rs_pending["regions"]
         ]
         harness.eq(reordered, [original[1], original[0]])
+        _rs_page._rs_save(ctx, page)
         saved = json.loads((project.path / "project.json").read_text())
         stack = list(saved["workflow"]["tasks"])
         found = None
@@ -412,6 +425,11 @@ def files_required() -> None:
         page = e2e.open_page(window, "rs-1", "region_size", "Region Size")
         harness.eq(page._rs_files, [])
         harness.eq(page._rs_params.get("files"), [])
+        harness.eq(page._rs_selected, [],
+                   "a new module does not preselect Regions")
+        harness.eq(page._rs_params.get("regions"), [])
+        harness.eq(page._rs_save_btn.text(), "Save")
+        harness.eq(page._rs_copy_btn.text(), "Copy table")
         with harness.patch_dialogs(
             _rs_page, information=QMessageBox.StandardButton.Ok
         ):
@@ -433,6 +451,8 @@ def files_required() -> None:
         ):
             _rs_page._rs_select_files(ctx, page)
         harness.eq(len(page._rs_files), len(names))
+        harness.eq(page._rs_selected, [],
+                   "selecting files does not select Regions")
     finally:
         e2e.close_window(window)
 
@@ -473,12 +493,12 @@ def empty_selection() -> None:
         e2e.close_window(window)
 
 
-@harness.case("mod.region_size.clear_cancel", "L4", "region_size",
+@harness.case("mod.region_size.save", "L4", "region_size",
               tags=("fast",))
-def clear_cancel() -> None:
-    """Clear results asks first; No keeps the table and the upstream lock."""
+def save_results() -> None:
+    """Calculated results stay pending until Save; closing warning works."""
     project, region_task, _rs_task, first, second = _two_file_project(
-        "region_size_clear"
+        "region_size_save"
     )
     window = e2e.open_window(project)
     try:
@@ -494,26 +514,27 @@ def clear_cancel() -> None:
             message="Region Size calculation",
         )
         harness.pump(300)
-        outputs = page._rs_params["outputs"]
-        harness.check(bool(outputs.get("files")))
-        harness.check(window._task_locked(window._find_task_by_id("reg-1")))
+        harness.eq(page._rs_params.get("outputs"), {})
+        harness.check(page._rs_pending is not None)
+        harness.check(not window._task_locked(
+            window._find_task_by_id("reg-1")
+        ))
 
+        # Closing with an unsaved table asks first; No keeps the page.
         with harness.patch_dialogs(
             _rs_page, question=QMessageBox.StandardButton.No
         ):
-            _rs_page._rs_clear_results(ctx, page)
+            _rs_page._rs_close(ctx, page)
+        harness.check(page._rs_pending is not None,
+                      "No keeps the unsaved table")
+
+        outputs = page._rs_pending
+        _rs_page._rs_save(ctx, page)
         harness.eq(page._rs_params["outputs"], outputs)
         harness.check(window._task_locked(window._find_task_by_id("reg-1")),
-                      "No keeps the upstream lock")
-
-        with harness.patch_dialogs(
-            _rs_page, question=QMessageBox.StandardButton.Yes
-        ):
-            _rs_page._rs_clear_results(ctx, page)
-        harness.eq(page._rs_params["outputs"], {})
-        harness.check(
-            not window._task_locked(window._find_task_by_id("reg-1"))
-        )
+                      "Save locks upstream modules")
+        harness.check(not page._rs_save_btn.isEnabled(),
+                      "Save is disabled once stored")
     finally:
         e2e.close_window(window)
 

@@ -354,12 +354,6 @@ class ExtensionsMixin:
                 "the cell segmentation in other software and import the "
                 "resulting mask files with the Segmentation module's Mask Input."
             )
-        if entry.get("family") == "sam3":
-            note += (
-                " SAM 3 model weights are gated on Hugging Face: accept the "
-                "model license and sign in in this environment (or set "
-                "HF_TOKEN) before using Download model."
-            )
         self_note = QLabel(note)
         self_note.setWordWrap(True)
         self_note.setStyleSheet("color: #6b7785;")
