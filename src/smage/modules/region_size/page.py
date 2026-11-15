@@ -895,17 +895,19 @@ class _RegionSizeWorker:
             if path not in set(item.get("files") or []):
                 values[item["key"]] = None
                 continue
-            polygons = _regions._region_polygons(
+            parts = _regions._region_parts(
                 item.get("region") or {}, path
             )
-            if polygons is None:
+            if parts is None:
                 values[item["key"]] = None
-            elif not polygons:
+            elif not parts:
                 values[item["key"]] = 0
             else:
-                from smage.core.region_detection import polygon_pixel_count
+                from smage.core.region_detection import (
+                    region_parts_pixel_count,
+                )
 
-                values[item["key"]] = polygon_pixel_count(
-                    polygons, x, y
+                values[item["key"]] = region_parts_pixel_count(
+                    parts, x, y
                 )
         return values, None

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtWidgets import QMessageBox
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -67,7 +68,9 @@ def detect_signal() -> None:
         harness.eq(region["name"], "Region 1")
         subs = region["samples"][parquet]["sub_regions"]
         harness.eq(len(subs), 2, "two signal squares")
-        harness.check(all(len(sub["points"]) >= 3 for sub in subs))
+        harness.check(all(
+            sub.get("in") and len(sub["in"][0]) >= 3 for sub in subs
+        ))
 
         _region_page._region_save_now(ctx, page)
         store_path = project.path / "Module" / "reg-1" / "regions.json"
@@ -104,7 +107,9 @@ def region_tree() -> None:
                     "visible": True,
                     "sub_regions": [{
                         "id": "s1", "name": "A", "visible": True,
-                        "points": [[2, 2], [6, 2], [6, 6], [2, 6]],
+                        "kind": "region",
+                        "in": [[[2, 2], [6, 2], [6, 6], [2, 6]]],
+                        "out": [],
                     }],
                 },
             },
@@ -160,21 +165,25 @@ def draw_shapes() -> None:
             "samples": {parquet: {"visible": True, "sub_regions": []}},
         }]
         _region_page._region_rebuild_region_tree(ctx, page)
+        top = page._region_tree.topLevelItem(0)
+        page._region_tree.setCurrentItem(top)
+        harness.pump(150)
+        _region_page._region_set_region_tool(ctx, page, "region_in")
+        from smage.core.gates import _point_in_polygon
         from smage.widgets.gate_editor.canvas import _GatePolygonROI
-        page._region_subregion_target = {
-            "region": "r1", "sample": parquet,
-        }
         roi = _GatePolygonROI(
             [(1, 1), (5, 1), (5, 5), (1, 5)], closed=True
         )
-        page._region_viewbox.addItem(roi)
-        _region_page._region_on_gate_created(ctx, page, "polygon", roi)
+        _region_page._region_on_region_shape(ctx, page, "region_in", roi)
         subs = page._region_store["regions"][0]["samples"][parquet][
             "sub_regions"
         ]
         harness.eq(len(subs), 1)
-        harness.eq(subs[0]["points"], [[1.0, 1.0], [5.0, 1.0],
-                                       [5.0, 5.0], [1.0, 5.0]])
+        harness.check(bool(subs[0]["in"]), "region in created an in ring")
+        harness.eq(subs[0].get("out") or [], [])
+        harness.check(bool(_point_in_polygon(
+            np.array([3.0]), np.array([3.0]), subs[0]["in"][0]
+        )[0]))
 
         import pyqtgraph as pg
         page._region_selected_gate_id = None
@@ -206,54 +215,72 @@ def signal_params() -> None:
     image = np.zeros((20, 20), dtype="float64")
     image[2:5, 2:5] = 100.0
     image[10:12, 10:12] = 100.0
-    polygons, _threshold, binary = signal_expansion(
+    parts, _threshold, binary = signal_expansion(
         image, threshold=50.0, smooth=0.0, expand=0, fill_holes=True,
         min_area=1, tolerance=0.0, x_origin=10.0, y_origin=20.0,
     )
-    harness.eq(len(polygons), 2)
-    xs = [point[0] for polygon in polygons for point in polygon]
-    ys = [point[1] for polygon in polygons for point in polygon]
+    harness.eq(len(parts), 2)
+    xs = [point[0] for part in parts for ring in part["in"] for point in ring]
+    ys = [point[1] for part in parts for ring in part["in"] for point in ring]
     harness.check(min(xs) >= 10.0 and max(xs) <= 22.0)
     harness.check(min(ys) >= 20.0 and max(ys) <= 32.0)
 
-    polygons, _threshold, _binary = signal_expansion(
+    parts, _threshold, _binary = signal_expansion(
         image, threshold=50.0, smooth=0.0, expand=0, fill_holes=True,
         min_area=10,
     )
-    harness.eq(polygons, [], "min area drops the 4-pixel component")
+    harness.eq(parts, [], "min area drops the 4-pixel component")
 
-    polygons, _threshold, grown = signal_expansion(
+    parts, _threshold, grown = signal_expansion(
         image, threshold=50.0, smooth=0.0, expand=2, fill_holes=True,
         min_area=1,
     )
-    harness.eq(len(polygons), 2)
+    harness.eq(len(parts), 2)
     harness.check(int(np.count_nonzero(grown)) > 13,
                   "expansion grows the selected area")
 
+    # Fill holes can be limited by hole area.
+    rings = np.zeros((24, 24), dtype="float64")
+    rings[2:12, 2:12] = 100.0       # large ring, 6x6 hole (36 px)
+    rings[4:10, 4:10] = 0.0
+    rings[15:20, 15:20] = 100.0     # small ring, 2x2 hole (4 px)
+    rings[16:18, 16:18] = 0.0
+    _polygons, _threshold, binary = signal_expansion(
+        rings, threshold=50.0, smooth=0.0, expand=0, fill_holes=True,
+        fill_max_area=10, min_area=1, tolerance=0.0,
+    )
+    harness.check(not bool(binary[7, 7]), "the large hole stays open")
+    harness.check(bool(binary[16, 16]), "the small hole is filled")
+    _polygons, _threshold, binary = signal_expansion(
+        rings, threshold=50.0, smooth=0.0, expand=0, fill_holes=True,
+        fill_max_area=0, min_area=1, tolerance=0.0,
+    )
+    harness.check(bool(binary[7, 7]), "0 still fills every hole")
+
     gate = np.zeros((20, 20), dtype=bool)
     gate[:, :10] = True
-    polygons, _threshold, _binary = signal_expansion(
+    parts, _threshold, _binary = signal_expansion(
         image, gate_mask=gate, threshold=50.0, smooth=0.0, expand=0,
         fill_holes=True, min_area=1,
     )
-    harness.eq(len(polygons), 1, "only the square inside the gate remains")
+    harness.eq(len(parts), 1, "only the square inside the gate remains")
 
 
 @harness.case("mod.region.sam_mask_polygons", "L3", "region",
               tags=("fast",))
 def sam_mask_polygons() -> None:
-    """SAM masks become polygons, with origin, gate and min-area handling."""
+    """SAM masks become region parts, with origin, gate and min-area handling."""
     from smage.core.region_detection import sam_mask_polygons
 
     mask = np.zeros((20, 20), dtype=bool)
     mask[2:6, 2:6] = True
     mask[10:14, 10:14] = True
-    polygons = sam_mask_polygons(
+    parts = sam_mask_polygons(
         mask, x_origin=100.0, y_origin=200.0, tolerance=0.0
     )
-    harness.eq(len(polygons), 2)
-    xs = [point[0] for polygon in polygons for point in polygon]
-    ys = [point[1] for polygon in polygons for point in polygon]
+    harness.eq(len(parts), 2)
+    xs = [point[0] for part in parts for ring in part["in"] for point in ring]
+    ys = [point[1] for part in parts for ring in part["in"] for point in ring]
     harness.check(min(xs) >= 100.0 and max(xs) <= 114.0)
     harness.check(min(ys) >= 200.0 and max(ys) <= 214.0)
 
@@ -332,7 +359,7 @@ def sam_runner_plumbing() -> None:
         region = page._region_store["regions"][0]
         subs = region["samples"][parquet]["sub_regions"]
         harness.eq(len(subs), 1, "the gate clips the second SAM mask")
-        xs = [point[0] for point in subs[0]["points"]]
+        xs = [point[0] for ring in subs[0]["in"] for point in ring]
         harness.check(max(xs) <= 16.0 + 1e-6)
     finally:
         e2e.close_window(window)
@@ -384,6 +411,69 @@ def boolean_nested() -> None:
         e2e.close_window(window)
 
 
+@harness.case("mod.region.region_out", "L4", "region", tags=("fast",))
+def region_out_and_island() -> None:
+    """Region out carves a hole; Region in inside it creates an island."""
+    from smage.core.region_detection import region_parts_mask
+
+    project, parquet, _task, _figure = _region_project("region_out")
+    window = e2e.open_window(project)
+    try:
+        ctx = window._ctx
+        page = e2e.open_page(window, "reg-1", "region", "Region")
+        page._region_store["regions"] = [{
+            "id": "r1", "name": "R", "visible": True,
+            "style": _region_page._region_default_style(0),
+            "samples": {parquet: {"visible": True, "sub_regions": []}},
+        }]
+        _region_page._region_rebuild_region_tree(ctx, page)
+        top = page._region_tree.topLevelItem(0)
+        page._region_tree.setCurrentItem(top)
+        harness.pump(150)
+
+        def draw(tool, points):
+            _region_page._region_set_region_tool(ctx, page, tool)
+            _region_page._region_on_region_shape(
+                ctx, page, tool,
+                _GatePolygonROI(points, closed=True),
+            )
+            harness.pump(150)
+
+        draw("region_in", [(2, 2), (18, 2), (18, 18), (2, 18)])
+        sample = page._region_store["regions"][0]["samples"][parquet]
+        sub = sample["sub_regions"][0]
+        page._region_selected_sub_id = sub["id"]
+        page._region_selected_sample = parquet
+        page._region_selected_region_id = "r1"
+        draw("region_out", [(6, 6), (14, 6), (14, 14), (6, 14)])
+        harness.eq(len(sub["in"]), 1)
+        harness.eq(len(sub["out"]), 1)
+        part = [{"in": sub["in"], "out": sub["out"]}]
+        harness.check(not bool(region_parts_mask(
+            part, np.array([10.0]), np.array([10.0])
+        )[0]), "the hole is empty")
+        harness.check(bool(region_parts_mask(
+            part, np.array([4.0]), np.array([4.0])
+        )[0]), "the outer area is filled")
+
+        page._region_selected_sub_id = sub["id"]
+        draw("region_in", [(8, 8), (12, 8), (12, 12), (8, 12)])
+        harness.eq(len(sub["in"]), 2,
+                   "the island is a second in ring")
+        harness.eq(len(sub["out"]), 1,
+                   "the surrounding out ring is kept")
+        part = [{"in": sub["in"], "out": sub["out"]}]
+        harness.check(bool(region_parts_mask(
+            part, np.array([10.0]), np.array([10.0])
+        )[0]), "the island is filled")
+        harness.check(not bool(region_parts_mask(
+            part, np.array([7.0]), np.array([7.0])
+        )[0]), "the rest of the hole stays empty")
+        harness.eq(len(page._region_edit_rois), 3)
+    finally:
+        e2e.close_window(window)
+
+
 @harness.case("mod.region.region_edit", "L4", "region", tags=("fast",))
 def region_edit() -> None:
     """Add, rename, sample-add and delete through the Region tree."""
@@ -416,14 +506,14 @@ def region_edit() -> None:
         _region_page._region_on_region_item_changed(ctx, page, item, 0)
         harness.eq(region["name"], "Tumour")
 
-        page._region_subregion_target = {
-            "region": region["id"], "sample": parquet,
-        }
+        page._region_selected_region_id = region["id"]
+        page._region_selected_sample = parquet
+        page._region_selected_sub_id = None
+        _region_page._region_set_region_tool(ctx, page, "region_in")
         roi = _GatePolygonROI(
             [(2, 2), (6, 2), (6, 6), (2, 6)], closed=True
         )
-        page._region_viewbox.addItem(roi)
-        _region_page._region_on_gate_created(ctx, page, "polygon", roi)
+        _region_page._region_on_region_shape(ctx, page, "region_in", roi)
         sub = region["samples"][parquet]["sub_regions"][0]
         harness.eq(len(region["samples"][parquet]["sub_regions"]), 1)
 
@@ -461,7 +551,9 @@ def style_visibility() -> None:
             "id": "r1", "name": "R", "visible": True, "style": style,
             "samples": {parquet: {"visible": True, "sub_regions": [{
                 "id": "s1", "name": "A", "visible": True,
-                "points": [[2, 2], [8, 2], [8, 8], [2, 8]],
+                "kind": "region",
+                "in": [[[2, 2], [8, 2], [8, 8], [2, 8]]],
+                "out": [],
             }]}},
         }]
         page._region_selected_region_id = "r1"
@@ -472,24 +564,42 @@ def style_visibility() -> None:
         item = page._region_overlay_items[0]
         harness.eq(item.brush().color().alpha(), 128)
         harness.eq(item.pen().widthF(), 4.0)
-        harness.check(page._region_edit_roi is None)
+        harness.eq(page._region_edit_rois, [])
+
+        # Widths below 3 px are honored even while the Region is selected.
+        page._region_store["regions"][0]["style"]["edge_width"] = 1
+        _region_page._region_render_overlays(ctx, page)
+        harness.eq(page._region_overlay_items[0].pen().widthF(), 1.0)
+        page._region_store["regions"][0]["style"]["edge_width"] = 4
+        _region_page._region_render_overlays(ctx, page)
 
         page._region_selected_sub_id = "s1"
         _region_page._region_render_overlays(ctx, page)
-        harness.check(page._region_edit_roi is not None,
-                      "selecting a sub-region shows its editable outline")
-        sub = page._region_store["regions"][0]["samples"][parquet][
-            "sub_regions"
-        ][0]
+        harness.check(len(page._region_edit_rois) >= 1,
+                      "selecting a sub-region shows its editable rings")
+        region = page._region_store["regions"][0]
+        sub = region["samples"][parquet]["sub_regions"][0]
         moved = _GatePolygonROI(
             [(3, 3), (9, 3), (9, 9), (3, 9)], closed=True
         )
-        page._region_viewbox.addItem(moved)
-        _region_page._region_on_subregion_dragged(
-            ctx, page, page._region_store["regions"][0], sub, moved
+        _region_page._region_on_subregion_ring_changed(
+            ctx, page, region, sub, "in", 0, moved
         )
-        harness.eq(sub["points"], [[3.0, 3.0], [9.0, 3.0], [9.0, 9.0],
-                                   [3.0, 9.0]])
+        from smage.core.region_detection import region_parts_mask
+        part = [{"in": sub["in"], "out": sub["out"]}]
+        harness.check(bool(region_parts_mask(
+            part, np.array([5.0]), np.array([5.0])
+        )[0]))
+        # Clicking the filled Sub-region selects it in the tree.
+        page._region_selected_sub_id = None
+        scene_pos = page._region_viewbox.mapViewToScene(QPointF(5.0, 5.0))
+        class _Click:
+            def button(self):
+                return Qt.MouseButton.LeftButton
+            def scenePos(self):
+                return scene_pos
+        _region_page._region_on_image_click(ctx, page, _Click())
+        harness.eq(page._region_selected_sub_id, "s1")
 
         page._region_store["regions"][0]["visible"] = False
         _region_page._region_render_overlays(ctx, page)
@@ -527,7 +637,7 @@ def gate_clip() -> None:
         region = page._region_store["regions"][0]
         subs = region["samples"][parquet]["sub_regions"]
         harness.eq(len(subs), 1, "only the signal inside the gate")
-        xs = [point[0] for point in subs[0]["points"]]
+        xs = [point[0] for ring in subs[0]["in"] for point in ring]
         harness.check(max(xs) <= 16.0 + 1e-6,
                       f"polygon clipped to the gate: {xs}")
     finally:
@@ -547,7 +657,9 @@ def copy_paste() -> None:
             "style": _region_page._region_default_style(0),
             "samples": {parquet: {"visible": True, "sub_regions": [{
                 "id": "s1", "name": "A", "visible": True,
-                "points": [[2, 2], [6, 2], [6, 6], [2, 6]],
+                "kind": "region",
+                "in": [[[2, 2], [6, 2], [6, 6], [2, 6]]],
+                "out": [],
             }]}},
         }]
         _region_page._region_copy(ctx, page, ("region", "r1", None, None))
@@ -697,11 +809,13 @@ def per_file_geometry() -> None:
         harness.eq(len(first_subs), 1)
         harness.eq(len(second_subs), 1)
         harness.check(
-            max(point[0] for point in first_subs[0]["points"]) <= 16.0 + 1e-6,
+            max(point[0] for ring in first_subs[0]["in"]
+                for point in ring) <= 16.0 + 1e-6,
             "the first file is detected inside its own gate",
         )
         harness.check(
-            min(point[0] for point in second_subs[0]["points"]) >= 16.0 - 1e-6,
+            min(point[0] for ring in second_subs[0]["in"]
+                for point in ring) >= 16.0 - 1e-6,
             "the second file is detected inside its own gate",
         )
 
@@ -758,7 +872,7 @@ def region_gate2col() -> None:
                 "style": _region_page._region_default_style(0),
                 "samples": {parquet: {"visible": True, "sub_regions": [{
                     "id": "s1", "name": "1", "visible": True,
-                    "points": points,
+                    "kind": "region", "in": [points], "out": [],
                 }]}},
             }],
         })
@@ -823,6 +937,121 @@ def region_files_required() -> None:
         harness.eq(page._region_files, [parquet])
         harness.eq(page._region_preview["file"], parquet)
         harness.eq(page._region_detect_files, [parquet])
+    finally:
+        e2e.close_window(window)
+
+
+@harness.case("mod.region.log", "L4", "region", tags=("fast",))
+def detection_log() -> None:
+    """Detection progress goes to the module log with readable file names."""
+    project, parquet, _task, _figure = _region_project("region_log")
+    window = e2e.open_window(project)
+    try:
+        ctx = window._ctx
+        page = e2e.open_page(window, "reg-1", "region", "Region")
+        page._region_detect_files = [parquet]
+        page._region_detect["files"] = [parquet]
+        page._region_detect["signal"].update({
+            "auto_threshold": False, "threshold": 50.0, "smooth": 0.0,
+            "expand": 0, "fill_holes": True, "min_area": 5,
+            "tolerance": 0.5,
+        })
+        _region_page._region_rebuild_detect_panel(ctx, page)
+        _region_page._region_start_detect(ctx, page)
+        harness.wait_for(
+            lambda: not _region_page._region_detect_running(page),
+            timeout=30, message="log detection",
+        )
+        harness.pump(300)
+        text = "\n".join(page._region_log_lines)
+        harness.check("nuclei.tif" in text, text)
+        harness.check(parquet not in text,
+                      "the log must not show internal file ids")
+        harness.check("Created Region 1" in text, text)
+        harness.check(not hasattr(page, "_region_progress"),
+                      "the Detect Region panel no longer has a progress bar")
+        harness.eq(page._region_right_split.count(), 3)
+        harness.eq(
+            page._region_tree.columnWidth(0),
+            4 * page._region_tree.columnWidth(1),
+            "Region/Show columns default to 4:1",
+        )
+        _region_page._region_save_now(ctx, page)
+        harness.eq(page._region_params["log"], page._region_log_lines)
+    finally:
+        e2e.close_window(window)
+
+
+@harness.case("mod.region.sample_switch", "L4", "region", tags=("fast",))
+def sample_switch() -> None:
+    """Clicking a Sample's Show box switches the image to that file."""
+    import tifffile
+    from smage.data import regions as _regions
+    from smage.data.image_index import _build_image_index_files
+
+    project, parquet, task, _figure = _region_project("region_sample_switch")
+    image = project.path.parent / "sample_switch.tif"
+    stack = np.zeros((1, 32, 32), dtype=np.uint8)
+    stack[0, 2:8, 2:8] = 200
+    tifffile.imwrite(image, stack, metadata={"axes": "CYX"})
+    second, _result = e2e.import_into_project(
+        project, "sample_switch", image
+    )
+    _build_image_index_files(second)
+    region_task = project.workflow["tasks"][0]["children"][0]
+    region_task["params"]["files"] = [parquet, second]
+    project.save()
+
+    window = e2e.open_window(project)
+    try:
+        ctx = window._ctx
+        page = e2e.open_page(window, "reg-1", "region", "Region")
+        _regions._region_store_save(ctx, task, {
+            "version": 1, "files": [parquet, second], "gates": [],
+            "per_file": {},
+            "regions": [{
+                "id": "r1", "name": "R", "visible": True,
+                "style": _region_page._region_default_style(0),
+                "samples": {
+                    parquet: {"visible": True, "sub_regions": [{
+                        "id": "s1", "name": "A", "visible": True,
+                        "kind": "region",
+                        "in": [[[20, 20], [28, 20], [28, 28], [20, 28]]],
+                        "out": [],
+                    }]},
+                    second: {"visible": True, "sub_regions": [{
+                        "id": "s2", "name": "B", "visible": True,
+                        "kind": "region",
+                        "in": [[[2, 2], [8, 2], [8, 8], [2, 8]]],
+                        "out": [],
+                    }]},
+                },
+            }],
+        })
+        page._region_store = _regions._region_store_load(ctx, task)
+        _region_page._region_rebuild_region_tree(ctx, page)
+        top = page._region_tree.topLevelItem(0)
+        harness.eq(top.childCount(), 2)
+        page._region_tree.setCurrentItem(top.child(0))
+        harness.pump(300)
+        harness.eq(page._region_preview["file"], parquet)
+
+        # Toggling the lower Sample's Show checkbox must switch the file;
+        # the upper Sample's polygon must not remain on screen.
+        lower = top.child(1)
+        lower.setCheckState(1, Qt.CheckState.Unchecked)
+        harness.pump(400)
+        harness.eq(page._region_preview["file"], second)
+        harness.eq(page._region_overlay_items, [])
+        lower.setCheckState(1, Qt.CheckState.Checked)
+        harness.pump(400)
+        harness.eq(page._region_preview["file"], second)
+        harness.eq(len(page._region_overlay_items), 1)
+        rect = page._region_overlay_items[0].path().boundingRect()
+        harness.check(
+            abs(rect.x() - 2.0) < 1e-6 and abs(rect.y() - 2.0) < 1e-6,
+            f"only the lower file's polygon is drawn: {rect}",
+        )
     finally:
         e2e.close_window(window)
 

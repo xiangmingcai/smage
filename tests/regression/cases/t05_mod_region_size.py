@@ -54,9 +54,13 @@ def _write_store(ctx, task, first, second):
                         "visible": True,
                         "sub_regions": [
                             {"id": "a1", "name": "1", "visible": True,
-                             "points": [[0, 0], [6, 0], [6, 6], [0, 6]]},
+                             "kind": "region",
+                             "in": [[[0, 0], [6, 0], [6, 6], [0, 6]]],
+                             "out": []},
                             {"id": "a2", "name": "2", "visible": True,
-                             "points": [[3, 3], [9, 3], [9, 9], [3, 9]]},
+                             "kind": "region",
+                             "in": [[[3, 3], [9, 3], [9, 9], [3, 9]]],
+                             "out": []},
                         ],
                     },
                     second: {"visible": True, "sub_regions": []},
@@ -68,7 +72,9 @@ def _write_store(ctx, task, first, second):
                 "samples": {
                     first: {"visible": True, "sub_regions": [
                         {"id": "b1", "name": "1", "visible": True,
-                         "points": [[20, 20], [25, 20], [25, 25], [20, 25]]},
+                         "kind": "region",
+                         "in": [[[20, 20], [25, 20], [25, 25], [20, 25]]],
+                         "out": []},
                     ]},
                 },
             },
@@ -219,7 +225,8 @@ def _write_named_store(ctx, task, first, second, region_id, name, points):
             "samples": {
                 first: {"visible": True, "sub_regions": [{
                     "id": f"{region_id}-1", "name": "1",
-                    "visible": True, "points": points,
+                    "visible": True, "kind": "region",
+                    "in": [points], "out": [],
                 }]},
             },
         }],

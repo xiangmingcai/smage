@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import copy
+import math
 import queue
 import subprocess
 import tempfile
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,9 +16,11 @@ from PySide6.QtCore import QPointF, QTimer, Qt
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QKeySequence,
     QPainterPath,
     QPen,
     QPolygonF,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -30,11 +35,9 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
-    QSpinBox,
     QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
@@ -47,9 +50,12 @@ from smage.core.constants import MODULE_STATE_MODIFIED
 from smage.core.gates import (
     _gate_geometry,
     _gate_source_ids,
+    _point_in_polygon,
     _resolve_gates_for_file,
 )
 from smage.core.region_detection import (
+    _mask_region,
+    region_parts_mask,
     sam_mask_polygons,
     signal_expansion,
 )
@@ -61,7 +67,11 @@ from smage.data import regions as _data_regions
 from smage.widgets import image_level as _widgets_image_level
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
-from smage.widgets.controls import _NoWheelComboBox
+from smage.widgets.controls import (
+    _NoWheelComboBox,
+    _NoWheelDoubleSpinBox,
+    _NoWheelSpinBox,
+)
 from smage.widgets.gate_editor.canvas import _GatePolygonROI, _GateViewBox
 from smage.widgets.plot import renderer as _widgets_plot_renderer
 from smage.widgets.plot_axes import _make_fit_plot_item, _make_sci_axis
@@ -74,6 +84,16 @@ _REGION_COLORS = [
 ]
 _GATE_PEN = "#2b6cb0"
 _GATE_SELECTED_PEN = "#e53935"
+_REGION_LOG_LIMIT = 2000
+_REGION_DISPLAY_KEYS = (
+    "show_axes",
+    "show_axis_names",
+    "show_indices",
+    "show_sample_name",
+    "axis_name_font_size",
+    "index_font_size",
+    "sample_name_font_size",
+)
 
 
 def _region_image_records(ctx, task_id):
@@ -235,6 +255,7 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
         "smooth": 1.0,
         "expand": 2,
         "fill_holes": True,
+        "fill_max_area": 0,
         "min_area": 50,
         "tolerance": 1.0,
     })
@@ -249,15 +270,17 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     })
     page._region_snapshot = copy.deepcopy(params)
     page._region_store_snapshot = copy.deepcopy(store)
+    page._region_log_lines = list(params.get("log") or [])
     page._region_selected_gate_id = None
     page._region_selected_region_id = None
     page._region_selected_sample = None
     page._region_selected_sub_id = None
     page._region_gate_tool = None
-    page._region_subregion_target = None
+    page._region_region_tool = None
+    page._region_region_target = None
     page._region_gate_rois = {}
     page._region_overlay_items = []
-    page._region_edit_roi = None
+    page._region_edit_rois = []
     page._region_overlay_file = None
     page._region_updating = False
     page._region_clipboard = None
@@ -275,6 +298,7 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
         ctx, first, page._region_task_id
     ) if first else []
     channels = [c for c in columns if c not in ("x", "y")]
+    display = params.get("preview_display") or {}
     page._region_preview = {
         "file": first,
         "file_name": _region_file_name(ctx, first, page._region_task_id)
@@ -284,6 +308,17 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
         ),
         "image_min": params.get("preview_min"),
         "image_max": params.get("preview_max"),
+        "show_axes": bool(display.get("show_axes", True)),
+        "show_axis_names": bool(display.get("show_axis_names", True)),
+        "show_indices": bool(display.get("show_indices", True)),
+        "show_sample_name": bool(display.get("show_sample_name", True)),
+        "axis_name_font_size": int(
+            display.get("axis_name_font_size", 11) or 11
+        ),
+        "index_font_size": int(display.get("index_font_size", 10) or 10),
+        "sample_name_font_size": int(
+            display.get("sample_name_font_size", 9) or 9
+        ),
     }
 
     content = QWidget()
@@ -301,10 +336,11 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     split.addWidget(left)
     split.addWidget(middle)
     split.addWidget(right)
-    split.setStretchFactor(0, 1)
-    split.setStretchFactor(1, 2)
+    split.setStretchFactor(0, 2)
+    split.setStretchFactor(1, 3)
     split.setStretchFactor(2, 2)
-    split.setSizes([300, 660, 520])
+    split.setSizes([320, 480, 320])
+    page._region_main_split = split
     cl.addWidget(split, 1)
     layout.addWidget(content, 1)
 
@@ -321,14 +357,14 @@ def _build_region_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
 
 
 def _region_left_panel(ctx, page) -> QWidget:
-    panel = _widgets_panels._build_panel_frame(ctx)
+    panel = QWidget()
     lay = QVBoxLayout(panel)
-    lay.setContentsMargins(10, 10, 10, 10)
-    lay.setSpacing(6)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
 
-    files_box = QWidget()
-    fl = QVBoxLayout(files_box)
-    fl.setContentsMargins(0, 0, 0, 0)
+    files_panel = _widgets_panels._build_panel_frame(ctx)
+    fl = QVBoxLayout(files_panel)
+    fl.setContentsMargins(10, 8, 10, 10)
     fl.setSpacing(4)
     fl.addWidget(QLabel("<b>Data files</b>"))
     select = QPushButton("Select files…")
@@ -338,6 +374,7 @@ def _region_left_panel(ctx, page) -> QWidget:
     fl.addWidget(select)
     from PySide6.QtWidgets import QListWidget, QAbstractItemView
     file_list = QListWidget()
+    file_list.setMinimumHeight(40)
     file_list.setStyleSheet(
         "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
     )
@@ -353,13 +390,14 @@ def _region_left_panel(ctx, page) -> QWidget:
     fl.addWidget(count)
     page._region_files_list = file_list
     page._region_files_count = count
-    lay.addWidget(files_box, 1)
+    left_split = QSplitter(Qt.Orientation.Vertical)
+    left_split.setChildrenCollapsible(False)
+    left_split.addWidget(files_panel)
+    page._region_left_split = left_split
 
-    tree_split = QSplitter(Qt.Orientation.Vertical)
-    tree_split.setChildrenCollapsible(False)
-    gates_host = QWidget()
-    gl = QVBoxLayout(gates_host)
-    gl.setContentsMargins(0, 0, 0, 0)
+    gates_panel = _widgets_panels._build_panel_frame(ctx)
+    gl = QVBoxLayout(gates_panel)
+    gl.setContentsMargins(10, 8, 10, 10)
     gl.setSpacing(4)
     gl.addWidget(QLabel("<b>Detection gates</b>"))
     hint = QLabel("The selected gate limits where regions are detected.")
@@ -386,18 +424,19 @@ def _region_left_panel(ctx, page) -> QWidget:
     )
     gl.addWidget(gate_tree, 1)
     page._region_gate_tree = gate_tree
-    tree_split.addWidget(gates_host)
+    left_split.addWidget(gates_panel)
 
-    regions_host = QWidget()
-    rl = QVBoxLayout(regions_host)
-    rl.setContentsMargins(0, 0, 0, 0)
+    regions_panel = _widgets_panels._build_panel_frame(ctx)
+    rl = QVBoxLayout(regions_panel)
+    rl.setContentsMargins(10, 8, 10, 10)
     rl.setSpacing(4)
     rl.addWidget(QLabel("<b>Regions</b>"))
     region_tree = QTreeWidget()
     region_tree.setColumnCount(2)
     region_tree.setHeaderLabels(["Region", "Show"])
-    region_tree.setColumnWidth(0, 230)
-    region_tree.setColumnWidth(1, 52)
+    # Default 4:1 split between the name and its visibility checkbox.
+    region_tree.setColumnWidth(0, 240)
+    region_tree.setColumnWidth(1, 60)
     region_tree.header().setStretchLastSection(False)
     region_tree.setStyleSheet(
         "QTreeWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
@@ -420,17 +459,25 @@ def _region_left_panel(ctx, page) -> QWidget:
     rl.addWidget(add_region)
     page._region_tree = region_tree
     page._region_add_btn = add_region
-    tree_split.addWidget(regions_host)
-    tree_split.setSizes([240, 300])
-    lay.addWidget(tree_split, 2)
+    left_split.addWidget(regions_panel)
+    left_split.setStretchFactor(0, 1)
+    left_split.setStretchFactor(1, 2)
+    left_split.setStretchFactor(2, 3)
+    left_split.setSizes([120, 240, 360])
+    lay.addWidget(left_split, 1)
     return panel
 
 
 def _region_middle_panel(ctx, page) -> QWidget:
-    panel = _widgets_panels._build_panel_frame(ctx)
+    panel = QWidget()
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(0)
+
+    image_panel = _widgets_panels._build_panel_frame(ctx)
+    top_lay = QVBoxLayout(image_panel)
+    top_lay.setContentsMargins(0, 0, 0, 0)
+    top_lay.setSpacing(0)
 
     tools = QWidget()
     tools.setStyleSheet(
@@ -440,6 +487,7 @@ def _region_middle_panel(ctx, page) -> QWidget:
     tl.setContentsMargins(10, 8, 10, 8)
     tl.setSpacing(6)
     tl.addWidget(QLabel("<b>Tools</b>"))
+    tl.addWidget(QLabel("<b>Gating tools</b>"))
     page._region_tool_buttons = {}
     from smage.widgets.plot_axes import _gate_tool_icon
     for text, key in (
@@ -459,12 +507,33 @@ def _region_middle_panel(ctx, page) -> QWidget:
         )
         tl.addWidget(btn)
         page._region_tool_buttons[key] = btn
+    tl.addSpacing(12)
+    tl.addWidget(QLabel("<b>Region tools</b>"))
+    page._region_region_buttons = {}
+    for text, key in (
+        ("Region in", "region_in"),
+        ("Region out", "region_out"),
+    ):
+        btn = QPushButton(text)
+        btn.setToolTip(
+            "Add a filled polygon to the selected Region."
+            if key == "region_in" else
+            "Remove the drawn polygon from the selected Sub-region."
+        )
+        btn.setFixedHeight(30)
+        btn.setCheckable(True)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setEnabled(not page._region_locked)
+        btn.clicked.connect(
+            lambda _=False, k=key: _region_set_region_tool(ctx, page, k)
+        )
+        tl.addWidget(btn)
+        page._region_region_buttons[key] = btn
     tl.addStretch()
-    cancel = QPushButton("Cancel drawing")
-    cancel.setCursor(Qt.CursorShape.PointingHandCursor)
-    cancel.clicked.connect(lambda _=False: _region_cancel_drawing(ctx, page))
-    tl.addWidget(cancel)
-    lay.addWidget(tools)
+    top_lay.addWidget(tools)
+    escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), page)
+    escape.activated.connect(lambda: _region_cancel_drawing(ctx, page))
+    page._region_escape = escape
 
     viewbox = _GateViewBox(
         on_gate_created=lambda tool, roi: _region_on_gate_created(
@@ -498,37 +567,61 @@ def _region_middle_panel(ctx, page) -> QWidget:
     page._region_img_timer = img_timer
     page._region_plot_widget = plot_widget
     page._region_viewbox = viewbox
-    lay.addWidget(plot_widget, 5)
+    plot_widget.scene().sigMouseClicked.connect(
+        lambda event: _region_on_image_click(ctx, page, event)
+    )
+    top_lay.addWidget(plot_widget, 1)
 
     detect_panel = _widgets_panels._build_panel_frame(ctx)
     dl = QVBoxLayout(detect_panel)
     dl.setContentsMargins(10, 8, 10, 8)
     dl.setSpacing(4)
     dl.addWidget(QLabel("<b>Detect Region</b>"))
+    detect_body = QWidget()
+    bl = QVBoxLayout(detect_body)
+    bl.setContentsMargins(0, 0, 0, 0)
+    bl.setSpacing(4)
     page._region_detect_host = QWidget()
     page._region_detect_layout = QVBoxLayout(page._region_detect_host)
     page._region_detect_layout.setContentsMargins(0, 0, 0, 0)
     page._region_detect_layout.setSpacing(4)
-    dl.addWidget(page._region_detect_host)
+    bl.addWidget(page._region_detect_host)
     page._region_detect_status = QLabel("")
     page._region_detect_status.setWordWrap(True)
     page._region_detect_status.setStyleSheet("color: #6b7785;")
-    dl.addWidget(page._region_detect_status)
-    page._region_progress = QProgressBar()
-    page._region_progress.setRange(0, 100)
-    page._region_progress.setValue(0)
-    page._region_progress.hide()
-    dl.addWidget(page._region_progress)
-    lay.addWidget(detect_panel, 2)
+    bl.addWidget(page._region_detect_status)
+    # The form stays scrollable inside its own panel, so the splitter can
+    # still reach the 3:1 image/detection ratio.
+    detect_scroll = QScrollArea()
+    detect_scroll.setWidgetResizable(True)
+    detect_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    detect_scroll.setStyleSheet("background: transparent;")
+    detect_scroll.setWidget(detect_body)
+    page._region_detect_scroll = detect_scroll
+    dl.addWidget(detect_scroll, 1)
+    middle_split = QSplitter(Qt.Orientation.Vertical)
+    middle_split.setChildrenCollapsible(False)
+    middle_split.addWidget(image_panel)
+    middle_split.addWidget(detect_panel)
+    middle_split.setStretchFactor(0, 3)
+    middle_split.setStretchFactor(1, 1)
+    middle_split.setSizes([600, 200])
+    page._region_middle_split = middle_split
+    lay.addWidget(middle_split, 1)
     return panel
 
 
 def _region_right_panel(ctx, page) -> QWidget:
-    panel = _widgets_panels._build_panel_frame(ctx)
+    panel = QWidget()
     lay = QVBoxLayout(panel)
-    lay.setContentsMargins(10, 10, 10, 10)
-    lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Image settings</b>"))
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    settings_panel = _widgets_panels._build_panel_frame(ctx)
+    sl0 = QVBoxLayout(settings_panel)
+    sl0.setContentsMargins(10, 8, 10, 10)
+    sl0.setSpacing(6)
+    sl0.addWidget(QLabel("<b>Image settings</b>"))
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -539,14 +632,14 @@ def _region_right_panel(ctx, page) -> QWidget:
     settings.setContentsMargins(0, 0, 0, 0)
     settings.setSpacing(6)
     scroll.setWidget(host)
-    lay.addWidget(scroll, 3)
+    sl0.addWidget(scroll, 1)
     page._region_settings_layout = settings
 
     style_panel = _widgets_panels._build_panel_frame(ctx)
     sl = QVBoxLayout(style_panel)
     sl.setContentsMargins(10, 8, 10, 10)
     sl.setSpacing(4)
-    sl.addWidget(QLabel("<b>Region drawing</b>"))
+    sl.addWidget(QLabel("<b>Region setting</b>"))
     fill_row = QHBoxLayout()
     fill_row.addWidget(QLabel("Fill"))
     fill_btn = QPushButton()
@@ -571,7 +664,7 @@ def _region_right_panel(ctx, page) -> QWidget:
     edge_btn.clicked.connect(lambda _=False: _region_pick_style(ctx, page, "edge"))
     edge_row.addWidget(edge_btn)
     edge_row.addWidget(QLabel("Width"))
-    width = QSpinBox()
+    width = _NoWheelSpinBox()
     width.setRange(0, 12)
     width.setValue(2)
     width.valueChanged.connect(
@@ -593,7 +686,33 @@ def _region_right_panel(ctx, page) -> QWidget:
     page._region_style_widgets = [
         fill_btn, edge_btn, opacity, width, reset,
     ]
-    lay.addWidget(style_panel, 2)
+    log_panel = _widgets_panels._build_panel_frame(ctx)
+    ll = QVBoxLayout(log_panel)
+    ll.setContentsMargins(10, 8, 10, 10)
+    ll.setSpacing(4)
+    ll.addWidget(QLabel("<b>Log</b>"))
+    log_box = _widgets_panels._log_widget(
+        "Detection progress appears here…"
+    )
+    for line in getattr(page, "_region_log_lines", []):
+        log_box.appendPlainText(line)
+    log_box.verticalScrollBar().setValue(
+        log_box.verticalScrollBar().maximum()
+    )
+    ll.addWidget(log_box, 1)
+    page._region_log = log_box
+
+    right_split = QSplitter(Qt.Orientation.Vertical)
+    right_split.setChildrenCollapsible(False)
+    right_split.addWidget(settings_panel)
+    right_split.addWidget(style_panel)
+    right_split.addWidget(log_panel)
+    right_split.setStretchFactor(0, 3)
+    right_split.setStretchFactor(1, 1)
+    right_split.setStretchFactor(2, 1)
+    right_split.setSizes([450, 150, 150])
+    page._region_right_split = right_split
+    lay.addWidget(right_split, 1)
     return panel
 
 
@@ -706,21 +825,24 @@ def _region_render_image(ctx, page) -> None:
         }],
         "image_min": preview.get("image_min"),
         "image_max": preview.get("image_max"),
-        "show_axes": True,
-        "show_axis_names": True,
-        "show_indices": True,
-        "show_sample_name": True,
+        "show_axes": preview.get("show_axes", True),
+        "show_axis_names": preview.get("show_axis_names", True),
+        "show_indices": preview.get("show_indices", True),
+        "show_sample_name": preview.get("show_sample_name", True),
+        "axis_name_font_size": preview.get("axis_name_font_size", 11),
+        "index_font_size": preview.get("index_font_size", 10),
+        "sample_name_font_size": preview.get("sample_name_font_size", 9),
     }
     _widgets_plot_renderer._figure_render_image(
         ctx, plot_dict, plot_widget, task_id=page._region_task_id
     )
     if page._region_overlay_file != path:
         page._region_overlay_file = path
-        # The renderer cleared the ViewBox for the new image; rebuild the
-        # items we own.
-        page._region_gate_rois = {}
-        page._region_overlay_items = []
-        page._region_edit_roi = None
+        # Remove our own viewbox items explicitly.  PlotItem.clear() may
+        # leave arbitrary QGraphicsItems behind, and dropping the Python
+        # references here used to make every sample switch accumulate one
+        # more copy of the previous file's Regions on the image.
+        _region_clear_overlays(page)
         _region_sync_gate_rois(ctx, page)
         _region_render_overlays(ctx, page)
 
@@ -756,7 +878,7 @@ def _region_rebuild_settings(ctx, page) -> None:
         if index >= 0:
             file_combo.setCurrentIndex(index)
     file_combo.setEnabled(enabled)
-    layout.addWidget(file_combo)
+    layout.addWidget(_widgets_panels._file_nav_row(ctx, file_combo, enabled))
 
     columns = _data_columns._columns_for(
         ctx, preview.get("file"), page._region_task_id
@@ -783,6 +905,10 @@ def _region_rebuild_settings(ctx, page) -> None:
             rec.get("parquet") if rec else None,
             preview.get("channel"),
         ),
+    )
+    _widgets_plot_renderer._figure_display_toggles(
+        ctx, layout, preview, enabled,
+        on_change=lambda: _region_apply_display(ctx, page),
     )
     layout.addStretch()
 
@@ -811,6 +937,15 @@ def _region_set_image_levels(ctx, page, low, high) -> None:
     page._region_params["preview_min"] = low
     page._region_params["preview_max"] = high
     _region_render_image(ctx, page)
+
+
+def _region_apply_display(ctx, page) -> None:
+    preview = page._region_preview
+    page._region_params["preview_display"] = {
+        key: preview.get(key) for key in _REGION_DISPLAY_KEYS
+    }
+    _region_render_image(ctx, page)
+    _region_mark_dirty(ctx, page)
 
 
 # ---------------------------------------------------------------------------
@@ -1186,8 +1321,15 @@ def _region_unify_gate(ctx, page, gate_id) -> None:
     _region_mark_dirty(ctx, page)
 
 
+def _region_clear_region_tool(page) -> None:
+    page._region_region_tool = None
+    page._region_region_target = None
+    for button in getattr(page, "_region_region_buttons", {}).values():
+        button.setChecked(False)
+
+
 def _region_set_gate_tool(ctx, page, key) -> None:
-    page._region_subregion_target = None
+    _region_clear_region_tool(page)
     active = page._region_gate_tool == key
     page._region_gate_tool = None if active else key
     page._region_viewbox.set_gate_tool(page._region_gate_tool)
@@ -1199,16 +1341,247 @@ def _region_set_gate_tool(ctx, page, key) -> None:
 
 def _region_cancel_drawing(ctx, page) -> None:
     page._region_gate_tool = None
-    page._region_subregion_target = None
+    _region_clear_region_tool(page)
     page._region_viewbox.set_gate_tool(None)
     for button in page._region_tool_buttons.values():
         button.setChecked(False)
     _region_set_status(page, "")
 
 
+def _region_region_tool_target(ctx, page, key):
+    """Resolve the Region-tree target for region in/out before drawing."""
+    region = _region_selected_region(page)
+    if key == "region_out":
+        if region is None or not page._region_selected_sub_id:
+            QMessageBox.information(
+                ctx.host, "Region out",
+                "Select a Sub-region in the Region tree first.",
+            )
+            return None
+        sample_path = page._region_selected_sample
+        if (
+            not sample_path
+            or sample_path != page._region_preview.get("file")
+        ):
+            QMessageBox.information(
+                ctx.host, "Region out",
+                "Switch the image to this Sub-region's Sample first.",
+            )
+            return None
+        sub = _region_sub_by_id(
+            region, sample_path, page._region_selected_sub_id
+        )
+        if sub is None:
+            QMessageBox.information(
+                ctx.host, "Region out",
+                "Select a Sub-region in the Region tree first.",
+            )
+            return None
+        return {
+            "region": str(region.get("id")),
+            "sample": str(sample_path),
+            "sub": str(sub.get("id")),
+            "key": key,
+        }
+
+    if region is None:
+        QMessageBox.information(
+            ctx.host, "Region in",
+            "Select a Region in the Region tree first.",
+        )
+        return None
+    sample_path = (
+        page._region_selected_sample
+        or page._region_preview.get("file")
+    )
+    if not sample_path:
+        QMessageBox.information(
+            ctx.host, "Region in", "Select an image file first."
+        )
+        return None
+    sample_path = str(sample_path)
+    if (
+        page._region_selected_sample
+        and page._region_selected_sample != page._region_preview.get("file")
+    ):
+        QMessageBox.information(
+            ctx.host, "Region in",
+            "Switch the image to this Sample first, then draw the Region.",
+        )
+        return None
+    if (
+        page._region_selected_sub_id
+        and page._region_selected_sample == sample_path
+    ):
+        sub = _region_sub_by_id(
+            region, sample_path, page._region_selected_sub_id
+        )
+        if sub is not None:
+            return {
+                "region": str(region.get("id")),
+                "sample": sample_path,
+                "sub": str(sub.get("id")),
+                "key": key,
+            }
+    samples = region.setdefault("samples", {})
+    if sample_path not in samples:
+        samples[sample_path] = {"visible": True, "sub_regions": []}
+        _region_rebuild_region_tree(ctx, page)
+    return {
+        "region": str(region.get("id")),
+        "sample": sample_path,
+        "sub": None,
+        "key": key,
+    }
+
+
+def _region_set_region_tool(ctx, page, key) -> None:
+    if page._region_locked:
+        return
+    if page._region_region_tool == key:
+        _region_cancel_drawing(ctx, page)
+        return
+    target = _region_region_tool_target(ctx, page, key)
+    if target is None:
+        return
+    _region_clear_region_tool(page)
+    page._region_gate_tool = None
+    page._region_region_tool = key
+    page._region_region_target = target
+    page._region_viewbox.set_gate_tool("polygon")
+    for button in page._region_tool_buttons.values():
+        button.setChecked(False)
+    for name, button in page._region_region_buttons.items():
+        button.setChecked(name == key)
+    _region_set_status(
+        page,
+        "Draw a filled polygon to add to the Region."
+        if key == "region_in" else
+        "Draw a polygon to remove it from the selected Sub-region.",
+    )
+
+
+def _region_retessellate(page, inside, outside, polygon=None, add=True):
+    """Rebuild one sub-region's in/out rings from a local pixel mask."""
+    import numpy as np
+
+    points = [
+        point
+        for ring in list(inside or []) + list(outside or [])
+        for point in ring
+    ]
+    if polygon:
+        points.extend(polygon)
+    if not points:
+        return None
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    x0 = int(math.floor(min(xs))) - 1
+    x1 = int(math.ceil(max(xs))) + 1
+    y0 = int(math.floor(min(ys))) - 1
+    y1 = int(math.ceil(max(ys))) + 1
+    gx = np.arange(x0, x1 + 1, dtype="float64")
+    gy = np.arange(y0, y1 + 1, dtype="float64")
+    xx, yy = np.meshgrid(gx, gy)
+    mask = region_parts_mask(
+        [{"in": list(inside or []), "out": list(outside or [])}],
+        xx.ravel(), yy.ravel(),
+    ).reshape(xx.shape)
+    if polygon:
+        poly_mask = _point_in_polygon(
+            xx.ravel(), yy.ravel(), polygon
+        ).reshape(xx.shape)
+        mask = mask | poly_mask if add else mask & ~poly_mask
+    if not mask.any():
+        return None
+    tolerance = float(
+        (page._region_detect.get("signal") or {}).get("tolerance") or 1.0
+    )
+    return _mask_region(mask, float(x0), float(y0), tolerance)
+
+
+def _region_on_region_shape(ctx, page, key, roi) -> None:
+    target = page._region_region_target
+    points = _region_roi_geometry("polygon", roi).get("points") or []
+    try:
+        page._region_viewbox.removeItem(roi)
+    except Exception:  # noqa: BLE001
+        pass
+    _region_cancel_drawing(ctx, page)
+    if target is None or len(points) < 3:
+        return
+    region = _region_region_by_id(page, target["region"])
+    if region is None:
+        return
+    sample = (region.get("samples") or {}).get(target["sample"])
+    if sample is None:
+        return
+
+    sub = None
+    if target.get("sub"):
+        sub = _region_sub_by_id(region, target["sample"], target["sub"])
+    if key == "region_out":
+        if sub is None:
+            return
+        part = _region_retessellate(
+            page, sub.get("in") or [], sub.get("out") or [],
+            points, add=False,
+        )
+        if part is None:
+            QMessageBox.information(
+                ctx.host, "Region out",
+                "This Region out removed the whole Sub-region; it will be "
+                "deleted.",
+            )
+            sample["sub_regions"] = [
+                item for item in sample.get("sub_regions") or []
+                if item is not sub
+            ]
+            page._region_selected_sub_id = None
+        else:
+            sub["kind"] = "region"
+            sub["in"] = part["in"]
+            sub["out"] = part["out"]
+            page._region_selected_region_id = region["id"]
+            page._region_selected_sample = target["sample"]
+            page._region_selected_sub_id = sub["id"]
+    else:
+        if sub is None:
+            part = _region_retessellate(page, [], [], points, add=True)
+            if part is None:
+                return
+            sub = {
+                "id": uuid4().hex,
+                "name": _region_next_sub_name(sample),
+                "visible": True,
+                "kind": "region",
+                "in": part["in"],
+                "out": part["out"],
+            }
+            sample.setdefault("sub_regions", []).append(sub)
+        else:
+            part = _region_retessellate(
+                page, sub.get("in") or [], sub.get("out") or [],
+                points, add=True,
+            )
+            if part is None:
+                return
+            sub["kind"] = "region"
+            sub["in"] = part["in"]
+            sub["out"] = part["out"]
+        page._region_selected_region_id = region["id"]
+        page._region_selected_sample = target["sample"]
+        page._region_selected_sub_id = sub["id"]
+
+    _region_rebuild_region_tree(ctx, page)
+    _region_style_panel_from_selection(ctx, page)
+    _region_mark_dirty(ctx, page)
+    _region_render_overlays(ctx, page)
+
+
 def _region_on_gate_created(ctx, page, tool, roi) -> None:
-    if page._region_subregion_target is not None:
-        _region_finish_subregion(ctx, page, roi)
+    if page._region_region_tool is not None:
+        _region_on_region_shape(ctx, page, page._region_region_tool, roi)
         return
     if page._region_locked:
         try:
@@ -1467,6 +1840,8 @@ def _region_on_region_selection(ctx, page) -> None:
     key = _region_item_key(item)
     if not key:
         return
+    if page._region_region_tool is not None:
+        _region_cancel_drawing(ctx, page)
     kind, region_id, sample_path, sub_id = key
     page._region_selected_region_id = region_id
     page._region_selected_sample = sample_path
@@ -1499,6 +1874,18 @@ def _region_on_region_item_changed(ctx, page, item, column) -> None:
             sub = _region_sub_by_id(region, sample_path, sub_id)
             if sub is not None:
                 sub["visible"] = checked
+        if kind in ("sample", "sub") and sample_path:
+            # Clicking the Show checkbox must also show that file. Otherwise
+            # the image stays on the previous sample and keeps drawing its
+            # Regions while the user is looking at a different tree row.
+            page._region_selected_region_id = region_id
+            page._region_selected_sample = sample_path
+            page._region_selected_sub_id = (
+                sub_id if kind == "sub" else None
+            )
+            if page._region_preview.get("file") != sample_path:
+                _region_switch_file(ctx, page, sample_path)
+            _region_style_panel_from_selection(ctx, page)
         _region_mark_dirty(ctx, page)
         _region_render_overlays(ctx, page)
         return
@@ -1631,56 +2018,10 @@ def _region_add_sample(ctx, page, region_id) -> None:
 
 
 def _region_arm_subregion(ctx, page, region_id, sample_path) -> None:
-    if sample_path != page._region_preview.get("file"):
-        QMessageBox.information(
-            ctx.host, "Region",
-            "Switch the image to this Sample first, then add the sub-region."
-        )
-        return
-    page._region_subregion_target = {
-        "region": str(region_id),
-        "sample": str(sample_path),
-    }
-    page._region_gate_tool = "polygon"
-    page._region_viewbox.set_gate_tool("polygon")
-    for name, button in page._region_tool_buttons.items():
-        button.setChecked(name == "polygon")
-    _region_set_status(
-        page,
-        "Draw the sub-region polygon. It is added after you close the shape.",
-    )
-
-
-def _region_finish_subregion(ctx, page, roi) -> None:
-    target = page._region_subregion_target
-    page._region_subregion_target = None
-    points = _region_roi_geometry("polygon", roi).get("points") or []
-    try:
-        page._region_viewbox.removeItem(roi)
-    except Exception:  # noqa: BLE001
-        pass
-    _region_cancel_drawing(ctx, page)
-    if not target or len(points) < 3:
-        return
-    region = _region_region_by_id(page, target["region"])
-    if region is None:
-        return
-    sample = (region.get("samples") or {}).get(target["sample"])
-    if sample is None:
-        return
-    sub = {
-        "id": uuid4().hex,
-        "name": _region_next_sub_name(sample),
-        "visible": True,
-        "points": points,
-    }
-    sample.setdefault("sub_regions", []).append(sub)
-    page._region_selected_region_id = target["region"]
-    page._region_selected_sample = target["sample"]
-    page._region_selected_sub_id = sub["id"]
-    _region_rebuild_region_tree(ctx, page)
-    _region_mark_dirty(ctx, page)
-    _region_render_overlays(ctx, page)
+    page._region_selected_region_id = str(region_id)
+    page._region_selected_sample = str(sample_path)
+    page._region_selected_sub_id = None
+    _region_set_region_tool(ctx, page, "region_in")
 
 
 def _region_next_sub_name(sample) -> str:
@@ -1793,12 +2134,64 @@ def _region_clear_overlays(page) -> None:
         except Exception:  # noqa: BLE001
             pass
     page._region_overlay_items = []
-    if page._region_edit_roi is not None:
+    for entry in list(getattr(page, "_region_edit_rois", []) or []):
         try:
-            page._region_viewbox.removeItem(page._region_edit_roi)
+            page._region_viewbox.removeItem(entry["roi"])
         except Exception:  # noqa: BLE001
             pass
-        page._region_edit_roi = None
+    page._region_edit_rois = []
+
+
+def _region_on_image_click(ctx, page, event) -> None:
+    """Select the Sub-region under a left click in the image."""
+    if event.button() != Qt.MouseButton.LeftButton:
+        return
+    if page._region_gate_tool or page._region_region_tool:
+        return
+    for roi in getattr(page, "_region_gate_rois", {}).values():
+        try:
+            if roi.sceneBoundingRect().contains(event.scenePos()):
+                return
+        except RuntimeError:
+            continue
+    viewbox = page._region_viewbox
+    if not viewbox.sceneBoundingRect().contains(event.scenePos()):
+        return
+    point = viewbox.mapSceneToView(event.scenePos())
+    path = page._region_preview.get("file")
+    if not path:
+        return
+    import numpy as np
+
+    x = np.asarray([float(point.x())], dtype="float64")
+    y = np.asarray([float(point.y())], dtype="float64")
+    for region in page._region_store.get("regions") or []:
+        if not region.get("visible", True):
+            continue
+        sample = (region.get("samples") or {}).get(path)
+        if sample is None or not sample.get("visible", True):
+            continue
+        for sub in sample.get("sub_regions") or []:
+            if not sub.get("visible", True):
+                continue
+            part = [{
+                "in": sub.get("in") or [],
+                "out": sub.get("out") or [],
+            }]
+            if not part[0]["in"]:
+                continue
+            if not bool(region_parts_mask(part, x, y)[0]):
+                continue
+            page._region_selected_region_id = str(region.get("id"))
+            page._region_selected_sample = str(path)
+            page._region_selected_sub_id = str(sub.get("id"))
+            _region_rebuild_region_tree(ctx, page)
+            _region_style_panel_from_selection(ctx, page)
+            item = page._region_tree.currentItem()
+            if item is not None:
+                page._region_tree.scrollToItem(item)
+            _region_render_overlays(ctx, page)
+            return
 
 
 def _region_render_overlays(ctx, page) -> None:
@@ -1816,79 +2209,130 @@ def _region_render_overlays(ctx, page) -> None:
         sample = (region.get("samples") or {}).get(path)
         if sample is None or not sample.get("visible", True):
             continue
-        polygons = [
-            sub.get("points") or []
-            for sub in sample.get("sub_regions") or []
-            if sub.get("visible", True) and len(sub.get("points") or []) >= 3
-        ]
-        if not polygons:
-            continue
         style = _region_style_for(region)
-        path_item = QPainterPath()
-        path_item.setFillRule(Qt.FillRule.WindingFill)
-        for polygon in polygons:
-            path_item.addPolygon(
-                QPolygonF([QPointF(float(x), float(y)) for x, y in polygon])
+        for sub in sample.get("sub_regions") or []:
+            if not sub.get("visible", True):
+                continue
+            rings = list(sub.get("in") or []) + list(sub.get("out") or [])
+            if not any(len(ring) >= 3 for ring in rings):
+                continue
+            # One path per sub-region: even-odd makes every nested ring a
+            # hole/island correctly, including a new in inside an old out.
+            path_item = QPainterPath()
+            path_item.setFillRule(Qt.FillRule.OddEvenFill)
+            for ring in rings:
+                if len(ring) < 3:
+                    continue
+                path_item.addPolygon(QPolygonF([
+                    QPointF(float(x), float(y)) for x, y in ring
+                ]))
+                path_item.closeSubpath()
+            item = QGraphicsPathItem(path_item)
+            fill = style["fill"]
+            edge = style["edge"]
+            opacity = max(0.0, min(1.0, style["fill_opacity"]))
+            item.setBrush(
+                QBrush(QColor(int(fill[0]), int(fill[1]), int(fill[2]),
+                              int(round(opacity * 255))))
             )
-            path_item.closeSubpath()
-        item = QGraphicsPathItem(path_item)
-        fill = style["fill"]
-        edge = style["edge"]
-        opacity = max(0.0, min(1.0, style["fill_opacity"]))
-        item.setBrush(
-            QBrush(QColor(int(fill[0]), int(fill[1]), int(fill[2]),
-                          int(round(opacity * 255))))
-        )
-        selected = str(region.get("id")) == str(
-            page._region_selected_region_id
-        )
-        width = max(
-            max(0.0, float(style["edge_width"])),
-            3.0 if selected else 0.0,
-        )
-        if width > 0:
-            item.setPen(QPen(
-                QColor(int(edge[0]), int(edge[1]), int(edge[2])),
-                width,
-            ))
-        else:
-            item.setPen(QPen(Qt.PenStyle.NoPen))
-        item.setZValue(10 + (total - index) * 0.01)
-        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        page._region_viewbox.addItem(item, ignoreBounds=True)
-        page._region_overlay_items.append(item)
+            # Use the chosen width exactly; selecting a Region must not
+            # silently clamp widths 0–2 to 3 px.
+            width = max(0.0, float(style["edge_width"]))
+            if width > 0:
+                item.setPen(QPen(
+                    QColor(int(edge[0]), int(edge[1]), int(edge[2])),
+                    width,
+                ))
+            else:
+                item.setPen(QPen(Qt.PenStyle.NoPen))
+            item.setZValue(10 + (total - index) * 0.01)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            page._region_viewbox.addItem(item, ignoreBounds=True)
+            page._region_overlay_items.append(item)
 
     sub_id = page._region_selected_sub_id
     if sub_id and page._region_selected_sample == path:
         region = _region_selected_region(page)
         sub = _region_sub_by_id(region, path, sub_id) if region else None
-        if sub and len(sub.get("points") or []) >= 3:
-            try:
-                roi = _GatePolygonROI(
-                    [tuple(point) for point in sub["points"]],
-                    closed=True,
-                    pen=pg.mkPen("#ffffff", width=2),
-                    handlePen=pg.mkPen("#ffffff", width=1),
-                )
-                roi.setZValue(40)
-                page._region_viewbox.addItem(roi, ignoreBounds=True)
-                roi.sigRegionChanged.connect(
-                    lambda r=roi, reg=region, sub_ref=sub:
-                        _region_on_subregion_dragged(ctx, page, reg, sub_ref, r)
-                )
-                page._region_edit_roi = roi
-            except Exception:  # noqa: BLE001
-                page._region_edit_roi = None
+        if sub is not None:
+            for kind in ("in", "out"):
+                for ring_index, ring in enumerate(sub.get(kind) or []):
+                    if len(ring) < 3:
+                        continue
+                    try:
+                        pen = pg.mkPen(
+                            "#ff9f43" if kind == "out" else "#ffffff",
+                            width=2,
+                            style=(
+                                Qt.PenStyle.DashLine if kind == "out"
+                                else Qt.PenStyle.SolidLine
+                            ),
+                        )
+                        roi = _GatePolygonROI(
+                            [tuple(point) for point in ring],
+                            closed=True, pen=pen,
+                            handlePen=pg.mkPen(
+                                "#ff9f43" if kind == "out" else "#ffffff",
+                                width=1,
+                            ),
+                        )
+                        roi.setZValue(40)
+                        page._region_viewbox.addItem(
+                            roi, ignoreBounds=True
+                        )
+                        signal = getattr(
+                            roi, "sigRegionChangeFinished",
+                            roi.sigRegionChanged,
+                        )
+                        signal.connect(
+                            lambda r=roi, reg=region, s=sub, k=kind,
+                            i=ring_index: _region_on_subregion_ring_changed(
+                                ctx, page, reg, s, k, i, r
+                            )
+                        )
+                        page._region_edit_rois.append({
+                            "roi": roi, "kind": kind, "index": ring_index,
+                        })
+                    except Exception:  # noqa: BLE001
+                        continue
 
 
-def _region_on_subregion_dragged(ctx, page, region, sub, roi) -> None:
-    geometry = _region_roi_geometry("polygon", roi)
-    points = geometry.get("points") or []
-    if len(points) >= 3:
-        sub["points"] = points
-        if not page._region_updating:
-            _region_mark_dirty(ctx, page)
-
+def _region_on_subregion_ring_changed(
+        ctx, page, region, sub, kind, index, roi) -> None:
+    if page._region_updating:
+        return
+    points = _region_roi_geometry("polygon", roi).get("points") or []
+    if len(points) < 3:
+        return
+    rings = list(sub.get(kind) or [])
+    if not (0 <= index < len(rings)):
+        return
+    rings[index] = points
+    sub[kind] = rings
+    part = _region_retessellate(
+        page, sub.get("in") or [], sub.get("out") or []
+    )
+    if part is None:
+        QMessageBox.information(
+            ctx.host, "Region",
+            "This edit removed the whole Sub-region; it will be deleted.",
+        )
+        sample = (region.get("samples") or {}).get(
+            page._region_selected_sample
+        )
+        if sample is not None:
+            sample["sub_regions"] = [
+                item for item in sample.get("sub_regions") or []
+                if item is not sub
+            ]
+        page._region_selected_sub_id = None
+    else:
+        sub["kind"] = "region"
+        sub["in"] = part["in"]
+        sub["out"] = part["out"]
+    _region_rebuild_region_tree(ctx, page)
+    _region_mark_dirty(ctx, page)
+    _region_render_overlays(ctx, page)
 
 def _region_style_panel_from_selection(ctx, page) -> None:
     region = _region_selected_region(page)
@@ -1987,6 +2431,10 @@ def _region_rebuild_detect_panel(ctx, page) -> None:
     layout = getattr(page, "_region_detect_layout", None)
     if layout is None:
         return
+    scroll = getattr(page, "_region_detect_scroll", None)
+    keep_scroll = (
+        scroll.verticalScrollBar().value() if scroll is not None else None
+    )
     _widgets_panels._clear_layout(ctx, layout)
     detect = page._region_detect
     enabled = not page._region_locked and not _region_detect_running(page)
@@ -2017,6 +2465,11 @@ def _region_rebuild_detect_panel(ctx, page) -> None:
     method.setEnabled(enabled)
     row.addWidget(method, 1)
     layout.addLayout(row)
+    layout.addWidget(_widgets_panels._param_hint(
+        ctx,
+        "Signal Expansion thresholds this channel; SAM 3 runs the external "
+        "model configured in Extension Manager.",
+    ))
 
     channel_row = QHBoxLayout()
     channel_row.setSpacing(6)
@@ -2034,6 +2487,9 @@ def _region_rebuild_detect_panel(ctx, page) -> None:
     channel.setEnabled(enabled and bool(columns))
     channel_row.addWidget(channel, 1)
     layout.addLayout(channel_row)
+    layout.addWidget(_widgets_panels._param_hint(
+        ctx, "Image channel whose intensity is used to find Regions."
+    ))
 
     is_sam = detect.get("method") == "sam"
     signal_host = QWidget()
@@ -2077,54 +2533,95 @@ def _region_rebuild_detect_panel(ctx, page) -> None:
     page._region_method_combo = method
     page._region_channel_combo = channel
     page._region_detect_btn = detect_btn
+    if scroll is not None and keep_scroll is not None:
+        bar = scroll.verticalScrollBar()
+
+        def restore_scroll(_bar=bar, _pos=keep_scroll):
+            try:
+                _bar.setValue(min(_pos, _bar.maximum()))
+            except RuntimeError:
+                pass
+
+        restore_scroll()
+        QTimer.singleShot(0, restore_scroll)
 
 
 def _region_build_signal_params(ctx, page, host, enabled) -> None:
     detect = page._region_detect.setdefault("signal", {})
     grid = QGridLayout(host)
     grid.setContentsMargins(0, 0, 0, 0)
-    grid.setSpacing(4)
+    grid.setSpacing(2)
+    grid.setColumnStretch(1, 1)
+
     auto = QCheckBox("Auto threshold")
     auto.setChecked(bool(detect.get("auto_threshold", True)))
     auto.setEnabled(enabled)
-    grid.addWidget(auto, 0, 0, 1, 2)
-    grid.addWidget(QLabel("Threshold"), 0, 2)
-    threshold = QDoubleSpinBox()
+    threshold = _NoWheelDoubleSpinBox()
     threshold.setDecimals(3)
     threshold.setRange(-1e12, 1e12)
     threshold.setValue(float(detect.get("threshold") or 0.0))
     threshold.setEnabled(enabled and not auto.isChecked())
-    grid.addWidget(threshold, 0, 3)
-    grid.addWidget(QLabel("Smooth"), 1, 0)
-    smooth = QDoubleSpinBox()
+    smooth = _NoWheelDoubleSpinBox()
     smooth.setRange(0.0, 20.0)
     smooth.setValue(float(detect.get("smooth") or 0.0))
     smooth.setEnabled(enabled)
-    grid.addWidget(smooth, 1, 1)
-    grid.addWidget(QLabel("Expand"), 1, 2)
-    expand = QSpinBox()
+    expand = _NoWheelSpinBox()
     expand.setRange(0, 100)
     expand.setValue(int(detect.get("expand") or 0))
     expand.setEnabled(enabled)
-    grid.addWidget(expand, 1, 3)
     fill = QCheckBox("Fill holes")
     fill.setChecked(bool(detect.get("fill_holes", True)))
     fill.setEnabled(enabled)
-    grid.addWidget(fill, 2, 0, 1, 2)
-    grid.addWidget(QLabel("Min area"), 2, 2)
-    min_area = QSpinBox()
+    fill_area = _NoWheelSpinBox()
+    fill_area.setRange(0, 10_000_000)
+    fill_area.setValue(int(detect.get("fill_max_area") or 0))
+    fill_area.setSuffix(" px")
+    fill_area.setEnabled(enabled and fill.isChecked())
+    min_area = _NoWheelSpinBox()
     min_area.setRange(0, 10_000_000)
     min_area.setValue(int(detect.get("min_area") or 0))
     min_area.setEnabled(enabled)
-    grid.addWidget(min_area, 2, 3)
-    grid.addWidget(QLabel("Tolerance"), 3, 0)
-    tolerance = QDoubleSpinBox()
+    tolerance = _NoWheelDoubleSpinBox()
     tolerance.setRange(0.0, 100.0)
     tolerance.setDecimals(2)
     tolerance.setValue(float(detect.get("tolerance") or 0.0))
     tolerance.setEnabled(enabled)
-    grid.addWidget(tolerance, 3, 1)
-    grid.addWidget(QLabel("px"), 3, 2)
+
+    hint = lambda text: _widgets_panels._param_hint(ctx, text)
+    row = 0
+
+    def add_param(label, widget, text):
+        nonlocal row
+        if label:
+            grid.addWidget(QLabel(label), row, 0)
+        grid.addWidget(widget, row, 1 if label else 0, 1, 1 if label else 2)
+        row += 1
+        grid.addWidget(hint(text), row, 0, 1, 2)
+        row += 1
+
+    add_param(None, auto,
+              "Let Otsu choose the cut-off from pixels inside the detection "
+              "gate. Untick to enter a fixed threshold.")
+    add_param("Threshold", threshold,
+              "Only used when Auto is off. Pixels above this value become "
+              "signal.")
+    add_param("Smooth", smooth,
+              "Gaussian blur radius in pixels before thresholding. Larger "
+              "values join noisy signal; 0 disables smoothing.")
+    add_param("Expand", expand,
+              "Grow every detected object by this many pixels to connect "
+              "nearby pieces. 0 keeps the thresholded shape.")
+    add_param(None, fill,
+              "Fill enclosed gaps inside a detected object.")
+    add_param("Max hole area", fill_area,
+              "0 fills every enclosed hole. A positive value only fills "
+              "holes up to this many pixels, leaving larger lumens open.")
+    add_param("Min area", min_area,
+              "Objects smaller than this many pixels are discarded as "
+              "debris.")
+    add_param("Tolerance", tolerance,
+              "Polygon simplification in pixels. Larger values give fewer "
+              "vertices and smaller sub-regions.")
 
     def store(*_args):
         detect["auto_threshold"] = bool(auto.isChecked())
@@ -2132,12 +2629,16 @@ def _region_build_signal_params(ctx, page, host, enabled) -> None:
         detect["smooth"] = float(smooth.value())
         detect["expand"] = int(expand.value())
         detect["fill_holes"] = bool(fill.isChecked())
+        detect["fill_max_area"] = int(fill_area.value())
         detect["min_area"] = int(min_area.value())
         detect["tolerance"] = float(tolerance.value())
         threshold.setEnabled(enabled and not auto.isChecked())
+        fill_area.setEnabled(enabled and fill.isChecked())
         _region_mark_dirty(ctx, page)
 
-    for widget in (auto, threshold, smooth, expand, fill, min_area, tolerance):
+    for widget in (
+        auto, threshold, smooth, expand, fill, fill_area, min_area, tolerance
+    ):
         signal = getattr(widget, "valueChanged", None)
         if signal is not None:
             signal.connect(store)
@@ -2152,30 +2653,49 @@ def _region_build_sam_params(ctx, page, host, enabled) -> None:
     grid.setContentsMargins(0, 0, 0, 0)
     grid.setSpacing(4)
     specs = [
-        ("Points / side", "points_per_side", 1, 200, 1),
-        ("Points / batch", "points_per_batch", 1, 256, 1),
-        ("IoU threshold", "pred_iou", 0.0, 1.0, 0.01),
-        ("Stability", "stability", 0.0, 1.0, 0.01),
-        ("Crop layers", "crop_layers", 0, 10, 1),
-        ("Min area", "min_area", 0, 10_000_000, 1),
-        ("Tolerance", "tolerance", 0.0, 100.0, 0.01),
+        ("Points / side", "points_per_side", 1, 200, 1,
+         "Grid of prompt points per image side. Higher values find smaller "
+         "objects but run slower."),
+        ("Points / batch", "points_per_batch", 1, 256, 1,
+         "Prompt points processed at once. Lower this if GPU memory is "
+         "tight."),
+        ("IoU threshold", "pred_iou", 0.0, 1.0, 0.01,
+         "Minimum predicted mask quality. Higher values keep fewer, cleaner "
+         "masks."),
+        ("Stability", "stability", 0.0, 1.0, 0.01,
+         "Minimum mask stability. Higher values keep fewer, more confident "
+         "masks."),
+        ("Crop layers", "crop_layers", 0, 10, 1,
+         "Extra image crops SAM analyses. More layers find small objects at "
+         "extra cost."),
+        ("Min area", "min_area", 0, 10_000_000, 1,
+         "Masks smaller than this many pixels are discarded."),
+        ("Tolerance", "tolerance", 0.0, 100.0, 0.01,
+         "Polygon simplification in pixels. Larger values give fewer "
+         "vertices and smaller sub-regions."),
     ]
     widgets = {}
-    for row, (label, key, low, high, step) in enumerate(specs):
-        grid.addWidget(QLabel(label), row // 2, (row % 2) * 2)
+    row = 0
+    for label, key, low, high, step, text in specs:
+        grid.addWidget(QLabel(label), row, 0)
         if isinstance(step, int):
-            widget = QSpinBox()
+            widget = _NoWheelSpinBox()
             widget.setRange(int(low), int(high))
             widget.setValue(int(detect.get(key) or low))
         else:
-            widget = QDoubleSpinBox()
+            widget = _NoWheelDoubleSpinBox()
             widget.setDecimals(3)
             widget.setRange(float(low), float(high))
             widget.setSingleStep(float(step))
             widget.setValue(float(detect.get(key) or low))
         widget.setEnabled(enabled)
-        grid.addWidget(widget, row // 2, (row % 2) * 2 + 1)
+        grid.addWidget(widget, row, 1)
         widgets[key] = widget
+        row += 1
+        grid.addWidget(
+            _widgets_panels._param_hint(ctx, text), row, 0, 1, 2
+        )
+        row += 1
 
     ready = ctx._ext_ready("sam3")
     hint = QLabel(
@@ -2189,7 +2709,7 @@ def _region_build_sam_params(ctx, page, host, enabled) -> None:
         "color: #8a94a6; font-size: 8pt;"
         if ready else "color: #b58900; font-size: 8pt;"
     )
-    grid.addWidget(hint, 4, 0, 1, 4)
+    grid.addWidget(hint, row, 0, 1, 2)
 
     def store(*_args):
         for key, widget in widgets.items():
@@ -2253,6 +2773,39 @@ def _region_set_status(page, text: str) -> None:
         label.setText(
             page._region_detect_message or _region_detect_status_text(page)
         )
+
+
+def _region_store_log(page) -> None:
+    """Keep the detection log in params (and the unsaved snapshot)."""
+    lines = list(getattr(page, "_region_log_lines", []))
+    params = getattr(page, "_region_params", None)
+    if params is not None:
+        params["log"] = lines
+    snapshot = getattr(page, "_region_snapshot", None)
+    if isinstance(snapshot, dict):
+        snapshot["log"] = lines
+
+
+def _region_log(ctx, page, text: str, timestamp: str | None = None) -> None:
+    """Append a timestamped, user-readable line to the Region log."""
+    ts = timestamp or datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    lines = getattr(page, "_region_log_lines", None)
+    if lines is None:
+        lines = []
+        page._region_log_lines = lines
+    for line in str(text or "").splitlines():
+        if line.strip():
+            lines.append(f"[{ts}] {line}")
+    if len(lines) > _REGION_LOG_LIMIT:
+        del lines[:-_REGION_LOG_LIMIT]
+    _region_store_log(page)
+    box = getattr(page, "_region_log", None)
+    if box is not None:
+        for line in str(text or "").splitlines():
+            if line.strip():
+                box.appendPlainText(f"[{ts}] {line}")
+        bar = box.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
 
 def _region_start_detect(ctx, page) -> None:
@@ -2322,10 +2875,13 @@ def _region_start_detect(ctx, page) -> None:
         "total": len(files),
         "done": 0,
     }
-    page._region_progress.setRange(0, len(files))
-    page._region_progress.setValue(0)
-    page._region_progress.show()
-    _region_set_status(page, "Starting detection…")
+    _region_set_status(page, "Detection started; see the log below.")
+    method_label = "SAM 3" if method == "sam" else "Signal Expansion"
+    _region_log(
+        ctx, page,
+        f"===== Region detection — {method_label}, {len(files)} file(s), "
+        f"channel '{channel}' =====",
+    )
     page._region_detect_worker.request(token, job)
     page._region_detect_timer.start()
     _region_rebuild_detect_panel(ctx, page)
@@ -2346,17 +2902,42 @@ def _region_poll_detect(ctx, page) -> None:
         if token != state["token"]:
             continue
         if kind == "progress":
-            _, _token, done, total, text = message
-            page._region_progress.setRange(0, total)
-            page._region_progress.setValue(done)
-            _region_set_status(page, text)
+            stamp = message[5] if len(message) > 5 else None
+            _, _token, index, total, _text = message[:5]
+            files = state.get("files") or []
+            path = files[index] if 0 <= index < len(files) else None
+            name = (
+                _region_file_name(ctx, path, page._region_task_id)
+                if path else "file"
+            )
+            _region_log(
+                ctx, page, f"→ Detecting {name} ({index + 1}/{total})…",
+                timestamp=stamp,
+            )
+        elif kind == "step":
+            _, _token, path, stamp, text = message
+            name = _region_file_name(
+                ctx, path, page._region_task_id
+            )
+            _region_log(
+                ctx, page, f"{name}: {text}", timestamp=stamp
+            )
         elif kind == "file":
-            _, _token, path, polygons, error = message
-            state["results"][path] = polygons or []
+            _, _token, path, parts, error = message
+            state["results"][path] = parts or []
             if error:
                 state["errors"][path] = error
             state["done"] += 1
-            page._region_progress.setValue(state["done"])
+            name = _region_file_name(
+                ctx, path, page._region_task_id
+            )
+            if error:
+                _region_log(ctx, page, f"✗ {name}: {error}")
+            else:
+                _region_log(
+                    ctx, page,
+                    f"✓ {name}: {len(parts or [])} sub-region(s)",
+                )
         elif kind == "done":
             finished = True
     if finished:
@@ -2367,7 +2948,6 @@ def _region_poll_detect(ctx, page) -> None:
 def _region_finish_detect(ctx, page) -> None:
     state = getattr(page, "_region_detect_state", None)
     page._region_detect_state = None
-    page._region_progress.hide()
     if not state:
         _region_rebuild_detect_panel(ctx, page)
         return
@@ -2377,8 +2957,12 @@ def _region_finish_detect(ctx, page) -> None:
         errors and not any(bool(value) for value in results.values())
     ):
         detail = "; ".join(
-            f"{Path(path).name}: {message}"
+            f"{_region_file_name(ctx, path, page._region_task_id)}: {message}"
             for path, message in list(errors.items())[:3]
+        )
+        _region_log(
+            ctx, page,
+            "Detection failed." + (f" {detail}" if detail else ""),
         )
         _region_set_status(
             page,
@@ -2399,16 +2983,19 @@ def _region_finish_detect(ctx, page) -> None:
     }
     total_polygons = 0
     for path in state.get("files") or []:
-        polygons = results.get(path) or []
+        parts = results.get(path) or []
         sub_regions = []
-        for number, points in enumerate(polygons, start=1):
-            if len(points) < 3:
+        for number, part in enumerate(parts, start=1):
+            inside = part.get("in") or []
+            if not inside:
                 continue
             sub_regions.append({
                 "id": uuid4().hex,
                 "name": f"Sub-region {number}",
                 "visible": True,
-                "points": points,
+                "kind": "region",
+                "in": inside,
+                "out": list(part.get("out") or []),
             })
         total_polygons += len(sub_regions)
         region["samples"][str(path)] = {
@@ -2419,14 +3006,15 @@ def _region_finish_detect(ctx, page) -> None:
     page._region_selected_region_id = region["id"]
     page._region_selected_sample = None
     page._region_selected_sub_id = None
-    _region_set_status(
-        page,
+    summary = (
         f"Created {region['name']} with {total_polygons} sub-region(s)."
         + (
             f" {len(errors)} file(s) could not be processed."
             if errors else ""
-        ),
+        )
     )
+    _region_set_status(page, summary)
+    _region_log(ctx, page, summary)
     _region_rebuild_region_tree(ctx, page)
     _region_style_panel_from_selection(ctx, page)
     _region_mark_dirty(ctx, page)
@@ -2475,13 +3063,34 @@ class _RegionDetectWorker:
                     self._results.put((
                         "progress", token, index, total,
                         f"Detecting {name} ({index + 1}/{total})…",
+                        datetime.now().strftime("%H:%M:%S.%f")[:-3],
                     ))
+
+                    def report(step, seconds, detail="", _path=path):
+                        stamp = datetime.now().strftime(
+                            "%H:%M:%S.%f"
+                        )[:-3]
+                        text = str(step)
+                        if detail:
+                            text += f" ({detail})"
+                        if seconds is not None:
+                            text += f" — {float(seconds):.3f} s"
+                        self._results.put((
+                            "step", token, str(_path), stamp, text,
+                        ))
+
+                    started_file = time.perf_counter()
                     try:
-                        polygons, error = self._detect_file(job, path)
+                        parts, error = self._detect_file(
+                            job, path, report
+                        )
                     except Exception as exc:  # noqa: BLE001
-                        polygons, error = [], str(exc)
+                        parts, error = [], str(exc)
+                    report(
+                        "total", time.perf_counter() - started_file
+                    )
                     self._results.put((
-                        "file", token, str(path), polygons, error,
+                        "file", token, str(path), parts, error,
                     ))
                 self._results.put(("done", token))
             except Exception as exc:  # noqa: BLE001
@@ -2492,48 +3101,66 @@ class _RegionDetectWorker:
                 self._results.put(("done", token))
 
     @staticmethod
-    def _detect_file(job, path):
+    def _detect_file(job, path, report):
         from smage.data import regions as _regions
 
         ctx = job["ctx"]
         task_id = job["task_id"]
         channel = job["channel"]
+        started = time.perf_counter()
         image, x0, y0 = _regions._region_image_grid(
             ctx, task_id, path, channel
         )
         if image is None:
+            report(
+                "read channel",
+                time.perf_counter() - started,
+                "channel or image index unavailable",
+            )
             return [], f"channel '{channel}' or the image index is unavailable"
+        report(
+            "read channel", time.perf_counter() - started,
+            f"{image.shape[1]}x{image.shape[0]} px",
+        )
+        started = time.perf_counter()
         gate = _regions._region_image_gate_mask(
             ctx, task_id, path, job.get("gates") or [],
             job.get("gate_id"), job.get("per_file") or {},
         )
+        report(
+            "detection gate", time.perf_counter() - started,
+            "none" if gate is None else "clipped",
+        )
         if job.get("method") == "sam":
             return _RegionDetectWorker._detect_sam(
-                job, path, image, gate, x0, y0
+                job, path, image, gate, x0, y0, report
             )
         params = job.get("signal") or {}
         threshold = (
             None if params.get("auto_threshold", True)
             else float(params.get("threshold") or 0.0)
         )
-        polygons, _used, _mask = signal_expansion(
+        parts, _used, _mask = signal_expansion(
             image, gate,
             threshold=threshold,
             smooth=float(params.get("smooth") or 0.0),
             expand=int(params.get("expand") or 0),
             fill_holes=bool(params.get("fill_holes", True)),
+            fill_max_area=int(params.get("fill_max_area") or 0),
             min_area=int(params.get("min_area") or 0),
             tolerance=float(params.get("tolerance") or 0.0),
             x_origin=float(x0 or 0.0),
             y_origin=float(y0 or 0.0),
+            progress=report,
         )
-        return polygons, None
+        return parts, None
 
     @staticmethod
-    def _detect_sam(job, path, image, gate, x0, y0):
+    def _detect_sam(job, path, image, gate, x0, y0, report):
         import numpy as np
 
         config = job.get("sam") or {}
+        started = time.perf_counter()
         finite = np.isfinite(image)
         if not finite.any():
             return [], "no finite pixels in this channel"
@@ -2547,6 +3174,10 @@ class _RegionDetectWorker:
         scaled = np.clip((image - low) / (high - low), 0.0, 1.0)
         scaled[~finite] = 0.0
         gray = (scaled * 255.0).astype("uint8")
+        report(
+            "sam prepare", time.perf_counter() - started,
+            f"range {low:.4g}..{high:.4g}",
+        )
         try:
             from PIL import Image
         except Exception:  # noqa: BLE001
@@ -2554,7 +3185,11 @@ class _RegionDetectWorker:
         with tempfile.TemporaryDirectory(prefix="smage-sam-") as folder:
             png = str(Path(folder) / "image.png")
             out = str(Path(folder) / "masks.npz")
+            started = time.perf_counter()
             Image.fromarray(gray, mode="L").convert("RGB").save(png)
+            report(
+                "sam write image", time.perf_counter() - started
+            )
             command = [
                 str(job["python"]), str(job["runner"]), "run",
                 "--input", png, "--output", out,
@@ -2567,6 +3202,7 @@ class _RegionDetectWorker:
                 "--crop-layers", str(int(config.get("crop_layers") or 0)),
                 "--min-area", str(int(config.get("min_area") or 0)),
             ]
+            started = time.perf_counter()
             try:
                 completed = subprocess.run(
                     command,
@@ -2579,9 +3215,14 @@ class _RegionDetectWorker:
                 )
             except Exception as exc:  # noqa: BLE001
                 return [], f"SAM could not start: {exc}"
+            report(
+                "sam inference", time.perf_counter() - started,
+                "external process",
+            )
             if completed.returncode != 0 or not Path(out).is_file():
                 detail = (completed.stderr or completed.stdout or "").strip()
                 return [], "SAM failed" + (f": {detail[-500:]}" if detail else "")
+            started = time.perf_counter()
             try:
                 # Closing the archive matters on Windows: the temporary
                 # folder cannot be removed while masks.npz is still open.
@@ -2591,7 +3232,12 @@ class _RegionDetectWorker:
                     packed = np.array(data["masks"])
             except Exception as exc:  # noqa: BLE001
                 return [], f"Could not read SAM output: {exc}"
-            polygons = []
+            report(
+                "sam read masks", time.perf_counter() - started,
+                f"{count} mask(s)",
+            )
+            started = time.perf_counter()
+            parts = []
             for index in range(count):
                 if count == 0:
                     continue
@@ -2600,7 +3246,7 @@ class _RegionDetectWorker:
                 if mask.size != height * width:
                     continue
                 mask = mask.reshape(height, width)
-                polygons.extend(
+                parts.extend(
                     sam_mask_polygons(
                         mask, gate,
                         min_area=int(config.get("min_area") or 0),
@@ -2609,7 +3255,11 @@ class _RegionDetectWorker:
                         y_origin=float(y0 or 0.0),
                     )
                 )
-            return polygons, None
+            report(
+                "sam regions", time.perf_counter() - started,
+                f"{len(parts)} region part(s)",
+            )
+            return parts, None
 
 
 # ---------------------------------------------------------------------------
@@ -2630,6 +3280,9 @@ def _region_save_now(ctx, page) -> None:
     params["preview_channel"] = page._region_preview.get("channel")
     params["preview_min"] = page._region_preview.get("image_min")
     params["preview_max"] = page._region_preview.get("image_max")
+    params["preview_display"] = {
+        key: page._region_preview.get(key) for key in _REGION_DISPLAY_KEYS
+    }
     if ctx.project is not None:
         ctx.project.save()
     page._region_snapshot = copy.deepcopy(params)

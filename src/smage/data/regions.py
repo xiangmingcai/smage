@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from smage.core.region_detection import polygon_pixel_count
+from smage.core.region_detection import region_parts_pixel_count
 
 
 def _region_store_path(ctx, task_def) -> Path | None:
@@ -102,8 +102,8 @@ def _region_by_id(ctx, task_def, region_id) -> dict | None:
     return None
 
 
-def _region_polygons(region, parquet_path) -> list | None:
-    """Sub-region polygons for one file, or None when the Sample is absent."""
+def _region_parts(region, parquet_path) -> list | None:
+    """Region parts for one file, or None when the Sample is absent."""
     if not region or parquet_path is None:
         return None
     samples = region.get("samples") or {}
@@ -117,12 +117,16 @@ def _region_polygons(region, parquet_path) -> list | None:
                 break
     if sample is None:
         return None
-    polygons = []
+    parts = []
     for sub in sample.get("sub_regions") or []:
-        points = sub.get("points") or []
-        if len(points) >= 3:
-            polygons.append(points)
-    return polygons
+        inside = sub.get("in") or []
+        if inside:
+            parts.append({
+                "kind": "region",
+                "in": inside,
+                "out": list(sub.get("out") or []),
+            })
+    return parts
 
 
 def _region_gate(ctx, task_def, region_id, parquet_path=None) -> dict | None:
@@ -136,8 +140,8 @@ def _region_gate(ctx, task_def, region_id, parquet_path=None) -> dict | None:
             str(path) for path in store.get("files") or []
         }:
             return None
-    polygons = _region_polygons(region, parquet_path)
-    # A missing Sample and an empty Sample both produce an empty polygon
+    parts = _region_parts(region, parquet_path)
+    # A missing Sample and an empty Sample both produce an empty parts
     # list downstream; Region Size distinguishes the two cases.
     return {
         "id": str(region.get("id")),
@@ -146,7 +150,7 @@ def _region_gate(ctx, task_def, region_id, parquet_path=None) -> dict | None:
         "x": "x",
         "y": "y",
         "parent": None,
-        "polygons": list(polygons or []),
+        "parts": list(parts or []),
     }
 
 
@@ -203,10 +207,10 @@ def _region_task_regions(ctx, task_id) -> list:
 def _region_area(ctx, task_id, parquet_path, region_record,
                  x=None, y=None) -> int | None:
     """Pixel area of one Region on one file; None when the Sample is absent."""
-    polygons = _region_polygons(region_record, parquet_path)
-    if polygons is None:
+    parts = _region_parts(region_record, parquet_path)
+    if parts is None:
         return None
-    if not polygons:
+    if not parts:
         return 0
     if x is None or y is None:
         from smage.data import columns as _data_columns
@@ -218,7 +222,7 @@ def _region_area(ctx, task_id, parquet_path, region_record,
         y = values.get("y")
     if x is None or y is None:
         return None
-    return polygon_pixel_count(polygons, x, y)
+    return region_parts_pixel_count(parts, x, y)
 
 
 def _region_image_grid(ctx, task_id, parquet_path, channel):

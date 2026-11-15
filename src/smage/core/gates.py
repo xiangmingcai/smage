@@ -18,7 +18,7 @@ _GATE_GEOMETRY_KEYS = {
     # the drawn gate.
     "ellipse": ("pos", "size", "points"),
     "polygon": ("points", "mask_points"),
-    "region": ("polygons",),
+    "region": ("parts",),
     "quadrant": ("vx", "hy"),
     "split": ("vx",),
     "range": ("x1", "x2"),
@@ -111,13 +111,19 @@ def _gate_mask(x, y, gate):
         x2 = max(gate["x1"], gate["x2"])
         return (x >= x1) & (x <= x2)
     if t == "region":
-        # A Region is the union of its sub-region polygons on one file.
+        # Each part is an even-odd fill of its rings; parts are OR-ed.
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
         inside = np.zeros(x.shape, dtype=bool)
-        for polygon in gate.get("polygons") or ():
-            if len(polygon) >= 3:
-                inside |= _point_in_polygon(x, y, polygon)
+        for part in gate.get("parts") or ():
+            part_inside = np.zeros(x.shape, dtype=bool)
+            rings = list(part.get("in") or ()) + list(
+                part.get("out") or ()
+            )
+            for ring in rings:
+                if len(ring) >= 3:
+                    part_inside ^= _point_in_polygon(x, y, ring)
+            inside |= part_inside
         return inside
     if t == "categorical":
         # Col2Gate: the point's `x` (the chosen column) equals a category value.

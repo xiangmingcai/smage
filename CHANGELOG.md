@@ -111,11 +111,57 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Changed
 
+- Region sub-regions now use the `in`/`out` ring representation. Projects
+  created with the earlier keyhole-polygon Region format are not migrated.
 - Calculation, Region and Region Size: a new module starts with **no data
   files selected**; choose the files explicitly instead of the module
   defaulting to every imported file.
 - **Add module**: **Region** now sits in the **Gate & select** group,
   directly after **Gating** (it is a spatial gate producer).
+- **Region layout**: seven independent panels — Data files, Detection gates
+  and Regions on the left; image and Detect Region in the middle; Image
+  settings, Region setting and Log on the right. The columns default to
+  2:3:2, the left stack to 1:2:3, the middle to 3:1 and the right to 3:1:1;
+  every divider is draggable. **Region drawing** is renamed **Region
+  setting**. The Regions tree gives **Region : Show** a default 4:1 width.
+- **Region in/out tools**: Sub-regions are now stored as `in` (filled) and
+  `out` (hole) rings and evaluated with even-odd fill, so a Region can be
+  carved into holes or split into several pieces. The image toolbar now has
+  **Gating tools** (rect / ellipse / polygon) and **Region tools**
+  (**Region in** / **Region out**); the Cancel button is replaced by Esc,
+  clicking the active tool again, or switching tools. Drawing a Region in
+  inside an existing hole creates an island without deleting the out ring.
+  Anchors are re-traced through a pixel mask after each edit.
+- **Region detection**: Signal Expansion and SAM now emit the same
+  `in/out` region parts instead of keyhole polygons; Detect Region's spin
+  boxes and combos ignore the mouse wheel so a scroll cannot change a
+  parameter.
+- **Region detection log**: the progress bar under Detect Region is gone;
+  per-file progress and results are written to a log panel that uses the
+  user-visible file names, is saved with the module and appends across
+  runs. Every detection stage logs its own timestamp and elapsed seconds
+  (read, gate, smooth, threshold, binarize, expand, fill, filter, contours,
+  total) for profiling.
+- **Region tree**: clicking a Sample or Sub-region Show checkbox now switches
+  the image to that file. Every sample switch explicitly removes the previous
+  overlay items, so Regions no longer accumulate on the image when browsing
+  Samples (PlotItem.clear() does not remove arbitrary QGraphicsItems).
+  Clicking a filled Sub-region directly in the image selects it in the tree.
+- **Region setting**: the edge Width spin box ignores the mouse wheel, and
+  widths below 3 px are no longer clamped to 3 px when the Region is
+  selected.
+- **Detect Region panel**: changing the method or a parameter keeps the
+  panel's scroll position instead of pulling it to the bottom. Every signal
+  and SAM option now has a short explanation underneath it, using the same
+  hint style as the other modules.
+- **Region fill holes**: a new **Max hole area** setting fills only holes up
+  to a given pixel area (0 keeps the old behaviour of filling every enclosed
+  hole), so large lumens between cells can stay open. Region polygons also
+  keep enclosed holes as `out` rings instead of covering them with the
+  outer contour, so blank lumens are no longer painted as Regions.
+- **Region image settings** now match the image options of the Gating pane:
+  file navigation, channel and levels, display toggles (axes, names,
+  indices, sample name) and the three font sizes.
 - Figure filters and image overlays, Gate2Col and Heatmap now accept Regions
   from upstream Region modules alongside Gating gates.
 - Illumination Correction: zooming or panning a preview re-samples the

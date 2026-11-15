@@ -23,7 +23,9 @@ A new Region Size module starts with **no image files selected**. Use
 
 - One row per selected file, one column per selected Region.
 - The value is the number of pixels inside the union of the Region's
-  sub-regions. Overlapping sub-regions are counted once.
+  sub-regions, after subtracting each sub-region's own `out` holes.
+  Overlapping sub-regions are counted once; a hole in one sub-region does not
+  subtract pixels belonging to another.
 - A file **without** a Sample for a Region shows **NA** (not 0).
 - A Sample with **no sub-regions** shows **0**.
 - Upstream row filtering (for example a Subsample module) is respected: only
