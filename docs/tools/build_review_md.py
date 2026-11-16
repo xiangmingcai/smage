@@ -36,7 +36,8 @@ SECTIONS = [
         ("Projects and data", "getting-started/project-and-data.md"),
     ]),
     ("Guides", [
-        ("Image workflow", "guides/image-workflow.md"),
+        ("Spectral image workflow", "guides/image-workflow.md"),
+        ("Multiplex image workflow", "guides/multiplex-image-workflow.md"),
         ("FCS workflow", "guides/fcs-workflow.md"),
     ]),
     ("Modules", [

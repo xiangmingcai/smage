@@ -42,12 +42,29 @@ compensation, unmixing, segmentation, clustering, feature tables and export.
     with Signal Expansion; per-Region pixel area; and per-class feature
     aggregation.
 
+-   :material-vector-polygon: **Detect Regions**
+
+    ---
+
+    Detect tissue, perivascular space, and special areas with Signal
+    Expansion, edit in/out boundaries on the image, convert each Region to
+    a 0/1 channel and measure its pixel area.
+
 -   :material-chart-scatter-plot: **Explore**
 
     ---
 
     UMAP / t-SNE, clustering (PhenoGraph, Leiden, FlowSOM, PARC), feature
     heatmaps and publication-ready figures.
+
+-   :material-image-multiple-outline: **Visualise with Figure**
+
+    ---
+
+    Scatter, histogram, image and N×N plots. Image plots overlay several
+    layers on one image — raw channels, segmentation masks, converted Region
+    channels and cell-type labels from gates — each with its own colour,
+    range and opacity.
 
 -   :material-table: **Build feature tables**
 

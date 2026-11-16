@@ -12,3 +12,17 @@
   /* Links need more contrast than the header on a white page. */
   --md-typeset-a-color:         #5b6f92;
 }
+
+/* The module list is long: keep the primary sidebar scrollable on desktop
+   instead of letting its content run past the viewport. */
+@media screen and (min-width: 76.25em) {
+  .md-sidebar--primary {
+    height: calc(100vh - 2.4rem);
+    max-height: calc(100vh - 2.4rem);
+  }
+  .md-sidebar--primary .md-sidebar__scrollwrap {
+    height: 100%;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+}

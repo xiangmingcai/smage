@@ -1,7 +1,7 @@
-# Image workflow
+# Spectral image workflow
 
-Segmenting microscopy images, aggregating per-object features and comparing
-populations between samples.
+Segmenting spectral microscopy images, aggregating per-object features and
+comparing populations between samples.
 
 ## 1. Import the images
 
@@ -13,7 +13,10 @@ populations between samples.
 
 Every pixel becomes a row with its `x`, `y` and channel values.
 
-## 2. Optional: unmix and correct
+## 2. Unmix and correct
+
+Unmix and Illumination Correction prepare the channels that segmentation,
+Regions and Feature Down read:
 
 - Add **Unmix** when channels overlap spectrally; define the spectra and let
   Smage solve the per-pixel contributions.
@@ -51,7 +54,21 @@ See [Region](../modules/region.md) and [Region Size](../modules/region-size.md)
 for the detection parameters, per-file thresholds, boundary editing and
 multi-selection.
 
-## 5. Aggregate per object
+## 5. Gate populations
+
+Add a **Gating** module below Segmentation (and Region) when you need to
+define populations or exclude debris before aggregation:
+
+- use image gates on a marker or the segmentation mask, or scatter /
+  histogram gates on marker intensities;
+- draw child and boolean gates as needed (NOT / AND / OR);
+- gate membership becomes 0/1 columns that downstream modules can use.
+
+Feature Down can aggregate a gate column as an extra rule (the mean per
+object is the fraction of that object inside the gate), and Figure can use
+the gate as a filter.
+
+## 6. Aggregate per object
 
 1. Add **Feature Down**.
 2. Set **Feature channel** to the mask column.
@@ -63,7 +80,7 @@ The default rules table already contains the Count row and a group-key row
 named after the feature channel; the group-key row can be deleted if you do
 not want the identifier column in the output.
 
-## 6. Compare and visualise
+## 7. Compare and visualise
 
 - **Heatmap** for a clustered view of the per-class features.
 - **Gating** on the aggregated table to define cell-type combinations.
