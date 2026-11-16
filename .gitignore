@@ -43,3 +43,7 @@ Thumbs.db
 
 # --- Claude Code local settings ---
 .claude/
+
+# --- Internal planning notes (kept local, not published) ---
+/TEST_PLAN.md
+/TODO.md
