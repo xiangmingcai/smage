@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="Smage logo" width="140">
+</p>
+
 # Smage
 
 Smage is a free, open-source desktop application for analyzing **spectral
