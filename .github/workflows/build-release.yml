@@ -11,7 +11,6 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.11"
-  SMAGE_TEST_ROOT: ${{ github.workspace }}/_smage_test
 
 jobs:
   windows:
@@ -44,6 +43,9 @@ jobs:
 
       - name: Full regression suite (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          # The harness refuses a workspace inside the source checkout.
+          SMAGE_TEST_ROOT: ${{ runner.temp }}/smage_test
         run: python tests/regression/run_all.py --full
 
       - name: Build portable bundle and self-tests
