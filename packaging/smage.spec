@@ -55,14 +55,18 @@ for package in ("smage", "numba", "llvmlite", "pynndescent", "umap", "scanpy"):
     hiddenimports += collect_submodules(package)
 hiddenimports += [
     "peacoqc",
+    # The bundled regression suite drives a right-click through QTest; it is
+    # only imported by test code, which PyInstaller does not analyse.
+    "PySide6.QtTest",
     "matplotlib.backends.backend_agg",
     "matplotlib.backends.backend_svg",
     "matplotlib.backends.backend_pdf",
 ]
 
-# Smage uses only QtCore/QtGui/QtWidgets/QtSvg.  Dropping the rest keeps the
-# bundle several hundred MB smaller; verify with ``Smage.exe --self-test``
-# and the smoke regression after changing this list.
+# Smage uses only QtCore/QtGui/QtWidgets/QtSvg, plus QtTest for the bundled
+# regression suite (see hiddenimports).  Dropping the rest keeps the bundle
+# several hundred MB smaller; verify with ``Smage.exe --self-test`` and the
+# smoke regression after changing this list.
 excludes = [
     "PySide6.QtWebEngineCore",
     "PySide6.QtWebEngineWidgets",
@@ -83,7 +87,6 @@ excludes = [
     "PySide6.QtPdf",
     "PySide6.QtPdfWidgets",
     "PySide6.QtDesigner",
-    "PySide6.QtTest",
     "PySide6.QtBluetooth",
     "PySide6.QtNfc",
     "PySide6.QtPositioning",

@@ -1,0 +1,110 @@
+name: build-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  SMAGE_TEST_ROOT: ${{ runner.temp }}\smage_test
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-deps -r requirements-lock.txt
+
+      - name: Read version and check tag
+        id: version
+        shell: pwsh
+        run: |
+          $version = python -c "import sys; sys.path.insert(0, 'src'); from smage import __version__; print(__version__)"
+          if (-not $version) { throw "Could not read __version__" }
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$version") {
+            throw "Tag ${{ github.ref_name }} does not match application version v$version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Full regression suite (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python tests/regression/run_all.py --full
+
+      - name: Build portable bundle and self-tests
+        run: python packaging/build_win.py
+
+      # SignPath Foundation signing is enabled after the project is approved.
+      # The signing request must replace dist\Smage\Smage.exe with the signed
+      # file before the zip is created. See CODE_SIGNING_POLICY.md.
+      #
+      # - name: Sign Smage.exe with SignPath
+      #   uses: signpath/github-action-submit-signing-request@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      #     project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      #     signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+      #     artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG }}
+      #     wait-for-completion: true
+      #     output-artifact-directory: dist\signed
+
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          Compress-Archive -Path "dist\Smage" `
+            -DestinationPath "dist\Smage-v$version-win64.zip" `
+            -CompressionLevel Optimal -Force
+
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $zip = "dist\Smage-v$version-win64.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$hash  Smage-v$version-win64.zip" |
+            Out-File -Encoding ascii dist\SHA256SUMS.txt
+
+      - name: Prepare release notes
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $body = Get-Content ".github\RELEASE_TEMPLATE.md" -Raw
+          $body = $body.Replace("vX.Y.Z", "v$version").Replace("X.Y.Z", $version)
+          $body | Out-File -Encoding utf8 dist\RELEASE_NOTES.md
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Smage-v${{ steps.version.outputs.version }}-win64
+          path: |
+            dist/Smage-v${{ steps.version.outputs.version }}-win64.zip
+            dist/SHA256SUMS.txt
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Smage-v${{ steps.version.outputs.version }}-win64.zip
+            dist/SHA256SUMS.txt
+          body_path: dist/RELEASE_NOTES.md
+          generate_release_notes: false

@@ -32,9 +32,25 @@ Any failure fails the build. Results are written to
 2. Run `run_all.py --full`.
 3. Run `packaging/build_win.py`; both self-checks must pass.
 4. Zip `dist\Smage` as `Smage-vX.Y.Z-win64.zip`, generate `SHA256SUMS.txt`.
-5. Create a GitHub release with the zip, the checksums and the release notes.
-6. Signing (planned): sign `Smage.exe` before zipping, and the installer
-   afterwards; always with an RFC 3161 timestamp.
+5. Create a GitHub release with the zip, the checksums and the release
+   notes, starting from `.github/RELEASE_TEMPLATE.md`.
+6. Code signing: once SignPath Foundation approves the project, `Smage.exe`
+   is signed in CI before the zip is written. The scope and approval rules
+   are in [CODE_SIGNING_POLICY.md](https://github.com/xiangmingcai/smage/blob/main/CODE_SIGNING_POLICY.md);
+   the privacy/network statement is in
+   [PRIVACY.md](https://github.com/xiangmingcai/smage/blob/main/PRIVACY.md).
+   Signing always uses a trusted timestamp.
+
+## Automated release
+
+Pushing a tag `v*` runs `.github/workflows/build-release.yml` on
+`windows-latest`: the full regression suite, `packaging/build_win.py`
+(self-test + frozen e2e), the portable zip, `SHA256SUMS.txt` and the GitHub
+release. A manual **workflow_dispatch** run builds the same artifacts but
+leaves them as Actions artifacts only.
+
+The workflow installs `requirements-lock.txt`, so the same tag produces the
+same dependency set. Update the lock whenever `requirements.txt` changes.
 
 ## Notes
 

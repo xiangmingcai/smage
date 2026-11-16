@@ -129,3 +129,33 @@
 - [ ] 发布流程脚本化：打 tag → `packaging/build_win.py` → 压缩 `dist/Smage` → 生成 `SHA256SUMS` → 上传 GitHub Release（可选 GitHub Actions `windows-latest`）。
 - [ ] 清理本地临时文件：`build_install.log` 等构建日志不要提交（已在 `.gitignore`）。
 - [ ] 统一错误提示与日志格式。
+
+### 0.2.0 发布执行清单（进行中）
+
+- [x] 版本号改为 0.2.0，CHANGELOG / release notes / README / docs 同步。
+- [x] GPL-3.0 授权文本加入 Amsterdam UMC 批准说明（NOTICE / README / AUTHORS / docs / About）。
+- [x] 移除 SAM 3（Region 检测、Extension Manager、runner、文档、第三方声明）。
+- [x] PyInstaller 便携版构建成功；`Smage.exe --self-test` 通过。
+- [x] frozen e2e 通过。首次失败原因：`t05_mod_figure` 导入 `PySide6.QtTest`，但 `packaging/smage.spec` 把它放在 `excludes` 里；已加入 `hiddenimports` 并重新构建验证。
+- [x] 打包 `dist/Smage` → `Smage-v0.2.0-win64.zip`，生成 `SHA256SUMS.txt`（本地产物，286 MB，SHA256 已记录）。
+- [ ] 在无 Python 的干净 Windows 上解压运行，验证导入 → 门控 → 导出。
+- [ ] 打 tag `v0.2.0` 并创建 GitHub Release（zip、SHA256、release notes）。
+- [ ] 发布后确认 docs workflow / GitHub Pages 已更新。
+
+### 打包注意事项
+
+- [ ] 新增测试或运行期依赖时，检查 `packaging/smage.spec` 的 `hiddenimports` / `excludes`；bundled regression suite 用到的模块（例如 QtTest）必须打进包。
+- [ ] 每次修改依赖或打包配置后重新运行 `packaging/build_win.py`（`--self-test` + frozen e2e 都必须通过）。
+- [ ] 正式 release 前锁定依赖版本（`requirements-lock.txt`），确保每次构建的依赖、体积和行为一致。
+
+### 代码签名（SignPath Foundation）
+
+- [ ] 在 GitHub 账号和 SignPath 账号启用 MFA。
+- [x] 编写 `CODE_SIGNING_POLICY.md` 和 `PRIVACY.md`：构建系统、author / reviewer / approver 角色、发布审批流程、隐私与网络访问声明。
+- [x] README / `.github/RELEASE_TEMPLATE.md` 加入 Code Signing Policy 链接和 SignPath 署名说明（签名生效后切换为正式署名）。
+- [x] 增加 GitHub Actions Windows 构建流程 `.github/workflows/build-release.yml`（PyInstaller → zip → SHA256 → release）；签名步骤已预留注释。SignPath 只签可验证的 CI 产物，本地构建的 exe 不能直接送签。
+- [x] 生成 `requirements-lock.txt`（当前可用的 Windows 构建环境快照，CI 用 `--no-deps` 安装）。
+- [ ] 向 <https://signpath.org/apply> 提交申请（仓库、GPL-3.0、release 页面、构建系统、角色）。
+- [ ] 通过后配置 SignPath organization / project / artifact configuration / signing policy，安装 SignPath GitHub App，并保存 API token。
+- [ ] 在发布 workflow 中调用 `signpath/github-action-submit-signing-request`，每次 release 由 approver 手动批准。
+- [ ] 签名后执行 `signtool verify /pa Smage.exe`，并检查 SmartScreen 行为。

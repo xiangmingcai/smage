@@ -51,6 +51,18 @@ The current builds are **not code-signed yet**, so Windows SmartScreen may
 show "Windows protected your PC" the first time. Choose **More info → Run
 anyway**. The download page includes a SHA-256 checksum for verification.
 
+## Code signing
+
+Code signing is being arranged through **SignPath Foundation**. Until it is
+active, Windows SmartScreen may show "Windows protected your PC" for the
+portable build. The process, scope and approval rules are described in
+[CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md). The privacy and network
+access statement is in [PRIVACY.md](PRIVACY.md).
+
+Once signing is active, release downloads will state:
+"Free code signing provided by SignPath.io, certificate by SignPath
+Foundation."
+
 ## Quick start
 
 1. `File → New Project…` and choose a folder; the project is a directory
