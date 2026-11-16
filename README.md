@@ -1,8 +1,9 @@
-<p align="center">
-  <img src="docs/assets/logo.png" alt="Smage logo" width="140">
-</p>
-
-# Smage
+<table width="100%">
+  <tr>
+    <td><h1>Smage</h1></td>
+    <td align="right"><img src="docs/assets/logo.png" alt="Smage logo" height="32"></td>
+  </tr>
+</table>
 
 Smage is a free, open-source desktop application for analyzing **spectral
 image and flow-cytometry data**. It imports FCS files and microscopy images
