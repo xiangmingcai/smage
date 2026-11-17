@@ -1,11 +1,11 @@
 # Code Signing Policy
 
-_Last updated: 2026-11-16_
+_Last updated: 2026-11-17_
 
-Smage is applying to **SignPath Foundation** for free code signing of its
-open-source Windows builds. Until that application is approved, release
-binaries are unsigned. Once signing is active, this policy describes what is
-signed, how it is built and who approves a signing request.
+Smage releases are currently **unsigned**. Code signing will be enabled once
+the project has established enough adoption and a suitable signing provider
+has been approved. This policy describes what will be signed, how it will be
+built and who will approve a signing request.
 
 ## Project
 
@@ -17,7 +17,8 @@ signed, how it is built and who approves a signing request.
 
 ## Scope
 
-Only official Windows binaries built from this repository are signed:
+When signing is enabled, only official Windows binaries built from this
+repository will be signed:
 
 - `Smage.exe` and the files inside the portable bundle;
 - a future `Setup.exe` installer, if one is published.
@@ -42,22 +43,23 @@ never signed with this project's certificate.
 - **Reviewer:** Xiangming Cai, with the advisor where applicable
 - **Approver:** Xiangming Cai
 
-Every signing request must be manually approved in the SignPath portal by
-the approver before a certificate is applied. A release is never signed
-automatically without that approval.
+Every signing request must be manually approved by the approver in the
+chosen signing service before a certificate is applied. A release is never
+signed automatically without that approval.
 
 ## Signing process
 
 1. A version tag (`vX.Y.Z`) is pushed to the repository.
 2. The GitHub Actions workflow builds and tests the portable bundle.
-3. The workflow submits `Smage.exe` to SignPath.
-4. The approver reviews and approves the request in SignPath.
+3. The workflow submits `Smage.exe` to the approved signing service.
+4. The approver reviews and approves the request in that service.
 5. The signed binary is returned to the workflow, packaged into
    `Smage-vX.Y.Z-win64.zip`, and published with `SHA256SUMS.txt` and the
    release notes.
 
-The private key is held by SignPath Foundation in a hardware security
-module; Smage never stores or handles a code-signing private key.
+The private key will be held by the selected certificate authority or
+signing service in a hardware security module; Smage never stores or
+handles a code-signing private key.
 
 ## Verification
 
@@ -81,10 +83,8 @@ security problem.
 
 ## Attribution
 
-When code signing is active, release downloads and this policy state:
-
-> Free code signing provided by SignPath.io, certificate by SignPath
-> Foundation.
+When code signing is active, release downloads and this policy will state
+the attribution required by the selected signing provider.
 
 ## Related documents
 

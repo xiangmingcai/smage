@@ -51,20 +51,9 @@ jobs:
       - name: Build portable bundle and self-tests
         run: python packaging/build_win.py
 
-      # SignPath Foundation signing is enabled after the project is approved.
-      # The signing request must replace dist\Smage\Smage.exe with the signed
-      # file before the zip is created. See CODE_SIGNING_POLICY.md.
-      #
-      # - name: Sign Smage.exe with SignPath
-      #   uses: signpath/github-action-submit-signing-request@v1
-      #   with:
-      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-      #     organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-      #     project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-      #     signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
-      #     artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG }}
-      #     wait-for-completion: true
-      #     output-artifact-directory: dist\signed
+      # Code signing is not enabled yet. When a signing provider is approved,
+      # sign dist\Smage\Smage.exe here and replace the unsigned file before
+      # the zip is created. See CODE_SIGNING_POLICY.md.
 
       - name: Create portable zip
         shell: pwsh

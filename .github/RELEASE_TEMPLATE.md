@@ -25,12 +25,11 @@ certutil -hashfile Smage-vX.Y.Z-win64.zip SHA256
 
 Compare the result with `SHA256SUMS.txt`.
 
-> **Code signing:** Smage uses the SignPath Foundation for code signing of
-> its Windows releases. The application is pending, so this build is not
-> signed yet. See
+> **Code signing:** this build is not signed yet. Code signing will be added
+> once the project has established enough adoption for an approved signing
+> provider; the planned process is in
 > [CODE_SIGNING_POLICY.md](https://github.com/xiangmingcai/smage/blob/main/CODE_SIGNING_POLICY.md).
-> Once signing is active, this section will state: "Free code signing
-> provided by SignPath.io, certificate by SignPath Foundation."
+> Verify the download with `SHA256SUMS.txt`.
 
 ## Notes
 

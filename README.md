@@ -53,16 +53,15 @@ anyway**. The download page includes a SHA-256 checksum for verification.
 
 ## Code signing
 
-Smage uses the **SignPath Foundation** for code signing of its Windows
-releases. The signing application is pending; until it is approved, builds
-are unsigned and Windows SmartScreen may show "Windows protected your PC"
-for the portable build. The process, scope and approval rules are described
-in [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md). The privacy and network
+Smage builds are currently **not code-signed**, so Windows SmartScreen may
+show "Windows protected your PC" for the portable build. Code signing will
+be added once the project has established enough adoption for an approved
+signing provider. The planned process, scope and approval rules are in
+[CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md); the privacy and network
 access statement is in [PRIVACY.md](PRIVACY.md).
 
-Once signing is active, release downloads will state:
-"Free code signing provided by SignPath.io, certificate by SignPath
-Foundation."
+Every release includes `SHA256SUMS.txt` so the downloaded archive can be
+verified independently.
 
 ## Quick start
 

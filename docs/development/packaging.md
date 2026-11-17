@@ -34,12 +34,12 @@ Any failure fails the build. Results are written to
 4. Zip `dist\Smage` as `Smage-vX.Y.Z-win64.zip`, generate `SHA256SUMS.txt`.
 5. Create a GitHub release with the zip, the checksums and the release
    notes, starting from `.github/RELEASE_TEMPLATE.md`.
-6. Code signing: once SignPath Foundation approves the project, `Smage.exe`
-   is signed in CI before the zip is written. The scope and approval rules
+6. Code signing is currently not enabled. When an approved signing provider
+   is in place, `Smage.exe` is signed in CI before the zip is written and
+   signing uses a trusted timestamp. The planned scope and approval rules
    are in [CODE_SIGNING_POLICY.md](https://github.com/xiangmingcai/smage/blob/main/CODE_SIGNING_POLICY.md);
    the privacy/network statement is in
    [PRIVACY.md](https://github.com/xiangmingcai/smage/blob/main/PRIVACY.md).
-   Signing always uses a trusted timestamp.
 
 ## Automated release
 

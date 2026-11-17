@@ -327,7 +327,7 @@ approval of Amsterdam UMC, the Netherlands.
 
 ### Planned
 
-- Code signing for the Windows executable and installer (SignPath Foundation).
+- Code signing for the Windows executable and installer (provider to be selected).
 - A dependency lock file so packaged builds are reproducible.
 - `CITATION.cff` / Zenodo DOI for academic citation.
 
