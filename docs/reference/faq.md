@@ -20,6 +20,34 @@ use it. If that option is missing, see
 [Windows protected your PC](windows-protected-your-pc.md) for unblocking the
 file, Smart App Control and managed-device policy.
 
+## Extension model download fails with CERTIFICATE_VERIFY_FAILED
+
+The optional StarDist environment runs in its own Python installation. Model
+downloads there use `urllib`, which may not trust the same CA bundle as `pip`,
+especially behind a corporate TLS proxy. The error looks like:
+
+```text
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED]
+```
+
+Do **not** disable SSL verification. Instead:
+
+1. Install your organization's root CA in the Windows certificate store
+   (ask IT for the PEM file), then retry **Download model**;
+2. or point Smage at a CA bundle containing that root:
+
+   ```bat
+   set SMAGE_CA_BUNDLE=C:\path\to\organization-root.pem
+   ```
+
+   then start Smage and retry the download.
+
+Current StarDist runners use the Windows trust store through `truststore`,
+with `certifi` as a fallback. The StarDist extension installs both packages.
+An environment created before this change can be repaired/reinstalled in the
+Extension Manager, or updated with
+`python -m pip install truststore certifi` in that environment.
+
 ## A module is locked / greyed out
 
 A module with saved output locks the modules above it. Unlock it (or remove

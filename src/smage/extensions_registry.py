@@ -34,7 +34,7 @@ EXTENSION_DEFS = [
         "family": "stardist",
         "device": "cpu",
         "pip": "stardist",
-        "deps": ["tensorflow"],
+        "deps": ["tensorflow", "certifi", "truststore"],
         "runner": "stardist_runner.py",
         "model": "2D_versatile_fluo",
         "desc": "StarDist star-convex cell segmentation on CPU",

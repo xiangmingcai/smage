@@ -6,6 +6,13 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- StarDist: model downloads now verify TLS with the Windows certificate store
+  (`truststore`) or a CA bundle from `SMAGE_CA_BUNDLE`, instead of failing
+  with `CERTIFICATE_VERIFY_FAILED` behind a corporate proxy. The StarDist
+  extension also installs `certifi` and `truststore`.
+
 ## [0.2.0] — 2026-11-16
 
 Second packaged release. Smage is now released under GPL-3.0 with the

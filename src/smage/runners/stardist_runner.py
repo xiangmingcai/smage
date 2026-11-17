@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import shutil
+import ssl
 import sys
 import time
 
@@ -88,15 +89,60 @@ def _tile_progress(iterable, disable=False, total=None):
         print(f"tile: {i}/{total}", flush=True)
 
 
+def _configure_tls():
+    """Trust the OS certificate store (or a user CA bundle) for downloads.
+
+    ``urllib`` in the external environment may not use the same CA bundle as
+    ``pip``; behind a corporate TLS proxy this ends in
+    ``CERTIFICATE_VERIFY_FAILED``.  Never disable verification: use the
+    Windows store through ``truststore``, an explicit CA bundle, or certifi.
+    """
+    bundle = os.environ.get("SMAGE_CA_BUNDLE") or os.environ.get(
+        "SSL_CERT_FILE"
+    )
+    if bundle and os.path.isfile(bundle):
+        context = ssl.create_default_context(cafile=bundle)
+        ssl._create_default_https_context = lambda: context
+        return
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+        return
+    except Exception:  # noqa: BLE001 - optional dependency
+        pass
+    try:
+        import certifi
+
+        context = ssl.create_default_context(cafile=certifi.where())
+        ssl._create_default_https_context = lambda: context
+    except Exception:  # noqa: BLE001 - fall back to Python's default store
+        pass
+
+
 def check():
     import stardist
     print(stardist.__version__)
 
 
 def download_model(model, threads):
+    _configure_tls()
     _limit_tensorflow_threads(threads)
     from stardist.models import StarDist2D
-    StarDist2D.from_pretrained(model)
+
+    try:
+        StarDist2D.from_pretrained(model)
+    except Exception as exc:  # noqa: BLE001 - add actionable TLS guidance
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+            print(
+                "TLS certificate verification failed. Install your "
+                "organization's root CA in the Windows certificate store, or "
+                "set SMAGE_CA_BUNDLE to a PEM file containing it, then retry "
+                "the download. Do not disable SSL verification.",
+                file=sys.stderr,
+                flush=True,
+            )
+        raise
     print("model ready:", model)
 
 
@@ -106,6 +152,7 @@ def segment(manifest_path, nucleus, model, prob, nms, threads, tile_size=0, devi
         # must be set before TensorFlow is imported below.
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     _limit_tensorflow_threads(threads)
+    _configure_tls()
     print("phase: importing tensorflow", flush=True)
     from csbdeep.utils import normalize
     from stardist.models import StarDist2D
