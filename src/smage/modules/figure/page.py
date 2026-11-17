@@ -61,6 +61,7 @@ from smage.core.gates import (
 )
 from smage.core.scale_math import (
     _apply_scale_transforms,
+    _forward_scale_value,
     _inverse_scale_value,
     _nice_ticks,
     _round_value_candidates,
@@ -1298,6 +1299,15 @@ def _figure_add_plot(ctx, page, ptype: str) -> None:
         "xmax": None,
         "ymin": None,
         "ymax": None,
+        **(
+            {"x_range_mode": "scale", "y_range_mode": "auto"}
+            if ptype == "histogram"
+            else (
+                {"x_range_mode": "scale", "y_range_mode": "scale"}
+                if ptype in ("scatter", "overlay")
+                else {}
+            )
+        ),
         "break_before": False,
         "show_axes": True,
         "show_axis_names": True,
@@ -1419,6 +1429,8 @@ def _figure_add_nxn(ctx, page) -> None:
                 "xmax": None,
                 "ymin": None,
                 "ymax": None,
+                "x_range_mode": "scale",
+                "y_range_mode": "scale",
                 # Each matrix row starts its own line of cards.
                 "break_before": column == 0,
                 "show_axes": True,
@@ -2435,14 +2447,11 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
             plot_dict[attr] = value
             # Remember this as the last-used parameter.
             plot_dict["last_" + attr] = value
-            # Reset the axis range to Auto so the plot refits to the new
-            # parameter and the settings panel shows the updated range.
-            if attr == "x":
-                plot_dict["xmin"] = None
-                plot_dict["xmax"] = None
-            elif attr == "y":
-                plot_dict["ymin"] = None
-                plot_dict["ymax"] = None
+            # Store the old channel's range and load the new channel's own
+            # record before re-rendering.
+            _widgets_plot_renderer._figure_sync_range_record(
+                plot_dict, attr
+            )
             _figure_apply_change(ctx, page, index, plot_dict)
             _figure_rebuild_settings(ctx, page)
         return handler
@@ -2629,6 +2638,12 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
         btn.clicked.connect(on_pick)
         return btn
 
+    def widget_for(plot):
+        for i, candidate in enumerate(page._fig_plots):
+            if candidate is plot and 0 <= i < len(page._fig_cards):
+                return page._fig_cards[i].plot_widget()
+        return None
+
     def make_range_row(ps, axis):
         min_key = f"{axis}min"
         max_key = f"{axis}max"
@@ -2636,45 +2651,169 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(4)
-        auto = QCheckBox("Auto")
         amin = common(ps, min_key)
         amax = common(ps, max_key)
-        if amin is _MIXED or amax is _MIXED:
-            auto.setTristate(True)
-            auto.setCheckState(Qt.CheckState.PartiallyChecked)
-        else:
-            auto.setChecked(amin is None and amax is None)
-        auto.setEnabled(enabled)
 
+        # Image plots keep the legacy Auto checkbox (no channel/Scale).
+        if any(p.get("type") == "image" for p in ps):
+            auto = QCheckBox("Auto")
+            if amin is _MIXED or amax is _MIXED:
+                auto.setTristate(True)
+                auto.setCheckState(Qt.CheckState.PartiallyChecked)
+            else:
+                auto.setChecked(amin is None and amax is None)
+            auto.setEnabled(enabled)
+
+            min_spin = _LogStepSpinBox(
+                None if amin is _MIXED else amin, lambda v: commit()
+            )
+            max_spin = _LogStepSpinBox(
+                None if amax is _MIXED else amax, lambda v: commit()
+            )
+
+            def commit():
+                st = auto.checkState()
+                if st == Qt.CheckState.Checked:
+                    apply(ps, min_key, None)
+                    apply(ps, max_key, None)
+                    min_spin.set_value(None)
+                    max_spin.set_value(None)
+                elif st == Qt.CheckState.Unchecked:
+                    mn = min_spin.value()
+                    mx = max_spin.value()
+                    if mn is not None and mx is not None:
+                        apply(ps, min_key, mn)
+                        apply(ps, max_key, mx)
+                editable = (
+                    enabled and auto.checkState() != Qt.CheckState.Checked
+                )
+                min_spin.set_enabled(editable)
+                max_spin.set_enabled(editable)
+                _figure_apply_change_multi(ctx, page)
+
+            auto.stateChanged.connect(lambda _=0: commit())
+            editable = enabled and auto.checkState() != Qt.CheckState.Checked
+            min_spin.set_enabled(editable)
+            max_spin.set_enabled(editable)
+            h.addWidget(auto)
+            h.addWidget(QLabel("Min"))
+            h.addWidget(min_spin)
+            h.addWidget(QLabel("Max"))
+            h.addWidget(max_spin)
+            h.addStretch()
+            return row
+
+        # Three-mode row for scatter / overlay / histogram.
+        modes = []
+        for p in ps:
+            p_mode = _widgets_plot_renderer._figure_axis_mode(
+                p, axis, p.get("type")
+            )
+            if p_mode == "scale":
+                if (
+                    p.get("type") == "histogram" and axis == "y"
+                    or _widgets_plot_renderer._figure_scale_axis_bounds(
+                        ctx, page._fig_task_id, p.get("file"), p.get(axis),
+                        page._fig_column_transforms,
+                    ) is None
+                ):
+                    p_mode = "auto"
+            modes.append(p_mode)
+        mode = modes[0] if modes and all(m == modes[0] for m in modes) else None
+        combo = _NoWheelComboBox()
+        if mode is None:
+            combo.addItem("Mixed", None)
+        combo.addItem("Manual", "manual")
+        combo.addItem("From scale", "scale")
+        combo.addItem("Auto", "auto")
+        if mode is not None:
+            combo.setCurrentIndex(max(0, combo.findData(mode)))
+        combo.setEnabled(enabled)
+        combo.setMinimumWidth(104)
+        combo.setStyleSheet(
+            "QToolTip { background-color: #ffffff; color: #2c3a48; "
+            "border: 1px solid #c9d3df; padding: 4px 6px; }"
+        )
+
+        def axis_configs(p):
+            return _widgets_plot_renderer._figure_axis_scale_configs(
+                ctx, page._fig_task_id, p.get("file"), p.get(axis),
+                page._fig_column_transforms,
+            )
+
+        def common_display(key):
+            vals = [
+                _widgets_plot_renderer._figure_display_range_value(
+                    p.get(key), axis_configs(p)
+                )
+                for p in ps
+            ]
+            if not vals:
+                return None
+            first = vals[0]
+            for value in vals[1:]:
+                if value != first:
+                    return _MIXED
+            return first
+
+        amin_disp = common_display(min_key)
+        amax_disp = common_display(max_key)
         min_spin = _LogStepSpinBox(
-            None if amin is _MIXED else amin, lambda v: commit()
+            None if amin_disp is _MIXED else amin_disp,
+            lambda v: commit_spin(),
         )
         max_spin = _LogStepSpinBox(
-            None if amax is _MIXED else amax, lambda v: commit()
+            None if amax_disp is _MIXED else amax_disp,
+            lambda v: commit_spin(),
         )
 
-        def commit():
-            st = auto.checkState()
-            if st == Qt.CheckState.Checked:
-                apply(ps, min_key, None)
-                apply(ps, max_key, None)
-                min_spin.set_value(None)
-                max_spin.set_value(None)
-            elif st == Qt.CheckState.Unchecked:
-                mn = min_spin.value()
-                mx = max_spin.value()
-                if mn is not None and mx is not None:
-                    apply(ps, min_key, mn)
-                    apply(ps, max_key, mx)
-            min_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
-            max_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
+        def commit_spin():
+            if mode != "manual":
+                return
+            mn = min_spin.value()
+            mx = max_spin.value()
+            if mn is not None and mx is not None:
+                for p in ps:
+                    configs = axis_configs(p)
+                    p[min_key] = _forward_scale_value(mn, configs)
+                    p[max_key] = _forward_scale_value(mx, configs)
+                    _widgets_plot_renderer._figure_save_range_record(
+                        p, axis, "manual", False
+                    )
+                _figure_apply_change_multi(ctx, page)
+
+        def on_mode():
+            new_mode = combo.currentData()
+            if new_mode is None:
+                return
+            for p in ps:
+                if new_mode == "manual":
+                    widget = widget_for(p)
+                    if widget is not None:
+                        lo, hi = _widgets_plot_renderer._figure_axis_range(
+                            ctx, page._fig_task_id, p.get("file"), p, axis,
+                            widget, page._fig_column_transforms,
+                        )
+                        if lo is not None and hi is not None:
+                            p[min_key] = lo
+                            p[max_key] = hi
+                else:
+                    p[min_key] = None
+                    p[max_key] = None
+                p[f"{axis}_range_mode"] = new_mode
+                p.pop(f"{axis}_range_auto_fallback", None)
+                _widgets_plot_renderer._figure_save_range_record(
+                    p, axis, new_mode, False
+                )
             _figure_apply_change_multi(ctx, page)
+            _figure_rebuild_settings_multi(ctx, page)
 
-        auto.stateChanged.connect(lambda _=0: commit())
-        min_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
-        max_spin.set_enabled(enabled and auto.checkState() != Qt.CheckState.Checked)
+        combo.currentIndexChanged.connect(lambda _=0: on_mode())
+        editable = enabled and mode == "manual"
+        min_spin.set_enabled(editable)
+        max_spin.set_enabled(editable)
 
-        h.addWidget(auto)
+        h.addWidget(combo)
         h.addWidget(QLabel("Min"))
         h.addWidget(min_spin)
         h.addWidget(QLabel("Max"))
@@ -2724,6 +2863,9 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                     if p.get("last_color_param") in cols
                     else None
                 )
+            if p.get("type") != "image":
+                _widgets_plot_renderer._figure_sync_range_record(p, "x")
+                _widgets_plot_renderer._figure_sync_range_record(p, "y")
         _figure_apply_change_multi(ctx, page)
         _figure_rebuild_settings_multi(ctx, page)
 
@@ -2743,8 +2885,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
         for p in plots:
             p["x"] = v
             p["last_x"] = v
-            p["xmin"] = None
-            p["xmax"] = None
+            _widgets_plot_renderer._figure_sync_range_record(p, "x")
         _figure_apply_change_multi(ctx, page)
         _figure_rebuild_settings_multi(ctx, page)
 
@@ -2811,8 +2952,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
             for p in scatter_plots:
                 p["y"] = v
                 p["last_y"] = v
-                p["ymin"] = None
-                p["ymax"] = None
+                _widgets_plot_renderer._figure_sync_range_record(p, "y")
             _figure_apply_change_multi(ctx, page)
             _figure_rebuild_settings_multi(ctx, page)
 

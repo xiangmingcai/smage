@@ -188,88 +188,234 @@ def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, ta
         )
 
 
-def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: bool, on_commit=None, auto_checked: bool=True, configs=None, task_id=None, column_transforms=None) -> QWidget:
-    """Build an Auto/Min/Max row for one axis range.
+def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: bool,
+                      on_commit=None, configs=None, task_id=None,
+                      column_transforms=None) -> QWidget:
+    """Build the range row: mode (Manual / From scale / Auto) + Min/Max.
 
-    The spin boxes show the axis in ORIGINAL (pre-Scale) values even
-    though the plot itself draws transformed values: entries are mapped
-    through the column's scale configs on the way in and out.
+    Scatter, overlay and histogram axes offer the three modes. Image plots
+    and the Scale module's own preview keep the old Auto checkbox (there is
+    no channel/Scale source to read there). The spin boxes show original
+    units even though the plot draws transformed values.
     """
+    ptype = plot_dict.get("type")
     min_key = f"{axis}min"
     max_key = f"{axis}max"
+    use_modes = ptype != "image" and bool(task_id)
     data_min = getattr(plot_widget, f"_data_{axis}min", None)
     data_max = getattr(plot_widget, f"_data_{axis}max", None)
-    if configs:
-        data_min = (
-            None if data_min is None
-            else _inverse_scale_value(data_min, configs)
+
+    def display(value):
+        return _figure_display_range_value(value, configs)
+
+    if not use_modes:
+        # Legacy two-state behaviour: Auto checkbox + Min/Max.
+        if configs:
+            data_min = display(data_min)
+            data_max = display(data_max)
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        auto = QCheckBox("Auto")
+        auto.setChecked(
+            plot_dict.get(min_key) is None
+            and plot_dict.get(max_key) is None
         )
-        data_max = (
-            None if data_max is None
-            else _inverse_scale_value(data_max, configs)
-        )
+        auto.setEnabled(enabled)
 
-    row = QWidget()
-    h = QHBoxLayout(row)
-    h.setContentsMargins(0, 0, 0, 0)
-    h.setSpacing(4)
-    auto = QCheckBox("Auto")
-    auto.setChecked(
-        auto_checked
-        and plot_dict.get(min_key) is None
-        and plot_dict.get(max_key) is None
-    )
-    auto.setEnabled(enabled)
+        min_val = display(plot_dict.get(min_key))
+        max_val = display(plot_dict.get(max_key))
+        if min_val is None:
+            min_val = data_min
+        if max_val is None:
+            max_val = data_max
 
-    min_val = plot_dict.get(min_key)
-    max_val = plot_dict.get(max_key)
-    if min_val is not None and configs:
-        min_val = _inverse_scale_value(min_val, configs)
-    if max_val is not None and configs:
-        max_val = _inverse_scale_value(max_val, configs)
-    if min_val is None:
-        min_val = data_min
-    if max_val is None:
-        max_val = data_max
+        min_spin = _LogStepSpinBox(min_val, lambda v: commit(), decimals=1)
+        max_spin = _LogStepSpinBox(max_val, lambda v: commit(), decimals=1)
 
-    min_spin = _LogStepSpinBox(min_val, lambda v: commit(), decimals=1)
-    max_spin = _LogStepSpinBox(max_val, lambda v: commit(), decimals=1)
-
-    def commit():
-        if auto.isChecked():
-            plot_dict[min_key] = None
-            plot_dict[max_key] = None
-            min_spin.set_value(data_min)
-            max_spin.set_value(data_max)
-        else:
-            plot_dict[min_key] = _forward_scale_value(
-                min_spin.value(), configs
+        def commit():
+            if auto.isChecked():
+                plot_dict[min_key] = None
+                plot_dict[max_key] = None
+                min_spin.set_value(data_min)
+                max_spin.set_value(data_max)
+            else:
+                plot_dict[min_key] = _forward_scale_value(
+                    min_spin.value(), configs
+                )
+                plot_dict[max_key] = _forward_scale_value(
+                    max_spin.value(), configs
+                )
+            min_spin.set_enabled(enabled and not auto.isChecked())
+            max_spin.set_enabled(enabled and not auto.isChecked())
+            ctx._figure_apply_ranges(
+                plot_dict, plot_widget, task_id, column_transforms
             )
-            plot_dict[max_key] = _forward_scale_value(
-                max_spin.value(), configs
-            )
+            if on_commit is not None:
+                on_commit()
+
+        auto.toggled.connect(lambda _: commit())
         min_spin.set_enabled(enabled and not auto.isChecked())
         max_spin.set_enabled(enabled and not auto.isChecked())
-        # A range change only affects the view, so apply the range directly
-        # instead of re-reading and re-rendering the plot's data.
+        h.addWidget(auto)
+        h.addWidget(QLabel("Min"))
+        h.addWidget(min_spin)
+        h.addWidget(QLabel("Max"))
+        h.addWidget(max_spin)
+        h.addStretch()
+        return row
+
+    # Three-mode row.
+    count_axis = ptype == "histogram" and axis == "y"
+    if not count_axis:
+        # Load this channel's own range; the previous channel was saved by
+        # its last edit or by this call.
+        _figure_sync_range_record(plot_dict, axis)
+    scale_ok = False
+    if not count_axis:
+        scale_ok = _figure_scale_axis_bounds(
+            ctx, task_id, plot_dict.get("file"), plot_dict.get(axis),
+            column_transforms,
+        ) is not None
+    fallback_key = f"{axis}_range_auto_fallback"
+    mode = _figure_axis_mode(plot_dict, axis, ptype)
+    if count_axis:
+        mode = "manual" if mode == "manual" else "auto"
+        plot_dict.pop(fallback_key, None)
+    elif scale_ok:
+        # If From scale had to fall back earlier, resume it now that this
+        # channel has a fully configured Scale (e.g. after switching axes).
+        if mode == "auto" and plot_dict.get(fallback_key):
+            mode = "scale"
+        plot_dict.pop(fallback_key, None)
+    else:
+        if mode == "scale":
+            mode = "auto"
+            plot_dict[fallback_key] = True
+        elif mode == "auto" and plot_dict.get(fallback_key):
+            pass  # keep waiting for a Scale on this axis
+        else:
+            # An explicit Auto/Manual choice must not be overridden later.
+            plot_dict.pop(fallback_key, None)
+    plot_dict[f"{axis}_range_mode"] = mode
+    _figure_save_range_record(
+        plot_dict, axis, mode, bool(plot_dict.get(fallback_key))
+    )
+
+    state = {"updating": False}
+    box = QWidget()
+    v = QVBoxLayout(box)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(2)
+    h = QHBoxLayout()
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(4)
+    combo = _NoWheelComboBox()
+    combo.addItem("Manual", "manual")
+    if scale_ok:
+        combo.addItem("From scale", "scale")
+    combo.addItem("Auto", "auto")
+    combo.setCurrentIndex(max(0, combo.findData(mode)))
+    combo.setEnabled(enabled)
+    combo.setMinimumWidth(104)
+    combo.setToolTip(
+        "Manual: use the Min/Max below.\n"
+        "From scale: the nearest upstream Scale with both Min and Max.\n"
+        "Auto: the extent of the drawn data."
+    )
+    # Tooltips inside the settings scroll area can inherit the platform's
+    # dark tooltip palette; pin this one to the app's light tooltip look.
+    combo.setStyleSheet(
+        "QToolTip { background-color: #ffffff; color: #2c3a48; "
+        "border: 1px solid #c9d3df; padding: 4px 6px; }"
+    )
+
+    def effective():
+        lo, hi = _figure_axis_range(
+            ctx, task_id, plot_dict.get("file"), plot_dict, axis,
+            plot_widget, column_transforms,
+        )
+        return display(lo), display(hi)
+
+    lo, hi = effective()
+    min_spin = _LogStepSpinBox(lo, lambda v: on_spin_changed(), decimals=1)
+    max_spin = _LogStepSpinBox(hi, lambda v: on_spin_changed(), decimals=1)
+
+    def set_spins(lo, hi):
+        state["updating"] = True
+        min_spin.set_value(lo)
+        max_spin.set_value(hi)
+        state["updating"] = False
+
+    def update_enabled():
+        editable = enabled and mode == "manual"
+        min_spin.set_enabled(editable)
+        max_spin.set_enabled(editable)
+
+    def on_spin_changed():
+        if state["updating"] or mode != "manual":
+            return
+        plot_dict[min_key] = _forward_scale_value(
+            min_spin.value(), configs
+        )
+        plot_dict[max_key] = _forward_scale_value(
+            max_spin.value(), configs
+        )
+        _figure_save_range_record(plot_dict, axis, "manual", False)
         ctx._figure_apply_ranges(
             plot_dict, plot_widget, task_id, column_transforms
         )
         if on_commit is not None:
             on_commit()
 
-    auto.toggled.connect(lambda _: commit())
+    def on_mode_changed(*_args):
+        nonlocal mode
+        if state["updating"]:
+            return
+        new_mode = combo.currentData() or "auto"
+        if new_mode == mode:
+            return
+        if new_mode == "manual":
+            # Pre-fill from the range currently on screen.
+            lo, hi = effective()
+            if lo is not None and hi is not None:
+                plot_dict[min_key] = _forward_scale_value(lo, configs)
+                plot_dict[max_key] = _forward_scale_value(hi, configs)
+        else:
+            plot_dict[min_key] = None
+            plot_dict[max_key] = None
+        mode = new_mode
+        plot_dict[f"{axis}_range_mode"] = mode
+        plot_dict.pop(fallback_key, None)
+        _figure_save_range_record(plot_dict, axis, mode, False)
+        set_spins(*effective())
+        update_enabled()
+        ctx._figure_apply_ranges(
+            plot_dict, plot_widget, task_id, column_transforms
+        )
+        if on_commit is not None:
+            on_commit()
 
-    min_spin.set_enabled(enabled and not auto.isChecked())
-    max_spin.set_enabled(enabled and not auto.isChecked())
+    combo.currentIndexChanged.connect(on_mode_changed)
+    update_enabled()
 
-    h.addWidget(auto)
+    h.addWidget(combo)
     h.addWidget(QLabel("Min"))
     h.addWidget(min_spin)
     h.addWidget(QLabel("Max"))
     h.addWidget(max_spin)
     h.addStretch()
-    return row
+    v.addLayout(h)
+    if plot_dict.get(fallback_key) and not count_axis:
+        hint = QLabel(
+            "No upstream Scale sets both Min and Max for this channel; "
+            "using Auto."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7785;")
+        v.addWidget(hint)
+    return box
 
 
 class _CursorLeaveFilter(QObject):
@@ -1465,12 +1611,27 @@ def _figure_image_layer_settings(ctx, layout, plot_dict, columns, enabled, on_ch
     table.verticalHeader().setVisible(False)
     table.verticalHeader().setDefaultSectionSize(30)
     table.setMinimumHeight(120)
+    # The table grows with its rows instead of scrolling internally, so every
+    # added channel stays visible; the settings panel's scroll area handles
+    # the resulting height.
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     table.setStyleSheet(
         "QTableWidget { background: #ffffff; border: none; }"
         "QTableWidget::item:selected { background: #dbeafa; }"
     )
-    layout.addWidget(table, 1)
+    layout.addWidget(table)
+
+    def fit_table_height() -> None:
+        table.resizeRowsToContents()
+        header = table.horizontalHeader()
+        header_h = max(header.height(), header.sizeHint().height())
+        rows_h = sum(
+            table.rowHeight(row) for row in range(table.rowCount())
+        )
+        # Reserve room for a possible horizontal scrollbar so the last row
+        # stays visible even when the settings panel is dragged narrow.
+        height = header_h + rows_h + 2 * table.frameWidth() + 22
+        table.setFixedHeight(max(120, height))
 
     # Channel signal histogram: helps pick sensible Min/Max levels.
     import numpy as np
@@ -1814,7 +1975,7 @@ def _figure_image_layer_settings(ctx, layout, plot_dict, columns, enabled, on_ch
             )
             table.setItem(i, 5, name_item)
         table.blockSignals(False)
-        table.resizeRowsToContents()
+        fit_table_height()
 
     table.itemChanged.connect(on_item_changed)
     add_btn.clicked.connect(on_add)
@@ -1893,14 +2054,155 @@ def _figure_fit_all(ctx, plot_dict: dict, plot_widget) -> None:
         vb.enableAutoRange("y", True)
 
 
-def _figure_scale_axis_bounds(ctx, task_id, parquet, column,
-                              column_transforms=None):
-    """Default (min, max) display bounds from the nearest upstream Scale.
+def _figure_axis_mode(plot_dict: dict, axis: str, ptype=None) -> str:
+    """The saved range mode for one axis, with migration for old plots.
 
-    The nearest Scale module that stores a Min and/or Max for the column
-    wins; a side that is not configured is returned as None so the caller can
-    fall back to the data extent. Bounds are stored in original units and
-    converted through the same display transforms the plot uses.
+    Old plots only stored Min/Max (``None`` meant Auto). They migrate to
+    Manual when values exist and to From-scale otherwise, preserving the
+    old effective behaviour (Scale first, data second).
+    """
+    ptype = ptype or plot_dict.get("type")
+    mode = plot_dict.get(f"{axis}_range_mode")
+    if ptype == "histogram" and axis == "y":
+        # The Y axis is the count axis: there is no channel to take from a
+        # Scale, so only Manual and Auto apply.
+        if mode == "manual":
+            return "manual"
+        if mode is None and (
+            plot_dict.get("ymin") is not None
+            or plot_dict.get("ymax") is not None
+        ):
+            return "manual"
+        return "auto"
+    if mode in ("manual", "scale", "auto"):
+        return mode
+    if (
+        plot_dict.get(f"{axis}min") is not None
+        or plot_dict.get(f"{axis}max") is not None
+    ):
+        return "manual"
+    return "scale"
+
+
+def _figure_display_range_value(value, configs):
+    """A stored plot-unit range value in display (original) units.
+
+    If the inverse transform overflows, return the stored value instead of
+    ``nan``; old multi-selection edits could store raw values on a
+    transformed axis, and showing a number lets the user correct it.
+    """
+    import math
+
+    if value is None or not configs:
+        return value
+    converted = _inverse_scale_value(value, configs)
+    try:
+        if converted is not None and math.isfinite(float(converted)):
+            return converted
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _figure_active_range_record(plot_dict, axis) -> dict:
+    """The current axis range as a per-channel record."""
+    min_key = f"{axis}min"
+    max_key = f"{axis}max"
+    mode = plot_dict.get(f"{axis}_range_mode")
+    if mode is None:
+        mode = (
+            "manual"
+            if plot_dict.get(min_key) is not None
+            or plot_dict.get(max_key) is not None
+            else "scale"
+        )
+    fallback = bool(
+        plot_dict.get(f"{axis}_range_auto_fallback")
+    ) and mode == "auto"
+    return {
+        "mode": mode,
+        "min": plot_dict.get(min_key) if mode == "manual" else None,
+        "max": plot_dict.get(max_key) if mode == "manual" else None,
+        "fallback": fallback,
+    }
+
+
+def _figure_sync_range_record(plot_dict, axis):
+    """Save the previous channel's range and load the current one's.
+
+    A channel seen for the first time starts from the default ``scale``
+    mode; its actual range then falls back to Auto when no Scale sets both
+    sides. Old plots with a saved manual range migrate to a Manual record.
+    """
+    channel = plot_dict.get(axis)
+    if not channel:
+        return None
+    records_key = f"{axis}_ranges"
+    records = plot_dict.get(records_key)
+    if not isinstance(records, dict):
+        records = {}
+        plot_dict[records_key] = records
+    marker_key = f"{axis}_range_channel"
+    previous = plot_dict.get(marker_key)
+    if previous == channel:
+        # Keep the record in step with edits that bypassed the row.
+        records[channel] = _figure_active_range_record(plot_dict, axis)
+    elif previous:
+        records[previous] = _figure_active_range_record(plot_dict, axis)
+    record = records.get(channel)
+    if record is None:
+        if previous:
+            # The active values belong to the previous channel.
+            record = {"mode": "scale", "min": None, "max": None,
+                      "fallback": False}
+        else:
+            # Migration from an older project without per-channel records.
+            active = _figure_active_range_record(plot_dict, axis)
+            if active["mode"] == "manual":
+                record = active
+            elif active["mode"] == "auto" and not active["fallback"]:
+                record = active  # an explicit Auto choice
+            else:
+                # Includes the old auto-fallback state: a first visit must
+                # start from From scale instead of inheriting it.
+                record = {"mode": "scale", "min": None, "max": None,
+                          "fallback": False}
+        records[channel] = record
+    plot_dict[f"{axis}_range_mode"] = record.get("mode", "scale")
+    plot_dict[f"{axis}min"] = record.get("min")
+    plot_dict[f"{axis}max"] = record.get("max")
+    if record.get("fallback"):
+        plot_dict[f"{axis}_range_auto_fallback"] = True
+    else:
+        plot_dict.pop(f"{axis}_range_auto_fallback", None)
+    plot_dict[marker_key] = channel
+    return record
+
+
+def _figure_save_range_record(plot_dict, axis, mode, fallback=False) -> None:
+    """Store one channel's range after the row resolved its mode."""
+    channel = plot_dict.get(axis)
+    if not channel:
+        return
+    records = plot_dict.get(f"{axis}_ranges")
+    if not isinstance(records, dict):
+        records = {}
+        plot_dict[f"{axis}_ranges"] = records
+    records[channel] = {
+        "mode": mode,
+        "min": plot_dict.get(f"{axis}min") if mode == "manual" else None,
+        "max": plot_dict.get(f"{axis}max") if mode == "manual" else None,
+        "fallback": bool(fallback) and mode == "auto",
+    }
+    plot_dict[f"{axis}_range_channel"] = channel
+
+
+def _figure_scale_range_config(ctx, task_id, parquet, column):
+    """The nearest upstream Scale config that sets BOTH Min and Max.
+
+    A Scale module that sets only one side does not qualify; the search
+    continues towards the root. Returns the raw config (original units) or
+    None.
     """
     if not task_id or not parquet or not column:
         return None
@@ -1910,7 +2212,6 @@ def _figure_scale_axis_bounds(ctx, task_id, parquet, column,
         ) or []
     except Exception:  # noqa: BLE001 - a missing pipeline must not break a plot
         return None
-    config = None
     for kind, stage in reversed(stages):
         if kind != "scale":
             continue
@@ -1920,24 +2221,64 @@ def _figure_scale_axis_bounds(ctx, task_id, parquet, column,
         candidate = (stage.get("columns") or {}).get(column)
         if not candidate:
             continue
-        if candidate.get("min") is None and candidate.get("max") is None:
+        if candidate.get("min") is None or candidate.get("max") is None:
             continue
-        config = candidate
-        break
+        return candidate
+    return None
+
+
+def _figure_scale_axis_bounds(ctx, task_id, parquet, column,
+                              column_transforms=None):
+    """Display bounds from the nearest fully configured upstream Scale.
+
+    Returns ``(min, max)`` in plot units, or None when no Scale module sets
+    both sides for this column. Callers then fall back to the data extent.
+    """
+    config = _figure_scale_range_config(ctx, task_id, parquet, column)
     if config is None:
         return None
     configs = _figure_axis_scale_configs(
         ctx, task_id, parquet, column, column_transforms
     )
-    return (
-        _forward_scale_value(config.get("min"), configs),
-        _forward_scale_value(config.get("max"), configs),
-    )
+    lo = _forward_scale_value(config.get("min"), configs)
+    hi = _forward_scale_value(config.get("max"), configs)
+    if lo is None or hi is None:
+        return None
+    return (lo, hi)
+
+
+def _figure_axis_range(ctx, task_id, parquet, plot_dict, axis, plot_widget,
+                       column_transforms=None):
+    """Resolve one axis' (min, max) in plot units for the active mode."""
+    ptype = plot_dict.get("type")
+    min_key = f"{axis}min"
+    max_key = f"{axis}max"
+    data_min = getattr(plot_widget, f"_data_{axis}min", None)
+    data_max = getattr(plot_widget, f"_data_{axis}max", None)
+    mode = _figure_axis_mode(plot_dict, axis, ptype)
+    if mode == "manual":
+        lo = plot_dict.get(min_key)
+        hi = plot_dict.get(max_key)
+        if lo is None:
+            lo = data_min
+        if hi is None:
+            hi = data_max
+        return lo, hi
+    if mode == "scale":
+        bounds = _figure_scale_axis_bounds(
+            ctx, task_id, parquet, plot_dict.get(axis),
+            column_transforms,
+        )
+        if bounds is not None:
+            return bounds
+        # No fully configured Scale: behave as Auto.
+        return data_min, data_max
+    return data_min, data_max
 
 
 def _figure_apply_ranges(ctx, plot_dict: dict, plot_widget,
                          task_id=None, column_transforms=None) -> None:
-    """Apply manual/auto X and Y ranges from the plot settings."""
+    """Apply manual/from-scale/auto X and Y ranges from the plot settings."""
     if plot_dict.get("type") == "image":
         # Image plots keep autoRange off: fit to the settings range, else
         # to the full image extent (so no auto-fit loop on a cropped image).
@@ -1960,42 +2301,15 @@ def _figure_apply_ranges(ctx, plot_dict: dict, plot_widget,
                 padding=0,
             )
         return
-    xmin, xmax = plot_dict.get("xmin"), plot_dict.get("xmax")
-    ymin, ymax = plot_dict.get("ymin"), plot_dict.get("ymax")
-    # Auto axes default to the nearest upstream Scale's Min/Max; a side that
-    # Scale does not configure falls back to the rendered data extent.
-    # Overlay plots and histogram counts keep their existing behaviour.
-    ptype = plot_dict.get("type")
     parquet = plot_dict.get("file")
-    if ptype in ("scatter", "histogram") and task_id and parquet:
-        if xmin is None or xmax is None:
-            bounds = _figure_scale_axis_bounds(
-                ctx, task_id, parquet, plot_dict.get("x"),
-                column_transforms,
-            )
-            if bounds is not None:
-                if xmin is None:
-                    xmin = bounds[0]
-                if xmax is None:
-                    xmax = bounds[1]
-                if xmin is None:
-                    xmin = getattr(plot_widget, "_data_xmin", None)
-                if xmax is None:
-                    xmax = getattr(plot_widget, "_data_xmax", None)
-        if ptype == "scatter" and (ymin is None or ymax is None):
-            bounds = _figure_scale_axis_bounds(
-                ctx, task_id, parquet, plot_dict.get("y"),
-                column_transforms,
-            )
-            if bounds is not None:
-                if ymin is None:
-                    ymin = bounds[0]
-                if ymax is None:
-                    ymax = bounds[1]
-                if ymin is None:
-                    ymin = getattr(plot_widget, "_data_ymin", None)
-                if ymax is None:
-                    ymax = getattr(plot_widget, "_data_ymax", None)
+    xmin, xmax = _figure_axis_range(
+        ctx, task_id, parquet, plot_dict, "x", plot_widget,
+        column_transforms,
+    )
+    ymin, ymax = _figure_axis_range(
+        ctx, task_id, parquet, plot_dict, "y", plot_widget,
+        column_transforms,
+    )
     if xmin is not None and xmax is not None and xmax > xmin:
         plot_widget.setXRange(float(xmin), float(xmax), padding=0)
     else:

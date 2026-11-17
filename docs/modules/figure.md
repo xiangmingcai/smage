@@ -12,15 +12,28 @@ histogram and image plots, several per module.
 | Plot type | Scatter, histogram or image. |
 | File | The data file plotted by this figure. |
 | Filter | Restrict the plotted events or pixels to an upstream Gating gate. [Regions](region.md) are not filters; once converted they appear as ordinary 0/1 channels in the Channels table. Image plots keep a gate filter on every channel, including unmixed and other generated channels. |
-| X/Y range | **Auto** uses the nearest upstream [Scale](scale.md) Min/Max as the default, falling back to the data extent; a manual range is saved and always wins. Overlay plots do not use Scale defaults. |
+| X/Y range | Each axis has three modes. **Manual** uses the entered Min/Max. **From scale** (default) uses the nearest upstream [Scale](scale.md) that sets **both** Min and Max for that channel; if none does, it switches to **Auto**. **Auto** uses the extent of the drawn data and ignores Scale. The mode applies to scatter, overlay and histogram plots; a histogram's Y axis (counts) offers Manual/Auto only. Image plots keep the Auto checkbox. |
 | X / Y parameter | The axes (Y is hidden for histograms). |
 | Color mode | Density, a parameter value, or a solid color. |
 | Color parameter / palette / point size | Appearance of the points. |
 | Bins / display mode | Histogram binning and how bars are drawn. |
-| X / Y range | Axis limits, in original data units. |
 | Size (px) / resolution | Output size and DPI of the exported image. |
 | Layers (image) | One layer per channel, with its own color, min/max and order. |
 | Display toggles | Axes, axis names, tick indices and sample name. |
+
+For **From scale**, a Scale module counts only when it sets both Min and Max
+for that channel. When no such module exists, the axis falls back to Auto; it
+returns to From scale automatically if the axis is later changed to a channel
+with a usable Scale. Explicitly choosing Auto keeps it on Auto.
+
+Range settings are remembered **per channel**: each X/Y channel keeps its own
+mode and manual Min/Max, so switching away and back restores them. A channel
+seen for the first time starts in From scale. The same applies to the Gating
+and Calculation previews.
+
+A multi-plot **Manual** range is entered in original units and converted
+through each channel's own Scale transform, so a value such as 0–10000 means
+the same thing on a linear, log10 or arcsinh channel.
 
 ## Multiple plots
 

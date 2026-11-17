@@ -2048,6 +2048,7 @@ def _calc_rebuild_settings(ctx, page) -> None:
                 ctx, page._calc_task_id, preview.get("file"),
                 preview.get("x"),
             ),
+            task_id=page._calc_task_id,
         ))
     if plot_type == "scatter":
         layout.addWidget(QLabel("Y range"))
@@ -2057,6 +2058,7 @@ def _calc_rebuild_settings(ctx, page) -> None:
                 ctx, page._calc_task_id, preview.get("file"),
                 preview.get("y"),
             ),
+            task_id=page._calc_task_id,
         ))
 
     _widgets_plot_renderer._figure_display_toggles(
@@ -2107,7 +2109,11 @@ def _calc_rebuild_settings(ctx, page) -> None:
 
     def on_param(key, combo):
         preview[key] = combo.currentText() or None
-        _calc_schedule_preview(ctx, page)
+        # Store the old channel's range and load the new channel's own
+        # record, then refresh the settings and the plot.
+        _widgets_plot_renderer._figure_sync_range_record(preview, key)
+        _calc_rebuild_settings(ctx, page)
+        _calc_render_preview(ctx, page)
 
     type_combo.currentIndexChanged.connect(lambda _=0: on_type())
     file_combo.currentIndexChanged.connect(lambda _=0: on_file())

@@ -22,6 +22,15 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Changed
 
+- **Figure**: plot X/Y ranges now have **Manual**, **From scale** and **Auto**
+  modes. From scale (the default) uses the nearest upstream Scale that sets
+  both Min and Max, and falls back to Auto when no Scale does; Auto uses the
+  drawn data extent and ignores Scale. Overlay plots now use Scale ranges
+  too, and histogram count axes offer Manual/Auto. The Gating preview also
+  defaults to From scale. X/Y ranges are remembered per channel (in Figure
+  plots, Gating previews and Calculation previews), so switching channels
+  restores each channel's mode and manual Min/Max; a channel seen for the
+  first time starts From scale.
 - **Data Import**: the image resize target limit is now 200 megapixels or the
   original pixel count, whichever is larger (previously 64 megapixels).
 - **Subsample**: the **Sampling basis** label is now **Sampling method**.
@@ -30,6 +39,15 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Fixed
 
+- **Figure multi-selection Manual ranges** are now entered in original units
+  and converted through each channel's Scale transform. Previously a value
+  such as 10000 was stored as a plot unit, which made arcsinh/log10 axes show
+  `nan` (or an empty plot) when converted back.
+- **Range mode tooltips** use a white background with dark text instead of the
+  platform's dark tooltip palette.
+- **Figure**: the image plot's **Channels** table now grows with the number of
+  added channels instead of scrolling internally, so every channel stays
+  visible; the settings panel scrolls instead.
 - StarDist: model downloads now verify TLS with the Windows certificate store
   (`truststore`) or a CA bundle from `SMAGE_CA_BUNDLE`, instead of failing
   with `CERTIFICATE_VERIFY_FAILED` behind a corporate proxy. The StarDist

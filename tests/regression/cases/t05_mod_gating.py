@@ -12,6 +12,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QMessageBox,
     QPushButton,
@@ -741,6 +742,86 @@ def subset_view() -> None:
         gating_page._gating_open_gate_subset(ctx, page, "missing")
         harness.eq(page._gating_parent_id, None)
         harness.eq(page._gating_active_gate_id, None)
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.channel_ranges", "L4", "gating", tags=("fast",))
+def channel_range_records() -> None:
+    """Gating axes start From scale and remember each channel's range."""
+    project = harness.new_project("gating_channel_ranges", rows=120)
+    parquet = str(project.data_dir / "case.parquet")
+    gating = harness.task_def("gating", task_id="g-1", name="Gating")
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={
+            "files": [parquet],
+            "columns": [
+                {"name": "FL1-A", "method": "linear", "param": None,
+                 "min": 10.0, "max": 90.0},
+                {"name": "FL2-A", "method": "linear", "param": None,
+                 "min": 5.0, "max": 50.0},
+            ],
+        },
+        children=[gating],
+    )
+    project.workflow["tasks"][0]["children"].append(scale)
+    project.save()
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("g-1", "gating", "Gating")
+    harness.pump(450)
+    try:
+        page = window.tabs.currentWidget()
+        preview = page._gating_preview
+        host = page._gating_settings_layout.parentWidget()
+
+        def param_combos():
+            return [
+                combo for combo in host.findChildren(QComboBox)
+                if combo.findText("FL1-A") >= 0
+                and combo.findText("FL2-A") >= 0
+            ]
+
+        def mode_combos():
+            return [
+                combo for combo in host.findChildren(QComboBox)
+                if combo.findData("manual") >= 0
+                and combo.findData("auto") >= 0
+            ]
+
+        harness.check(len(param_combos()) >= 2)
+        param_combos()[0].setCurrentText("FL1-A")
+        harness.pump(150)
+        param_combos()[1].setCurrentText("FL2-A")
+        harness.pump(150)
+
+        harness.eq(preview.get("x_range_mode"), "scale")
+        harness.eq(preview.get("y_range_mode"), "scale")
+        modes = mode_combos()
+        harness.eq(len(modes), 2)
+        harness.check(
+            all(combo.currentData() == "scale" for combo in modes),
+            "both axes start From scale",
+        )
+
+        # Give X=FL1-A a manual range, switch to FL2-A and back.
+        modes[0].setCurrentIndex(modes[0].findData("manual"))
+        harness.pump(150)
+        harness.eq(preview.get("x_range_mode"), "manual")
+        manual_min = preview.get("xmin")
+        manual_max = preview.get("xmax")
+        harness.check(manual_min is not None and manual_max is not None)
+
+        param_combos()[0].setCurrentText("FL2-A")
+        harness.pump(150)
+        harness.eq(preview.get("x_range_mode"), "scale")
+
+        param_combos()[0].setCurrentText("FL1-A")
+        harness.pump(150)
+        harness.eq(preview.get("x_range_mode"), "manual")
+        harness.check(abs(preview.get("xmin") - manual_min) < 1e-6)
+        harness.check(abs(preview.get("xmax") - manual_max) < 1e-6)
     finally:
         _close(window)
 

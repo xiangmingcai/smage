@@ -18,6 +18,7 @@ from smage.widgets.controls import (
 )
 from smage.widgets.gate_editor.canvas import _GatingCanvasView
 from smage.widgets.panels import _param_hint
+from smage.widgets.plot import renderer as _plot_renderer
 from smage.widgets.plot_axes import _gate_color, _gate_tool_icon
 
 
@@ -40,6 +41,8 @@ def _default_gating_preview(rec, cols) -> dict:
         "xmax": None,
         "ymin": None,
         "ymax": None,
+        "x_range_mode": "scale",
+        "y_range_mode": "scale",
         "point_size": 4,
         "fixed_point_size": False,
         "solid_color": (0, 0, 200),
@@ -93,6 +96,10 @@ def _gating_state_init(ctx, page, task_def: dict, locked: bool) -> None:
     # The gating plot sits on a bordered canvas card whose size is saved
     # with the module (Plot settings: W / H / resolution / square).
     preview.setdefault("size", list(_GATING_PLOT_SIZE))
+    # Gating defaults to From scale; saved gate ranges only matter after the
+    # user switches that axis to Manual.
+    preview.setdefault("x_range_mode", "scale")
+    preview.setdefault("y_range_mode", "scale")
     page._gating_preview = preview
     page._gating_task_def = task_def
     page._gating_task_id = task_def.get("id")
@@ -793,8 +800,13 @@ def _gating_rebuild_settings(ctx, page) -> None:
                 page._gating_settings_x = value
             elif attr == "y":
                 page._gating_settings_y = value
+            # Store the old channel's range and load the new channel's own
+            # record before re-rendering.
+            _plot_renderer._figure_sync_range_record(preview, attr)
             # Keep the active subset / context; only the display axes change.
             ctx._gating_render(page)
+            # Reload the per-channel range record in the settings panel.
+            ctx._gating_rebuild_settings(page)
             ctx._gating_mark_dirty(page)
         return handler
     if x_combo is not None:

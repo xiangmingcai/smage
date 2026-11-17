@@ -9,8 +9,10 @@ from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFileDialog,
+    QLineEdit,
     QMenu,
     QTableWidget,
 )
@@ -65,6 +67,149 @@ def add_plots() -> None:
         _close(window)
 
 
+@harness.case(
+    "mod.figure.range_fallback", "L4", "figure", tags=("fast",)
+)
+def range_fallback() -> None:
+    """Without a fully configured Scale, From scale falls back to Auto."""
+    window, _project, page = _open("figure_range_fallback")
+    try:
+        ctx = window._ctx
+        _figure_page._figure_add_plot(ctx, page, "scatter")
+        harness.pump(300)
+        plot = page._fig_plots[0]
+        harness.eq(plot.get("x_range_mode"), "auto")
+        harness.eq(plot.get("y_range_mode"), "auto")
+
+        combos = [
+            combo for combo in page._fig_settings_layout.parentWidget()
+            .findChildren(QComboBox)
+            if combo.findData("auto") >= 0
+            and combo.findData("manual") >= 0
+        ]
+        harness.eq(len(combos), 2)
+        harness.check(
+            all(combo.findData("scale") < 0 for combo in combos),
+            "From scale is hidden when no Scale provides both sides",
+        )
+        harness.check(
+            all(combo.currentData() == "auto" for combo in combos),
+            "the fallback is Auto",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.range_modes", "L4", "figure", tags=("fast",))
+def range_modes() -> None:
+    """New scatters use From scale, and Manual pre-fills the current range."""
+    project = harness.new_project("figure_range_modes", rows=80)
+    parquet = str(project.data_dir / "case.parquet")
+    figure = harness.task_def("figure", task_id="fig-1", name="Figure")
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={
+            "files": [parquet],
+            "columns": [
+                {"name": "x", "method": "linear", "param": None,
+                 "min": 1.0, "max": 9.0},
+                {"name": "y", "method": "linear", "param": None,
+                 "min": 0.0, "max": 2.0},
+            ],
+        },
+        children=[figure],
+    )
+    project.workflow["tasks"][0]["children"].append(scale)
+    project.save()
+
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("fig-1", "figure", "Figure")
+    harness.pump(400)
+    try:
+        ctx = window._ctx
+        page = window.tabs.currentWidget()
+        _figure_page._figure_add_plot(ctx, page, "scatter")
+        harness.pump(300)
+        plot = page._fig_plots[0]
+        harness.eq(plot.get("x_range_mode"), "scale")
+        harness.eq(plot.get("y_range_mode"), "scale")
+        widget = page._fig_cards[0].plot_widget()
+        xr, yr = widget.getPlotItem().getViewBox().viewRange()
+        harness.check(abs(xr[0] - 1.0) < 1e-6, f"x min from Scale: {xr}")
+        harness.check(abs(xr[1] - 9.0) < 1e-6, f"x max from Scale: {xr}")
+        harness.check(abs(yr[0] - 0.0) < 1e-6, f"y min from Scale: {yr}")
+        harness.check(abs(yr[1] - 2.0) < 1e-6, f"y max from Scale: {yr}")
+
+        combos = [
+            combo for combo in page._fig_settings_layout.parentWidget()
+            .findChildren(QComboBox)
+            if combo.findData("scale") >= 0
+            and combo.findData("manual") >= 0
+        ]
+        harness.eq(len(combos), 2)
+        harness.check(
+            all(combo.currentData() == "scale" for combo in combos),
+            "new scatter defaults to From scale",
+        )
+
+        x_combo = combos[0]
+        x_combo.setCurrentIndex(x_combo.findData("manual"))
+        harness.pump(120)
+        harness.eq(plot.get("x_range_mode"), "manual")
+        harness.check(plot.get("xmin") is not None)
+        harness.check(plot.get("xmax") is not None)
+        harness.check(abs(plot["xmin"] - 1.0) < 1e-6)
+        harness.check(abs(plot["xmax"] - 9.0) < 1e-6)
+
+        x_combo.setCurrentIndex(x_combo.findData("auto"))
+        harness.pump(120)
+        harness.eq(plot.get("x_range_mode"), "auto")
+        xr, _yr = widget.getPlotItem().getViewBox().viewRange()
+        data_min = getattr(widget, "_data_xmin", None)
+        data_max = getattr(widget, "_data_xmax", None)
+        harness.check(
+            data_min is not None and abs(xr[0] - data_min) < 1e-6,
+            f"Auto uses the data min: {xr}",
+        )
+        harness.check(
+            data_max is not None and abs(xr[1] - data_max) < 1e-6,
+            f"Auto uses the data max: {xr}",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.channel_ranges", "L4", "figure", tags=("fast",))
+def channel_range_records() -> None:
+    """Each channel keeps its own mode and manual range."""
+    from smage.widgets.plot import renderer
+
+    plot = {
+        "type": "scatter", "file": "f", "x": "Channel 1",
+        "x_range_mode": "manual", "xmin": 1.0, "xmax": 9.0,
+    }
+    renderer._figure_sync_range_record(plot, "x")
+    harness.eq(plot["x_ranges"]["Channel 1"]["mode"], "manual")
+
+    plot["x"] = "Channel 2"
+    renderer._figure_sync_range_record(plot, "x")
+    harness.eq(plot["x_range_mode"], "scale")
+    harness.check(plot["xmin"] is None and plot["xmax"] is None)
+
+    plot["x_range_mode"] = "auto"
+    renderer._figure_save_range_record(plot, "x", "auto")
+    plot["x"] = "Channel 1"
+    renderer._figure_sync_range_record(plot, "x")
+    harness.eq(plot["x_range_mode"], "manual")
+    harness.eq(plot["xmin"], 1.0)
+    harness.eq(plot["xmax"], 9.0)
+
+    plot["x"] = "Channel 2"
+    renderer._figure_sync_range_record(plot, "x")
+    harness.eq(plot["x_range_mode"], "auto")
+
+
 @harness.case("mod.figure.scale_defaults", "L4", "figure", tags=("fast",))
 def scale_axis_defaults() -> None:
     """Auto axes take their default range from the nearest upstream Scale."""
@@ -103,13 +248,30 @@ def scale_axis_defaults() -> None:
         plot["x"], plot["y"] = "FL1-A", "FL2-A"
         plot["xmin"] = plot["xmax"] = None
         plot["ymin"] = plot["ymax"] = None
+        # Changing the axis rebuilds the settings; the automatic fallback is
+        # then replaced by From scale for FL1-A (which has both sides).
+        _figure_page._figure_rebuild_settings(ctx, page)
         _figure_page._figure_apply_change(ctx, page, 0, plot)
         harness.pump(150)
         xr, _yr = card.plot_widget().getPlotItem().getViewBox().viewRange()
         harness.check(abs(xr[0] - 10.0) < 1e-6, f"x min from Scale: {xr}")
         harness.check(abs(xr[1] - 90.0) < 1e-6, f"x max from Scale: {xr}")
 
-        # A saved manual range wins over the Scale default.
+        # The range inputs show the same Scale default as the view.
+        _figure_page._figure_rebuild_settings(ctx, page)
+        harness.pump(100)
+        texts = {
+            edit.text()
+            for edit in page._fig_settings_layout.parentWidget()
+            .findChildren(QLineEdit)
+        }
+        harness.check(
+            "10.0" in texts and "90.0" in texts,
+            f"range fields show the Scale bounds: {texts}",
+        )
+
+        # Manual mode wins over the Scale default.
+        plot["x_range_mode"] = "manual"
         plot["xmin"], plot["xmax"] = 20.0, 40.0
         _figure_page._figure_apply_change(ctx, page, 0, plot)
         harness.pump(150)
@@ -117,18 +279,126 @@ def scale_axis_defaults() -> None:
         harness.check(abs(xr[0] - 20.0) < 1e-6, f"saved x min kept: {xr}")
         harness.check(abs(xr[1] - 40.0) < 1e-6, f"saved x max kept: {xr}")
 
-        # One configured side uses Scale, the other falls back to the data.
+        # A Scale with only one side does not qualify: From scale falls back
+        # to the data extent on both sides.
         plot["x"] = "FL2-A"
+        plot["x_range_mode"] = "scale"
         plot["xmin"] = plot["xmax"] = None
         _figure_page._figure_apply_change(ctx, page, 0, plot)
         harness.pump(150)
         xr, _yr = card.plot_widget().getPlotItem().getViewBox().viewRange()
+        data_min = getattr(card.plot_widget(), "_data_xmin", None)
         data_max = getattr(card.plot_widget(), "_data_xmax", None)
-        harness.check(abs(xr[0] - 5.0) < 1e-6, f"one-sided min: {xr}")
+        harness.check(
+            data_min is not None and abs(xr[0] - data_min) < 1e-6,
+            f"one-sided Scale falls back to data min: {xr} vs {data_min}",
+        )
         harness.check(
             data_max is not None and abs(xr[1] - data_max) < 1e-6,
-            f"one-sided other side uses data: {xr} vs {data_max}",
+            f"one-sided Scale falls back to data max: {xr} vs {data_max}",
         )
+    finally:
+        _close(window)
+
+
+@harness.case(
+    "mod.figure.multi_manual_ranges", "L4", "figure", tags=("fast",)
+)
+def multi_manual_ranges() -> None:
+    """Multi-plot Manual ranges convert original units on each channel."""
+    import math
+
+    from smage.widgets.controls import _LogStepSpinBox
+
+    project = harness.new_project("figure_multi_manual", rows=80)
+    parquet = str(project.data_dir / "case.parquet")
+    figure = harness.task_def("figure", task_id="fig-1", name="Figure")
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={
+            "files": [parquet],
+            "columns": [
+                {"name": "FL1-A", "method": "arcsinh", "param": 1000.0,
+                 "min": 0.0, "max": 65535.0},
+                {"name": "FL2-A", "method": "arcsinh", "param": 1000.0,
+                 "min": 0.0, "max": 65535.0},
+                {"name": "FL3-A", "method": "linear", "param": None,
+                 "min": 0.0, "max": 65535.0},
+            ],
+        },
+        children=[figure],
+    )
+    project.workflow["tasks"][0]["children"].append(scale)
+    project.save()
+
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("fig-1", "figure", "Figure")
+    harness.pump(400)
+    try:
+        ctx = window._ctx
+        page = window.tabs.currentWidget()
+        for _ in range(2):
+            _figure_page._figure_add_plot(ctx, page, "scatter")
+            harness.pump(200)
+        plots = page._fig_plots
+        plots[0]["x"], plots[0]["y"] = "FL1-A", "FL2-A"
+        plots[1]["x"], plots[1]["y"] = "FL3-A", "FL2-A"
+        for i, plot in enumerate(plots):
+            _widgets_plot_renderer._figure_sync_range_record(plot, "x")
+            _widgets_plot_renderer._figure_sync_range_record(plot, "y")
+            _figure_page._figure_apply_change(ctx, page, i, plot)
+        _figure_page._figure_set_selection(ctx, page, [0, 1])
+        harness.pump(200)
+        host = page._fig_settings_layout.parentWidget()
+
+        # Put both the X and Y rows into Manual (each change rebuilds).
+        for _ in range(2):
+            modes = [
+                combo for combo in host.findChildren(QComboBox)
+                if combo.findData("manual") >= 0
+                and combo.findData("auto") >= 0
+            ]
+            target = next(
+                (combo for combo in modes if combo.currentData() != "manual"),
+                None,
+            )
+            if target is None:
+                break
+            target.setCurrentIndex(target.findData("manual"))
+            harness.pump(150)
+
+        spins = host.findChildren(_LogStepSpinBox)
+        harness.check(len(spins) >= 4, f"range spins: {len(spins)}")
+        # The point-size/bins fields come first; the two range rows are last.
+        for spin, value in zip(spins[-4:], (0, 10000, 0, 10000)):
+            spin.edit.setText(str(value))
+            spin.edit.editingFinished.emit()
+        harness.pump(200)
+
+        # FL1-A is arcsinh: 10000 original becomes asinh(10) plot units.
+        arc = math.asinh(10000 / 1000.0)
+        harness.check(
+            abs(plots[0]["xmax"] - arc) < 1e-6,
+            f"arcsinh x max: {plots[0]['xmax']} vs {arc}",
+        )
+        harness.check(abs(plots[0]["xmin"]) < 1e-9)
+        # FL3-A is linear: the value is stored unchanged.
+        harness.check(abs(plots[1]["xmax"] - 10000.0) < 1e-6)
+        # Both Y axes use FL2-A (arcsinh).
+        harness.check(abs(plots[0]["ymax"] - arc) < 1e-6)
+        harness.check(abs(plots[1]["ymax"] - arc) < 1e-6)
+
+        # The single-plot display converts back without a NaN.
+        configs = _widgets_plot_renderer._figure_axis_scale_configs(
+            ctx, page._fig_task_id, parquet, "FL1-A",
+            page._fig_column_transforms,
+        )
+        shown = _widgets_plot_renderer._figure_display_range_value(
+            plots[0]["xmax"], configs
+        )
+        harness.check(math.isfinite(shown))
+        harness.check(abs(shown - 10000.0) < 1e-6)
     finally:
         _close(window)
 

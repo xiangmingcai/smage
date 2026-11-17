@@ -593,6 +593,11 @@ def _gating_set_plot_type(ctx, page, ptype) -> None:
     gate_axes_ok = gate is not None and gate_type in (None, ptype)
     preview["type"] = ptype
 
+    # Save the current channels' ranges before the axes move.
+    if previous != "image":
+        _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+        _widgets_plot_renderer._figure_sync_range_record(preview, "y")
+
     if ptype == "image":
         if previous != "image":
             # Remember the data axes so Scatter/Histogram can come back to
@@ -601,6 +606,17 @@ def _gating_set_plot_type(ctx, page, ptype) -> None:
             preview["last_y"] = preview.get("y")
         preview["x"] = "x" if "x" in cols else None
         preview["y"] = "y" if "y" in cols else None
+        # Data-space ranges and channel records do not apply to the image
+        # view; clear the active state and markers (the records stay for a
+        # later switch back to a data plot).
+        for key in ("xmin", "xmax", "ymin", "ymax"):
+            preview[key] = None
+        for key in (
+            "x_range_mode", "y_range_mode",
+            "x_range_auto_fallback", "y_range_auto_fallback",
+            "x_range_channel", "y_range_channel",
+        ):
+            preview.pop(key, None)
         channels = [c for c in cols if c not in ("x", "y")]
         if preview.get("image_channel") not in channels:
             preview["image_channel"] = channels[0] if channels else None
@@ -619,13 +635,10 @@ def _gating_set_plot_type(ctx, page, ptype) -> None:
                 cols, preview
             )
 
-    if ptype == "image" or previous == "image":
-        # Pixel-space ranges mean nothing in a data plot (and vice versa);
-        # fall back to auto-range unless the gate carries this type's range.
-        for key in ("xmin", "xmax", "ymin", "ymax"):
-            preview[key] = gate.get(key) if gate_axes_ok else None
-
     if ptype != "image":
+        # Load the destination channels' own range records.
+        _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+        _widgets_plot_renderer._figure_sync_range_record(preview, "y")
         # The settings panel now shows these parameters, so "All Events"
         # should return to them later.
         page._gating_settings_x = preview.get("x")
@@ -645,13 +658,24 @@ def _gating_set_plot_type(ctx, page, ptype) -> None:
 
 
 def _gating_restore_gate_display(ctx, page, gate) -> None:
-    """Restore the plot type, axes, range and colour state a gate was drawn in."""
+    """Restore the plot type, axes and colour state a gate was drawn in.
+
+    Axis ranges are per channel now, so they come from the channel's own
+    range record rather than from the gate's saved viewport.
+    """
     preview = page._gating_preview
     plot_type_changed = False
+    previous_type = preview.get("type")
     ptype = gate.get("plot_type")
-    if ptype in ("scatter", "image", "histogram") and preview.get("type") != ptype:
+    if ptype not in ("scatter", "image", "histogram"):
+        ptype = previous_type
+    if ptype in ("scatter", "image", "histogram") and previous_type != ptype:
         preview["type"] = ptype
         plot_type_changed = True
+    # Save the current channels' ranges before the gate changes the axes.
+    if previous_type != "image":
+        _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+        _widgets_plot_renderer._figure_sync_range_record(preview, "y")
     # Boolean gates (and/or) carry no axes of their own; leave the current
     # ones. Histogram gates store y=None on purpose, so a histogram gate
     # clears the y axis while gates that never define one are skipped.
@@ -661,11 +685,23 @@ def _gating_restore_gate_display(ctx, page, gate) -> None:
         preview["y"] = gate["y"]
     elif gate.get("plot_type") == "histogram":
         preview["y"] = None
-    for key in ("xmin", "xmax", "ymin", "ymax"):
-        if gate.get(key) is not None:
-            preview[key] = gate[key]
     for key, value in (gate.get("display") or {}).items():
         preview[key] = copy.deepcopy(value)
+    if ptype == "image":
+        # Data-space ranges do not apply to the image view; the records stay
+        # for a later switch back to a data plot.
+        for key in ("xmin", "xmax", "ymin", "ymax"):
+            preview[key] = None
+        for key in (
+            "x_range_mode", "y_range_mode",
+            "x_range_auto_fallback", "y_range_auto_fallback",
+            "x_range_channel", "y_range_channel",
+        ):
+            preview.pop(key, None)
+    else:
+        # Axis ranges are per channel; load the record for the gate's axes.
+        _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+        _widgets_plot_renderer._figure_sync_range_record(preview, "y")
     if plot_type_changed:
         _gating_update_tools(ctx, page)
         _gating_reload_rois(ctx, page)
@@ -2637,12 +2673,16 @@ def _gating_apply_selection(ctx, page, idx) -> None:
     else:
         page._gating_context_gate_id = None
         page._gating_parent_id = None
+        if preview.get("type") != "image":
+            # Save the previous channels before moving the axes.
+            _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+            _widgets_plot_renderer._figure_sync_range_record(preview, "y")
         preview["x"] = page._gating_settings_x
         preview["y"] = page._gating_settings_y
-        preview["xmin"] = None
-        preview["xmax"] = None
-        preview["ymin"] = None
-        preview["ymax"] = None
+        if preview.get("type") != "image":
+            # Load the destination channels' own records.
+            _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+            _widgets_plot_renderer._figure_sync_range_record(preview, "y")
     _gating_show_handles(ctx, page, idx if isinstance(idx, int) and idx >= 0 else -1)
     # Update ROI/label visibility right away, so a single click shows the
     # correct gates immediately (the data render is deferred to catch
@@ -3382,6 +3422,9 @@ def _gating_switch_file(ctx, page, path, name=None) -> None:
         plot_type != "image"
         and (preview.get("x"), preview.get("y")) == old_axes
     )
+    if plot_type != "image":
+        _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+        _widgets_plot_renderer._figure_sync_range_record(preview, "y")
     vb = page._gating_viewbox
     xr, yr = vb.viewRange()
     _gating_reload_rois(ctx, page)

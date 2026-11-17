@@ -19,6 +19,7 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import (QTimer, Qt)
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMessageBox, QPushButton)
 
 from smage.extensions_registry import EXTENSION_DEFS, _extension_def
@@ -430,6 +431,12 @@ def main() -> int:
     font.setPointSize(int(_setting("appearance", "font_size", 9) or 9))
     app.setFont(font)
     app.setStyleSheet(_app_stylesheet())
+    # Some Windows themes draw native tooltips with a dark palette even
+    # though the app is light; pin the tooltip colours used by Qt.
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#2c3a48"))
+    app.setPalette(palette)
 
     window = MainWindow()
     window.show()
