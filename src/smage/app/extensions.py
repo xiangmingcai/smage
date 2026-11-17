@@ -381,6 +381,14 @@ class ExtensionsMixin:
         eh.addWidget(browse_btn)
         lay.addWidget(env_row)
 
+        path_examples = QLabel(
+            "Examples — conda env: ...\\envs\\<env_name>\\python.exe\n"
+            "venv: ...\\<env_name>\\Scripts\\python.exe"
+        )
+        path_examples.setWordWrap(True)
+        path_examples.setStyleSheet("color: #6b7785;")
+        lay.addWidget(path_examples)
+
         install_box = QGroupBox("No suitable Python?")
         ib = QVBoxLayout(install_box)
         ib.setContentsMargins(8, 8, 8, 8)

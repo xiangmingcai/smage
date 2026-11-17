@@ -56,8 +56,10 @@ from smage.widgets import panels as _widgets_panels
 
 IMAGE_RESIZE_MIN = 8
 IMAGE_RESIZE_MAX = 32768
-# Guard against an accidental upscale that would exhaust memory (pixels).
-IMAGE_RESIZE_PIXEL_LIMIT = 64_000_000
+# Guard against an accidental upscale that would exhaust memory. Images that
+# are already larger than this may still be imported at their original size
+# (see _image_resize_pixel_limit).
+IMAGE_RESIZE_PIXEL_LIMIT = 200_000_000
 
 
 def _import_locked(ctx) -> bool:
@@ -430,13 +432,15 @@ def _run_import(ctx) -> None:
         if resize is None or not resize.get("enabled"):
             continue
         pixels = int(resize["width"]) * int(resize["height"])
-        if pixels > IMAGE_RESIZE_PIXEL_LIMIT:
+        limit = _image_resize_pixel_limit(entry.get("dimensions") or {})
+        if pixels > limit:
             QMessageBox.warning(
                 ctx.host,
                 "Import",
                 f"{Path(entry['path']).name}: the resize target has "
-                f"{pixels / 1_000_000:.1f} megapixels, which is too large "
-                "to import. Choose a smaller size.",
+                f"{pixels / 1_000_000:.1f} megapixels, above the limit of "
+                f"{limit / 1_000_000:.1f} megapixels (200 MP or the original "
+                "size, whichever is larger). Choose a smaller size.",
             )
             return
 
@@ -918,6 +922,16 @@ def _image_dimensions(dims) -> tuple[int, int]:
     )
     width = int(dims.get("width") or (shape[-1] if shape else 0))
     return width, height
+
+
+def _image_resize_pixel_limit(dims) -> int:
+    """Largest resize target for an image: 200 MP or the original size.
+
+    The original size is the floor so an image that is already larger than
+    the fixed guard can still be imported at (or below) its own resolution.
+    """
+    width, height = _image_dimensions(dims)
+    return max(IMAGE_RESIZE_PIXEL_LIMIT, int(width) * int(height))
 
 
 def _image_resize_defaults(dims) -> dict:

@@ -463,6 +463,22 @@ def page_image() -> None:
         _close(window)
 
 
+@harness.case("import.resize_pixel_limit", "L3", "import", tags=("fast",))
+def resize_pixel_limit() -> None:
+    """The resize guard is 200 MP, raised to the original pixel count."""
+    from smage.modules.import_ import page as import_page
+
+    def limit(width, height):
+        return import_page._image_resize_pixel_limit(
+            {"kind": "image", "width": width, "height": height}
+        )
+
+    harness.eq(limit(64, 64), 200_000_000)
+    harness.eq(limit(20000, 12000), 240_000_000,
+               "an original above 200 MP raises the limit to its own size")
+    harness.eq(limit(40000, 25000), 1_000_000_000)
+
+
 @harness.case("import.page.image_resize", "L3", "import", tags=("fast",))
 def page_image_resize() -> None:
     """The image entry exposes resize controls; import writes the new size."""

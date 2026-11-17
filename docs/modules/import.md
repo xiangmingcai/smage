@@ -45,6 +45,11 @@ project. Very large originals can need a ratio below `0.01` to reach the
 8-pixel minimum, and images already near the pixel limit cannot reach `10×`;
 use the pixel fields for those extremes.
 
+A resize target is limited to **200 megapixels or the original pixel count,
+whichever is larger**. This guard prevents an accidental upscale from
+exhausting memory while still allowing an already larger image to be imported
+at its own resolution.
+
 ## Output
 
 One normalized Parquet file per imported file in `<project>.smage/data/`,

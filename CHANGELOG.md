@@ -8,6 +8,8 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Added
 
+- **Extensions**: the Python environment path field now shows example
+  `python.exe` locations for conda environments and venvs.
 - **Data Import** image resize offers linked **Width ratio** and **Height
   ratio** fields next to the pixel sizes. Ratios use two decimals
   (`0.01×`–`10.00×`) and stay in sync with the pixel values; pixels remain
@@ -20,6 +22,8 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Changed
 
+- **Data Import**: the image resize target limit is now 200 megapixels or the
+  original pixel count, whichever is larger (previously 64 megapixels).
 - **Subsample**: the **Sampling basis** label is now **Sampling method**.
 - **Unmix**: the gate-tree action **Re-set as spectrum** is now **Set other
   gate as spectrum**.
