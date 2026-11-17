@@ -83,10 +83,10 @@ verified independently.
 
 1. `File → New Project…` and choose a folder; the project is a directory
    named `<name>.smage`.
-2. **Data Import**: add your `.fcs` or image files and import them.
+2. **Data Import**: add your image files and import them.
 3. Add modules from the workflow tree. Each module has its own settings,
    a **Save** button and a **Run/Calculate** action where it produces data.
-4. Open **Figure** or **Heatmap** to look at the results; finish with
+4. Open **Figure** to look at the results; finish with
    **Export** to write CSV/parquet or images.
 
 ## Where your data lives
