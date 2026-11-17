@@ -31,8 +31,9 @@ The current builds are **not code-signed yet**, so Windows may show
 1. Click **More info**.
 2. Click **Run anyway**.
 
-This is expected until code signing is in place (planned for a future
-release).
+If the **Run anyway** button is missing, or the app still does not start, see
+[Windows protected your PC / the app won't run](../reference/windows-protected-your-pc.md)
+for the file-unblock, Smart App Control and managed-device cases.
 
 ## First start
 

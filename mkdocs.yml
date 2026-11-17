@@ -67,6 +67,7 @@ nav:
       - Export: modules/export.md
   - Reference:
       - FAQ and troubleshooting: reference/faq.md
+      - Windows protected your PC: reference/windows-protected-your-pc.md
       - Release notes: reference/release-notes.md
   - Development:
       - Build from source: development/build.md

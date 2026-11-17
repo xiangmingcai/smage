@@ -13,10 +13,12 @@ and full tracebacks. **Attach the newest log when reporting a problem.**
 
 Global settings and the self-check report live in `%APPDATA%\Smage\`.
 
-## Windows says "Windows protected your PC"
+## Windows says "Windows protected your PC" / the app won't run
 
-The build is not code-signed yet. Click **More info → Run anyway**. See
-[Installation](../getting-started/installation.md).
+The build is not code-signed yet. If **More info → Run anyway** is available,
+use it. If that option is missing, see
+[Windows protected your PC](windows-protected-your-pc.md) for unblocking the
+file, Smart App Control and managed-device policy.
 
 ## A module is locked / greyed out
 

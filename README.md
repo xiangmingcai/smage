@@ -47,9 +47,25 @@ see the data produced by the ones above them.
 2. Extract the whole `Smage` folder somewhere on a local disk.
 3. Double-click `Smage.exe`.
 
-The current builds are **not code-signed yet**, so Windows SmartScreen may
-show "Windows protected your PC" the first time. Choose **More info → Run
-anyway**. The download page includes a SHA-256 checksum for verification.
+The current builds are **not code-signed yet**, so Windows may block the
+first start. See **If Windows blocks the app** below. The download page
+includes a SHA-256 checksum for verification.
+
+## If Windows blocks the app
+
+Smage is not code-signed yet. If Windows shows "Windows protected your PC":
+
+1. If **More info → Run anyway** is available, use it.
+2. If that option is missing, right-click the downloaded zip or `Smage.exe` →
+   **Properties → General → Security → Unblock**, apply, then extract/run
+   again. PowerShell: `Unblock-File -Path "C:\path\to\Smage.exe"`.
+3. If it still does not start, check **Windows Security → App & browser
+   control → Smart App Control settings**. On a personal PC, Smart App
+   Control can be switched off; on a managed work or university PC, contact
+   IT because policy may hide the Run anyway button.
+
+The detailed steps are in
+[Windows protected your PC](docs/reference/windows-protected-your-pc.md).
 
 ## Code signing
 
