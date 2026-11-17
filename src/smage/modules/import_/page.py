@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -41,6 +42,7 @@ from smage.importer import import_file
 from smage.runlog import runlog
 from smage.widgets.controls import (
     _NoWheelComboBox,
+    _NoWheelDoubleSpinBox,
     _NoWheelSpinBox,
 )
 from smage.widgets.resources import _dot_pixmap
@@ -986,22 +988,59 @@ def _build_image_resize_section(ctx, entry, dims, locked: bool) -> None:
     enabled.setEnabled(not locked)
     lay.addWidget(enabled)
 
-    size_row = QHBoxLayout()
-    size_row.setSpacing(6)
-    size_row.addWidget(QLabel("Width"))
+    size_grid = QGridLayout()
+    size_grid.setHorizontalSpacing(6)
+    size_grid.setVerticalSpacing(4)
+    pixels_header = QLabel("Pixels")
+    pixels_header.setStyleSheet("color: #6b7785;")
+    ratio_header = QLabel("Ratio")
+    ratio_header.setStyleSheet("color: #6b7785;")
+    pixels_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    ratio_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    size_grid.addWidget(pixels_header, 0, 1)
+    size_grid.addWidget(ratio_header, 0, 2)
+
+    size_grid.addWidget(QLabel("Width"), 1, 0)
     width_spin = _NoWheelSpinBox()
     width_spin.setRange(IMAGE_RESIZE_MIN, max_w)
     width_spin.setSuffix(" px")
     width_spin.setMaximumWidth(90)
-    size_row.addWidget(width_spin)
-    size_row.addWidget(QLabel("Height"))
+    size_grid.addWidget(width_spin, 1, 1)
+    width_ratio = _NoWheelDoubleSpinBox()
+    width_ratio.setDecimals(2)
+    width_ratio.setRange(0.01, 10.0)
+    width_ratio.setSingleStep(0.01)
+    # Commit on Enter/focus-out: normalising the linked pixel mid-keystroke
+    # would overwrite what the user is typing.
+    width_ratio.setKeyboardTracking(False)
+    width_ratio.setSuffix("×")
+    width_ratio.setMaximumWidth(100)
+    width_ratio.setToolTip(
+        "Resize ratio for width: target pixels ÷ original pixels, rounded "
+        "to two decimals. The pixel value is what gets imported."
+    )
+    size_grid.addWidget(width_ratio, 1, 2)
+
+    size_grid.addWidget(QLabel("Height"), 2, 0)
     height_spin = _NoWheelSpinBox()
     height_spin.setRange(IMAGE_RESIZE_MIN, max_h)
     height_spin.setSuffix(" px")
     height_spin.setMaximumWidth(90)
-    size_row.addWidget(height_spin)
-    size_row.addStretch()
-    lay.addLayout(size_row)
+    size_grid.addWidget(height_spin, 2, 1)
+    height_ratio = _NoWheelDoubleSpinBox()
+    height_ratio.setDecimals(2)
+    height_ratio.setRange(0.01, 10.0)
+    height_ratio.setSingleStep(0.01)
+    height_ratio.setKeyboardTracking(False)
+    height_ratio.setSuffix("×")
+    height_ratio.setMaximumWidth(100)
+    height_ratio.setToolTip(
+        "Resize ratio for height: target pixels ÷ original pixels, rounded "
+        "to two decimals. The pixel value is what gets imported."
+    )
+    size_grid.addWidget(height_ratio, 2, 2)
+    size_grid.setColumnStretch(3, 1)
+    lay.addLayout(size_grid)
 
     keep = QCheckBox("Keep aspect ratio (Y follows X)")
     keep.setToolTip(
@@ -1028,14 +1067,6 @@ def _build_image_resize_section(ctx, entry, dims, locked: bool) -> None:
     info.setWordWrap(True)
     lay.addWidget(info)
 
-    width_spin.setValue(
-        int(resize.get("width") or original_w or IMAGE_RESIZE_MIN)
-    )
-    height_spin.setValue(
-        int(resize.get("height") or original_h or IMAGE_RESIZE_MIN)
-    )
-    state["updating"] = False
-
     def height_for_width() -> int:
         if original_w > 0:
             value = int(
@@ -1045,12 +1076,62 @@ def _build_image_resize_section(ctx, entry, dims, locked: bool) -> None:
             value = height_spin.value()
         return max(IMAGE_RESIZE_MIN, min(max_h, value))
 
+    def clamp_width(value) -> int:
+        return max(IMAGE_RESIZE_MIN, min(max_w, int(round(value))))
+
+    def clamp_height(value) -> int:
+        return max(IMAGE_RESIZE_MIN, min(max_h, int(round(value))))
+
+    def ratio_for(value, original) -> float:
+        """Target / original, rounded to the ratio field's two decimals."""
+        if original <= 0:
+            return 0.01
+        return max(0.01, min(10.0, round(value / float(original), 2)))
+
+    def pixel_for_width(ratio) -> int:
+        if original_w <= 0:
+            return width_spin.value()
+        return clamp_width(float(ratio) * original_w)
+
+    def pixel_for_height(ratio) -> int:
+        if original_h <= 0:
+            return height_spin.value()
+        return clamp_height(float(ratio) * original_h)
+
+    def set_ratio(spin, value) -> None:
+        spin.blockSignals(True)
+        spin.setValue(float(value))
+        spin.blockSignals(False)
+
+    width_spin.setValue(
+        int(resize.get("width") or original_w or IMAGE_RESIZE_MIN)
+    )
+    height_spin.setValue(
+        int(resize.get("height") or original_h or IMAGE_RESIZE_MIN)
+    )
+    state["updating"] = False
+    # Keep the stored height in step with the aspect lock after an edit or
+    # after the source image changed size.
+    if keep.isChecked():
+        computed = height_for_width()
+        if computed != height_spin.value():
+            state["updating"] = True
+            height_spin.setValue(computed)
+            state["updating"] = False
+            resize["height"] = int(computed)
+            _persist_import_files(ctx)
+    set_ratio(width_ratio, ratio_for(width_spin.value(), original_w))
+    set_ratio(height_ratio, ratio_for(height_spin.value(), original_h))
+
     def update_enabled() -> None:
         on = enabled.isChecked() and not locked
         width_spin.setEnabled(on)
+        width_ratio.setEnabled(on and original_w > 0)
         keep.setEnabled(on)
         method.setEnabled(on)
-        height_spin.setEnabled(on and not keep.isChecked())
+        height_on = on and not keep.isChecked()
+        height_spin.setEnabled(height_on)
+        height_ratio.setEnabled(height_on and original_h > 0)
 
     def update_info() -> None:
         if enabled.isChecked():
@@ -1073,15 +1154,48 @@ def _build_image_resize_section(ctx, entry, dims, locked: bool) -> None:
         resize["method"] = method.currentData() or "smooth"
         _persist_import_files(ctx)
 
-    def sync_height() -> None:
+    def on_width_changed(*_args, ratio=None) -> None:
         if state["updating"]:
             return
-        if keep.isChecked():
-            state["updating"] = True
-            height_spin.setValue(height_for_width())
+        state["updating"] = True
+        try:
+            if ratio is not None:
+                target = pixel_for_width(ratio)
+                if width_spin.value() != target:
+                    width_spin.setValue(target)
+            set_ratio(width_ratio, ratio_for(width_spin.value(), original_w))
+            if keep.isChecked():
+                target_h = height_for_width()
+                if height_spin.value() != target_h:
+                    height_spin.setValue(target_h)
+            set_ratio(
+                height_ratio, ratio_for(height_spin.value(), original_h)
+            )
+        finally:
             state["updating"] = False
         update_info()
         store()
+
+    def on_height_changed(*_args, ratio=None) -> None:
+        if state["updating"] or keep.isChecked():
+            return
+        state["updating"] = True
+        try:
+            if ratio is not None:
+                target = pixel_for_height(ratio)
+                if height_spin.value() != target:
+                    height_spin.setValue(target)
+            set_ratio(
+                height_ratio, ratio_for(height_spin.value(), original_h)
+            )
+        finally:
+            state["updating"] = False
+        update_info()
+        store()
+
+    def on_keep_toggled(*_args) -> None:
+        update_enabled()
+        on_width_changed()
 
     def on_toggle(*_args) -> None:
         update_enabled()
@@ -1089,30 +1203,31 @@ def _build_image_resize_section(ctx, entry, dims, locked: bool) -> None:
         store()
 
     enabled.toggled.connect(on_toggle)
-    keep.toggled.connect(lambda _=False: (update_enabled(), sync_height()))
-    width_spin.valueChanged.connect(lambda _=0: sync_height())
-    height_spin.valueChanged.connect(lambda _=0: (update_info(), store()))
+    keep.toggled.connect(on_keep_toggled)
+    width_spin.valueChanged.connect(lambda _=0: on_width_changed())
+    width_ratio.valueChanged.connect(
+        lambda value=0.0: on_width_changed(ratio=float(value))
+    )
+    height_spin.valueChanged.connect(lambda _=0: on_height_changed())
+    height_ratio.valueChanged.connect(
+        lambda value=0.0: on_height_changed(ratio=float(value))
+    )
     method.currentIndexChanged.connect(lambda _=0: store())
 
-    # Keep the stored height in step with the aspect lock after an edit or
-    # after the source image changed size.
-    if keep.isChecked():
-        computed = height_for_width()
-        if computed != height_spin.value():
-            state["updating"] = True
-            height_spin.setValue(computed)
-            state["updating"] = False
-            resize["height"] = int(computed)
-            _persist_import_files(ctx)
     update_enabled()
     update_info()
 
     ctx._resize_enabled = enabled
     ctx._resize_width = width_spin
     ctx._resize_height = height_spin
+    ctx._resize_width_ratio = width_ratio
+    ctx._resize_height_ratio = height_ratio
     ctx._resize_keep = keep
     ctx._resize_method = method
-    ctx._resize_controls = [enabled, width_spin, height_spin, keep, method]
+    ctx._resize_controls = [
+        enabled, width_spin, height_spin, width_ratio, height_ratio,
+        keep, method,
+    ]
     ctx.parameter_rows_layout.addWidget(box)
 
 
@@ -1120,6 +1235,7 @@ def _clear_parameter_rows(ctx) -> None:
     ctx._resize_controls = []
     for name in (
         "_resize_enabled", "_resize_width", "_resize_height",
+        "_resize_width_ratio", "_resize_height_ratio",
         "_resize_keep", "_resize_method",
     ):
         setattr(ctx, name, None)

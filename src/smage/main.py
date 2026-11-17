@@ -130,7 +130,7 @@ from smage.widgets import settings as _widgets_settings
 # does not grow without bound.
 
 
-# Defaults shown when a Subsample module first gets a sampling basis.
+# Defaults shown when a Subsample module first gets a sampling method.
 
 
 # Extensions: external Python environments managed outside the workflow. Each

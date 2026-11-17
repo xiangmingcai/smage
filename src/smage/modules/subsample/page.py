@@ -4,11 +4,11 @@ from __future__ import annotations
 import copy
 import json
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QHeaderView, QLabel, QListWidget,
-    QMessageBox, QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QScrollArea, QSplitter, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from smage.core.constants import MODULE_STATE_MODIFIED
@@ -24,6 +24,7 @@ from smage.data import naming as _data_naming
 from smage.data import sampling as _data_sampling
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
+from smage.runlog import runlog
 
 
 _SUBS_DEFAULT_COUNT = 10000
@@ -206,6 +207,7 @@ def _build_subsample_page(ctx, name: str, task_def: dict, locked: bool) -> QWidg
     params.setdefault("percent", None)
     params.setdefault("allocation", "uniform")
     params.setdefault("overrides", {})
+    params.setdefault("gate_filters", [])
     page._subs_task_def = task_def
     page._subs_task_id = task_def.get("id")
     page._subs_params = params
@@ -214,6 +216,20 @@ def _build_subsample_page(ctx, name: str, task_def: dict, locked: bool) -> QWidg
     page._subs_dirty = False
     page._subs_snapshot = copy.deepcopy(params)
     page._subs_updating = False
+    # Gate counts are computed one file per timer tick so a large selection
+    # never blocks the UI; the cache holds (signature, count) per file.
+    page._subs_original_sizes = {}
+    page._subs_count_cache = {}
+    page._subs_count_pending = []
+    page._subs_gate_ready = True
+    page._subs_gate_total = 0
+    page._subs_gate_done_n = 0
+    page._subs_count_generation = 0
+    page._subs_options_cache = None
+    gate_timer = QTimer(page)
+    gate_timer.setInterval(10)
+    gate_timer.timeout.connect(lambda: _subs_counts_tick(ctx, page))
+    page._subs_counts_timer = gate_timer
     save_btn.clicked.connect(lambda _=False: _subs_save_now(ctx, page))
 
     content = QWidget()
@@ -224,7 +240,12 @@ def _build_subsample_page(ctx, name: str, task_def: dict, locked: bool) -> QWidg
 
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setChildrenCollapsible(False)
-    splitter.addWidget(_subs_settings_panel(ctx, page))
+    settings_scroll = QScrollArea()
+    settings_scroll.setWidgetResizable(True)
+    settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    settings_scroll.setStyleSheet("background: transparent;")
+    settings_scroll.setWidget(_subs_settings_panel(ctx, page))
+    splitter.addWidget(settings_scroll)
     splitter.addWidget(_subs_table_panel(ctx, page))
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 1)
@@ -264,7 +285,50 @@ def _subs_settings_panel(ctx, page) -> QWidget:
     page._subs_files_box = files_box
 
     lay.addSpacing(8)
-    lay.addWidget(QLabel("<b>Sampling basis</b>"))
+    lay.addWidget(QLabel("<b>Filter</b>"))
+    filter_hint = QLabel(
+        "Sample only inside the selected gates. Multiple gates are combined "
+        "with OR; only gates available for every selected file are listed."
+    )
+    filter_hint.setWordWrap(True)
+    filter_hint.setStyleSheet("color: #6b7785;")
+    lay.addWidget(filter_hint)
+    filter_row = QHBoxLayout()
+    filter_row.setSpacing(4)
+    gates_btn = QPushButton("Select gates…")
+    gates_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    gates_btn.setEnabled(False)
+    clear_gates_btn = QPushButton("Clear")
+    clear_gates_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    clear_gates_btn.setEnabled(False)
+    filter_row.addWidget(gates_btn)
+    filter_row.addWidget(clear_gates_btn)
+    filter_row.addStretch()
+    lay.addLayout(filter_row)
+    gates_box = QListWidget()
+    gates_box.setFixedHeight(90)
+    gates_box.setStyleSheet(
+        "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+    )
+    lay.addWidget(gates_box)
+    filter_warning = QLabel("")
+    filter_warning.setWordWrap(True)
+    filter_warning.setStyleSheet("color: #b58900;")
+    filter_warning.setVisible(False)
+    lay.addWidget(filter_warning)
+    gate_progress = QLabel("")
+    gate_progress.setWordWrap(True)
+    gate_progress.setStyleSheet("color: #6b7785;")
+    gate_progress.setVisible(False)
+    lay.addWidget(gate_progress)
+    page._subs_gates_btn = gates_btn
+    page._subs_clear_gates_btn = clear_gates_btn
+    page._subs_gates_box = gates_box
+    page._subs_filter_warning = filter_warning
+    page._subs_gate_progress = gate_progress
+
+    lay.addSpacing(8)
+    lay.addWidget(QLabel("<b>Sampling method</b>"))
     basis = _NoWheelComboBox()
     basis.addItem("", None)
     basis.addItem("Per file", "per_file")
@@ -307,6 +371,8 @@ def _subs_settings_panel(ctx, page) -> QWidget:
     lay.addStretch()
 
     files_btn.clicked.connect(lambda _=False: _subs_select_files(ctx, page))
+    gates_btn.clicked.connect(lambda _=False: _subs_select_gates(ctx, page))
+    clear_gates_btn.clicked.connect(lambda _=False: _subs_clear_gates(ctx, page))
     basis.currentIndexChanged.connect(lambda _=0: _subs_on_basis(ctx, page))
     unit.currentIndexChanged.connect(lambda _=0: _subs_on_unit(ctx, page))
     count_box.valueChanged.connect(lambda _=0: _subs_on_value(ctx, page))
@@ -322,18 +388,22 @@ def _subs_table_panel(ctx, page) -> QWidget:
     lay.addWidget(QLabel("<b>Sampling</b>"))
     hint = QLabel(
         "The sampled count is editable — type a value to override the "
-        "computed one for that file."
+        "computed one for that file. In gates is the number of points "
+        "inside the selected gates."
     )
     hint.setWordWrap(True)
     hint.setStyleSheet("color: #6b7785;")
     lay.addWidget(hint)
     table = QTableWidget()
-    table.setColumnCount(3)
-    table.setHorizontalHeaderLabels(["File", "Original points", "Sampled points"])
+    table.setColumnCount(4)
+    table.setHorizontalHeaderLabels(
+        ["File", "Original points", "In gates", "Sampled points"]
+    )
     header = table.horizontalHeader()
     header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
     header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
     table.verticalHeader().setVisible(False)
     table.verticalHeader().setDefaultSectionSize(26)
     table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
@@ -355,11 +425,254 @@ def _subs_visible_sizes(ctx, page) -> dict:
     }
 
 
+def _subs_gate_filters(page) -> list:
+    return _data_sampling._subsample_gate_filters(page._subs_params)
+
+
+def _subs_filter_options(ctx, page) -> list:
+    """Common gates for the selected files (cached until the chain changes)."""
+    files = tuple(str(p) for p in page._subs_params.get("files") or [])
+    chain = tuple(
+        task.get("id") for task in ctx._task_chain(page._subs_task_id)
+        if task.get("type") == "gating"
+    )
+    key = (files, chain, getattr(ctx, "_stages_revision", 0))
+    cached = getattr(page, "_subs_options_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    options = _data_sampling._subsample_filter_options(
+        ctx, page._subs_task_id, files
+    )
+    page._subs_options_cache = (key, options)
+    return options
+
+
+def _subs_validate_filters(ctx, page) -> None:
+    """Drop gates that are no longer available for every selected file."""
+    filters = _subs_gate_filters(page)
+    warning = ""
+    if filters:
+        valid = {
+            (entry.get("task_id"), entry.get("gate_id"))
+            for _label, entry in _subs_filter_options(ctx, page)
+        }
+        kept = []
+        seen = set()
+        for entry in filters:
+            key = (entry.get("task_id"), entry.get("gate_id"))
+            if key in valid and key not in seen:
+                seen.add(key)
+                kept.append(entry)
+        removed = len(filters) - len(kept)
+        if removed:
+            if page._subs_locked:
+                warning = (
+                    f"{removed} selected gate(s) are no longer available for "
+                    "all selected files. Unlock the module to fix the "
+                    "selection."
+                )
+            else:
+                page._subs_params["gate_filters"] = kept
+                warning = (
+                    f"Removed {removed} gate(s) that are no longer available "
+                    "for all selected files."
+                )
+                _subs_mark_dirty(ctx, page)
+    box = getattr(page, "_subs_filter_warning", None)
+    if box is not None:
+        box.setText(warning)
+        box.setVisible(bool(warning))
+
+
+def _subs_prepare_counts(ctx, page) -> None:
+    """Queue the files whose in-gate count must be (re)computed."""
+    params = page._subs_params
+    files = [str(p) for p in params.get("files") or []]
+    filters = _subs_gate_filters(page)
+    page._subs_count_generation = getattr(
+        page, "_subs_count_generation", 0
+    ) + 1
+    timer = getattr(page, "_subs_counts_timer", None)
+    if not filters:
+        page._subs_count_cache = {}
+        page._subs_count_pending = []
+        page._subs_gate_ready = True
+        page._subs_gate_total = 0
+        page._subs_gate_done_n = 0
+        if timer is not None:
+            timer.stop()
+        return
+    cached = getattr(page, "_subs_count_cache", {}) or {}
+    saved = _data_sampling._subsample_load_counts(
+        ctx, page._subs_task_id
+    )
+    fresh = {}
+    pending = []
+    for path in files:
+        sig = _data_sampling._subsample_count_sig(
+            ctx, page._subs_task_def, path, params=params
+        )
+        entry = cached.get(path)
+        if entry is None or entry[0] != sig:
+            stored = saved.get(path)
+            if stored is not None and stored.get("sig") == sig:
+                try:
+                    entry = (sig, int(stored.get("count")))
+                except (TypeError, ValueError):
+                    entry = None
+        if entry is not None and entry[0] == sig:
+            fresh[path] = entry
+        else:
+            pending.append(path)
+    page._subs_count_cache = fresh
+    page._subs_count_pending = pending
+    page._subs_gate_total = len(files)
+    page._subs_gate_done_n = len(files) - len(pending)
+    page._subs_gate_ready = not pending
+    if timer is not None:
+        if pending:
+            timer.start()
+        else:
+            timer.stop()
+
+
+def _subs_counts_tick(ctx, page) -> None:
+    """Compute one file's gate count per timer tick (keeps the UI alive)."""
+    pending = list(getattr(page, "_subs_count_pending", []) or [])
+    timer = getattr(page, "_subs_counts_timer", None)
+    if not pending:
+        if timer is not None:
+            timer.stop()
+        return
+    generation = page._subs_count_generation
+    params = page._subs_params
+    path = pending.pop(0)
+    page._subs_count_pending = pending
+    sig = _data_sampling._subsample_count_sig(
+        ctx, page._subs_task_def, path, params=params
+    )
+    try:
+        count = _data_sampling._subsample_eligible_count(
+            ctx, page._subs_task_def, path, params=params
+        )
+    except Exception as error:  # noqa: BLE001 - keep the page usable
+        runlog.error("subsample.gate_count", exc=error)
+        count = _data_sampling._subsample_visible_count(
+            ctx, page._subs_task_id, path
+        )
+    if generation != page._subs_count_generation:
+        return
+    page._subs_count_cache[path] = (sig, int(count))
+    page._subs_gate_done_n = getattr(page, "_subs_gate_done_n", 0) + 1
+    if not pending:
+        page._subs_gate_ready = True
+        if timer is not None:
+            timer.stop()
+    _subs_refresh(ctx, page, restart_counts=False)
+
+
+def _subs_effective_sizes(ctx, page) -> dict:
+    """Rows available for sampling per file: the gate union when filtered."""
+    files = [str(p) for p in page._subs_params.get("files") or []]
+    original = getattr(page, "_subs_original_sizes", {}) or {}
+    if not _subs_gate_filters(page):
+        return {path: int(original.get(path, 0)) for path in files}
+    if not getattr(page, "_subs_gate_ready", True):
+        return {}
+    cache = getattr(page, "_subs_count_cache", {}) or {}
+    out = {}
+    for path in files:
+        entry = cache.get(path)
+        if entry is None:
+            return {}
+        out[path] = int(entry[1])
+    return out
+
+
 def _subs_computed(ctx, page, sizes) -> dict:
     """Computed counts, ignoring manual overrides."""
+    if not sizes:
+        return {}
     params = dict(page._subs_params)
     params["overrides"] = {}
     return _subsample_allocate(params, sizes)
+
+
+def _subs_refresh_filter_list(ctx, page) -> None:
+    box = getattr(page, "_subs_gates_box", None)
+    if box is None:
+        return
+    filters = _subs_gate_filters(page)
+    labels = {}
+    if filters:
+        labels = {
+            (entry.get("task_id"), entry.get("gate_id")): label
+            for label, entry in _subs_filter_options(ctx, page)
+        }
+    wanted = []
+    for entry in filters:
+        key = (entry.get("task_id"), entry.get("gate_id"))
+        label = labels.get(key)
+        if label is None:
+            task = ctx._find_task_by_id(entry.get("task_id"))
+            module = (task or {}).get("name") or "?"
+            label = f"{module} → {entry.get('gate_id')} (not available)"
+        wanted.append(label)
+    if box.count() == len(wanted) and all(
+        box.item(i).text() == wanted[i] for i in range(len(wanted))
+    ):
+        return
+    box.clear()
+    for label in wanted:
+        box.addItem(label)
+
+
+def _subs_select_gates(ctx, page) -> None:
+    files = list(page._subs_params.get("files") or [])
+    if not files:
+        QMessageBox.information(
+            ctx.host, "Subsample", "Select data files first."
+        )
+        return
+    options = _subs_filter_options(ctx, page)
+    if not options:
+        QMessageBox.information(
+            ctx.host, "Subsample",
+            "No gates are available for all selected files.",
+        )
+        return
+    labels = [label for label, _entry in options]
+    entry_by_label = dict(options)
+    current = []
+    labels_by_key = {
+        (entry.get("task_id"), entry.get("gate_id")): label
+        for label, entry in options
+    }
+    for entry in _subs_gate_filters(page):
+        label = labels_by_key.get(
+            (entry.get("task_id"), entry.get("gate_id"))
+        )
+        if label is not None:
+            current.append(label)
+    chosen = _widgets_picker._pick_items_dialog(
+        ctx, "Select gates", labels, current, "Filter gates..."
+    )
+    if chosen is None:
+        return
+    selected = [
+        entry_by_label[label] for label in chosen if label in entry_by_label
+    ]
+    if selected == _subs_gate_filters(page):
+        return
+    page._subs_params["gate_filters"] = selected
+    _subs_param_changed(ctx, page)
+
+
+def _subs_clear_gates(ctx, page) -> None:
+    if not _subs_gate_filters(page):
+        return
+    page._subs_params["gate_filters"] = []
+    _subs_param_changed(ctx, page)
 
 
 def _subs_select_files(ctx, page) -> None:
@@ -373,12 +686,15 @@ def _subs_select_files(ctx, page) -> None:
     if chosen is None:
         return
     page._subs_params["files"] = [by_name[n] for n in chosen if n in by_name]
-    # Drop overrides for files that are no longer selected.
     files = set(page._subs_params["files"])
+    # Drop overrides for files that are no longer selected.
     page._subs_params["overrides"] = {
         p: k for p, k in (page._subs_params.get("overrides") or {}).items()
         if p in files
     }
+    if not files:
+        # Gate filters only make sense with files to evaluate them on.
+        page._subs_params["gate_filters"] = []
     _subs_refresh(ctx, page)
     _subs_mark_dirty(ctx, page)
 
@@ -467,12 +783,12 @@ def _subs_on_alloc(ctx, page) -> None:
 def _subs_on_cell(ctx, page, item) -> None:
     if page._subs_updating or page._subs_locked:
         return
-    if item.column() != 2:
+    if item.column() != 3:
         return
     path = item.data(Qt.ItemDataRole.UserRole)
     if not path:
         return
-    sizes = _subs_visible_sizes(ctx, page)
+    sizes = _subs_effective_sizes(ctx, page)
     if path not in sizes:
         return
     text = (item.text() or "").strip()
@@ -494,11 +810,16 @@ def _subs_on_cell(ctx, page, item) -> None:
     _subs_mark_dirty(ctx, page)
 
 
-def _subs_refresh(ctx, page) -> None:
+def _subs_refresh(ctx, page, restart_counts=True) -> None:
     params = page._subs_params
     files = list(params.get("files") or [])
-    sizes = _subs_visible_sizes(ctx, page)
-    counts = _subsample_allocate(params, sizes)
+    page._subs_original_sizes = _subs_visible_sizes(ctx, page)
+    if restart_counts:
+        _subs_validate_filters(ctx, page)
+        _subs_prepare_counts(ctx, page)
+    filters = _subs_gate_filters(page)
+    sizes = _subs_effective_sizes(ctx, page)
+    counts = _subsample_allocate(params, sizes) if sizes else {}
 
     page._subs_updating = True
     try:
@@ -552,6 +873,22 @@ def _subs_refresh(ctx, page) -> None:
         for path in files:
             page._subs_files_box.addItem(_data_naming._comp_file_name(ctx, path, page._subs_task_id))
 
+        page._subs_gates_btn.setEnabled(
+            bool(files) and not page._subs_locked
+        )
+        page._subs_clear_gates_btn.setEnabled(
+            bool(filters) and not page._subs_locked
+        )
+        _subs_refresh_filter_list(ctx, page)
+        if filters and not page._subs_gate_ready:
+            page._subs_gate_progress.setText(
+                "Calculating gate counts… "
+                f"{page._subs_gate_done_n}/{page._subs_gate_total}"
+            )
+            page._subs_gate_progress.setVisible(True)
+        else:
+            page._subs_gate_progress.setVisible(False)
+
         table = page._subs_table
         table.blockSignals(True)
         table.setRowCount(len(files))
@@ -559,19 +896,30 @@ def _subs_refresh(ctx, page) -> None:
             name_item = QTableWidgetItem(_data_naming._comp_file_name(ctx, path, page._subs_task_id))
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             table.setItem(i, 0, name_item)
-            orig_item = QTableWidgetItem(str(sizes.get(path, 0)))
+            orig_item = QTableWidgetItem(str(page._subs_original_sizes.get(path, 0)))
             orig_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             orig_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             table.setItem(i, 1, orig_item)
+            if not filters:
+                in_gates_text = "—"
+            else:
+                entry = page._subs_count_cache.get(path)
+                in_gates_text = "…" if entry is None else str(entry[1])
+            in_gates_item = QTableWidgetItem(in_gates_text)
+            in_gates_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            in_gates_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            table.setItem(i, 2, in_gates_item)
             k = counts.get(path)
             sampled = QTableWidgetItem("" if k is None else str(k))
             sampled.setData(Qt.ItemDataRole.UserRole, path)
             flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-            if not page._subs_locked:
+            if not page._subs_locked and sizes:
                 flags |= Qt.ItemFlag.ItemIsEditable
             sampled.setFlags(flags)
             sampled.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            table.setItem(i, 2, sampled)
+            table.setItem(i, 3, sampled)
         table.blockSignals(False)
     finally:
         page._subs_updating = False
@@ -590,10 +938,17 @@ def _subs_mark_dirty(ctx, page) -> None:
 def _subs_update_save_btn(ctx, page) -> None:
     btn = getattr(page, "_subs_save_btn", None)
     if btn is not None:
-        btn.setEnabled(page._subs_dirty and not page._subs_locked)
+        btn.setEnabled(
+            page._subs_dirty
+            and not page._subs_locked
+            and getattr(page, "_subs_gate_ready", True)
+        )
 
 
 def _subs_save_now(ctx, page) -> None:
+    timer = getattr(page, "_subs_counts_timer", None)
+    if timer is not None:
+        timer.stop()
     params = page._subs_params
     page._subs_task_def["params"] = params
     # Commit the settings first: the mask builders read the saved snapshot.
@@ -607,6 +962,27 @@ def _subs_save_now(ctx, page) -> None:
     try:
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
+        # Persist the in-gate counts first, so building the image coverage
+        # masks (and later Total allocations downstream) can reuse them.
+        files = [str(p) for p in params.get("files") or []]
+        counts = {}
+        for path in files:
+            entry = page._subs_count_cache.get(path)
+            sig = _data_sampling._subsample_count_sig(
+                ctx, page._subs_task_def, path
+            )
+            if entry is not None and entry[0] == sig:
+                counts[path] = int(entry[1])
+            else:
+                counts[path] = _data_sampling._subsample_eligible_count(
+                    ctx, page._subs_task_def, path
+                )
+        if _subs_gate_filters(page):
+            _data_sampling._subsample_write_counts(
+                ctx, page._subs_task_def, counts
+            )
+        else:
+            _data_sampling._subsample_clear_counts(ctx, page._subs_task_id)
         count = _subsample_write_masks(ctx, page)
     finally:
         QApplication.restoreOverrideCursor()
@@ -631,4 +1007,7 @@ def _subs_close(ctx, page) -> None:
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._subs_task_def["params"] = page._subs_snapshot
+    timer = getattr(page, "_subs_counts_timer", None)
+    if timer is not None:
+        timer.stop()
     ctx._close_module_page(page)

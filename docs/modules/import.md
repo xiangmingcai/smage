@@ -32,12 +32,18 @@ modified.
 |---|---|
 | Resize on import | Off by default. The width/height fields are pre-filled with the original size. |
 | Width / Height | Target pixel size. Smaller values reduce the stored table and speed up every downstream module; larger values upscale the image. |
-| Keep aspect ratio (Y follows X) | When ticked, Height is computed from Width so the proportions stay the same, and the Height field is read-only. |
+| Width ratio / Height ratio | The same target expressed as a multiple of the original size, with two decimals (`1.00×` = original, `0.50×` = half). Editing a ratio updates its pixel value, and editing a pixel value updates its ratio. The range is `0.01`–`10.00`; the pixel value is what gets imported and saved. |
+| Keep aspect ratio (Y follows X) | When ticked, Height is computed from Width so the proportions stay the same, and the Height field and Height ratio are read-only. |
 | Method | **Smooth (anti-aliased)** for intensity images, or **Nearest neighbor** to keep exact source pixel values (labels, masks). |
 
 The imported size is shown in the Processed list and in the file's tooltip.
 Sampling is disabled for image files: dropping random pixel rows would punch
 holes in the image.
+
+Ratios are only a convenient way to type a size; they are not stored in the
+project. Very large originals can need a ratio below `0.01` to reach the
+8-pixel minimum, and images already near the pixel limit cannot reach `10×`;
+use the pixel fields for those extremes.
 
 ## Output
 

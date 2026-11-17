@@ -2168,7 +2168,7 @@ def _gating_delete_gate(ctx, page, idx, cascade: bool) -> None:
             ctx.host,
             "Delete gate",
             "This gate is the source of a spectrum.\n"
-            'Use "Re-set as spectrum..." to move the source to another '
+            'Use "Set other gate as spectrum" to move the source to another '
             "gate before deleting it.",
         )
         return

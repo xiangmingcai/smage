@@ -6,6 +6,24 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Data Import** image resize offers linked **Width ratio** and **Height
+  ratio** fields next to the pixel sizes. Ratios use two decimals
+  (`0.01×`–`10.00×`) and stay in sync with the pixel values; pixels remain
+  the stored and imported size.
+- **Subsample** can sample inside one or more upstream gates. The new
+  **Filter** setting lists only gates shared by every selected file; multiple
+  gates are combined with OR. The table gains an **In gates** column, and
+  percentages, Total allocation and manual count edits are based on the
+  in-gate point count. Image coverage masks match the gate restriction.
+
+### Changed
+
+- **Subsample**: the **Sampling basis** label is now **Sampling method**.
+- **Unmix**: the gate-tree action **Re-set as spectrum** is now **Set other
+  gate as spectrum**.
+
 ### Fixed
 
 - StarDist: model downloads now verify TLS with the Windows certificate store

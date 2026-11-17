@@ -9,7 +9,15 @@ import json
 from pathlib import Path
 
 from smage.core.feature import _feature_safe_stem
-from smage.core.sampling import _subsample_allocate
+from smage.core.gates import (
+    _compute_gate_filter_mask,
+    _gate_needed_columns,
+)
+from smage.core.sampling import (
+    _stable_sample_selection,
+    _subsample_allocate,
+)
+from smage.runlog import runlog
 
 
 def _subsample_tasks(ctx, task_id) -> list:
@@ -31,6 +39,372 @@ def _subsample_params_for(ctx, task_def) -> dict:
         if isinstance(snap, dict):
             return snap
     return task_def.get("params") or {}
+
+
+def _subsample_gate_filters(params) -> list:
+    """Normalised gate filters of a Subsample module's parameters."""
+    out = []
+    for entry in (params or {}).get("gate_filters") or []:
+        if not isinstance(entry, dict):
+            continue
+        task_id = entry.get("task_id")
+        gate_id = entry.get("gate_id")
+        if task_id and gate_id:
+            out.append({"task_id": task_id, "gate_id": gate_id})
+    return out
+
+
+def _subsample_gate_chain(ctx, gating_task, parquet_path, gate_id) -> list:
+    """A gate plus its ancestors, as resolved for one file."""
+    from smage.data import stores as _data_stores
+
+    gates = _data_stores._gating_gates_for(ctx, gating_task, parquet_path)
+    by_id = {g.get("id"): g for g in gates}
+    chain = []
+    seen = set()
+    cur = by_id.get(gate_id)
+    while cur is not None and cur.get("id") not in seen:
+        seen.add(cur.get("id"))
+        chain.append(cur)
+        cur = by_id.get(cur.get("parent"))
+    chain.reverse()
+    return chain
+
+
+def _subsample_filter_options(ctx, task_id, files) -> list:
+    """Gates that can be used as a Subsample filter, as ``(label, entry)``.
+
+    A gate qualifies when every selected file is part of its Gating module
+    and has the columns the gate (and its ancestors) need. This is the same
+    "common gates" rule the page shows in the picker.
+    """
+    from smage.data import columns as _data_columns
+    from smage.data import stores as _data_stores
+
+    files = [str(p) for p in (files or []) if p]
+    if not files:
+        return []
+    options = []
+    labels = {}
+    for task in ctx._task_chain(task_id):
+        if task.get("id") == task_id or task.get("type") != "gating":
+            continue
+        gates = _data_stores._gating_gates_for(ctx, task)
+        if not gates:
+            continue
+        by_id = {g.get("id"): g for g in gates}
+        per_file = {}
+        for path in files:
+            resolved = _data_stores._gating_gates_for(ctx, task, path)
+            ids = {g.get("id") for g in resolved}
+            columns = set(
+                _data_columns._columns_for(ctx, path, task.get("id"))
+            )
+            per_file[path] = (ids, columns)
+        module_name = task.get("name") or "Gating"
+        for gate in gates:
+            gate_id = gate.get("id")
+            if not gate_id:
+                continue
+            needed = _gate_needed_columns(gate, by_id)
+            if not all(
+                gate_id in per_file[path][0]
+                and not (needed - per_file[path][1])
+                for path in files
+            ):
+                continue
+            label = f"{module_name} → {gate.get('name', gate_id)}"
+            count = labels.get(label, 0) + 1
+            labels[label] = count
+            if count > 1:
+                label = f"{label} ({count})"
+            options.append((
+                label,
+                {"task_id": task.get("id"), "gate_id": gate_id},
+            ))
+    return options
+
+
+def _subsample_filter_sig(ctx, params, parquet_path) -> str:
+    """Fingerprint of the selected gates' geometry for one file.
+
+    Gate edits are stored in the Gating module; hashing the resolved gate
+    chains makes saved sampling masks and generated outputs stale when a
+    gate is moved, renamed or deleted.
+    """
+    filters = _subsample_gate_filters(params)
+    if not filters:
+        return ""
+    path = str(parquet_path)
+    revision = getattr(ctx, "_stages_revision", 0)
+    key = (
+        path,
+        revision,
+        tuple((f["task_id"], f["gate_id"]) for f in filters),
+    )
+    cache = getattr(ctx, "_subsample_filter_sig_cache", None)
+    if cache is None:
+        cache = {}
+        ctx._subsample_filter_sig_cache = cache
+    if key in cache:
+        return cache[key]
+    parts = []
+    for entry in filters:
+        task = ctx._find_task_by_id(entry.get("task_id"))
+        if task is None:
+            parts.append({"task": entry["task_id"],
+                          "gate": entry["gate_id"], "missing": True})
+            continue
+        parts.append({
+            "task": entry["task_id"],
+            "gate": entry["gate_id"],
+            "gates": _subsample_gate_chain(
+                ctx, task, path, entry["gate_id"]
+            ),
+        })
+    sig = hashlib.sha1(
+        json.dumps(parts, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    if len(cache) > 64:
+        cache.clear()
+    cache[key] = sig
+    return sig
+
+
+def _subsample_gate_mask_for(ctx, entry, parquet_path, this_rows, n):
+    """One selected gate's mask, aligned with this module's visible rows."""
+    import numpy as np
+
+    from smage.data import columns as _data_columns
+    from smage.data import stores as _data_stores
+
+    path = str(parquet_path)
+    gating_task = ctx._find_task_by_id(entry.get("task_id"))
+    if gating_task is None:
+        return None
+    gates = _data_stores._gating_gates_for(ctx, gating_task, path)
+    if not gates:
+        return None
+    by_id = {g.get("id"): g for g in gates}
+    gates_for = _subsample_gate_chain(
+        ctx, gating_task, path, entry.get("gate_id")
+    )
+    if not gates_for:
+        return None
+    needed = set()
+    for gate in gates_for:
+        needed |= _gate_needed_columns(gate, by_id)
+    if not needed:
+        return None
+    try:
+        values = _data_columns._column_data(
+            ctx, gating_task.get("id"), path, sorted(needed)
+        )
+    except Exception as error:  # noqa: BLE001 - a broken gate must not break sampling
+        runlog.error("subsample.gate_error", exc=error)
+        return None
+    if needed - set(values):
+        return None
+    try:
+        mask = _compute_gate_filter_mask(
+            gates, entry.get("gate_id"), path, {},
+            existing=set(values), extra=values,
+        )
+    except Exception as error:  # noqa: BLE001
+        runlog.error("subsample.gate_error", exc=error)
+        return None
+    if mask is None:
+        return None
+    mask = np.asarray(mask, dtype=bool)
+
+    gating_rows = ctx._subsample_row_index(gating_task.get("id"), path)
+    if gating_rows is None:
+        if this_rows is None:
+            return mask if mask.size == n else None
+        full_n = ctx._data_row_count(path)
+        if mask.size != full_n:
+            return None
+        return mask[np.asarray(this_rows, dtype=np.int64)]
+    if mask.size != len(gating_rows):
+        return None
+    if this_rows is None:
+        target = np.arange(ctx._data_row_count(path), dtype=np.int64)
+    else:
+        target = np.asarray(this_rows, dtype=np.int64)
+    if target.size == 0:
+        return np.zeros(0, dtype=bool)
+    if len(gating_rows) == 0:
+        return np.zeros(target.size, dtype=bool)
+    pos = np.searchsorted(gating_rows, target)
+    clipped = np.minimum(pos, len(gating_rows) - 1)
+    valid = (pos < len(gating_rows)) & (gating_rows[clipped] == target)
+    out = np.zeros(target.size, dtype=bool)
+    if valid.any():
+        out[valid] = mask[pos[valid]]
+    return out
+
+
+def _subsample_task_eligible_mask(ctx, task_def, parquet_path, params=None):
+    """Union of the selected gates over the rows this module can see.
+
+    Returns ``None`` when no usable gate filter is configured, so callers
+    keep the old "no filtering" behaviour. Rows outside the selected gates
+    are hidden downstream (and from the coverage mask).
+    """
+    import numpy as np
+
+    path = str(parquet_path)
+    if params is None:
+        params = _subsample_params_for(ctx, task_def)
+    filters = _subsample_gate_filters(params)
+    if not filters:
+        return None
+    task_id = task_def.get("id")
+    rows = ctx._subsample_row_index(task_id, path)
+    n = len(rows) if rows is not None else ctx._data_row_count(path)
+    if n <= 0:
+        return np.zeros(0, dtype=bool)
+    union = np.zeros(n, dtype=bool)
+    usable = False
+    for entry in filters:
+        mask = _subsample_gate_mask_for(ctx, entry, path, rows, n)
+        if mask is None:
+            runlog.warn(
+                "subsample.gate_skipped",
+                file=path,
+                task=entry.get("task_id"),
+                gate=entry.get("gate_id"),
+                why="gate or its columns are unavailable",
+            )
+            continue
+        usable = True
+        union |= mask
+    return union if usable else None
+
+
+def _subsample_count_sig(ctx, task_def, parquet_path, params=None) -> str:
+    """Fingerprint of everything the in-gate point count depends on.
+
+    The target count and the allocation do not change how many points lie in
+    the gates, so they are deliberately not part of this signature; changing
+    the target therefore does not rescan every file.
+    """
+    path = str(parquet_path)
+    if params is None:
+        params = _subsample_params_for(ctx, task_def)
+    try:
+        st = Path(path).stat()
+        stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+    except OSError:
+        stat = ""
+    payload = {
+        "task": task_def.get("id"),
+        "upstream": _subsample_sig(ctx, task_def.get("id"), path),
+        "stat": stat,
+        "gates": _subsample_filter_sig(ctx, params, path),
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _subsample_eligible_count(ctx, task_def, parquet_path, params=None) -> int:
+    """Rows of a file that lie inside the selected gate union.
+
+    Without gate filters this is simply the number of visible rows; with
+    them it is read from the counts saved next to the module, so a Total
+    allocation does not rescan every file.
+    """
+    path = str(parquet_path)
+    if params is None:
+        params = _subsample_params_for(ctx, task_def)
+    if not _subsample_gate_filters(params):
+        return _subsample_visible_count(ctx, task_def.get("id"), path)
+    sig = _subsample_count_sig(ctx, task_def, path, params)
+    entry = _subsample_load_counts(ctx, task_def.get("id")).get(path)
+    if entry and entry.get("sig") == sig:
+        try:
+            return max(0, int(entry.get("count")))
+        except (TypeError, ValueError):
+            pass
+    mask = _subsample_task_eligible_mask(ctx, task_def, path, params)
+    if mask is None:
+        return _subsample_visible_count(ctx, task_def.get("id"), path)
+    return int(mask.sum())
+
+
+def _subsample_counts_path(ctx, task_id):
+    """Where a Subsample module caches its per-file gate counts."""
+    if ctx.project is None or not task_id:
+        return None
+    folder = ctx._module_dir(task_id)
+    return folder / "eligible.json" if folder is not None else None
+
+
+def _subsample_load_counts(ctx, task_id) -> dict:
+    """Read the saved per-file gate counts for one module."""
+    path = _subsample_counts_path(ctx, task_id)
+    if path is None or not path.is_file():
+        return {}
+    try:
+        st = path.stat()
+        key = (str(path), int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return {}
+    cache = getattr(ctx, "_subsample_counts_cache", None)
+    if cache is None:
+        cache = {}
+        ctx._subsample_counts_cache = cache
+    if key in cache:
+        return cache[key]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    entries = data.get("entries") if isinstance(data, dict) else None
+    result = {
+        str(k): v for k, v in (entries or {}).items() if isinstance(v, dict)
+    }
+    if len(cache) > 4:
+        cache.clear()
+    cache[key] = result
+    return result
+
+
+def _subsample_write_counts(ctx, task_def, counts) -> None:
+    """Persist per-file gate counts for downstream Total allocations."""
+    path = _subsample_counts_path(ctx, task_def.get("id"))
+    if path is None:
+        return
+    entries = {}
+    for parquet_path, count in (counts or {}).items():
+        entries[str(parquet_path)] = {
+            "sig": _subsample_count_sig(ctx, task_def, parquet_path),
+            "count": int(count),
+        }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps({"version": 1, "entries": entries}),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError as error:
+        runlog.error("subsample.counts_write", exc=error)
+        return
+    ctx._subsample_counts_cache = {}
+
+
+def _subsample_clear_counts(ctx, task_id) -> None:
+    """Drop the saved gate counts when filters are removed."""
+    path = _subsample_counts_path(ctx, task_id)
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    ctx._subsample_counts_cache = {}
 
 
 def _subsample_seed(ctx, task_id, parquet_path) -> int:
@@ -78,19 +452,47 @@ def _subsample_row_index(ctx, task_id, parquet_path):
         if n <= 0:
             continue
         sizes = {
-            p: ctx._subsample_visible_count(task.get("id"), p)
-            for p in files
+            p: _subsample_eligible_count(ctx, task, p) for p in files
         }
         k = _subsample_allocate(params, sizes).get(path)
-        if k is None or k >= n:
+        eligible = _subsample_task_eligible_mask(ctx, task, path)
+        if eligible is not None:
+            eligible = np.asarray(eligible, dtype=bool)
+            if eligible.size != n:
+                eligible = None
+        if eligible is None:
+            if k is None or k >= n:
+                continue
+            if k <= 0:
+                index = (index[:0] if index is not None
+                         else np.zeros(0, dtype=np.int64))
+                continue
+            rng = np.random.default_rng(
+                ctx._subsample_seed(task.get("id"), path)
+            )
+            keep = np.sort(rng.permutation(n)[:k]).astype(np.int64)
+            index = keep if index is None else index[keep]
             continue
+        # A module without a sampling method has no effect, even when gates
+        # are selected; the filter only defines the pool to sample from.
+        if k is None:
+            continue
+        # Gate filter: rows outside the selected gates are hidden even when
+        # the target count does not cut anything.
+        positions = np.flatnonzero(eligible).astype(np.int64)
         if k <= 0:
             index = (index[:0] if index is not None
                      else np.zeros(0, dtype=np.int64))
             continue
-        rng = np.random.default_rng(ctx._subsample_seed(task.get("id"), path))
-        keep = np.sort(rng.permutation(n)[:k]).astype(np.int64)
-        index = keep if index is None else index[keep]
+        if k >= positions.size:
+            local = positions
+        else:
+            pick = _stable_sample_selection(
+                eligible, int(k),
+                ctx._subsample_seed(task.get("id"), path),
+            )
+            local = positions if pick is None else positions[pick]
+        index = local if index is None else index[local]
     if len(cache) > 16:
         cache.clear()
     cache[key] = index
@@ -106,13 +508,27 @@ def _subsample_sig(ctx, task_id, parquet_path) -> str:
         files = {str(p) for p in (params.get("files") or [])}
         if path not in files:
             continue
-        parts.append({
+        part = {
             "task": task.get("id"),
             "basis": params.get("basis"),
             "count": params.get("count"),
             "allocation": params.get("allocation"),
             "override": (params.get("overrides") or {}).get(path),
-        })
+        }
+        gate_sig = _subsample_filter_sig(ctx, params, path)
+        if gate_sig:
+            # Only modules with a gate filter change their existing hash, so
+            # projects without one keep their generated outputs valid.
+            part["gates"] = gate_sig
+        if (params.get("unit") or "points") == "percent":
+            # Percentage mode carries its target in `percent`, not `count`.
+            part["unit"] = "percent"
+            part["percent"] = params.get("percent")
+        if params.get("basis") == "total":
+            # A total is split across the selected files, so their set and
+            # in-gate sizes are part of the decision.
+            part["files"] = sorted(files)
+        parts.append(part)
     if not parts:
         return ""
     return hashlib.sha1(
@@ -181,18 +597,44 @@ def _subsample_own_mask(ctx, task, parquet_path, manifest):
     if path not in files:
         return None
     sizes = {
-        p: ctx._subsample_visible_count(task.get("id"), p) for p in files
+        p: _subsample_eligible_count(ctx, task, p) for p in files
     }
-    n = sizes.get(path, 0)
+    n = ctx._subsample_visible_count(task.get("id"), path)
     k = _subsample_allocate(params, sizes).get(path)
-    if k is None or n <= 0 or k >= n:
+    eligible = _subsample_task_eligible_mask(ctx, task, path)
+    if eligible is not None:
+        eligible = np.asarray(eligible, dtype=bool)
+        if eligible.size != n:
+            eligible = None
+    if k is None:
+        # No sampling method: this module hides nothing.
+        return None
+    if n <= 0:
         return None
     base = ctx._subsample_row_index(task.get("id"), path)
-    if k <= 0:
-        sel = np.zeros(0, dtype=np.int64)
+    if eligible is None:
+        if k >= n:
+            return None
+        if k <= 0:
+            sel = np.zeros(0, dtype=np.int64)
+        else:
+            rng = np.random.default_rng(
+                ctx._subsample_seed(task.get("id"), path)
+            )
+            local = np.sort(rng.permutation(n)[:k]).astype(np.int64)
+            sel = local if base is None else np.asarray(base)[local]
     else:
-        rng = np.random.default_rng(ctx._subsample_seed(task.get("id"), path))
-        local = np.sort(rng.permutation(n)[:k]).astype(np.int64)
+        positions = np.flatnonzero(eligible).astype(np.int64)
+        if k <= 0:
+            local = np.zeros(0, dtype=np.int64)
+        elif k >= positions.size:
+            local = positions
+        else:
+            pick = _stable_sample_selection(
+                eligible, int(k),
+                ctx._subsample_seed(task.get("id"), path),
+            )
+            local = positions if pick is None else positions[pick]
         sel = local if base is None else np.asarray(base)[local]
     xmin = float(manifest["xmin"])
     ymin = float(manifest["ymin"])
@@ -241,7 +683,7 @@ def _subsample_mask_meta(ctx, task, parquet_path, manifest) -> dict:
         stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
     except OSError:
         stat = ""
-    return {
+    meta = {
         "version": 1,
         "stat": stat,
         "upstream": ctx._subsample_sig(task.get("id"), path),
@@ -255,3 +697,10 @@ def _subsample_mask_meta(ctx, task, parquet_path, manifest) -> dict:
         "xmax": float(manifest["xmax"]),
         "ymax": float(manifest["ymax"]),
     }
+    gate_sig = _subsample_filter_sig(ctx, params, path)
+    if gate_sig:
+        meta["gates"] = gate_sig
+    if (params.get("unit") or "points") == "percent":
+        meta["unit"] = "percent"
+        meta["percent"] = params.get("percent")
+    return meta

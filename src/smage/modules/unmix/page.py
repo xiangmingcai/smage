@@ -1127,12 +1127,12 @@ def _unmix_reset_spectrum_source(ctx, page, tree) -> None:
     if not others:
         QMessageBox.information(
             ctx.host,
-            "Re-set spectrum source",
+            "Set other gate as spectrum",
             "This gate tree has no other gates.",
         )
         return
     dialog = QDialog(ctx.host)
-    dialog.setWindowTitle("Re-set spectrum source")
+    dialog.setWindowTitle("Set other gate as spectrum")
     dlg = QVBoxLayout(dialog)
     dlg.addWidget(QLabel("Use another gate as the source of this spectrum:"))
     combo = QComboBox()
@@ -1176,7 +1176,7 @@ def _unmix_spectrum_menu(ctx, page, holder, idx, menu) -> None:
         )
         menu.addAction(act)
     elif spectrum is not None and spectrum.get("gate_id") == gate_id:
-        act = QAction("Re-set as spectrum...", menu)
+        act = QAction("Set other gate as spectrum", menu)
         act.setEnabled(not page._unmix_locked)
         act.triggered.connect(
             lambda _=False: _unmix_reset_spectrum_source(ctx, page, tree)

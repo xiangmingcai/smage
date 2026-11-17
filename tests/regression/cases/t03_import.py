@@ -489,21 +489,56 @@ def page_image_resize() -> None:
         harness.eq(ctx._resize_height.value(), 64)
         harness.check(ctx._resize_keep.isChecked(),
                       "the aspect ratio is kept by default")
+        harness.eq(ctx._resize_width_ratio.value(), 1.00,
+                   "the width ratio starts at the original size")
+        harness.eq(ctx._resize_height_ratio.value(), 1.00,
+                   "the height ratio starts at the original size")
+        harness.eq(ctx._resize_width_ratio.decimals(), 2,
+                   "ratios show two decimals")
+        harness.eq(ctx._resize_width_ratio.minimum(), 0.01)
+        harness.eq(ctx._resize_width_ratio.maximum(), 10.0)
         harness.check(not ctx.sample_combo.isEnabled(),
                       "sampling is disabled for images")
 
         ctx._resize_enabled.setChecked(True)
-        ctx._resize_width.setValue(128)
-        harness.eq(ctx._resize_width.value(), 128,
-                   "enlarging is allowed")
-        harness.eq(ctx._resize_height.value(), 128,
-                   "the height follows the width")
-        ctx._resize_width.setValue(32)
+        ctx._resize_width_ratio.setValue(0.50)
+        harness.eq(ctx._resize_width.value(), 32,
+                   "a width ratio drives the width pixels")
         harness.eq(ctx._resize_height.value(), 32,
-                   "the height follows the width")
+                   "a width ratio drives the height when aspect is kept")
+        harness.eq(ctx._resize_height_ratio.value(), 0.50,
+                   "the height ratio follows the computed height")
+
+        ctx._resize_width.setValue(128)
+        harness.eq(ctx._resize_width_ratio.value(), 2.00,
+                   "width pixels drive the width ratio")
+        harness.eq(ctx._resize_height_ratio.value(), 2.00,
+                   "the height ratio follows the width")
+        harness.check(not ctx._resize_height_ratio.isEnabled(),
+                      "the height ratio is read-only while aspect is kept")
+
+        ctx._resize_keep.setChecked(False)
+        harness.check(ctx._resize_height_ratio.isEnabled(),
+                      "the height ratio is editable without the aspect lock")
+        ctx._resize_height_ratio.setValue(0.25)
+        harness.eq(ctx._resize_height.value(), 16,
+                   "a height ratio drives the height pixels")
+        ctx._resize_width_ratio.setValue(0.50)
+        harness.eq(ctx._resize_width.value(), 32)
+        harness.eq(ctx._resize_height.value(), 16,
+                   "width and height are independent without the lock")
+        ctx._resize_height.setValue(32)
+        harness.eq(ctx._resize_height_ratio.value(), 0.50,
+                   "height pixels drive the height ratio")
+        ctx._resize_keep.setChecked(True)
+        harness.eq(ctx._resize_height.value(), 32,
+                   "the height follows the width again")
+
         settings = ctx._import_files[0]["image_resize"]
         harness.eq(settings["width"], 32)
         harness.eq(settings["height"], 32)
+        harness.check("width_ratio" not in settings,
+                      "ratios are not stored in the project")
 
         # Import just the image.
         window._import_files[1]["checked"] = False
