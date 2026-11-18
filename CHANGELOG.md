@@ -4,6 +4,27 @@ All notable changes to Smage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [0.3.1] — 2026-11-19
+
+### Added
+
+- The spectral and multiplex image workflow guides now embed video
+  walkthroughs for every step.
+- README documents the optional Cellpose, StarDist, FlowSOM and PARC
+  extensions with their versions, repositories and the Python 3.11 note.
+
+### Fixed
+
+- **Feature Up**: **Match** now pairs files by their visible names instead of
+  the stored parquet filename. Imported files are stored as
+  `data/<hash>.parquet`, so the old prefix test never matched; a message now
+  appears when no automatic pairing is possible.
+- **Feature Up**: **Save** now persists the settings and clears the unsaved
+  changes flag (the button called a helper that was not registered on the
+  context).
+- **Feature Up** logs name the mapped output after the visible To file
+  (`sample_mapped.parquet`) instead of the internal hash-based filename.
+
 ## [0.3.0] — 2026-11-18
 
 ### Added

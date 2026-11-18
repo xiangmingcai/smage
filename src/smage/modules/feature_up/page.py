@@ -504,17 +504,41 @@ def _fup_duplicate_names(ctx, page) -> set:
     return dup
 
 
+def _fup_display_core(ctx, path, task_id) -> str:
+    """Display name without a real file extension (``.tif``, ``.fcs``).
+
+    ``Path.stem`` is not usable here: ``raw.ome_Mask`` would lose
+    ``.ome_Mask`` (it looks like a suffix but is part of the sample name).
+    Only strip a short alphanumeric extension.
+    """
+    name = _data_naming._comp_file_name(ctx, path, task_id)
+    suffix = Path(name).suffix
+    if suffix and 1 < len(suffix) <= 6 and suffix[1:].isalnum():
+        return name[: -len(suffix)]
+    return name
+
+
 def _fup_default_to(ctx, page, from_path):
-    """Default pairing: the To file whose stem is the longest prefix."""
-    from_stem = Path(str(from_path)).stem
+    """Default pairing: the To file whose display name is the longest prefix.
+
+    Imported files are stored as ``data/<hash>.parquet``, so the stored file
+    stem says nothing about the sample. Match on the user-visible names
+    instead (``cells.tif`` for a To file, ``cells_Mask`` for a From file).
+    """
+    from_core = _fup_display_core(ctx, from_path, page._fup_task_id)
     best = None
+    best_len = -1
     for to_path in page._fup_params.get("to_files") or []:
         if str(to_path) == str(from_path):
             continue
-        stem = Path(str(to_path)).stem
-        if stem and from_stem.startswith(stem):
-            if best is None or len(Path(str(best)).stem) < len(stem):
-                best = to_path
+        to_core = _fup_display_core(ctx, to_path, page._fup_task_id)
+        if (
+            to_core
+            and from_core.startswith(to_core)
+            and len(to_core) > best_len
+        ):
+            best = to_path
+            best_len = len(to_core)
     return best
 
 
@@ -539,15 +563,28 @@ def _fup_match(ctx, page) -> None:
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+    from_files = params.get("from_files") or []
     matches = {}
-    for from_path in params.get("from_files") or []:
+    for from_path in from_files:
         to_path = _fup_default_to(ctx, page, from_path)
         if to_path is not None:
             matches[from_path] = to_path
     params["matches"] = matches
     _fup_rebuild_matches(ctx, page)
     _fup_mark_dirty(ctx, page)
-    _fup_log(ctx, page, "Matched files.")
+    if matches:
+        _fup_log(
+            ctx, page,
+            f"Matched {len(matches)} of {len(from_files)} From file(s).",
+        )
+    else:
+        message = (
+            "No From file name starts with a To file name.\n\n"
+            "Choose the To file for each row in the Match table, or rename "
+            "the files so the matching names share a prefix."
+        )
+        _fup_log(ctx, page, "No automatic match found.")
+        QMessageBox.information(ctx.host, "Match", message)
 
 
 def _fup_key_values(ctx, task_id, parquet_path, key):
@@ -809,8 +846,12 @@ def _fup_calculate(ctx, page) -> None:
                 ),
             }
             done += 1
+            # The stored output name starts with the To file's hash; show the
+            # name the user knows instead.
+            out_name = f"{Path(name).stem}_mapped.parquet"
             _fup_log(ctx,
-                page, f"✓ {name} → {Path(rel).name} ({len(columns)} channel(s))"
+                page,
+                f"✓ {name} → {out_name} ({len(columns)} channel(s))",
             )
     finally:
         QApplication.restoreOverrideCursor()

@@ -81,6 +81,7 @@ _TARGETS = {
     "_file_nav_row": ("smage.widgets.panels", "_file_nav_row"),
     "_file_record": ("smage.data.files", "_file_record"),
     "_fup_matched_from": ("smage.modules.feature_up.page", "_fup_matched_from"),
+    "_fup_save_now": ("smage.modules.feature_up.page", "_fup_save_now"),
     "_g2c_raster": ("smage.data.outputs", "_g2c_raster"),
     "_gate2col_applied_columns": ("smage.data.feature_outputs", "_gate2col_applied_columns"),
     "_gate2col_column_values": ("smage.data.feature_outputs", "_gate2col_column_values"),

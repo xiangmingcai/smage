@@ -6,7 +6,7 @@ into a common tabular representation and lets you compose analysis pipelines
 from interactive modules — gating, compensation, unmixing, segmentation,
 feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.3.0`; modules and
+> **Status:** early development. The current release is `0.3.1`; modules and
 > file formats may still change between releases.
 
 > **Intended use:** research software, not a medical device. Not for clinical
@@ -17,19 +17,15 @@ feature aggregation, clustering, dimensionality reduction and export.
 **Releases:** <https://github.com/xiangmingcai/smage/releases> ·
 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
-## What's new in 0.3.0
+## What's new in 0.3.1
 
-- **Subsample** can sample inside gates shared by every selected file, with a
-  new **In gates** column and gate-based percentages and allocation.
-- **Data Import** image resize adds linked width/height ratio fields; the
-  target limit is now 200 megapixels or the original image size.
-- **Figure**, **Gating** and **Calculation** axes offer **Manual**,
-  **From scale** and **Auto** ranges, remembered per channel, with a 5 %
-  border so the data no longer touches the axis frame.
-- **Gating** stays empty until **Data files** are selected; the **Scale**
-  preview only lists the selected files.
-- Tooltips stay readable on dark Windows themes, and the Unmix action is now
-  **Set other gate as spectrum**.
+- **Feature Up**: **Match** now pairs files by their visible names, **Save**
+  persists the settings, and the log shows mapped names instead of internal
+  file ids.
+- The **spectral** and **multiplex image workflow** guides now embed video
+  walkthroughs for every step.
+- README lists the optional Cellpose, StarDist, FlowSOM and PARC extensions
+  with their versions and repositories.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -71,7 +67,7 @@ Optional analysis methods run in a separate Python environment created from
 | PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
 
 The Extension Manager installs the current pip release; the versions above
-were current when Smage 0.3.0 was released. Use a **Python 3.11** environment
+were current when Smage 0.3.1 was released. Use a **Python 3.11** environment
 for these extensions, matching the Python version Smage is built with. Each
 environment may need extra packages (for example PyTorch for Cellpose or
 TensorFlow for StarDist) — see the extension's repository for its
@@ -170,7 +166,7 @@ are accepted; commits must be signed off (DCO) — see
 ## Credits
 
 - Author and maintainer: **Xiangming Cai**
-- Advisor: **Juan J. Garcia Vallejo**
+- Advisor: **Dr. Juan J. Garcia Vallejo**
 - Developed at **Amsterdam UMC**, the Netherlands.
 
 See [AUTHORS.md](AUTHORS.md) for the full list and [NOTICE](NOTICE) for the

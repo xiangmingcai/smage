@@ -6,6 +6,15 @@ marker tables and population comparisons.
 
 ## 1. Import the image stack
 
+<div class="video-grid">
+  <div class="video-frame">
+    <iframe src="https://www.youtube-nocookie.com/embed/zzpiDxgE824" title="Import the image stack (part 1)" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+  </div>
+  <div class="video-frame">
+    <iframe src="https://www.youtube-nocookie.com/embed/gIVv938QoZY" title="Import the image stack (part 2)" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+  </div>
+</div>
+
 1. `File → New Project…`.
 2. In **Data Import**, add the OME-TIFF or multi-page TIFF containing all
    marker channels.
@@ -36,6 +45,10 @@ aggregation.
 
 ## 3. Calculate channels for segmentation
 
+<div class="video-frame">
+  <iframe src="https://www.youtube-nocookie.com/embed/KkN88UF3ph8" title="Calculate channels for segmentation" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+</div>
+
 Use the **Calculation** module to build an input channel that is easier to
 segment than any raw channel, for example:
 
@@ -49,7 +62,11 @@ to disk, and the new channels are available to Segmentation, Region, Feature
 Down and Figure. A row can be limited to a subset of files and hidden from
 downstream modules while still feeding later rows.
 
-## 4. Segment nuclei and cells
+## 4. Segment cells
+
+<div class="video-frame">
+  <iframe src="https://www.youtube-nocookie.com/embed/UA55CXn2jAM" title="Segment cells" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+</div>
 
 1. Add a **Segmentation** module.
 2. Choose **Nuclear Expansion**, **StarDist**, **Cellpose GPU/CPU** or
@@ -63,6 +80,10 @@ The mask is a label channel: every segmented object has a unique integer.
 Downstream modules use it as the **Feature channel** (the object identifier).
 
 ## 5. Optional: tissue Regions
+
+<div class="video-frame">
+  <iframe src="https://www.youtube-nocookie.com/embed/hcajLI3rZJM" title="Optional: tissue Regions" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+</div>
 
 For compartments such as tumour, stroma or perivascular space, add a
 **Region** module:
@@ -78,6 +99,10 @@ Add **Region Size** when the pixel area of a compartment per file is needed.
 
 ## 6. Aggregate marker intensities per object
 
+<div class="video-frame">
+  <iframe src="https://www.youtube-nocookie.com/embed/RUqDa3ZN38o" title="Aggregate marker intensities per object" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+</div>
+
 1. Add **Feature Down** and set **Feature channel** to the mask column.
 2. Add one rule per marker (for example `Mean` of `CD8`, `Median` of `PD1`).
 3. Check **Background ignore** so the background label is excluded.
@@ -87,6 +112,10 @@ The feature table is the input for clustering, dimension reduction and
 heatmaps.
 
 ## 7. Gate populations
+
+<div class="video-frame">
+  <iframe src="https://www.youtube-nocookie.com/embed/ruhREiNVGj8" title="Gate populations" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+</div>
 
 After Feature Down, the table has one row per object. Add a **Gating** module
 to define cell types on marker intensities:
@@ -104,6 +133,18 @@ aggregation and export.
 
 ## 8. Explore and compare
 
+<div class="video-grid">
+  <div class="video-frame">
+    <iframe src="https://www.youtube-nocookie.com/embed/kdmgPvIxVbY" title="Explore and compare (part 1)" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+  </div>
+  <div class="video-frame">
+    <iframe src="https://www.youtube-nocookie.com/embed/qk0PCVgEfcA" title="Explore and compare (part 2)" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+  </div>
+  <div class="video-frame">
+    <iframe src="https://www.youtube-nocookie.com/embed/KkN88UF3ph8" title="Explore and compare (part 3)" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+  </div>
+</div>
+
 - **Cluster** to group cells by marker expression.
 - **Dimensionality Reduction** (UMAP or t-SNE) to embed the same features.
 - **Heatmap** for a clustered marker × population view.
@@ -116,6 +157,10 @@ Use **Subsample** above the clustering modules when a file has millions of
 pixels or objects.
 
 ## 9. Export
+
+<div class="video-frame">
+  <iframe src="https://www.youtube-nocookie.com/embed/_uMRT2gWi3E" title="Export" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+</div>
 
 Add an **Export** module to write the feature tables (CSV/parquet) or the
 figures. The project folder keeps every module setting, so the analysis can

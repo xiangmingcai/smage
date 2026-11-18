@@ -6,15 +6,18 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QFileDialog,
     QLineEdit,
     QMenu,
+    QPushButton,
     QTableWidget,
+    QToolTip,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -804,6 +807,54 @@ def save_plot_as() -> None:
             {path.name for path in out_dir.iterdir()}, before,
             "cancelling Save as… leaves no file",
         )
+    finally:
+        _close(window)
+
+
+@harness.case(
+    "mod.figure.color_tooltip", "L4", "figure", tags=("fast",)
+)
+def colour_swatch_tooltip_stays_light() -> None:
+    """The mixed-colour swatch keeps the light tooltip palette."""
+    window, _project, page = _open("figure_colour_tooltip")
+    try:
+        ctx = window._ctx
+        for _ in range(2):
+            _figure_page._figure_add_plot(ctx, page, "scatter")
+            harness.pump(200)
+        plots = page._fig_plots
+        for index, colour in enumerate(((255, 0, 0), (0, 0, 255))):
+            plots[index]["color_mode"] = "solid"
+            plots[index]["solid_color"] = colour
+            _figure_page._figure_apply_change(ctx, page, index, plots[index])
+        _figure_page._figure_set_selection(ctx, page, [0, 1])
+        harness.pump(250)
+
+        host = page._fig_settings_layout.parentWidget()
+        buttons = [
+            button for button in host.findChildren(QPushButton)
+            if button.toolTip() == "Colors differ"
+        ]
+        harness.check(bool(buttons), "the mixed-colour swatch is shown")
+        button = buttons[0]
+        QToolTip.showText(QPoint(10, 10), button.toolTip(), button)
+        QApplication.processEvents()
+        tip = next(
+            (
+                child for child in QApplication.allWidgets()
+                if child.metaObject().className() == "QTipLabel"
+            ),
+            None,
+        )
+        harness.check(tip is not None, "the swatch tooltip is shown")
+        if tip is not None:
+            colour = QColor(tip.palette().color(QPalette.ColorRole.Window))
+            harness.check(
+                colour.lightness() >= 200,
+                f"tooltip background is light: {colour.name()}",
+            )
+        QToolTip.hideText()
+        QApplication.processEvents()
     finally:
         _close(window)
 

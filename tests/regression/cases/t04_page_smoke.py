@@ -113,5 +113,62 @@ def open_import_page() -> None:
     harness.eq(window.tabs.count(), 1, "Data Import page did not close")
 
 
+@harness.case("pages.tooltips_light", "L4", "shell", tags=("fast",))
+def tooltips_keep_light_palette() -> None:
+    """Every visible tooltip in the module pages uses a light background."""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QColor, QPalette
+    from PySide6.QtWidgets import QApplication, QToolTip, QWidget
+
+    state = _setup()
+    window = state["window"]
+    checked = 0
+    for task_type in TYPES:
+        task_id = state["ids"][task_type]
+        window._open_module(task_id, task_type, task_type.title())
+        harness.pump(350)
+        page = window.tabs.currentWidget()
+        try:
+            widgets = [
+                widget for widget in page.findChildren(QWidget)
+                if widget.toolTip() and widget.isVisible()
+            ]
+            for widget in widgets:
+                QToolTip.showText(
+                    QPoint(10, 10), widget.toolTip(), widget
+                )
+                QApplication.processEvents()
+                tip = next(
+                    (
+                        child for child in QApplication.allWidgets()
+                        if child.metaObject().className() == "QTipLabel"
+                    ),
+                    None,
+                )
+                harness.check(
+                    tip is not None,
+                    f"{task_type}: tooltip not shown for "
+                    f"{widget.toolTip()!r}",
+                )
+                if tip is not None:
+                    color = QColor(
+                        tip.palette().color(QPalette.ColorRole.Window)
+                    )
+                    harness.check(
+                        color.lightness() >= 200,
+                        f"{task_type}: dark tooltip {color.name()} for "
+                        f"{widget.toolTip()!r}",
+                    )
+                checked += 1
+                QToolTip.hideText()
+                QApplication.processEvents()
+        finally:
+            window._close_module_page(page)
+            harness.pump(100)
+    harness.check(
+        checked >= 20, f"only {checked} tooltips were checked"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(harness.main())

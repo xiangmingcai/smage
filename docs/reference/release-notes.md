@@ -3,6 +3,18 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.3.1 — 2026-11-19
+
+- **Feature Up**: **Match** pairs files by their visible names, **Save**
+  persists the settings, and the log shows mapped names instead of internal
+  file ids.
+- The spectral and multiplex image workflow guides embed video walkthroughs
+  for every step.
+- README documents the optional Cellpose, StarDist, FlowSOM and PARC
+  extensions, including their Python 3.11 requirement.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.3.0 — 2026-11-18
 
 Third release.

@@ -2,16 +2,12 @@
 
 ## Highlights
 
-- **Subsample** can sample inside gates shared by every selected file, with an
-  **In gates** column and gate-based percentages and allocation.
-- **Data Import** image resize adds linked width/height ratio fields and allows
-  up to 200 megapixels or the original image size.
-- **Figure**, **Gating** and **Calculation** axes offer **Manual**,
-  **From scale** and **Auto** ranges, remembered per channel, with a 5 %
-  border around the data.
-- **Gating** waits for a Data files selection, and the **Scale** preview only
-  offers the selected files.
-- Light, readable tooltips in every settings panel and colour swatch.
+- **Feature Up Match** pairs files by their visible names, **Save** persists
+  the settings, and the log shows mapped names instead of internal file ids.
+- The spectral and multiplex image workflow guides now embed video
+  walkthroughs for every step.
+- README lists the optional Cellpose, StarDist, FlowSOM and PARC extensions
+  with their versions and repositories.
 
 ## Downloads
 

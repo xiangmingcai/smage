@@ -113,5 +113,146 @@ def validation() -> None:
         _close(window)
 
 
+@harness.case("mod.feature_up.match", "L4", "feature_up", tags=("fast",))
+def match_uses_display_names() -> None:
+    """Match pairs hashed To parquet files by their visible names."""
+    project = harness.new_project("feature_up_match", rows=4)
+    to_path = project.data_dir / "4ffec2de1d4b41409aa5364df06e3889.parquet"
+    from_path = project.data_dir / "raw_sample.ome_Mask.parquet"
+    pd.DataFrame({
+        "cell": np.arange(1, 5, dtype="int32"),
+        "x": np.arange(1, 5, dtype="int32"),
+        "y": np.arange(1, 5, dtype="int32"),
+    }).to_parquet(to_path, index=False)
+    pd.DataFrame({
+        "cell": np.arange(1, 5, dtype="int32"),
+        "area": np.arange(1, 5, dtype="float64"),
+    }).to_parquet(from_path, index=False)
+    columns = project.load_columns()
+    columns[to_path.name] = ["cell", "x", "y"]
+    columns[from_path.name] = ["cell", "area"]
+    project.save_columns(columns)
+    project.workflow["tasks"][0]["params"]["processed"].extend([
+        {"name": "raw_sample.ome.tiff", "source": "C:/data/sample.tiff",
+         "parquet": str(to_path), "rows": 4},
+        {"name": "raw_sample.ome_Mask", "source": "C:/data/sample_Mask",
+         "parquet": str(from_path), "rows": 4},
+    ])
+    task = harness.task_def(
+        "feature_up", task_id="fup-match", name="Feature Up",
+        params={
+            "from_files": [str(from_path)],
+            "to_files": [str(to_path)],
+            "key_from": "cell",
+            "key_to": "cell",
+            "features": [{"source": "area", "name": "area"}],
+        },
+    )
+    project.workflow["tasks"][0]["children"].append(task)
+    project.save()
+
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("fup-match", "feature_up", "Feature Up")
+    harness.pump(300)
+    try:
+        ctx = window._ctx
+        page = window.tabs.currentWidget()
+        # The stored To stem is a hash; the display name is what matches.
+        harness.check(
+            not Path(str(to_path)).stem.startswith("raw_sample"),
+            "the To parquet uses an opaque name",
+        )
+        from smage.data import naming as _data_naming
+
+        harness.eq(
+            _data_naming._comp_file_name(ctx, str(to_path), "fup-match"),
+            "raw_sample.ome.tiff",
+            "the To display name comes from its record",
+        )
+        harness.eq(
+            _data_naming._comp_file_name(ctx, str(from_path), "fup-match"),
+            "raw_sample.ome_Mask",
+            "the From display name comes from its record",
+        )
+        harness.eq(page._fup_params.get("key_from"), "cell")
+        harness.eq(page._fup_params.get("key_to"), "cell")
+        harness.eq(
+            page._fup_params.get("from_files"), [str(from_path)],
+            "the From selection survives opening",
+        )
+        harness.eq(
+            page._fup_params.get("to_files"), [str(to_path)],
+            "the To selection survives opening",
+        )
+        harness.check(
+            feature_up_page._fup_display_core(
+                ctx, str(from_path), "fup-match"
+            ).startswith(
+                feature_up_page._fup_display_core(
+                    ctx, str(to_path), "fup-match"
+                )
+            ),
+            "the sample names share a prefix",
+        )
+        harness.eq(
+            feature_up_page._fup_default_to(ctx, page, str(from_path)),
+            str(to_path),
+            "the display-name prefix pairs the files",
+        )
+        with harness.patch_dialogs(
+            feature_up_page, information=QMessageBox.StandardButton.Ok
+        ):
+            feature_up_page._fup_match(ctx, page)
+        harness.eq(
+            page._fup_params.get("matches", {}).get(str(from_path)),
+            str(to_path),
+        )
+
+        with harness.patch_dialogs(
+            feature_up_page,
+            information=QMessageBox.StandardButton.Ok,
+            question=QMessageBox.StandardButton.Yes,
+        ):
+            feature_up_page._fup_calculate(ctx, page)
+        mapped = [
+            line for line in page._fup_log_lines
+            if "mapped.parquet" in line
+        ]
+        harness.check(mapped, "a per-file mapping line was logged")
+        last = mapped[-1] if mapped else ""
+        harness.check(
+            "raw_sample.ome_mapped.parquet" in last,
+            f"the log uses the display name: {last}",
+        )
+        harness.check(
+            Path(str(to_path)).stem not in last,
+            f"the internal file id is hidden: {last}",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.feature_up.save", "L4", "feature_up", tags=("fast",))
+def save_clears_dirty() -> None:
+    """The Save button persists the settings and clears the dirty flag."""
+    window, project, page, _to_path = _open("feature_up_save")
+    try:
+        ctx = window._ctx
+        page._fup_params["key_from"] = "cell"
+        feature_up_page._fup_mark_dirty(ctx, page)
+        harness.check(page._fup_dirty, "the edit marks the module dirty")
+        page._fup_save_btn.click()
+        harness.pump(150)
+        harness.check(not page._fup_dirty, "Save clears the dirty flag")
+        from smage.project import Project
+
+        saved = Project.load(project.path)
+        task = saved.workflow["tasks"][0]["children"][0]
+        harness.eq(task["params"]["key_from"], "cell")
+    finally:
+        _close(window)
+
+
 if __name__ == "__main__":
     raise SystemExit(harness.main())
