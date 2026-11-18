@@ -1231,9 +1231,17 @@ def _heatmap_params_panel(ctx, page) -> QWidget:
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setStyleSheet("background: transparent;")
+    # Scoped selectors keep the transparent rule from reaching QToolTip,
+    # whose palette would otherwise turn black.
+    scroll.setObjectName("heatmapSettingsScroll")
+    scroll.setStyleSheet(
+        "QScrollArea#heatmapSettingsScroll { background: transparent; }"
+    )
     host = QWidget()
-    host.setStyleSheet("background: transparent;")
+    host.setObjectName("heatmapSettingsHost")
+    host.setStyleSheet(
+        "QWidget#heatmapSettingsHost { background: transparent; }"
+    )
     form = QVBoxLayout(host)
     form.setContentsMargins(0, 0, 0, 0)
     form.setSpacing(6)

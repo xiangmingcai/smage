@@ -992,9 +992,17 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setStyleSheet("background: transparent;")
+    # Scoped selectors keep the transparent rule from reaching QToolTip,
+    # whose palette would otherwise turn black.
+    scroll.setObjectName("illumSettingsScroll")
+    scroll.setStyleSheet(
+        "QScrollArea#illumSettingsScroll { background: transparent; }"
+    )
     host = QWidget()
-    host.setStyleSheet("background: transparent;")
+    host.setObjectName("illumSettingsHost")
+    host.setStyleSheet(
+        "QWidget#illumSettingsHost { background: transparent; }"
+    )
     settings = QVBoxLayout(host)
     settings.setContentsMargins(0, 0, 0, 0)
     settings.setSpacing(6)
@@ -1053,7 +1061,10 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
     # Image display levels (Min/Max, signal histogram, Auto set). The same
     # bounds drive the Before and After plots, which share `plot_dict`.
     levels_host = QWidget()
-    levels_host.setStyleSheet("background: transparent;")
+    levels_host.setObjectName("illumLevelsHost")
+    levels_host.setStyleSheet(
+        "QWidget#illumLevelsHost { background: transparent; }"
+    )
     levels_lay = QVBoxLayout(levels_host)
     levels_lay.setContentsMargins(0, 0, 0, 0)
     levels_lay.setSpacing(6)

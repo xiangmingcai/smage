@@ -409,10 +409,9 @@ def _gating_refresh_files(ctx, page) -> None:
     """Fill the left 'Data files' list and the right File combo's scope."""
     if not getattr(page, "_gating_uses_store", False):
         return
+    records = _data_files._available_files(ctx, page._gating_task_id)
     # Drop selected files that are no longer visible (hidden/renamed).
-    visible = {
-        rec.get("parquet") for rec in _data_files._available_files(ctx, page._gating_task_id)
-    }
+    visible = {rec.get("parquet") for rec in records}
     page._gating_files = [p for p in (page._gating_files or []) if p in visible]
     box = getattr(page, "_gating_files_box", None)
     if box is not None:
@@ -431,23 +430,112 @@ def _gating_refresh_files(ctx, page) -> None:
     count = getattr(page, "_gating_files_count", None)
     if count is not None:
         count.setText(f"{len(page._gating_files)} file(s) selected")
-    # The preview file must be one of the selected files.
+    # The preview shows a selected file; without a selection it stays empty.
     preview = page._gating_preview
-    if preview.get("file") not in page._gating_files and page._gating_files:
+    if not page._gating_files:
+        _gating_clear_preview_file(preview)
+        page._gating_settings_x = None
+        page._gating_settings_y = None
+        return
+    if preview.get("file") not in page._gating_files:
         rec = next(
-            (r for r in _data_files._available_files(ctx, page._gating_task_id)
-             if r.get("parquet") == page._gating_files[0]), None
+            (r for r in records if r.get("parquet") == page._gating_files[0]),
+            None,
         )
         if rec is not None:
-            cols = _data_columns._columns_for(ctx,
-                rec.get("parquet"), page._gating_task_id
-            )
-            preview["file"] = rec.get("parquet")
-            preview["file_name"] = rec.get("name")
-            if preview.get("x") not in cols:
-                preview["x"] = None
-            if preview.get("y") not in cols:
-                preview["y"] = None
+            _gating_set_preview_file(ctx, page, preview, rec)
+        return
+    _gating_ensure_preview_axes(ctx, page, preview)
+
+
+def _gating_first_channels(cols) -> tuple:
+    """The first two non-pixel columns of a file (pixel x/y are skipped)."""
+    usable = [c for c in cols if c not in ("x", "y")] or list(cols)
+    x = usable[0] if usable else None
+    y = usable[1] if len(usable) > 1 else x
+    return x, y
+
+
+def _gating_clear_preview_file(preview) -> None:
+    """Forget the preview file and axes when no files are selected."""
+    if (
+        preview.get("file") is None
+        and preview.get("x") is None
+        and preview.get("y") is None
+    ):
+        return
+    # Store the outgoing channels' own range records before they are lost.
+    if preview.get("type") != "image":
+        _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+        _widgets_plot_renderer._figure_sync_range_record(preview, "y")
+    preview["file"] = None
+    preview["file_name"] = None
+    preview["x"] = None
+    preview["y"] = None
+    preview["last_x"] = None
+    preview["last_y"] = None
+    if preview.get("type") == "image":
+        preview["image_channel"] = None
+
+
+def _gating_set_preview_file(ctx, page, preview, rec) -> None:
+    """Open `rec` in the preview, with its first two channels as axes."""
+    parquet = rec.get("parquet")
+    cols = _data_columns._columns_for(ctx, parquet, page._gating_task_id)
+    if preview.get("type") != "image":
+        _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+        _widgets_plot_renderer._figure_sync_range_record(preview, "y")
+    preview["file"] = parquet
+    preview["file_name"] = rec.get("name")
+    if preview.get("type") == "image":
+        preview["x"] = "x" if "x" in cols else None
+        preview["y"] = "y" if "y" in cols else None
+        channels = [c for c in cols if c not in ("x", "y")]
+        preview["image_channel"] = channels[0] if channels else None
+    else:
+        x, y = _gating_first_channels(cols)
+        preview["x"] = x
+        preview["last_x"] = x
+        preview["last_y"] = y
+        preview["y"] = None if preview.get("type") == "histogram" else y
+        _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+        _widgets_plot_renderer._figure_sync_range_record(preview, "y")
+    page._gating_settings_x = preview.get("x")
+    page._gating_settings_y = preview.get("y")
+
+
+def _gating_ensure_preview_axes(ctx, page, preview) -> None:
+    """Fill in missing axes of the kept preview file (never resets them)."""
+    rec = _widgets_plot_renderer._figure_record(ctx, preview.get("file"))
+    if rec is None:
+        return
+    cols = _data_columns._columns_for(
+        ctx, rec.get("parquet"), page._gating_task_id
+    )
+    if preview.get("type") == "image":
+        if preview.get("x") not in cols:
+            preview["x"] = "x" if "x" in cols else None
+        if preview.get("y") not in cols:
+            preview["y"] = "y" if "y" in cols else None
+        channels = [c for c in cols if c not in ("x", "y")]
+        if preview.get("image_channel") not in channels:
+            preview["image_channel"] = channels[0] if channels else None
+        return
+    if preview.get("x") in cols and (
+        preview.get("type") == "histogram" or preview.get("y") in cols
+    ):
+        return
+    _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+    _widgets_plot_renderer._figure_sync_range_record(preview, "y")
+    x, y = _gating_first_channels(cols)
+    preview["x"] = x
+    preview["last_x"] = x
+    preview["last_y"] = y
+    preview["y"] = None if preview.get("type") == "histogram" else y
+    _widgets_plot_renderer._figure_sync_range_record(preview, "x")
+    _widgets_plot_renderer._figure_sync_range_record(preview, "y")
+    page._gating_settings_x = preview.get("x")
+    page._gating_settings_y = preview.get("y")
 
 
 def _gating_select_files(ctx, page) -> None:
@@ -472,6 +560,10 @@ def _gating_select_files(ctx, page) -> None:
             f: g for f, g in overrides.items() if f in drop
         }
     _gating_refresh_files(ctx, page)
+    _gating_update_tools(ctx, page)
+    _gating_reload_rois(ctx, page)
+    _widgets_gate_editor_editor._gating_render(ctx, page)
+    _gating_update_roi_visibility(ctx, page)
     _widgets_gate_editor_editor._gating_rebuild_settings(ctx, page)
     _gating_mark_dirty(ctx, page)
 
@@ -530,6 +622,7 @@ def _gating_set_tool(ctx, page, tool) -> None:
 def _gating_update_tools(ctx, page) -> None:
     """Enable only the gate tools that make sense for the current plot type."""
     ptype = page._gating_preview.get("type", "scatter")
+    has_file = bool(page._gating_preview.get("file"))
     allowed = {
         "scatter": ("rect", "ellipse", "polygon", "quadrant",
                     "skewed_quadrant", "split", "range"),
@@ -537,8 +630,11 @@ def _gating_update_tools(ctx, page) -> None:
         "histogram": ("range", "split"),
     }.get(ptype, ())
     for key, btn in page._gating_tool_buttons.items():
-        btn.setEnabled(key in allowed and not page._gating_locked)
-    if page._gating_tool not in allowed:
+        btn.setEnabled(has_file and key in allowed and not page._gating_locked)
+    col2gate_btn = getattr(page, "_gating_col2gate_btn", None)
+    if col2gate_btn is not None:
+        col2gate_btn.setEnabled(has_file and not page._gating_locked)
+    if not has_file or page._gating_tool not in allowed:
         _gating_set_tool(ctx, page, None)
 
 
@@ -3299,9 +3395,13 @@ def _gating_pick_gate_color(ctx, page, button=None) -> None:
         return
     preview["gate_color"] = chosen.name()
     if button is not None:
+        # Scoped: a bare background rule also styles QToolTip and would
+        # replace its white palette with the chosen colour.
+        button.setObjectName("gateColorButton")
         button.setStyleSheet(
+            f"QPushButton#gateColorButton {{ "
             f"background-color: {chosen.name()}; "
-            "border: 1px solid #6b7785; border-radius: 3px;"
+            "border: 1px solid #6b7785; border-radius: 3px; }"
         )
     _gating_apply_gate_color(ctx, page)
     _gating_mark_dirty(ctx, page)

@@ -35,6 +35,12 @@ A multi-plot **Manual** range is entered in original units and converted
 through each channel's own Scale transform, so a value such as 0–10000 means
 the same thing on a linear, log10 or arcsinh channel.
 
+Every mode leaves a border: the active Min/Max sit at 5 % and 95 % of the
+visible axis, so points, bars and curves do not touch the frame. The saved
+and displayed Min/Max are unchanged; the margin is applied to the view only.
+Histogram count axes follow the same rule, so their bottom edge is slightly
+below zero. Image plots keep their exact pixel extent.
+
 ## Multiple plots
 
 A Figure module can hold several plots; each has its own settings and its own

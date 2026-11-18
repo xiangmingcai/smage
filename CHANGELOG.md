@@ -4,7 +4,7 @@ All notable changes to Smage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] — 2026-11-18
 
 ### Added
 
@@ -22,6 +22,23 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Changed
 
+- **Scale**: the preview's **File** list now offers only the files chosen in
+  **Data files**, so the preview always shows the module's changes. The first
+  selected file opens automatically; deselecting the current file switches to
+  the first remaining one, and clearing the selection returns the preview to
+  an empty state with a **Select data files to start.** hint.
+- **Gating**: a new module no longer draws the first available file. The plot
+  stays empty with a **Select data files to start.** hint, and the gate tools
+  and Col2Gate are disabled until files are chosen. Selecting files opens the
+  first one with its first two channels as X and Y. The preview keeps the
+  current file while it remains selected, and returns to the empty state if
+  the selection is cleared.
+- **Plots**: scatter, overlay and histogram views keep a 5 % border, so the
+  active Min/Max sit at 5 % and 95 % of the visible axis instead of on the
+  frame. This applies to every range mode and to the Gating, Calculation and
+  other previews. Saved and displayed Min/Max are unchanged; image plots keep
+  their exact pixel extent. Histogram count axes follow the same rule, so the
+  bottom of the axis is slightly below zero.
 - **Figure**: plot X/Y ranges now have **Manual**, **From scale** and **Auto**
   modes. From scale (the default) uses the nearest upstream Scale that sets
   both Min and Max, and falls back to Auto when no Scale does; Auto uses the
@@ -39,6 +56,15 @@ All notable changes to Smage are recorded here. The format follows
 
 ### Fixed
 
+- **Tooltips** inside transparent settings panels no longer fall back to the
+  dark Windows tooltip. The containers' bare `background: transparent;` rules
+  (Data Import's Parameter panel, Figure, Scale, Heatmap, Illumination,
+  Region, Subsample, Unmix and Gating settings) are now scoped to the
+  container with an object name, so they no longer override QToolTip's
+  palette. Colour swatches with tooltips (the Gating **Gate color** button
+  and Figure's **Colors differ** button) use the same scoped rule, so their
+  tooltips stay light too. The light tooltip rule is kept in the shared
+  `TOOLTIP_QSS` constant.
 - **Figure multi-selection Manual ranges** are now entered in original units
   and converted through each channel's Scale transform. Previously a value
   such as 10000 was stored as a plot unit, which made arcsinh/log10 axes show

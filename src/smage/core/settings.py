@@ -115,8 +115,17 @@ def _setting(section: str, key: str, default=None):
     return (_global_settings().get(section) or {}).get(key, default)
 
 
-APP_STYLE = """
-QToolTip { background-color: #ffffff; color: #2c3a48; border: 1px solid #c9d3df; padding: 4px 6px; }
+# The app's light tooltip look, shared by the application sheet and the few
+# widgets that need a local QToolTip rule (for example combos inside settings
+# panels). A bare "background: transparent" stylesheet must never be used on a
+# tooltip's ancestor: it also matches QToolTip and turns its palette black.
+# Scope such rules to the container with an object name instead.
+TOOLTIP_QSS = (
+    "QToolTip { background-color: #ffffff; color: #2c3a48; "
+    "border: 1px solid #c9d3df; padding: 4px 6px; }"
+)
+
+APP_STYLE = TOOLTIP_QSS + """
 QMainWindow { background: #f5f8fb; }
 
 /* menu bar */

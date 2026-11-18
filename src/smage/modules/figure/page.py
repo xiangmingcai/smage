@@ -67,6 +67,7 @@ from smage.core.scale_math import (
     _round_value_candidates,
 )
 from smage.core.settings import (
+    TOOLTIP_QSS,
     _debug_log,
     _default_palette,
     _log_exception,
@@ -672,9 +673,17 @@ def _build_figure_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setStyleSheet("background: transparent;")
+    # Scoped selectors keep the transparent rule from reaching QToolTip,
+    # whose palette would otherwise turn black.
+    scroll.setObjectName("figureSettingsScroll")
+    scroll.setStyleSheet(
+        "QScrollArea#figureSettingsScroll { background: transparent; }"
+    )
     host = QWidget()
-    host.setStyleSheet("background: transparent;")
+    host.setObjectName("figureSettingsHost")
+    host.setStyleSheet(
+        "QWidget#figureSettingsHost { background: transparent; }"
+    )
     settings_layout = QVBoxLayout(host)
     settings_layout.setContentsMargins(0, 0, 0, 0)
     settings_layout.setSpacing(6)
@@ -2612,16 +2621,21 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
         btn.setFixedSize(36, 20)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setEnabled(enabled)
+        # Scoped: a bare background rule also styles QToolTip and would
+        # replace its white palette with the swatch colour.
+        btn.setObjectName("figureColorButton")
         if cur is _MIXED:
             btn.setStyleSheet(
+                "QPushButton#figureColorButton { "
                 "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
-                "stop:0 #cccccc, stop:1 #999999); border: 1px solid #555;"
+                "stop:0 #cccccc, stop:1 #999999); border: 1px solid #555; }"
             )
             btn.setToolTip("Colors differ")
         else:
             btn.setStyleSheet(
+                "QPushButton#figureColorButton { "
                 f"background-color: rgb({cur[0]},{cur[1]},{cur[2]}); "
-                "border: 1px solid #555;"
+                "border: 1px solid #555; }"
             )
 
         def on_pick(_=False):
@@ -2630,8 +2644,9 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
                 rgb = (chosen.red(), chosen.green(), chosen.blue())
                 apply(ps, key, rgb)
                 btn.setStyleSheet(
+                    "QPushButton#figureColorButton { "
                     f"background-color: rgb({rgb[0]},{rgb[1]},{rgb[2]}); "
-                    "border: 1px solid #555;"
+                    "border: 1px solid #555; }"
                 )
                 _figure_apply_change_multi(ctx, page)
 
@@ -2730,10 +2745,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
             combo.setCurrentIndex(max(0, combo.findData(mode)))
         combo.setEnabled(enabled)
         combo.setMinimumWidth(104)
-        combo.setStyleSheet(
-            "QToolTip { background-color: #ffffff; color: #2c3a48; "
-            "border: 1px solid #c9d3df; padding: 4px 6px; }"
-        )
+        combo.setStyleSheet(TOOLTIP_QSS)
 
         def axis_configs(p):
             return _widgets_plot_renderer._figure_axis_scale_configs(
@@ -3354,8 +3366,7 @@ def _figure_overlay_settings(ctx, layout, plot_dict, plot_widget, enabled, on_ch
         "QTableWidget::item:hover { background: #f0f7fe; }"
         "QHeaderView::section { background: #f5f8fb; color: #2c3a48; "
         "border: none; padding: 2px 4px; }"
-        "QToolTip { background-color: #ffffff; color: #2c3a48; "
-        "border: 1px solid #c9d3df; }"
+        + TOOLTIP_QSS
     )
     table.setMinimumHeight(110)
     table.setMaximumHeight(220)

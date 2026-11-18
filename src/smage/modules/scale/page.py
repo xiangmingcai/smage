@@ -92,6 +92,18 @@ def _scaling_union_columns(ctx, page) -> list:
     return sorted(columns)
 
 
+def _scaling_selected_records(ctx, page) -> list:
+    """Available file records of the Data files selection, in its order."""
+    by_path = {
+        str(rec.get("parquet")): rec
+        for rec in _data_files._available_files(ctx, page._scaling_task_id)
+    }
+    return [
+        by_path[str(path)] for path in (page._scaling_files or [])
+        if str(path) in by_path
+    ]
+
+
 def _scaling_visible_configs(ctx, page) -> list:
     """Configs whose column exists in at least one selected file."""
     visible = set(_scaling_union_columns(ctx, page))
@@ -174,6 +186,7 @@ def _scaling_rebuild_visible(ctx, page) -> None:
     page._scaling_rows = _scaling_visible_configs(ctx, page)
     _scaling_populate_table(ctx, page)
     _scaling_rebuild_apply_list(ctx, page)
+    _scaling_sync_preview_file(ctx, page)
     _scaling_render_preview(ctx, page)
     _scaling_rebuild_settings(ctx, page)
 
@@ -442,8 +455,9 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
 
     # Build the preview config first so the plot widget's A/F buttons can
     # bind to it (same dict object is mutated in place later).
-    records = _data_files._available_files(ctx, task_def.get("id"))
-    rec = records[0] if records else None
+    # The preview may only show files the Data files panel selected.
+    selected_records = _scaling_selected_records(ctx, page)
+    rec = selected_records[0] if selected_records else None
     cols = _data_columns._columns_for(ctx,
         rec.get("parquet"), task_def.get("id")
     ) if rec else []
@@ -523,9 +537,17 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     settings_scroll = QScrollArea()
     settings_scroll.setWidgetResizable(True)
     settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-    settings_scroll.setStyleSheet("background: transparent;")
+    # Scoped selectors keep the transparent rule from reaching QToolTip,
+    # whose palette would otherwise turn black.
+    settings_scroll.setObjectName("scaleSettingsScroll")
+    settings_scroll.setStyleSheet(
+        "QScrollArea#scaleSettingsScroll { background: transparent; }"
+    )
     settings_host = QWidget()
-    settings_host.setStyleSheet("background: transparent;")
+    settings_host.setObjectName("scaleSettingsHost")
+    settings_host.setStyleSheet(
+        "QWidget#scaleSettingsHost { background: transparent; }"
+    )
     settings_layout = QVBoxLayout(settings_host)
     settings_layout.setContentsMargins(0, 0, 0, 0)
     settings_layout.setSpacing(6)
@@ -559,6 +581,12 @@ def _build_scaling_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     _scaling_rebuild_apply_list(ctx, page)
     table.itemSelectionChanged.connect(lambda: _scaling_on_selection(ctx, page))
     _scaling_on_selection(ctx, page)
+    if not _scaling_visible_configs(ctx, page):
+        # No selected files: show the empty-state hint and build the settings
+        # (the File combo and parameters stay disabled).
+        _scaling_sync_preview_file(ctx, page)
+        _scaling_render_preview(ctx, page)
+        _scaling_rebuild_settings(ctx, page)
     return page
 
 
@@ -763,6 +791,13 @@ def _scaling_autofill_minmax(ctx, page, row_idx) -> None:
 
 def _scaling_render_preview(ctx, page) -> None:
     preview = page._scaling_preview
+    if page._scaling_files:
+        _scaling_sync_preview_file(ctx, page)
+    if not page._scaling_files or preview.get("file") is None:
+        page._scaling_plot_widget.clear()
+        page._scaling_overlay_box.setText("Select data files to start.")
+        page._scaling_overlay.show()
+        return
     rec = _widgets_plot_renderer._figure_record(ctx, preview.get("file"))
     cols = _data_columns._columns_for(ctx,
         rec.get("parquet"), page._scaling_task_id
@@ -850,8 +885,8 @@ def _scaling_render_preview(ctx, page) -> None:
     )
 
 
-def _scaling_set_preview_file(ctx, page, file_path, file_name=None) -> None:
-    """Point the preview at another file, keeping the axis/channel choices.
+def _scaling_apply_preview_file(ctx, page, file_path, file_name=None) -> None:
+    """Point the preview at a file, keeping existing axis/channel choices.
 
     Switching files used to reset X/Y and the image channel to the new
     file's first columns, which also discarded the per-column min/max the
@@ -886,6 +921,45 @@ def _scaling_set_preview_file(ctx, page, file_path, file_name=None) -> None:
     # parameters.
     preview["image_min"] = None
     preview["image_max"] = None
+
+
+def _scaling_clear_preview_file(preview) -> None:
+    """Forget the preview file and its parameters (no files selected)."""
+    preview["file"] = None
+    preview["file_name"] = None
+    preview["x"] = None
+    preview["y"] = None
+    preview["color_param"] = None
+    preview["image_channel"] = None
+    preview["image_min"] = None
+    preview["image_max"] = None
+
+
+def _scaling_sync_preview_file(ctx, page) -> None:
+    """Keep the preview on a selected file, using the first when needed."""
+    preview = page._scaling_preview
+    records = _scaling_selected_records(ctx, page)
+    selected = {str(rec.get("parquet")) for rec in records}
+    current = preview.get("file")
+    if current is not None and str(current) in selected:
+        return
+    if not records:
+        _scaling_clear_preview_file(preview)
+        return
+    first = records[0]
+    _scaling_apply_preview_file(
+        ctx, page, first.get("parquet"), first.get("name")
+    )
+
+
+def _scaling_set_preview_file(ctx, page, file_path, file_name=None) -> None:
+    """Switch the preview to a selected file and re-render it."""
+    if not file_path:
+        return
+    selected = {str(path) for path in (page._scaling_files or [])}
+    if str(file_path) not in selected:
+        return
+    _scaling_apply_preview_file(ctx, page, file_path, file_name)
     _scaling_render_preview(ctx, page)
     _scaling_rebuild_settings(ctx, page)
 
@@ -903,11 +977,14 @@ def _scaling_rebuild_settings(ctx, page) -> None:
     enabled = not page._scaling_locked
     plot_widget = page._scaling_plot_widget
 
-    records = _data_files._available_files(ctx, page._scaling_task_id)
+    # The File combo only offers the files chosen in the Data files panel.
+    _scaling_sync_preview_file(ctx, page)
+    records = _scaling_selected_records(ctx, page)
     rec = _widgets_plot_renderer._figure_record(ctx, preview.get("file"))
     columns = _data_columns._columns_for(ctx,
         rec.get("parquet"), page._scaling_task_id
     ) if rec else []
+    has_file = rec is not None
     # Scale configs at this point: upstream scales plus this module's
     # current (possibly unsaved) settings.
     live_transforms = {}
@@ -923,8 +1000,12 @@ def _scaling_rebuild_settings(ctx, page) -> None:
         idx = file_combo.findData(preview["file"])
         if idx >= 0:
             file_combo.setCurrentIndex(idx)
-    file_combo.setEnabled(enabled)
+    file_combo.setEnabled(enabled and bool(records))
     layout.addWidget(file_combo)
+
+    # The remaining controls operate on the preview file: without one they
+    # stay disabled.
+    enabled = enabled and has_file
 
     layout.addWidget(QLabel("Plot type"))
     type_combo = _NoWheelComboBox()

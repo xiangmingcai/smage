@@ -639,7 +639,12 @@ def _region_middle_panel(ctx, page) -> QWidget:
     detect_scroll = QScrollArea()
     detect_scroll.setWidgetResizable(True)
     detect_scroll.setFrameShape(QFrame.Shape.NoFrame)
-    detect_scroll.setStyleSheet("background: transparent;")
+    # Scoped selectors keep the transparent rule from reaching QToolTip,
+    # whose palette would otherwise turn black.
+    detect_scroll.setObjectName("regionDetectScroll")
+    detect_scroll.setStyleSheet(
+        "QScrollArea#regionDetectScroll { background: transparent; }"
+    )
     detect_scroll.setWidget(detect_body)
     page._region_detect_scroll = detect_scroll
     dl.addWidget(detect_scroll, 1)
@@ -669,9 +674,15 @@ def _region_right_panel(ctx, page) -> QWidget:
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setStyleSheet("background: transparent;")
+    scroll.setObjectName("regionSettingsScroll")
+    scroll.setStyleSheet(
+        "QScrollArea#regionSettingsScroll { background: transparent; }"
+    )
     host = QWidget()
-    host.setStyleSheet("background: transparent;")
+    host.setObjectName("regionSettingsHost")
+    host.setStyleSheet(
+        "QWidget#regionSettingsHost { background: transparent; }"
+    )
     settings = QVBoxLayout(host)
     settings.setContentsMargins(0, 0, 0, 0)
     settings.setSpacing(6)

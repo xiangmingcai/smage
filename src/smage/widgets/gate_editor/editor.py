@@ -26,14 +26,19 @@ _GATING_PLOT_SIZE = (560, 480)
 
 def _default_gating_preview(rec, cols) -> dict:
     """A fresh scatter preview config for the gating tree (first file + axes)."""
+    # Pixel positions (`x`/`y`) are not channels: a scatter of them is just a
+    # picture of the sample, so the first two real columns are used instead.
+    usable = [c for c in cols if c not in ("x", "y")] or list(cols)
+    x_default = usable[0] if usable else None
+    y_default = usable[1] if len(usable) > 1 else x_default
     return {
         "type": "scatter",
         "file": rec.get("parquet") if rec else None,
         "file_name": rec.get("name") if rec else None,
-        "x": cols[0] if cols else None,
-        "y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
-        "last_x": cols[0] if cols else None,
-        "last_y": cols[1] if len(cols) > 1 else (cols[0] if cols else None),
+        "x": x_default,
+        "y": y_default,
+        "last_x": x_default,
+        "last_y": y_default,
         "color_mode": "density",
         "color_param": None,
         "palette": _default_palette(),
@@ -75,7 +80,24 @@ def _gating_state_init(ctx, page, task_def: dict, locked: bool) -> None:
     the same methods can drive several gate trees in the Unmix module.
     """
     records = ctx._available_files(task_def.get("id"))
-    rec = records[0] if records else None
+    uses_store = task_def.get("type") == "gating"
+    store = None
+    if uses_store:
+        # The Gating module plots only the files chosen in Data files. A new
+        # module has no selection yet, so the preview starts empty instead of
+        # showing the first available file.
+        store = ctx._gating_store_load(task_def)
+        selected = [
+            f for f in (store.get("files") or [])
+            if any(r.get("parquet") == f for r in records)
+        ]
+        rec = next(
+            (r for r in records if r.get("parquet") == selected[0]), None
+        ) if selected else None
+    else:
+        # Unmix's embedded trees have no file picker: plot the first file.
+        selected = []
+        rec = records[0] if records else None
     cols = ctx._columns_for(
         rec.get("parquet"), task_def.get("id")
     ) if rec else []
@@ -105,10 +127,9 @@ def _gating_state_init(ctx, page, task_def: dict, locked: bool) -> None:
     page._gating_task_id = task_def.get("id")
     # The Gating module keeps its gate tree (files, gates, per-file
     # overrides) in the module folder; Unmix's embedded trees stay inline.
-    page._gating_uses_store = task_def.get("type") == "gating"
-    if page._gating_uses_store:
-        store = ctx._gating_store_load(task_def)
-        page._gating_files = list(store.get("files") or [])
+    page._gating_uses_store = uses_store
+    if uses_store:
+        page._gating_files = list(selected)
         page._gating_gates = list(store.get("gates") or [])
         page._gating_per_file = dict(store.get("per_file") or {})
     else:
@@ -381,9 +402,17 @@ def _gating_build_content(ctx, page, locked: bool) -> QWidget:
     settings_scroll = QScrollArea()
     settings_scroll.setWidgetResizable(True)
     settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-    settings_scroll.setStyleSheet("background: transparent;")
+    # Scoped selectors keep the transparent rule from reaching QToolTip,
+    # whose palette would otherwise turn black.
+    settings_scroll.setObjectName("gatingSettingsScroll")
+    settings_scroll.setStyleSheet(
+        "QScrollArea#gatingSettingsScroll { background: transparent; }"
+    )
     settings_host = QWidget()
-    settings_host.setStyleSheet("background: transparent;")
+    settings_host.setObjectName("gatingSettingsHost")
+    settings_host.setStyleSheet(
+        "QWidget#gatingSettingsHost { background: transparent; }"
+    )
     settings_layout = QVBoxLayout(settings_host)
     settings_layout.setContentsMargins(0, 0, 0, 0)
     settings_layout.setSpacing(6)
@@ -428,6 +457,17 @@ def _gating_render(ctx, page) -> None:
     plot_type = preview.get("type", "scatter")
     runlog.action("gating.render", type=str(plot_type),
                   items=len(plot_widget.getPlotItem().items))
+
+    # A new Gating module has no Data files selected yet: keep the plot empty
+    # instead of drawing the first available file.
+    if getattr(page, "_gating_uses_store", False) and not page._gating_files:
+        plot_widget.clear()
+        page._gating_gates_hidden = True
+        page._gating_render_key = None
+        page._gating_overlay_box.setText("Select data files to start.")
+        page._gating_overlay.show()
+        ctx._gating_update_roi_visibility(page)
+        return
 
     # Undo image-view locks (aspect / auto-range) when leaving image mode.
     if plot_type != "image":
@@ -728,9 +768,13 @@ def _gating_rebuild_settings(ctx, page) -> None:
     gate_color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     gate_color_btn.setEnabled(enabled)
     gate_color_btn.setToolTip("Colour of the gate outlines")
+    # Scoped: a bare background rule also styles QToolTip and replaces its
+    # white palette with the gate colour.
+    gate_color_btn.setObjectName("gateColorButton")
     gate_color_btn.setStyleSheet(
+        f"QPushButton#gateColorButton {{ "
         f"background-color: {_gate_color(preview)}; "
-        "border: 1px solid #6b7785; border-radius: 3px;"
+        "border: 1px solid #6b7785; border-radius: 3px; }"
     )
     gate_color_btn.clicked.connect(
         lambda _=False: ctx._gating_pick_gate_color(page, gate_color_btn)

@@ -610,6 +610,60 @@ def page_image_resize() -> None:
         _close(window)
 
 
+@harness.case("import.page.tooltip_light", "L3", "import", tags=("fast",))
+def page_tooltips_are_light() -> None:
+    """Tooltips inside the Parameter panel keep the light app palette."""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QColor, QPalette
+    from PySide6.QtWidgets import QLineEdit, QToolTip
+
+    window, _project = _import_page("import_page_tooltip")
+    try:
+        _set_files(window, [IMAGE])
+        ctx = window._ctx
+        with harness.patch_dialogs(
+            _import__page, question=QMessageBox.StandardButton.Yes
+        ):
+            _import__page._peek_files(ctx)
+        ctx.import_list.setCurrentRow(0)
+        harness.pump(50)
+
+        rename = next(
+            (
+                edit for edit in ctx.parameter_rows.findChildren(QLineEdit)
+                if "Rename this parameter" in edit.toolTip()
+            ),
+            None,
+        )
+        harness.check(rename is not None, "the imported-name field exists")
+        widgets = [ctx._resize_enabled, ctx._resize_keep, rename]
+
+        for widget in widgets:
+            QToolTip.showText(QPoint(10, 10), widget.toolTip(), widget)
+            QApplication.processEvents()
+            tip = next(
+                (
+                    child for child in QApplication.allWidgets()
+                    if child.metaObject().className() == "QTipLabel"
+                ),
+                None,
+            )
+            harness.check(tip is not None, "the tooltip is shown")
+            if tip is not None:
+                color = QColor(
+                    tip.palette().color(QPalette.ColorRole.Window)
+                )
+                harness.check(
+                    color.lightness() >= 200,
+                    "tooltip background is light for "
+                    f"{widget.toolTip()!r}: {color.name()}",
+                )
+            QToolTip.hideText()
+            QApplication.processEvents()
+    finally:
+        _close(window)
+
+
 @harness.case("import.page.delete", "L3", "import", tags=("smoke",))
 def page_delete() -> None:
     from smage.modules.import_ import page as import_page

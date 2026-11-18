@@ -15,6 +15,17 @@ in plots and the coordinates used for gate shapes on screen.
 | Param | The cofactor for `arcsinh` (ignored for the other methods). |
 | Min / Max | Optional default axis range in original units. Downstream scatter and histogram plots use it while their axis is **Auto**. |
 
+## Data files and preview
+
+The **Data files** panel chooses the files this module scales. Only those
+files appear in the preview's **File** list, and the preview always applies
+the module's current settings.
+
+The first selected file opens automatically; if the file on screen is
+deselected, the preview switches to the first remaining file. Clearing the
+selection returns the preview to an empty state with a **Select data files to
+start.** hint, and the preview controls are disabled until a file is chosen.
+
 ## Behaviour
 
 - Plots below the module are drawn in transformed coordinates, with axis

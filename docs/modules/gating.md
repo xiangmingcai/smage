@@ -5,6 +5,17 @@ percentage of events in each gate.
 
 ![Gating](../assets/screenshots/gating.png)
 
+## Data files
+
+A new Gating module starts empty. Choose **Select files…** to pick the files
+the gate tree applies to. The first selected file then opens in the preview,
+with its first two channels as the X and Y axes; gate tools stay disabled
+until a file is available.
+
+Changing the selection keeps the file currently on screen while it is still
+selected. Clearing the selection returns the preview to the empty state; the
+gate tree itself is kept.
+
 ## Plot settings
 
 | Setting | Description |

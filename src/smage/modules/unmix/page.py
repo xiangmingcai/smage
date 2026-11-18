@@ -393,9 +393,17 @@ def _unmix_spectrum_area(ctx, page) -> QWidget:
     settings_scroll = QScrollArea()
     settings_scroll.setWidgetResizable(True)
     settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-    settings_scroll.setStyleSheet("background: transparent;")
+    # Scoped selectors keep the transparent rule from reaching QToolTip,
+    # whose palette would otherwise turn black.
+    settings_scroll.setObjectName("unmixSettingsScroll")
+    settings_scroll.setStyleSheet(
+        "QScrollArea#unmixSettingsScroll { background: transparent; }"
+    )
     settings_host = QWidget()
-    settings_host.setStyleSheet("background: transparent;")
+    settings_host.setObjectName("unmixSettingsHost")
+    settings_host.setStyleSheet(
+        "QWidget#unmixSettingsHost { background: transparent; }"
+    )
     settings_layout = QVBoxLayout(settings_host)
     settings_layout.setContentsMargins(0, 0, 0, 0)
     settings_layout.setSpacing(6)
@@ -1947,11 +1955,17 @@ def _unmix_matrix_settings_panel(ctx, page) -> QWidget:
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setStyleSheet("background: transparent;")
+    scroll.setObjectName("unmixCurveScroll")
+    scroll.setStyleSheet(
+        "QScrollArea#unmixCurveScroll { background: transparent; }"
+    )
     scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     host = QWidget()
-    host.setStyleSheet("background: transparent;")
+    host.setObjectName("unmixCurveHost")
+    host.setStyleSheet(
+        "QWidget#unmixCurveHost { background: transparent; }"
+    )
     host_lay = QVBoxLayout(host)
     host_lay.setContentsMargins(0, 0, 6, 0)
     host_lay.setSpacing(6)

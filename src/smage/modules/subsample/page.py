@@ -243,7 +243,12 @@ def _build_subsample_page(ctx, name: str, task_def: dict, locked: bool) -> QWidg
     settings_scroll = QScrollArea()
     settings_scroll.setWidgetResizable(True)
     settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-    settings_scroll.setStyleSheet("background: transparent;")
+    # Scoped selector: a bare transparent rule also reaches QToolTip and
+    # turns its palette black.
+    settings_scroll.setObjectName("subsSettingsScroll")
+    settings_scroll.setStyleSheet(
+        "QScrollArea#subsSettingsScroll { background: transparent; }"
+    )
     settings_scroll.setWidget(_subs_settings_panel(ctx, page))
     splitter.addWidget(settings_scroll)
     splitter.addWidget(_subs_table_panel(ctx, page))

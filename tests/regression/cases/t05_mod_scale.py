@@ -174,6 +174,62 @@ def preview_keeps_axes() -> None:
         _close(window)
 
 
+@harness.case("mod.scale.preview_files", "L4", "scale", tags=("fast",))
+def preview_files_follow_selection() -> None:
+    """The preview File list only offers the selected Data files."""
+    window, _project, page, first, second = _open_two_files("scale_preview_files")
+    try:
+        ctx = window._ctx
+        # Nothing selected: empty preview and an empty File list.
+        harness.eq(page._scaling_file_combo.count(), 0)
+        harness.check(
+            not page._scaling_plot_widget.getPlotItem().items,
+            "no data is drawn without a selected file",
+        )
+        harness.check(
+            not page._scaling_overlay.isHidden(),
+            "the select-files hint is shown",
+        )
+        harness.check(
+            "Select data files" in page._scaling_overlay_box.text(),
+            page._scaling_overlay_box.text(),
+        )
+
+        # The selection order drives the list; the first file opens.
+        page._scaling_files = [str(second), str(first)]
+        scale_page._scaling_rebuild_visible(ctx, page)
+        # The first render may wait for the column pool; let it finish.
+        harness.pump(400)
+        combo = page._scaling_file_combo
+        harness.eq(combo.count(), 2)
+        harness.eq(combo.itemData(0), str(second))
+        harness.eq(combo.itemData(1), str(first))
+        harness.eq(page._scaling_preview["file"], str(second))
+        harness.check(page._scaling_overlay.isHidden())
+        harness.check(
+            bool(page._scaling_plot_widget.getPlotItem().items),
+            "the selected file is drawn",
+        )
+
+        # Removing the file on screen switches to the first remaining one.
+        page._scaling_files = [str(first)]
+        scale_page._scaling_rebuild_visible(ctx, page)
+        harness.eq(page._scaling_file_combo.count(), 1)
+        harness.eq(page._scaling_preview["file"], str(first))
+
+        # Clearing the selection returns to the empty state.
+        page._scaling_files = []
+        scale_page._scaling_rebuild_visible(ctx, page)
+        harness.eq(page._scaling_file_combo.count(), 0)
+        harness.eq(page._scaling_preview["file"], None)
+        harness.check(
+            not page._scaling_plot_widget.getPlotItem().items,
+            "the plot is cleared again",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("mod.scale.validation", "L4", "scale", tags=("fast",))
 def apply_validation() -> None:
     window, _project, page = _open("scale_validation")

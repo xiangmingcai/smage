@@ -1945,9 +1945,17 @@ def _calc_preview_panel(ctx, page) -> QWidget:
     settings_scroll = QScrollArea()
     settings_scroll.setWidgetResizable(True)
     settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-    settings_scroll.setStyleSheet("background: transparent;")
+    # Scoped selectors keep the transparent rule from reaching QToolTip,
+    # whose palette would otherwise turn black.
+    settings_scroll.setObjectName("calcSettingsScroll")
+    settings_scroll.setStyleSheet(
+        "QScrollArea#calcSettingsScroll { background: transparent; }"
+    )
     settings_host = QWidget()
-    settings_host.setStyleSheet("background: transparent;")
+    settings_host.setObjectName("calcSettingsHost")
+    settings_host.setStyleSheet(
+        "QWidget#calcSettingsHost { background: transparent; }"
+    )
     settings_layout = QVBoxLayout(settings_host)
     settings_layout.setContentsMargins(0, 0, 0, 0)
     settings_layout.setSpacing(6)

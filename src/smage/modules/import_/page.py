@@ -683,10 +683,18 @@ def _build_parameter_panel(ctx) -> QFrame:
     ctx.parameter_scroll = QScrollArea()
     ctx.parameter_scroll.setWidgetResizable(True)
     ctx.parameter_scroll.setFrameShape(QFrame.Shape.NoFrame)
-    ctx.parameter_scroll.setStyleSheet("background: transparent;")
+    # Scope the transparent rule to the container: a bare stylesheet acts on
+    # every descendant, including QToolTip, which turns its palette black.
+    ctx.parameter_scroll.setObjectName("parameterScroll")
+    ctx.parameter_scroll.setStyleSheet(
+        "QScrollArea#parameterScroll { background: transparent; }"
+    )
 
     ctx.parameter_rows = QWidget()
-    ctx.parameter_rows.setStyleSheet("background: transparent;")
+    ctx.parameter_rows.setObjectName("parameterRows")
+    ctx.parameter_rows.setStyleSheet(
+        "QWidget#parameterRows { background: transparent; }"
+    )
     ctx.parameter_rows_layout = QVBoxLayout(ctx.parameter_rows)
     ctx.parameter_rows_layout.setContentsMargins(0, 0, 0, 0)
     ctx.parameter_rows_layout.setSpacing(2)

@@ -42,6 +42,22 @@ def _close(window) -> None:
     harness.close_window(window)
 
 
+def _assert_axis_margin(test, view_range, lo, hi, label) -> None:
+    """The configured min/max sit at 5 % and 95 % of the visible axis."""
+    span = view_range[1] - view_range[0]
+    test.check(span > 0, f"{label}: empty view range {view_range}")
+    pos_lo = (lo - view_range[0]) / span
+    pos_hi = (hi - view_range[0]) / span
+    test.check(
+        abs(pos_lo - 0.05) < 1e-6,
+        f"{label}: min at 5 % of the axis, got {pos_lo:.4f} ({view_range})",
+    )
+    test.check(
+        abs(pos_hi - 0.95) < 1e-6,
+        f"{label}: max at 95 % of the axis, got {pos_hi:.4f} ({view_range})",
+    )
+
+
 @harness.case("mod.figure.add", "L4", "figure", tags=("fast",))
 def add_plots() -> None:
     window, _project, page = _open("figure_add")
@@ -136,10 +152,8 @@ def range_modes() -> None:
         harness.eq(plot.get("y_range_mode"), "scale")
         widget = page._fig_cards[0].plot_widget()
         xr, yr = widget.getPlotItem().getViewBox().viewRange()
-        harness.check(abs(xr[0] - 1.0) < 1e-6, f"x min from Scale: {xr}")
-        harness.check(abs(xr[1] - 9.0) < 1e-6, f"x max from Scale: {xr}")
-        harness.check(abs(yr[0] - 0.0) < 1e-6, f"y min from Scale: {yr}")
-        harness.check(abs(yr[1] - 2.0) < 1e-6, f"y max from Scale: {yr}")
+        _assert_axis_margin(harness, xr, 1.0, 9.0, "from-scale x")
+        _assert_axis_margin(harness, yr, 0.0, 2.0, "from-scale y")
 
         combos = [
             combo for combo in page._fig_settings_layout.parentWidget()
@@ -169,12 +183,11 @@ def range_modes() -> None:
         data_min = getattr(widget, "_data_xmin", None)
         data_max = getattr(widget, "_data_xmax", None)
         harness.check(
-            data_min is not None and abs(xr[0] - data_min) < 1e-6,
-            f"Auto uses the data min: {xr}",
+            data_min is not None and data_max is not None,
+            "Auto has a data extent",
         )
-        harness.check(
-            data_max is not None and abs(xr[1] - data_max) < 1e-6,
-            f"Auto uses the data max: {xr}",
+        _assert_axis_margin(
+            harness, xr, data_min, data_max, "auto x"
         )
     finally:
         _close(window)
@@ -254,8 +267,7 @@ def scale_axis_defaults() -> None:
         _figure_page._figure_apply_change(ctx, page, 0, plot)
         harness.pump(150)
         xr, _yr = card.plot_widget().getPlotItem().getViewBox().viewRange()
-        harness.check(abs(xr[0] - 10.0) < 1e-6, f"x min from Scale: {xr}")
-        harness.check(abs(xr[1] - 90.0) < 1e-6, f"x max from Scale: {xr}")
+        _assert_axis_margin(harness, xr, 10.0, 90.0, "FL1-A x")
 
         # The range inputs show the same Scale default as the view.
         _figure_page._figure_rebuild_settings(ctx, page)
@@ -276,8 +288,7 @@ def scale_axis_defaults() -> None:
         _figure_page._figure_apply_change(ctx, page, 0, plot)
         harness.pump(150)
         xr, _yr = card.plot_widget().getPlotItem().getViewBox().viewRange()
-        harness.check(abs(xr[0] - 20.0) < 1e-6, f"saved x min kept: {xr}")
-        harness.check(abs(xr[1] - 40.0) < 1e-6, f"saved x max kept: {xr}")
+        _assert_axis_margin(harness, xr, 20.0, 40.0, "manual x")
 
         # A Scale with only one side does not qualify: From scale falls back
         # to the data extent on both sides.
@@ -290,12 +301,54 @@ def scale_axis_defaults() -> None:
         data_min = getattr(card.plot_widget(), "_data_xmin", None)
         data_max = getattr(card.plot_widget(), "_data_xmax", None)
         harness.check(
-            data_min is not None and abs(xr[0] - data_min) < 1e-6,
-            f"one-sided Scale falls back to data min: {xr} vs {data_min}",
+            data_min is not None and data_max is not None,
+            "the fallback has a data extent",
+        )
+        _assert_axis_margin(
+            harness, xr, data_min, data_max, "one-sided Scale fallback"
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.figure.axis_margin", "L4", "figure", tags=("fast",))
+def axis_margin() -> None:
+    """Data plots keep a 5 % border; the saved range values stay unpadded."""
+    window, _project, page = _open("figure_axis_margin")
+    try:
+        ctx = window._ctx
+        _figure_page._figure_add_plot(ctx, page, "scatter")
+        harness.pump(300)
+        _figure_page._figure_add_plot(ctx, page, "histogram")
+        harness.pump(300)
+
+        scatter = page._fig_cards[0].plot_widget()
+        xr, yr = scatter.getPlotItem().getViewBox().viewRange()
+        _assert_axis_margin(
+            harness, xr, scatter._data_xmin, scatter._data_xmax, "scatter x"
+        )
+        _assert_axis_margin(
+            harness, yr, scatter._data_ymin, scatter._data_ymax, "scatter y"
+        )
+
+        hist = page._fig_cards[1].plot_widget()
+        hx, hy = hist.getPlotItem().getViewBox().viewRange()
+        _assert_axis_margin(
+            harness, hx, hist._data_xmin, hist._data_xmax, "histogram x"
+        )
+        # Counts follow the strict rule, so 0 sits just above the bottom edge.
+        _assert_axis_margin(
+            harness, hy, hist._data_ymin, hist._data_ymax, "histogram y"
+        )
+
+        # Empty or missing ranges are left to auto-range.
+        harness.check(
+            _widgets_plot_renderer._figure_pad_range(5.0, 5.0) is None,
+            "an empty range is not padded",
         )
         harness.check(
-            data_max is not None and abs(xr[1] - data_max) < 1e-6,
-            f"one-sided Scale falls back to data max: {xr} vs {data_max}",
+            _widgets_plot_renderer._figure_pad_range(None, 1.0) is None,
+            "a missing bound is not padded",
         )
     finally:
         _close(window)

@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QPoint, QTimer
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QMessageBox,
     QPushButton,
+    QToolTip,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -32,6 +34,19 @@ from smage.data import naming as _data_naming
 from smage.modules.gating import page as gating_page
 
 
+def _select_all_files(ctx, page) -> None:
+    """Choose every upstream file, as the Data files picker would."""
+    records = ctx._available_files("g-1")
+    page._gating_files = [rec.get("parquet") for rec in records]
+    gating_page._gating_refresh_files(ctx, page)
+    gating_page._gating_update_tools(ctx, page)
+    gating_page._gating_reload_rois(ctx, page)
+    _gate_editor._gating_render(ctx, page)
+    gating_page._gating_update_roi_visibility(ctx, page)
+    _gate_editor._gating_rebuild_settings(ctx, page)
+    harness.pump(200)
+
+
 def _open(case_id: str):
     task = harness.task_def("gating", task_id="g-1", name="Gating")
     project = harness.new_project(case_id, rows=120, tasks=[task])
@@ -39,11 +54,125 @@ def _open(case_id: str):
     harness.open_project(window, project)
     window._open_module("g-1", "gating", "Gating")
     harness.pump(450)
-    return window, project, window.tabs.currentWidget()
+    page = window.tabs.currentWidget()
+    _select_all_files(window._ctx, page)
+    return window, project, page
 
 
 def _close(window) -> None:
     harness.close_window(window)
+
+
+@harness.case("mod.gating.empty_state", "L4", "gating", tags=("fast",))
+def empty_state() -> None:
+    """A new Gating module waits for Data files before drawing anything."""
+    task = harness.task_def("gating", task_id="g-1", name="Gating")
+    project = harness.new_project("gating_empty_state", rows=80, tasks=[task])
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("g-1", "gating", "Gating")
+    harness.pump(450)
+    page = window.tabs.currentWidget()
+    try:
+        preview = page._gating_preview
+        harness.eq(page._gating_files, [])
+        harness.eq(preview.get("file"), None)
+        harness.eq(preview.get("x"), None)
+        harness.eq(preview.get("y"), None)
+        harness.check(
+            not page._gating_plot_widget.getPlotItem().items,
+            "no data is drawn before files are selected",
+        )
+        harness.check(
+            not page._gating_overlay.isHidden(),
+            "the select-files hint is shown",
+        )
+        harness.check(
+            "Select data files" in page._gating_overlay_box.text(),
+            page._gating_overlay_box.text(),
+        )
+        harness.check(
+            not any(
+                btn.isEnabled()
+                for btn in page._gating_tool_buttons.values()
+            ),
+            "gate tools are disabled without a file",
+        )
+        harness.check(
+            not page._gating_col2gate_btn.isEnabled(),
+            "Col2Gate is disabled without a file",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.auto_open_first", "L4", "gating", tags=("fast",))
+def auto_open_first_file() -> None:
+    """Selecting files opens the first one with its first two channels."""
+    task = harness.task_def("gating", task_id="g-1", name="Gating")
+    project = harness.new_project("gating_auto_open", rows=80, tasks=[task])
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("g-1", "gating", "Gating")
+    harness.pump(450)
+    page = window.tabs.currentWidget()
+    try:
+        ctx = window._ctx
+        _select_all_files(ctx, page)
+        preview = page._gating_preview
+        records = ctx._available_files("g-1")
+        harness.check(bool(records), "the project has an imported file")
+        harness.eq(preview.get("file"), records[0].get("parquet"))
+        harness.eq(page._gating_files, [records[0].get("parquet")])
+        harness.eq(preview.get("x"), "FSC-A")
+        harness.eq(preview.get("y"), "SSC-A")
+        harness.check(
+            bool(page._gating_plot_widget.getPlotItem().items),
+            "the selected file is drawn",
+        )
+        harness.check(
+            page._gating_overlay.isHidden(),
+            "the empty-state hint is gone",
+        )
+        harness.check(
+            page._gating_tool_buttons["rect"].isEnabled(),
+            "gate tools are usable again",
+        )
+        harness.check(
+            page._gating_col2gate_btn.isEnabled(),
+            "Col2Gate is usable again",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.tooltip_light", "L4", "gating", tags=("fast",))
+def gate_colour_tooltip_is_light() -> None:
+    """The gate-colour swatch keeps the light tooltip palette."""
+    window, _project, page = _open("gating_tooltip")
+    try:
+        button = page.findChild(QPushButton, "gateColorButton")
+        harness.check(button is not None, "the gate colour button exists")
+        QToolTip.showText(QPoint(10, 10), button.toolTip(), button)
+        QApplication.processEvents()
+        tip = next(
+            (
+                widget for widget in QApplication.allWidgets()
+                if widget.metaObject().className() == "QTipLabel"
+            ),
+            None,
+        )
+        harness.check(tip is not None, "the tooltip is shown")
+        if tip is not None:
+            color = QColor(tip.palette().color(QPalette.ColorRole.Window))
+            harness.check(
+                color.lightness() >= 200,
+                f"tooltip background is light: {color.name()}",
+            )
+        QToolTip.hideText()
+        QApplication.processEvents()
+    finally:
+        _close(window)
 
 
 @harness.case("mod.gating.real_coordinates", "L4", "gating", tags=("fast",))
@@ -64,6 +193,7 @@ def gates_live_in_real_coordinates() -> None:
         harness.pump(400)
         page = window.tabs.currentWidget()
         ctx = window._ctx
+        _select_all_files(ctx, page)
         page._gating_preview["x"] = "FL1-A"
         page._gating_preview["y"] = "FL2-A"
         gate = {
@@ -106,6 +236,7 @@ def ellipse_follows_the_drawn_shape() -> None:
         harness.pump(400)
         page = window.tabs.currentWidget()
         ctx = window._ctx
+        _select_all_files(ctx, page)
         page._gating_preview["x"] = "FL1-A"
         page._gating_preview["y"] = "FL2-A"
 
@@ -222,6 +353,7 @@ def image_polygon_not() -> None:
     page = window.tabs.currentWidget()
     try:
         ctx = window._ctx
+        _select_all_files(ctx, page)
         page._gating_preview["type"] = "image"
         page._gating_preview["x"] = "x"
         page._gating_preview["y"] = "y"
@@ -339,6 +471,7 @@ def polygon_scaled_axes() -> None:
     page = window.tabs.currentWidget()
     try:
         ctx = window._ctx
+        _select_all_files(ctx, page)
         from smage.core.gates import _point_in_polygon
         from smage.core.scale_math import _apply_scale_transforms
         from smage.data import columns as _data_columns
@@ -773,6 +906,7 @@ def channel_range_records() -> None:
     harness.pump(450)
     try:
         page = window.tabs.currentWidget()
+        _select_all_files(window._ctx, page)
         preview = page._gating_preview
         host = page._gating_settings_layout.parentWidget()
 

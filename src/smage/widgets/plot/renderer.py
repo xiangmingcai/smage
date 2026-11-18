@@ -20,7 +20,7 @@ from smage.core.scale_math import (
     _apply_scale_transforms, _forward_scale_value, _inverse_scale_value,
 )
 from smage.core.settings import (
-    _default_palette, _plot_background, _setting,
+    TOOLTIP_QSS, _default_palette, _plot_background, _setting,
 )
 from smage.runlog import runlog
 from smage.widgets.colormap import _figure_colormap
@@ -48,6 +48,11 @@ IMAGE_LAYER_COLORS = [
     (255, 128, 0),    # orange
     (128, 0, 255),    # violet
 ]
+
+# Empty margin around a data plot: the configured Min/Max sit at 5 % and 95 %
+# of the visible axis, so points and bars do not touch the frame. Image plots
+# keep their exact extent (aspect-locked pixels).
+FIGURE_AXIS_MARGIN = 0.05
 
 class _FigureLegendWidget(QFrame):
     """A compact colour legend shown beside an image plot."""
@@ -322,14 +327,12 @@ def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: boo
     combo.setToolTip(
         "Manual: use the Min/Max below.\n"
         "From scale: the nearest upstream Scale with both Min and Max.\n"
-        "Auto: the extent of the drawn data."
+        "Auto: the extent of the drawn data.\n"
+        "Every mode leaves a 5 % border around the range."
     )
     # Tooltips inside the settings scroll area can inherit the platform's
     # dark tooltip palette; pin this one to the app's light tooltip look.
-    combo.setStyleSheet(
-        "QToolTip { background-color: #ffffff; color: #2c3a48; "
-        "border: 1px solid #c9d3df; padding: 4px 6px; }"
-    )
+    combo.setStyleSheet(TOOLTIP_QSS)
 
     def effective():
         lo, hi = _figure_axis_range(
@@ -2025,6 +2028,29 @@ def _figure_make_plot_widget(ctx, plot_dict: dict):
     return plot_widget
 
 
+def _figure_pad_range(lo, hi, margin=FIGURE_AXIS_MARGIN):
+    """Widen ``(lo, hi)`` so the pair sits at ``margin``/``1 - margin`` of the
+    visible axis.
+
+    With the default 5 % margin, ``lo`` lands at 5 % and ``hi`` at 95 %, which
+    leaves an even border around the drawn data. Returns ``None`` when the
+    range cannot be padded (missing, non-finite or empty).
+    """
+    import math
+
+    if lo is None or hi is None:
+        return None
+    try:
+        lo = float(lo)
+        hi = float(hi)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+        return None
+    pad = (hi - lo) * margin / (1.0 - 2.0 * margin)
+    return lo - pad, hi + pad
+
+
 def _figure_fit_all(ctx, plot_dict: dict, plot_widget) -> None:
     """Fit the view to the full data extent (without changing settings)."""
     vb = plot_widget.getPlotItem().getViewBox()
@@ -2042,14 +2068,14 @@ def _figure_fit_all(ctx, plot_dict: dict, plot_widget) -> None:
     xmax = getattr(plot_widget, "_data_xmax", None)
     ymin = getattr(plot_widget, "_data_ymin", None)
     ymax = getattr(plot_widget, "_data_ymax", None)
-    if xmin is not None and xmax is not None and xmax > xmin:
-        pad = 0.02 * (xmax - xmin)
-        vb.setXRange(xmin - pad, xmax + pad, padding=0)
+    xr = _figure_pad_range(xmin, xmax)
+    yr = _figure_pad_range(ymin, ymax)
+    if xr is not None:
+        vb.setXRange(*xr, padding=0)
     else:
         vb.enableAutoRange("x", True)
-    if ymin is not None and ymax is not None and ymax > ymin:
-        pad = 0.02 * (ymax - ymin)
-        vb.setYRange(ymin - pad, ymax + pad, padding=0)
+    if yr is not None:
+        vb.setYRange(*yr, padding=0)
     else:
         vb.enableAutoRange("y", True)
 
@@ -2310,12 +2336,16 @@ def _figure_apply_ranges(ctx, plot_dict: dict, plot_widget,
         ctx, task_id, parquet, plot_dict, "y", plot_widget,
         column_transforms,
     )
-    if xmin is not None and xmax is not None and xmax > xmin:
-        plot_widget.setXRange(float(xmin), float(xmax), padding=0)
+    # Keep a 5 % border so the configured Min/Max sit inside the frame
+    # instead of on it. The saved and displayed values stay unpadded.
+    xr = _figure_pad_range(xmin, xmax)
+    yr = _figure_pad_range(ymin, ymax)
+    if xr is not None:
+        plot_widget.setXRange(*xr, padding=0)
     else:
         plot_widget.enableAutoRange("x", True)
-    if ymin is not None and ymax is not None and ymax > ymin:
-        plot_widget.setYRange(float(ymin), float(ymax), padding=0)
+    if yr is not None:
+        plot_widget.setYRange(*yr, padding=0)
     else:
         plot_widget.enableAutoRange("y", True)
 
