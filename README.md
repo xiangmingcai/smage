@@ -17,6 +17,22 @@ feature aggregation, clustering, dimensionality reduction and export.
 **Releases:** <https://github.com/xiangmingcai/smage/releases> ·
 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
+## What's new in 0.3.0
+
+- **Subsample** can sample inside gates shared by every selected file, with a
+  new **In gates** column and gate-based percentages and allocation.
+- **Data Import** image resize adds linked width/height ratio fields; the
+  target limit is now 200 megapixels or the original image size.
+- **Figure**, **Gating** and **Calculation** axes offer **Manual**,
+  **From scale** and **Auto** ranges, remembered per channel, with a 5 %
+  border so the data no longer touches the axis frame.
+- **Gating** stays empty until **Data files** are selected; the **Scale**
+  preview only lists the selected files.
+- Tooltips stay readable on dark Windows themes, and the Unmix action is now
+  **Set other gate as spectrum**.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list.
+
 ## Modules
 
 Every analysis step is a module in the workflow tree, and downstream modules
@@ -39,6 +55,27 @@ see the data produced by the ones above them.
 
 - **Windows 10 or 11, 64-bit.**
 - No Python installation is required for the packaged build.
+- Optional extensions (Cellpose, StarDist, FlowSOM, PARC) have their own
+  Python and package requirements; see [Extensions](#extensions).
+
+## Extensions
+
+Optional analysis methods run in a separate Python environment created from
+**Extension → Manage Extensions…**. Smage does not bundle these packages.
+
+| Extension | Used by | Version | Repository |
+|---|---|---|---|
+| Cellpose (CPU / GPU) | Segmentation | 4.2.1.1 | [MouseLand/cellpose](https://github.com/MouseLand/cellpose) |
+| StarDist (CPU) | Segmentation | 0.9.2 | [stardist/stardist](https://github.com/stardist/stardist) |
+| FlowSOM | Cluster, Batch Align | 0.2.2 | [saeyslab/FlowSOM_Python](https://github.com/saeyslab/FlowSOM_Python) |
+| PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
+
+The Extension Manager installs the current pip release; the versions above
+were current when Smage 0.3.0 was released. Use a **Python 3.11** environment
+for these extensions, matching the Python version Smage is built with. Each
+environment may need extra packages (for example PyTorch for Cellpose or
+TensorFlow for StarDist) — see the extension's repository for its
+requirements.
 
 ## Install
 
