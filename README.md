@@ -202,8 +202,9 @@ archive attached to each GitHub release).
 
 If you use Smage in your research, please give the
 [GitHub repository](https://github.com/xiangmingcai/smage) a star. Smage is
-a labour of love maintained alongside our research, and those stars are what
-keep us motivated to keep improving it.
+a labour of love maintained alongside our research. Those stars let us know
+that you enjoy Smage, and they are what keep us motivated to maintain and
+improve it.
 
 A paper describing Smage will be made public soon. The full citation will be
 added here once it is available, so you can reference it in your own
