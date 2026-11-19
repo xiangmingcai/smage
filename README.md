@@ -121,6 +121,11 @@ verified independently.
 4. Open **Figure** to look at the results; finish with
    **Export** to write CSV/parquet or images.
 
+## Video tutorials
+
+- **English (YouTube):** <https://www.youtube.com/@XMCai-yc7ws>
+- **Chinese (Bilibili):** <https://www.bilibili.com/video/BV1zwsx6PEwn/>
+
 ## Where your data lives
 
 - **Everything is processed locally.** Smage does not upload your data.
