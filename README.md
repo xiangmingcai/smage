@@ -13,9 +13,9 @@ feature aggregation, clustering, dimensionality reduction and export.
 > diagnosis or decision-making. Provided without warranty; you are responsible
 > for the analysis and its results. See [DISCLAIMER.md](DISCLAIMER.md).
 
-**Documentation:** <https://xiangmingcai.github.io/smage/> ·
-**Releases:** <https://github.com/xiangmingcai/smage/releases> ·
-**Issues:** <https://github.com/xiangmingcai/smage/issues>
+📖 **Documentation:** <https://xiangmingcai.github.io/smage/><br>
+📦 **Releases:** <https://github.com/xiangmingcai/smage/releases><br>
+🐛 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
 ## What's new in 0.3.2
 
