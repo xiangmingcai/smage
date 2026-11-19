@@ -6,7 +6,7 @@ into a common tabular representation and lets you compose analysis pipelines
 from interactive modules — gating, compensation, unmixing, segmentation,
 feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.3.1`; modules and
+> **Status:** early development. The current release is `0.3.2`; modules and
 > file formats may still change between releases.
 
 > **Intended use:** research software, not a medical device. Not for clinical
@@ -17,15 +17,14 @@ feature aggregation, clustering, dimensionality reduction and export.
 **Releases:** <https://github.com/xiangmingcai/smage/releases> ·
 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
-## What's new in 0.3.1
+## What's new in 0.3.2
 
-- **Feature Up**: **Match** now pairs files by their visible names, **Save**
-  persists the settings, and the log shows mapped names instead of internal
-  file ids.
-- The **spectral** and **multiplex image workflow** guides now embed video
-  walkthroughs for every step.
-- README lists the optional Cellpose, StarDist, FlowSOM and PARC extensions
-  with their versions and repositories.
+- **Extensions**: **Install dependencies** for Cellpose/StarDist now upgrades
+  pip in the target environment to at least 23.2 first. This fixes the
+  `typing_extensions` / `flit_core` failure seen with the old pip bundled in
+  some Python 3.11 venvs.
+- See [CHANGELOG.md](CHANGELOG.md) for the full list, including the Feature Up
+  fixes and workflow videos added in 0.3.1.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -67,7 +66,7 @@ Optional analysis methods run in a separate Python environment created from
 | PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
 
 The Extension Manager installs the current pip release; the versions above
-were current when Smage 0.3.1 was released. Use a **Python 3.11** environment
+were current when Smage 0.3.2 was released. Use a **Python 3.11** environment
 for these extensions, matching the Python version Smage is built with. Each
 environment may need extra packages (for example PyTorch for Cellpose or
 TensorFlow for StarDist) — see the extension's repository for its

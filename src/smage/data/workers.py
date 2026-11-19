@@ -37,7 +37,15 @@ class _ProcessWorker:
         self._thread.start()
 
     def run(self, key, argv, cwd=None):
-        self._req_q.put((key, list(argv), cwd))
+        self._req_q.put((key, [list(argv)], cwd))
+
+    def run_chain(self, key, commands, cwd=None):
+        """Run several commands in order; stop at the first failure.
+
+        Used when a step must complete before the next one (upgrading pip
+        before installing packages into that environment).
+        """
+        self._req_q.put((key, [list(cmd) for cmd in commands], cwd))
 
     def poll(self):
         """Return finished events: ``(key, "line", text)`` for streaming output
@@ -75,34 +83,41 @@ class _ProcessWorker:
 
         while not self._stop.is_set():
             try:
-                key, argv, cwd = self._req_q.get(timeout=0.2)
+                key, commands, cwd = self._req_q.get(timeout=0.2)
             except queue.Empty:
                 continue
             try:
-                proc = subprocess.Popen(
-                    argv,
-                    cwd=cwd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    # Run without a console window (the external python is a
-                    # console app; this hides the flash that would otherwise
-                    # pop up on Windows).
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                self._proc = proc
                 chunks = []
-                for line in proc.stdout:
-                    line = line.rstrip("\r\n")
-                    if line:
-                        chunks.append(line)
-                        self._res_q.put((key, "line", line))
-                proc.wait()
+                returncode = 0
+                for argv in commands:
+                    proc = subprocess.Popen(
+                        argv,
+                        cwd=cwd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        bufsize=1,
+                        # Run without a console window (the external python is
+                        # a console app; this hides the flash that would
+                        # otherwise pop up on Windows).
+                        creationflags=getattr(
+                            subprocess, "CREATE_NO_WINDOW", 0
+                        ),
+                    )
+                    self._proc = proc
+                    for line in proc.stdout:
+                        line = line.rstrip("\r\n")
+                        if line:
+                            chunks.append(line)
+                            self._res_q.put((key, "line", line))
+                    proc.wait()
+                    returncode = int(proc.returncode)
+                    if returncode != 0:
+                        break
                 self._res_q.put(
-                    (key, "done", int(proc.returncode), "\n".join(chunks))
+                    (key, "done", returncode, "\n".join(chunks))
                 )
             except Exception as exc:  # noqa: BLE001
                 self._res_q.put((key, "done", -1, str(exc)))

@@ -39,6 +39,13 @@ from smage.modules.cluster import page as _cluster_page
 from smage.widgets import panels as _widgets_panels
 
 
+# Minimum pip for extension environments. The pip bundled with older Python
+# 3.11 venvs (22.3.1) rejects valid wheels whose metadata normalises '-' and
+# '_' differently, then tries to build from source; PyTorch's index has no
+# build tools (flit_core), so the install fails.
+_PIP_MIN_VERSION = "23.2"
+
+
 def _nvidia_cuda_version():
     """Return the CUDA version (float) the installed NVIDIA driver supports,
     or None when no NVIDIA driver is found. Queries ``nvidia-smi``."""
@@ -631,11 +638,23 @@ class ExtensionsMixin:
             else:
                 argv += deps
             log.appendPlainText(
+                f"Upgrading pip (>= {_PIP_MIN_VERSION}) in {python}…\n"
                 f"Reinstalling {' '.join(deps)} into {python}…\n"
                 + (f"Using index: {index_url}\n" if index_url else "")
                 + "This can take several minutes."
             )
-            worker.run(("deps", ext_id), argv)
+            # Old pip cannot use the modern wheels and then fails while
+            # building from source; upgrade it before touching the packages.
+            worker.run_chain(
+                ("deps", ext_id),
+                [
+                    [
+                        python, "-m", "pip", "install", "--upgrade",
+                        f"pip>={_PIP_MIN_VERSION}",
+                    ],
+                    argv,
+                ],
+            )
 
         def on_download_model():
             python = current_python()

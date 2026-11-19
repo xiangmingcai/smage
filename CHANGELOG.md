@@ -4,6 +4,16 @@ All notable changes to Smage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [0.3.2] — 2026-11-19
+
+### Fixed
+
+- **Extensions**: installing Cellpose/StarDist dependencies now upgrades pip
+  in the target environment to at least 23.2 first. Older pip (for example
+  the 22.3.1 bundled with Python 3.11 venvs) rejected the `typing_extensions`
+  wheel and then failed to build it because the PyTorch index has no
+  `flit_core`.
+
 ## [0.3.1] — 2026-11-19
 
 ### Added

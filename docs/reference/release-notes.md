@@ -3,6 +3,15 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.3.2 — 2026-11-19
+
+- **Extensions**: **Install dependencies** now upgrades pip in the target
+  environment to at least 23.2 before installing Cellpose/StarDist packages.
+  This fixes the `typing_extensions` / `flit_core` failure with the old pip
+  bundled in some Python 3.11 venvs.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.3.1 — 2026-11-19
 
 - **Feature Up**: **Match** pairs files by their visible names, **Save**

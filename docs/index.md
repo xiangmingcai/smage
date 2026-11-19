@@ -13,7 +13,7 @@ compensation, unmixing, segmentation, clustering, feature tables and export.
 ![Smage workflow](assets/screenshots/workflow.png)
 
 !!! info "Status"
-    Smage is in early development (`0.3.1`). Modules, file formats and
+    Smage is in early development (`0.3.2`). Modules, file formats and
     settings may still change between releases. Windows 10/11 (64-bit) only.
 
 ## What you can do

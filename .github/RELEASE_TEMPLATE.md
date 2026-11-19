@@ -2,12 +2,10 @@
 
 ## Highlights
 
-- **Feature Up Match** pairs files by their visible names, **Save** persists
-  the settings, and the log shows mapped names instead of internal file ids.
-- The spectral and multiplex image workflow guides now embed video
-  walkthroughs for every step.
-- README lists the optional Cellpose, StarDist, FlowSOM and PARC extensions
-  with their versions and repositories.
+- **Extensions**: **Install dependencies** for Cellpose/StarDist now upgrades
+  pip in the target environment to at least 23.2 first, fixing the
+  `typing_extensions` / `flit_core` failure with old Python 3.11 venvs.
+- See the 0.3.1 notes for the Feature Up fixes and workflow videos.
 
 ## Downloads
 
