@@ -18,7 +18,7 @@ compensation, unmixing, segmentation, clustering, feature tables and export.
 
 ## What you can do
 
-<div class="grid cards" markdown>
+<div class="grid cards video-cards" markdown>
 
 -   :material-file-import: **Import anything**
 
@@ -27,12 +27,39 @@ compensation, unmixing, segmentation, clustering, feature tables and export.
     `.fcs` files, TIFF/OME image stacks and tabular data become the same
     row-per-observation table that every module understands.
 
+-   :material-flask-outline: **Unmix spectra**
+
+    ---
+
+    Extract reference spectra from the image channels before unmixing.
+
+    <video class="clip" muted loop playsinline preload="none"
+           poster="assets/videos/extract-spectra-poster.jpg">
+      <source src="assets/videos/extract-spectra.mp4" type="video/mp4">
+    </video>
+
+-   :material-check-decagram-outline: **Check unmixing**
+
+    ---
+
+    Inspect the unmixed channels and residuals before mapping the result.
+
+    <video class="clip" muted loop playsinline preload="none"
+           poster="assets/videos/unmix-qc-poster.jpg">
+      <source src="assets/videos/unmix-qc.mp4" type="video/mp4">
+    </video>
+
 -   :material-selection-drag: **Gate interactively**
 
     ---
 
     Rectangle, ellipse, polygon, quadrant, split and range gates, boolean
     gates, per-file gate shapes, and live gate statistics.
+
+    <video class="clip" muted loop playsinline preload="none"
+           poster="assets/videos/gating-poster.jpg">
+      <source src="assets/videos/gating.mp4" type="video/mp4">
+    </video>
 
 -   :material-image-filter-center-focus: **Analyse images**
 
@@ -42,6 +69,11 @@ compensation, unmixing, segmentation, clustering, feature tables and export.
     with Signal Expansion; per-Region pixel area; and per-class feature
     aggregation.
 
+    <video class="clip" muted loop playsinline preload="none"
+           poster="assets/videos/segmentation-poster.jpg">
+      <source src="assets/videos/segmentation.mp4" type="video/mp4">
+    </video>
+
 -   :material-vector-polygon: **Detect Regions**
 
     ---
@@ -50,12 +82,22 @@ compensation, unmixing, segmentation, clustering, feature tables and export.
     Expansion, edit in/out boundaries on the image, convert each Region to
     a 0/1 channel and measure its pixel area.
 
+    <video class="clip" muted loop playsinline preload="none"
+           poster="assets/videos/region-poster.jpg">
+      <source src="assets/videos/region.mp4" type="video/mp4">
+    </video>
+
 -   :material-chart-scatter-plot: **Explore**
 
     ---
 
     UMAP / t-SNE, clustering (PhenoGraph, Leiden, FlowSOM, PARC), feature
     heatmaps and publication-ready figures.
+
+    <video class="clip" muted loop playsinline preload="none"
+           poster="assets/videos/cluster-umap-heatmap-poster.jpg">
+      <source src="assets/videos/cluster-umap-heatmap.mp4" type="video/mp4">
+    </video>
 
 -   :material-image-multiple-outline: **Visualise with Figure**
 

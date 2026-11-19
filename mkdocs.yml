@@ -9,6 +9,9 @@ copyright: Copyright &copy; 2026 Amsterdam UMC — GPL-3.0
 extra_css:
   - assets/extra.css
 
+extra_javascript:
+  - assets/videos.js
+
 theme:
   name: material
   language: en

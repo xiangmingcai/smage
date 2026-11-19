@@ -13,6 +13,22 @@
   --md-typeset-a-color:         #5b6f92;
 }
 
+/* Feature clips embedded in the "What you can do" cards. One card per row. */
+.md-typeset .grid.video-cards {
+  grid-template-columns: 1fr;
+}
+
+.clip {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  margin: 0.8rem 0 0;
+  background: #000000;
+  border: 1px solid #dbe3ec;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
 /* Responsive 16:9 video embeds used by the workflow guides. */
 .video-grid {
   display: grid;
