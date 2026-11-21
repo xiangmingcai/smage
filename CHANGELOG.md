@@ -4,6 +4,37 @@ All notable changes to Smage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [0.3.3] — 2026-11-21
+
+### Added
+
+- **Gating**: right-clicking the plot offers **Save plot as…**, using the same
+  export as Figure: an editable PDF with vector axes and text (gates and
+  labels are included), or a PNG/JPEG image.
+
+### Changed
+
+- The Workflow tree keeps its scroll position when a module is added, pasted
+  or deleted instead of jumping back to the top.
+- **Feature Down**, **Feature Up** and **Gate2Col** now run their Calculate /
+  Convert work on a background thread and report progress through the status
+  line and log. The window stays responsive while a large file is processed;
+  closing the module still stops the run after the current file.
+- Workflow **Copy/Paste** keeps the saved **Data files** selection and points
+  it at the equivalent files of the new branch (matching the parquet filename,
+  then the display name). Selections with no equivalent in the new branch are
+  cleared. This covers Gating and Region stores and the preview file.
+- **Gating**: switching files while no gate is selected (root) keeps the X/Y
+  axes configured in Plot settings; a selected or active gate still uses its
+  own axes.
+
+### Fixed
+
+- Scatter **point size** is now always a screen-pixel diameter. With
+  **Fixed** checked it could previously be interpreted in data units, so a
+  round point became an ellipse when the X and Y axes had different scales.
+  Very large sizes saved by older projects fall back to the default.
+
 ## [0.3.2] — 2026-11-19
 
 ### Fixed

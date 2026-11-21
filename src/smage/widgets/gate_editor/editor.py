@@ -87,12 +87,11 @@ def _gating_state_init(ctx, page, task_def: dict, locked: bool) -> None:
         # module has no selection yet, so the preview starts empty instead of
         # showing the first available file.
         store = ctx._gating_store_load(task_def)
-        selected = [
-            f for f in (store.get("files") or [])
-            if any(r.get("parquet") == f for r in records)
-        ]
+        # Keep the saved selection even when this branch cannot see some
+        # files yet (a pasted branch recalculates its upstream modules).
+        selected = list(dict.fromkeys(store.get("files") or []))
         rec = next(
-            (r for r in records if r.get("parquet") == selected[0]), None
+            (r for r in records if r.get("parquet") in selected), None
         ) if selected else None
     else:
         # Unmix's embedded trees have no file picker: plot the first file.
@@ -105,6 +104,7 @@ def _gating_state_init(ctx, page, task_def: dict, locked: bool) -> None:
     preview = params.get("preview")
     valid = isinstance(preview, dict) and (
         preview.get("file") is None
+        or preview.get("file") in selected
         or any(r.get("parquet") == preview.get("file") for r in records)
     )
     if not valid:

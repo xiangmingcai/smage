@@ -53,12 +53,21 @@ def _close(window) -> None:
     harness.close_window(window)
 
 
+def _wait_calc(page) -> None:
+    harness.wait_for(
+        lambda: not getattr(page, "_g2c_running", False),
+        timeout=60,
+        message="Gate2Col conversion to finish",
+    )
+
+
 @harness.case("mod.gate2col.calculate", "L4", "gate2col", tags=("fast",))
 def calculate() -> None:
     window, project, page, parquet = _open("gate2col_calc")
     try:
         ctx = window._ctx
         gate2col_page._g2c_calculate(ctx, page)
+        _wait_calc(page)
         outputs = page._g2c_params.get("outputs") or {}
         harness.check(parquet in outputs, f"outputs: {outputs}")
         record = outputs[parquet]
@@ -78,6 +87,39 @@ def calculate() -> None:
         _close(window)
 
 
+@harness.case("mod.gate2col.nonblocking", "L4", "gate2col", tags=("fast",))
+def convert_runs_in_background() -> None:
+    """Convert returns while the conversion continues on a worker thread."""
+    import time
+
+    window, _project, page, _parquet = _open("gate2col_nonblocking")
+    original = gate2col_page._g2c_compute_file
+
+    def slow(*args, **kwargs):
+        time.sleep(0.8)
+        return original(*args, **kwargs)
+
+    gate2col_page._g2c_compute_file = slow
+    try:
+        ctx = window._ctx
+        started = time.perf_counter()
+        gate2col_page._g2c_calculate(ctx, page)
+        elapsed = time.perf_counter() - started
+        harness.check(
+            elapsed < 0.5,
+            f"Convert blocked the UI for {elapsed:.2f}s",
+        )
+        harness.check(
+            page._g2c_running,
+            "the conversion continues after Convert returns",
+        )
+        _wait_calc(page)
+        harness.check(not page._g2c_running)
+    finally:
+        gate2col_page._g2c_compute_file = original
+        _close(window)
+
+
 @harness.case("mod.gate2col.validation", "L4", "gate2col", tags=("fast",))
 def validation() -> None:
     window, _project, page, _parquet = _open("gate2col_validation")
@@ -87,6 +129,7 @@ def validation() -> None:
         with harness.patch_dialogs(gate2col_page,
                                    warning=QMessageBox.StandardButton.Ok):
             gate2col_page._g2c_calculate(ctx, page)
+        _wait_calc(page)
         harness.check(not page._g2c_params.get("outputs"))
 
         page._g2c_params["rules"] = [
@@ -95,6 +138,7 @@ def validation() -> None:
         with harness.patch_dialogs(gate2col_page,
                                    warning=QMessageBox.StandardButton.Ok):
             gate2col_page._g2c_calculate(ctx, page)
+        _wait_calc(page)
         harness.check(not page._g2c_params.get("outputs"),
                       "a name colliding with an existing column is rejected")
     finally:

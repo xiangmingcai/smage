@@ -8,6 +8,7 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QRect,
+    QTimer,
     Qt,
 )
 from PySide6.QtGui import (
@@ -20,6 +21,7 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFrame,
     QHBoxLayout,
@@ -41,8 +43,10 @@ from smage.widgets.resources import (
 )
 from uuid import uuid4
 import copy
+from pathlib import Path
 from smage.data import columns as _data_columns
 from smage.data import files as _data_files
+from smage.data import naming as _data_naming
 from smage.data import stores as _data_stores
 from smage.modules.import_ import page as _import__page
 from smage.modules.rename import page as _rename_page
@@ -538,6 +542,10 @@ class WorkflowTreeMixin:
         self.workflow_tree = QTreeWidget()
         self.workflow_tree.setHeaderHidden(True)
         self.workflow_tree.setIndentation(22)
+        # Pixel scrolling lets a refresh restore the exact visible offset.
+        self.workflow_tree.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
         # Remember which nodes the user collapsed, so a rebuild (adding a
         # module, saving, reopening the project) never re-expands everything.
         self.workflow_tree.itemExpanded.connect(
@@ -784,6 +792,116 @@ class WorkflowTreeMixin:
             text = text.replace(f"Module/{old}/", f"Module/{new}/")
         return text
 
+    def _remap_pasted_files(self, task: dict) -> None:
+        """Point saved file selections at equivalent files in this branch.
+
+        A single-module paste has no id mapping for its upstream modules, so
+        its selections can still point at the source branch's generated
+        files. Match by parquet file name first, then by display name.
+        Selections with no equivalent here are cleared.
+        """
+        for node in self._walk_tasks(task):
+            records = _data_files._available_files(
+                self._ctx, node.get("id")
+            )
+            available = set()
+            by_name = {}
+            by_display = {}
+            for rec in records:
+                path = str(rec.get("parquet") or "")
+                if not path:
+                    continue
+                available.add(path)
+                by_name.setdefault(Path(path).name, path)
+                name = str(rec.get("name") or "")
+                if name:
+                    by_display.setdefault(name, path)
+                    by_display.setdefault(Path(name).stem, path)
+
+            def fix(value):
+                if (
+                    not isinstance(value, str)
+                    or not value.lower().endswith(".parquet")
+                ):
+                    return value
+                if value in available:
+                    return value
+                mapped = by_name.get(Path(value).name)
+                if mapped:
+                    return mapped
+                display = _data_naming._comp_file_name(
+                    self._ctx, value, node.get("id")
+                )
+                mapped = by_display.get(display)
+                if mapped is None:
+                    mapped = by_display.get(Path(display).stem)
+                return mapped
+
+            node["params"] = self._remap_file_value(node.get("params"), fix)
+            for key in ("_gating_store", "_region_store"):
+                store = node.get(key)
+                if not isinstance(store, dict):
+                    continue
+                files = []
+                for path in store.get("files") or []:
+                    mapped = fix(path)
+                    if mapped:
+                        files.append(mapped)
+                store["files"] = files
+                if isinstance(store.get("per_file"), dict):
+                    per_file = {}
+                    for path, overrides in store["per_file"].items():
+                        mapped = fix(path)
+                        if mapped:
+                            per_file[mapped] = overrides
+                    store["per_file"] = per_file
+                for region in store.get("regions") or []:
+                    samples = region.get("samples") or {}
+                    kept = {}
+                    for path, value in samples.items():
+                        mapped = fix(path)
+                        if mapped:
+                            kept[mapped] = value
+                    region["samples"] = kept
+
+    def _remap_file_value(self, value, fix):
+        """Apply ``fix`` to every .parquet path in a params structure.
+
+        ``fix`` returns None for a selection that has no equivalent here;
+        such list entries and dict keys/values are dropped.
+        """
+        if isinstance(value, dict):
+            out = {}
+            for key, item in value.items():
+                if isinstance(key, str) and key.lower().endswith(".parquet"):
+                    key = fix(key)
+                    if key is None:
+                        continue
+                mapped = self._remap_file_value(item, fix)
+                if (
+                    isinstance(item, str)
+                    and item.lower().endswith(".parquet")
+                    and mapped is None
+                ):
+                    continue
+                out[key] = mapped
+            return out
+        if isinstance(value, list):
+            out = []
+            for item in value:
+                mapped = self._remap_file_value(item, fix)
+                if (
+                    isinstance(item, str)
+                    and item.lower().endswith(".parquet")
+                    and mapped is None
+                ):
+                    continue
+                out.append(mapped)
+            return out
+        if isinstance(value, str):
+            return fix(value)
+        return value
+
     def _remap_pasted_refs(self, task: dict, mapping: dict) -> None:
         """Point pasted modules at the pasted copies of their inputs.
 
@@ -833,6 +951,7 @@ class WorkflowTreeMixin:
         self._remap_pasted_paths(new_task, mapping)
         task_def.setdefault("children", []).append(new_task)
         self._remap_pasted_refs(new_task, mapping)
+        self._remap_pasted_files(new_task)
         _data_stores._restore_gating_stores(self._ctx, new_task, mapping)
         if self.project is not None:
             self.project.save()
@@ -993,8 +1112,16 @@ class WorkflowTreeMixin:
         self._tree_expanded = dict(expanded) if isinstance(expanded, dict) else {}
 
     def _refresh_workflow_tree(self) -> None:
-        """Rebuild the workflow tree, keeping each node's expansion state."""
-        if self.project is not self._tree_project:
+        """Rebuild the workflow tree, keeping expansion and scroll state.
+
+        Adding or deleting a module rebuilds every card, which would
+        otherwise jump the view back to the top.  The module at the top of
+        the viewport (and its pixel offset) is restored after the rebuild;
+        a different project starts at the top.
+        """
+        same_project = self.project is self._tree_project
+        anchor = self._workflow_scroll_anchor() if same_project else None
+        if not same_project:
             # A different project is open: pick up its saved layout.
             self._tree_project = self.project
             self._load_tree_state()
@@ -1017,6 +1144,65 @@ class WorkflowTreeMixin:
                     self._tree_expanded.pop(task_id, None)
         finally:
             self._tree_restoring = False
+            if anchor is not None:
+                # Let the tree lay out the new cards before scrolling.
+                QTimer.singleShot(
+                    0, lambda a=anchor: self._restore_workflow_scroll(a)
+                )
+
+    def _workflow_scroll_anchor(self):
+        """The first visible task card plus its pixel offset."""
+        tree = getattr(self, "workflow_tree", None)
+        if tree is None:
+            return None
+        scroll = tree.verticalScrollBar().value()
+        root = tree.invisibleRootItem()
+        stack = [root.child(i) for i in range(root.childCount())]
+        best = None
+        best_rect = None
+        while stack:
+            item = stack.pop()
+            stack.extend(item.child(i) for i in range(item.childCount()))
+            if not item.data(0, Qt.ItemDataRole.UserRole):
+                continue  # the "Workflow" header has no task id
+            rect = tree.visualItemRect(item)
+            if not rect.isValid() or rect.bottom() < 0:
+                continue  # wholly above the viewport
+            if best is None or rect.top() < best_rect.top():
+                best, best_rect = item, rect
+        if best is None:
+            return (None, 0, scroll)
+        task_id = best.data(0, Qt.ItemDataRole.UserRole)
+        return (str(task_id), best_rect.top(), scroll)
+
+    def _restore_workflow_scroll(self, anchor) -> None:
+        """Put the anchored task back where it was before the rebuild."""
+        tree = getattr(self, "workflow_tree", None)
+        if tree is None:
+            return
+        task_id, offset, scroll = anchor
+        item = self._workflow_tree_item(task_id) if task_id else None
+        bar = tree.verticalScrollBar()
+        if item is None:
+            # The top module was deleted: keep the old pixel position.
+            bar.setValue(scroll)
+            return
+        tree.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtTop)
+        # scrollToItem aligns the item with the viewport top; move by the
+        # difference to reproduce a partially scrolled first card.
+        shift = tree.visualItemRect(item).top() - offset
+        bar.setValue(bar.value() + shift)
+
+    def _workflow_tree_item(self, task_id):
+        """Find a workflow card by task id."""
+        root = self.workflow_tree.invisibleRootItem()
+        stack = [root.child(i) for i in range(root.childCount())]
+        while stack:
+            item = stack.pop()
+            if str(item.data(0, Qt.ItemDataRole.UserRole) or "") == str(task_id):
+                return item
+            stack.extend(item.child(i) for i in range(item.childCount()))
+        return None
 
     def _add_task_from_definition(self, parent, task_def: dict, parent_task_def=None,
                                   force=None, live=None):

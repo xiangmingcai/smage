@@ -53,12 +53,21 @@ def _close(window) -> None:
     harness.close_window(window)
 
 
+def _wait_calc(page) -> None:
+    harness.wait_for(
+        lambda: not getattr(page, "_feat_running", False),
+        timeout=60,
+        message="Feature Down calculation to finish",
+    )
+
+
 @harness.case("mod.feature.calculate", "L4", "feature", tags=("fast",))
 def calculate() -> None:
     window, project, page, parquet = _open("feature_calc", ignore=[])
     try:
         ctx = window._ctx
         feature_page._feat_calculate(ctx, page)
+        _wait_calc(page)
         outputs = page._feat_params.get("outputs") or {}
         harness.check(parquet in outputs, f"outputs: {outputs}")
         record = outputs[parquet]
@@ -232,9 +241,45 @@ def feature_row() -> None:
             "a deleted group-key row is not re-created",
         )
         feature_page._feat_calculate(ctx, page)
+        _wait_calc(page)
         record = page._feat_params["outputs"][str(parquet)]
         harness.eq(record["columns"], ["n", "mean_v"])
     finally:
+        _close(window)
+
+
+@harness.case("mod.feature.nonblocking", "L4", "feature", tags=("fast",))
+def calculate_runs_in_background() -> None:
+    """Calculate returns while aggregation continues on a worker thread."""
+    import time
+
+    window, _project, page, _parquet = _open(
+        "feature_nonblocking", ignore=[]
+    )
+    original = feature_page._feat_compute_file
+
+    def slow(*args, **kwargs):
+        time.sleep(0.8)
+        return original(*args, **kwargs)
+
+    feature_page._feat_compute_file = slow
+    try:
+        ctx = window._ctx
+        started = time.perf_counter()
+        feature_page._feat_calculate(ctx, page)
+        elapsed = time.perf_counter() - started
+        harness.check(
+            elapsed < 0.5,
+            f"Calculate blocked the UI for {elapsed:.2f}s",
+        )
+        harness.check(
+            page._feat_running,
+            "the calculation continues after Calculate returns",
+        )
+        _wait_calc(page)
+        harness.check(not page._feat_running)
+    finally:
+        feature_page._feat_compute_file = original
         _close(window)
 
 
@@ -246,6 +291,7 @@ def ignore_background() -> None:
         with harness.patch_dialogs(feature_page,
                                    question=QMessageBox.StandardButton.Yes):
             feature_page._feat_calculate(ctx, page)
+        _wait_calc(page)
         output = project.path / page._feat_params["outputs"][parquet]["path"]
         frame = pd.read_parquet(output)
         harness.eq(sorted(frame["group"].tolist()), [1, 2],
@@ -263,6 +309,7 @@ def validation() -> None:
         with harness.patch_dialogs(feature_page,
                                    warning=QMessageBox.StandardButton.Ok):
             feature_page._feat_calculate(ctx, page)
+        _wait_calc(page)
         harness.check(not page._feat_params.get("outputs"))
 
         page._feat_params["feature"] = "group"
@@ -270,6 +317,7 @@ def validation() -> None:
         with harness.patch_dialogs(feature_page,
                                    warning=QMessageBox.StandardButton.Ok):
             feature_page._feat_calculate(ctx, page)
+        _wait_calc(page)
         harness.check(not page._feat_params.get("outputs"),
                       "Count must be the first rule")
     finally:

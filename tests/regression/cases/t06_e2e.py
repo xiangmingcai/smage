@@ -35,6 +35,14 @@ def _close_window(window) -> None:
     harness.close_window(window)
 
 
+def _wait_calc(page, attr: str) -> None:
+    harness.wait_for(
+        lambda: not getattr(page, attr, False),
+        timeout=120,
+        message=f"{attr} calculation to finish",
+    )
+
+
 def _drain(q: queue.Queue) -> list:
     messages = []
     while True:
@@ -81,6 +89,7 @@ def gating_gate2col_export() -> None:
         harness.pump(350)
         page = window.tabs.currentWidget()
         _gate2col_page._g2c_calculate(ctx, page)
+        _wait_calc(page, "_g2c_running")
         window._close_module_page(page)
         harness.pump(80)
 
@@ -145,6 +154,7 @@ def feature_export() -> None:
         harness.pump(350)
         page = window.tabs.currentWidget()
         feature_page._feat_calculate(ctx, page)
+        _wait_calc(page, "_feat_running")
         record = page._feat_params["outputs"][str(parquet)]
         feature_path = str(project.path / record["path"])
         window._close_module_page(page)
@@ -423,6 +433,7 @@ def rename_feature_export() -> None:
         harness.check("Cluster" in _data_columns._columns_for(ctx, str(parquet), "f-1"))
         page = e2e.open_page(window, "f-1", "feature", "Feature")
         feature_page._feat_calculate(ctx, page)
+        _wait_calc(page, "_feat_running")
         record = page._feat_params["outputs"][str(parquet)]
         harness.eq(record["columns"], ["Cluster", "n", "mean_x"])
         output = project.path / record["path"]
@@ -498,6 +509,7 @@ def map_pipeline_feature() -> None:
         )
         page = e2e.open_page(window, "f-1", "feature", "Feature")
         feature_page._feat_calculate(ctx, page)
+        _wait_calc(page, "_feat_running")
         record = page._feat_params["outputs"][parquet]
         output = pd.read_parquet(project.path / record["path"]).sort_values("group")
 
@@ -570,6 +582,7 @@ def image_seg_feature_export() -> None:
                                    warning=QMessageBox.StandardButton.Ok,
                                    information=QMessageBox.StandardButton.Ok):
             feature_page._feat_calculate(ctx, page)
+        _wait_calc(page, "_feat_running")
         harness.check(
             parquet in (page._feat_params.get("outputs") or {}),
             "feature validation/calculation produced no output",
@@ -674,6 +687,7 @@ def project_roundtrip() -> None:
         ctx = window._ctx
         page = e2e.open_page(window, "f-1", "feature", "Feature")
         feature_page._feat_calculate(ctx, page)
+        _wait_calc(page, "_feat_running")
         record = page._feat_params["outputs"][parquet]
         feature_path = str(project.path / record["path"])
     finally:

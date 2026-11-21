@@ -61,28 +61,9 @@ def _restore_region_store(ctx, task: dict, store: dict,
                 ctx._remap_path_text(str(path), mapping): value
                 for path, value in samples.items()
             }
-    visible = {
-        rec.get("parquet")
-        for rec in ctx._available_files(task.get("id"))
-    }
-    if visible:
-        store["files"] = [
-            path for path in store.get("files") or [] if path in visible
-        ]
-        store["per_file"] = {
-            gate_id: {
-                path: geometry
-                for path, geometry in (overrides or {}).items()
-                if path in visible
-            }
-            for gate_id, overrides in (store.get("per_file") or {}).items()
-        }
-        for region in store.get("regions") or []:
-            samples = region.get("samples") or {}
-            region["samples"] = {
-                path: value for path, value in samples.items()
-                if path in visible
-            }
+    # Keep the saved selection even when the pasted location cannot see the
+    # files yet (the upstream modules of a copied branch are recalculated
+    # later). The module shows the files as unavailable until then.
     _regions._region_store_save(ctx, task, store)
 
 
@@ -109,15 +90,9 @@ def _restore_gating_stores(ctx, task: dict, mapping: dict | None=None) -> None:
                 ctx._remap_path_text(path, mapping): overrides
                 for path, overrides in (store.get("per_file") or {}).items()
             }
-        # Files that belong to another upstream branch cannot apply here.
-        visible = {
-            rec.get("parquet")
-            for rec in ctx._available_files(node.get("id"))
-        }
-        if visible:
-            store["files"] = [
-                p for p in (store.get("files") or []) if p in visible
-            ]
+        # Keep the saved selection even when the pasted location cannot see
+        # the files yet (a copied branch recalculates its upstream modules
+        # later). The module shows them as unavailable until then.
         ctx._gating_store_save(node, store)
 
 

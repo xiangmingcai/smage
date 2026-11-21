@@ -2,10 +2,17 @@
 
 ## Highlights
 
-- **Extensions**: **Install dependencies** for Cellpose/StarDist now upgrades
-  pip in the target environment to at least 23.2 first, fixing the
-  `typing_extensions` / `flit_core` failure with old Python 3.11 venvs.
-- See the 0.3.1 notes for the Feature Up fixes and workflow videos.
+- **Gating**: right-click the plot and choose **Save plot as…** to export the
+  current view (gates and labels included) as an editable PDF, PNG or JPEG.
+- **Feature Down**, **Feature Up** and **Gate2Col** calculate in the
+  background, so the window stays responsive on large files.
+- Workflow **Copy/Paste** keeps the saved **Data files** selection and maps it
+  to the equivalent files in the new branch; the workflow view also keeps its
+  scroll position when modules are added or deleted.
+- Scatter **Fixed** point size is now a screen-pixel diameter, keeping points
+  round when the X and Y axes have different scales.
+- **Gating** keeps the Plot settings axes when switching files at the root;
+  selecting a gate still uses that gate's axes.
 
 ## Downloads
 

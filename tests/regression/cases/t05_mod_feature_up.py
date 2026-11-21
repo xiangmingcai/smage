@@ -68,12 +68,21 @@ def _close(window) -> None:
     harness.close_window(window)
 
 
+def _wait_calc(page) -> None:
+    harness.wait_for(
+        lambda: not getattr(page, "_fup_running", False),
+        timeout=60,
+        message="Feature Up calculation to finish",
+    )
+
+
 @harness.case("mod.feature_up.calculate", "L4", "feature_up", tags=("fast",))
 def calculate() -> None:
     window, project, page, to_path = _open("feature_up_calc")
     try:
         ctx = window._ctx
         feature_up_page._fup_calculate(ctx, page)
+        _wait_calc(page)
         outputs = page._fup_params.get("outputs") or {}
         harness.check(to_path in outputs, f"outputs: {outputs}")
         record = outputs[to_path]
@@ -92,6 +101,39 @@ def calculate() -> None:
         _close(window)
 
 
+@harness.case("mod.feature_up.nonblocking", "L4", "feature_up", tags=("fast",))
+def calculate_runs_in_background() -> None:
+    """Calculate returns while the mapping continues on a worker thread."""
+    import time
+
+    window, _project, page, _to_path = _open("feature_up_nonblocking")
+    original = feature_up_page._fup_compute_file
+
+    def slow(*args, **kwargs):
+        time.sleep(0.8)
+        return original(*args, **kwargs)
+
+    feature_up_page._fup_compute_file = slow
+    try:
+        ctx = window._ctx
+        started = time.perf_counter()
+        feature_up_page._fup_calculate(ctx, page)
+        elapsed = time.perf_counter() - started
+        harness.check(
+            elapsed < 0.5,
+            f"Calculate blocked the UI for {elapsed:.2f}s",
+        )
+        harness.check(
+            page._fup_running,
+            "the calculation continues after Calculate returns",
+        )
+        _wait_calc(page)
+        harness.check(not page._fup_running)
+    finally:
+        feature_up_page._fup_compute_file = original
+        _close(window)
+
+
 @harness.case("mod.feature_up.validation", "L4", "feature_up", tags=("fast",))
 def validation() -> None:
     window, _project, page, _to_path = _open("feature_up_validation")
@@ -101,6 +143,7 @@ def validation() -> None:
         with harness.patch_dialogs(feature_up_page,
                                    warning=QMessageBox.StandardButton.Ok):
             feature_up_page._fup_calculate(ctx, page)
+        _wait_calc(page)
         harness.check(not page._fup_params.get("outputs"))
 
         page._fup_params["from_files"] = list(page._fup_params["matches"].keys())
@@ -108,6 +151,7 @@ def validation() -> None:
         with harness.patch_dialogs(feature_up_page,
                                    warning=QMessageBox.StandardButton.Ok):
             feature_up_page._fup_calculate(ctx, page)
+        _wait_calc(page)
         harness.check(not page._fup_params.get("outputs"))
     finally:
         _close(window)
@@ -215,6 +259,7 @@ def match_uses_display_names() -> None:
             question=QMessageBox.StandardButton.Yes,
         ):
             feature_up_page._fup_calculate(ctx, page)
+        _wait_calc(page)
         mapped = [
             line for line in page._fup_log_lines
             if "mapped.parquet" in line

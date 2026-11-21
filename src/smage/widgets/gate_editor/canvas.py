@@ -90,10 +90,12 @@ class _NoClickScatter(pg.ScatterPlotItem):
 class _GateViewBox(pg.ViewBox):
     """Scatter ViewBox that draws gate ROIs (rectangle / ellipse / polygon)."""
 
-    def __init__(self, on_gate_created, on_empty_click=None, *args, **kwargs):
+    def __init__(self, on_gate_created, on_empty_click=None,
+                 on_context_menu=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._on_gate_created = on_gate_created
         self._on_empty_click = on_empty_click
+        self._on_context_menu = on_context_menu
         # Colour used while drawing gates (kept in sync with the settings).
         self.gate_color = _GATE_COLOR_DEFAULT
         self._tool = None  # "rect" | "ellipse" | "polygon" | ...
@@ -279,8 +281,16 @@ class _GateViewBox(pg.ViewBox):
                               x=round(pos.x(), 3), y=round(pos.y(), 3))
             except Exception:
                 runlog.action("gating.click", tool=str(self._tool))
-        if self._tool == "polygon" and ev.button() == Qt.MouseButton.RightButton:
-            self._finish_polygon()
+        if ev.button() == Qt.MouseButton.RightButton:
+            # The right button finishes a polygon under construction.  Any
+            # other right-click is the page's context menu (Gating: Save
+            # plot as…), not pyqtgraph's built-in menu.
+            if self._tool == "polygon":
+                self._finish_polygon()
+            elif self._on_context_menu is not None:
+                self._on_context_menu(ev.screenPos().toPoint())
+            else:
+                super().mouseClickEvent(ev)
             ev.accept()
             return
         if ev.button() != Qt.MouseButton.LeftButton:
@@ -800,8 +810,14 @@ class _GatingCanvasView(QGraphicsView):
         QApplication.sendEvent(self._plot_viewport, forwarded)
 
     def mousePressEvent(self, event) -> None:
+        # Forward right-button clicks too: pyqtgraph only receives a click
+        # (for the plot's context menu and the polygon gate menu) when both
+        # the press and the release reach the embedded plot viewport.
         if (
-            event.button() == Qt.MouseButton.LeftButton
+            event.button() in (
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.RightButton,
+            )
             and self._over_plot(event.position().toPoint())
         ):
             self._plot_pressed = True

@@ -114,6 +114,57 @@ def workflow_add() -> None:
         _close(window)
 
 
+@harness.case("shell.workflow.scroll_kept", "L5", "shell", tags=("fast",))
+def workflow_scroll_kept() -> None:
+    """Adding or deleting a module keeps the visible cards where they were."""
+    tasks = [
+        harness.task_def("scale", task_id=f"s-{index}", name=f"Scale {index}")
+        for index in range(80)
+    ]
+    window, _project = _open("shell_scroll_kept", tasks)
+    try:
+        tree = window.workflow_tree
+        harness.pump(150)
+        bar = tree.verticalScrollBar()
+        harness.check(
+            bar.maximum() > 200,
+            f"the fixture is tall enough to scroll ({bar.maximum()})",
+        )
+        bar.setValue(bar.maximum() // 2)
+        harness.pump(60)
+        anchor = tree.itemAt(QPoint(1, 100))
+        harness.check(anchor is not None, "a card is visible in the view")
+        anchor_id = anchor.data(0, Qt.ItemDataRole.UserRole)
+        harness.check(bool(anchor_id), "the visible card is a task, not the header")
+        anchor_top = tree.visualItemRect(anchor).top()
+
+        parent = window.project.workflow["tasks"][0]["children"][0]
+        window._add_module(parent, "gating")
+        harness.pump(150)
+        moved = window._workflow_tree_item(anchor_id)
+        harness.check(moved is not None, "the anchored card still exists")
+        harness.check(
+            abs(tree.visualItemRect(moved).top() - anchor_top) <= 1,
+            f"adding kept the card at {anchor_top}, now "
+            f"{tree.visualItemRect(moved).top()}",
+        )
+
+        added = parent["children"][-1]
+        with harness.patch_dialogs(
+            workflow_tree, question=QMessageBox.StandardButton.Yes
+        ):
+            window._delete_task(added, parent, with_branch=False)
+        harness.pump(150)
+        moved = window._workflow_tree_item(anchor_id)
+        harness.check(
+            abs(tree.visualItemRect(moved).top() - anchor_top) <= 1,
+            f"deleting kept the card at {anchor_top}, now "
+            f"{tree.visualItemRect(moved).top()}",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("shell.workflow.copy_paste", "L5", "shell", tags=("fast",))
 def workflow_copy_paste() -> None:
     """Copied modules paste as new children and survive a reload."""
@@ -151,6 +202,130 @@ def workflow_copy_paste() -> None:
         saved = Project.load(project.path)
         harness.eq(len(saved.workflow["tasks"][0]["children"]), 3,
                    "single and branch pastes persist")
+    finally:
+        _close(window)
+
+
+@harness.case("shell.workflow.copy_files", "L5", "shell", tags=("fast",))
+def workflow_copy_file_selections() -> None:
+    """Copy/paste keeps saved Data files selections, even across branches."""
+    from smage.data import regions as _regions
+
+    scale = harness.task_def(
+        "scale", task_id="s-copy", name="Scale",
+        params={"files": [], "columns": []},
+    )
+    subset = harness.task_def(
+        "subset", task_id="sub-copy", name="Subset",
+        params={"files": [], "columns": []},
+    )
+    gating = harness.task_def("gating", task_id="g-copy", name="Gating")
+    region = harness.task_def("region", task_id="r-copy", name="Region")
+    window, _project = _open(
+        "shell_copy_files", [scale, subset, gating, region]
+    )
+    try:
+        ctx = window._ctx
+        project = window.project
+        import_task = project.workflow["tasks"][0]
+        by_id = {t["id"]: t for t in import_task["children"]}
+        parquet = str(project.data_dir / "case.parquet")
+        by_id["s-copy"]["params"]["files"] = [parquet]
+        by_id["sub-copy"]["params"]["files"] = [parquet]
+        ctx._gating_store_save(
+            by_id["g-copy"],
+            {"files": [parquet], "gates": [], "per_file": {}},
+        )
+        _regions._region_store_save(ctx, by_id["r-copy"], {
+            "files": [parquet], "gates": [], "per_file": {}, "regions": [],
+        })
+        project.save()
+
+        for task_id, task_type in (
+            ("s-copy", "scale"), ("sub-copy", "subset"),
+            ("g-copy", "gating"), ("r-copy", "region"),
+        ):
+            source = by_id[task_id]
+            window._copy_task(source)
+            window._paste_task(import_task)
+            pasted = import_task["children"][-1]
+            harness.eq(pasted["type"], task_type)
+            if task_type in ("scale", "subset"):
+                harness.eq(
+                    (pasted.get("params") or {}).get("files"), [parquet],
+                    f"{task_type} keeps its selected files",
+                )
+            elif task_type == "gating":
+                store = ctx._gating_store_load(pasted)
+                harness.eq(store.get("files"), [parquet],
+                           "Gating keeps its selected files")
+            else:
+                store = _regions._region_store_load(ctx, pasted)
+                harness.eq(store.get("files"), [parquet],
+                           "Region keeps its selected files")
+
+        # The pasted Gating module must also keep the selection when opened,
+        # even though the file is not available in this branch yet.
+        pasted_gating = next(
+            t for t in import_task["children"]
+            if t["type"] == "gating" and t["id"] != "g-copy"
+        )
+        window._open_module(pasted_gating["id"], "gating", "Gating")
+        harness.pump(300)
+        page = window.tabs.currentWidget()
+        harness.eq(page._gating_files, [parquet])
+        harness.eq(
+            (page._gating_task_def.get("params") or {}).get("preview", {}).get(
+                "file"
+            ),
+            parquet,
+        )
+        window._close_module_page(page)
+        harness.pump(80)
+    finally:
+        _close(window)
+
+
+@harness.case("shell.workflow.remap_pasted_files", "L5", "shell",
+              tags=("fast",))
+def remap_pasted_file_selections() -> None:
+    """Pasted selections point at the equivalent output of the new branch."""
+    window, _project = _open("shell_remap_files")
+    try:
+        old = r"C:\proj\Module\feature-old\sample_Mask.parquet"
+        new = r"C:\proj\Module\feature-new\sample_Mask.parquet"
+        imported = r"C:\proj\data\imported.parquet"
+        task = {
+            "id": "gating-new",
+            "type": "gating",
+            "params": {
+                "files": [old, imported],
+                "preview": {"file": old},
+                "matches": {old: imported},
+            },
+            "_gating_store": {
+                "files": [old, r"C:\proj\Module\gone\missing.parquet"],
+                "per_file": {old: {"pos": [0, 0]}},
+            },
+        }
+        original = workflow_tree._data_files._available_files
+        workflow_tree._data_files._available_files = (
+            lambda ctx, task_id=None: [
+                {"parquet": new, "name": "sample_Mask"},
+                {"parquet": imported, "name": "sample.fcs"},
+            ]
+        )
+        try:
+            window._remap_pasted_files(task)
+        finally:
+            workflow_tree._data_files._available_files = original
+
+        params = task["params"]
+        harness.eq(params["files"], [new, imported])
+        harness.eq(params["preview"]["file"], new)
+        harness.eq(params["matches"], {new: imported})
+        harness.eq(task["_gating_store"]["files"], [new])
+        harness.eq(task["_gating_store"]["per_file"], {new: {"pos": [0, 0]}})
     finally:
         _close(window)
 

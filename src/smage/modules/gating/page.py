@@ -78,6 +78,7 @@ from smage.data import outputs as _data_outputs
 from smage.data import sampling as _data_sampling
 from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
 from smage.widgets import picker as _widgets_picker
+from smage.widgets.plot import export as _widgets_plot_export
 from smage.widgets.plot import renderer as _widgets_plot_renderer
 
 
@@ -410,9 +411,9 @@ def _gating_refresh_files(ctx, page) -> None:
     if not getattr(page, "_gating_uses_store", False):
         return
     records = _data_files._available_files(ctx, page._gating_task_id)
-    # Drop selected files that are no longer visible (hidden/renamed).
-    visible = {rec.get("parquet") for rec in records}
-    page._gating_files = [p for p in (page._gating_files or []) if p in visible]
+    # Keep the saved selection even when some files are not visible yet:
+    # a pasted branch recalculates its upstream modules, and the selection
+    # must survive until they are available again.
     box = getattr(page, "_gating_files_box", None)
     if box is not None:
         box.blockSignals(True)
@@ -573,6 +574,7 @@ def _gating_make_plot(ctx, page):
     viewbox = _GateViewBox(
         on_gate_created=lambda tool, roi: _gating_add_gate(ctx, page, tool, roi),
         on_empty_click=lambda: _gating_deselect(ctx, page),
+        on_context_menu=lambda pos: _gating_plot_context_menu(ctx, page, pos),
     )
     viewbox.gate_color = _gate_color(page._gating_preview)
     plot_item = _make_fit_plot_item(viewbox=viewbox)
@@ -598,7 +600,83 @@ def _gating_make_plot(ctx, page):
     # cached as device-coordinate pixmaps so those moves blit the cached
     # scatter/image instead of re-running the per-point paint.
     plot_widget._gate_cache_data = True
+    # Replace pyqtgraph's built-in context menu with Gating's own.
+    try:
+        plot_item.setMenuEnabled(False)
+    except Exception:  # noqa: BLE001 - older pyqtgraph lacks the setter
+        pass
+    try:
+        viewbox.setMenuEnabled(False)
+    except Exception:  # noqa: BLE001 - older pyqtgraph lacks the setter
+        pass
     return plot_widget, viewbox
+
+
+def _gating_export_name(preview: dict) -> str:
+    """A readable default filename for the gating plot."""
+    parts = []
+    file_name = preview.get("file_name")
+    if file_name:
+        parts.append(Path(str(file_name)).stem)
+    plot_type = preview.get("type") or "scatter"
+    if plot_type == "image":
+        parts.append("image")
+    else:
+        x_name = preview.get("x")
+        y_name = preview.get("y")
+        if x_name:
+            parts.append(str(x_name))
+        # A histogram has no Y parameter, even if an old preview still
+        # carries the last scatter's value.
+        if plot_type != "histogram" and y_name:
+            parts.append(f"vs {y_name}")
+    return " ".join(parts) or "gating plot"
+
+
+def _gating_can_export(page) -> bool:
+    """True when the gating plot currently shows a file."""
+    preview = getattr(page, "_gating_preview", None) or {}
+    if not preview.get("file"):
+        return False
+    if getattr(page, "_gating_uses_store", False) and not page._gating_files:
+        return False
+    return True
+
+
+def _gating_save_plot_as(ctx, page) -> None:
+    """Save the gating plot exactly as it is currently displayed."""
+    plot_widget = getattr(page, "_gating_plot_widget", None)
+    if plot_widget is None or not _gating_can_export(page):
+        return
+    try:
+        path = _widgets_plot_export._plot_export_save(
+            plot_widget,
+            ctx.host,
+            _gating_export_name(page._gating_preview),
+        )
+    except Exception as exc:  # noqa: BLE001 - report, never break the page
+        _log_exception(exc)
+        QMessageBox.critical(
+            ctx.host, "Save Plot As", f"Could not save the plot:\n{exc}"
+        )
+        return
+    if path:
+        runlog.info("gating.export", path=str(path))
+        ctx.statusBar().showMessage(f"Plot saved to {path}", 4000)
+
+
+def _gating_plot_context_menu(ctx, page, global_pos) -> None:
+    """Right-click menu of the gating plot: Save plot as… only."""
+    menu = QMenu(ctx.host)
+    save_as = menu.addAction("Save plot as…")
+    save_as.setToolTip(
+        "Save the plot as currently shown (gates and labels included): "
+        "an editable PDF with vector axes and text, or a PNG/JPEG image"
+    )
+    save_as.setEnabled(_gating_can_export(page))
+    chosen = menu.exec(global_pos)
+    if chosen is save_as:
+        _gating_save_plot_as(ctx, page)
 
 
 def _gating_readout_suppress(page, flag: bool) -> None:
@@ -3502,6 +3580,10 @@ def _gating_switch_file(ctx, page, path, name=None) -> None:
     elif plot_type == "histogram":
         x = gate["x"] if gate_axes_ok and gate.get("x") else None
         if x not in new_cols:
+            x = page._gating_settings_x
+        if x not in new_cols:
+            x = preview.get("x")
+        if x not in new_cols:
             x, _ = _gating_default_axes(ctx, new_cols, preview)
         preview["x"] = x if x in new_cols else (
             new_cols[0] if new_cols else None
@@ -3512,9 +3594,24 @@ def _gating_switch_file(ctx, page, path, name=None) -> None:
             preview["x"] = gate["x"]
             preview["y"] = gate["y"]
         else:
-            preview["x"], preview["y"] = _gating_default_axes(ctx,
-                new_cols, preview
-            )
+            # No gate is driving this view: keep the axes configured in Plot
+            # settings, then the current axes, then the first two columns.
+            x = page._gating_settings_x
+            y = page._gating_settings_y
+            if x not in new_cols:
+                x = preview.get("x")
+            if y not in new_cols:
+                y = preview.get("y")
+            if x not in new_cols or y not in new_cols:
+                dx, dy = _gating_default_axes(ctx, new_cols, preview)
+                if x not in new_cols:
+                    x = dx
+                if y not in new_cols:
+                    y = dy
+                if y == x:
+                    y = next((c for c in new_cols if c != x), x)
+            preview["x"] = x if x in new_cols else None
+            preview["y"] = y if y in new_cols else None
     # Keep the visible range when switching files (not for image view,
     # which uses the image's own extent), but only when the axes did not
     # change with the file.

@@ -9,7 +9,6 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -1669,74 +1668,182 @@ def _feat_calculate(ctx, page) -> None:
     status = getattr(page, "_feat_calc_status", None)
     if status is not None:
         status.setText("Calculating…")
-    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-    done = 0
-    failed = []
     page._feat_running = True
     page._feat_cancel = False
+    button = getattr(page, "_feat_calc_btn", None)
+    if button is not None:
+        button.setEnabled(False)
+
+    # Snapshot the settings: edits made while the worker runs must not change
+    # the meaning of the results already being computed.
+    snapshot = copy.deepcopy(params)
+    selected = list(snapshot.get("files") or [])
+    names = {
+        path: _data_naming._comp_file_name(
+            ctx, path, page._feat_task_id
+        )
+        for path in selected
+    }
+    page._feat_pending_outputs = {}
+    page._feat_run_selected = list(selected)
+    page._feat_run_settings = {
+        key: copy.deepcopy(value)
+        for key, value in snapshot.items()
+        if key not in ("outputs", "log")
+    }
+    q = queue.Queue()
+    page._feat_queue = q
+    page._feat_thread = threading.Thread(
+        target=_feat_run_bg,
+        args=(ctx, page, q, snapshot, selected, names),
+        daemon=True,
+    )
+    page._feat_thread.start()
+    timer = QTimer(ctx.host)
+    timer.setInterval(100)
+    timer.timeout.connect(lambda: _feat_poll(ctx, page))
+    timer.start()
+    page._feat_calc_timer = timer
+    _feat_log(ctx, page, f"Calculating {len(selected)} file(s)…")
+
+
+def _feat_run_bg(ctx, page, q, params, selected, names) -> None:
+    """Aggregate the selected files off the UI thread."""
+    done = 0
+    failed = []
     try:
-        for path in selected:
+        for index, path in enumerate(selected):
             if getattr(page, "_feat_cancel", False):
-                _feat_log(ctx, page, "Calculation cancelled.")
+                q.put(("log", "Calculation cancelled."))
                 break
-            name = _data_naming._comp_file_name(ctx, path, page._feat_task_id)
-            if status is not None:
-                status.setText(f"Calculating… {name}")
-            QApplication.processEvents()
-            previous = outputs.get(path)
+            name = names.get(path, str(path))
+            q.put((
+                "status",
+                f"Calculating {index + 1}/{len(selected)} — {name}",
+            ))
             try:
-                rel, columns, warnings = _feat_compute_file(ctx, page, path)
+                rel, columns, warnings = _feat_compute_file(
+                    ctx, page, path, params
+                )
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{name}: {exc}")
-                _feat_log(ctx, page, f"✗ {name}: {exc}")
+                q.put(("log", f"✗ {name}: {exc}"))
                 continue
-            # A renamed output (e.g. after this file's name scheme changed)
-            # leaves its old parquet behind; remove it.
-            if isinstance(previous, dict) and previous.get("path"):
-                if previous["path"] != rel and ctx.project is not None:
-                    try:
-                        (ctx.project.path / previous["path"]).unlink(
-                            missing_ok=True
-                        )
-                    except OSError:
-                        pass
             for warning in warnings:
-                _feat_log(ctx, page, warning)
-            outputs[path] = {
+                q.put(("log", warning))
+            record = {
                 "path": rel,
                 "name": Path(rel).stem,
                 "columns": columns,
-                "signature": _data_feature_outputs._feature_signature(ctx,
-                    params, path, page._feat_task_id
+                "signature": _data_feature_outputs._feature_signature(
+                    ctx, params, path, page._feat_task_id
                 ),
             }
+            q.put(("file", path, record))
             done += 1
-            _feat_log(ctx,
-                page,
+            q.put((
+                "log",
                 f"✓ {name} → {Path(rel).name} "
                 f"({len(columns)} column(s))",
-            )
-    finally:
-        QApplication.restoreOverrideCursor()
-        page._feat_running = False
+            ))
+    except Exception as exc:  # noqa: BLE001
+        q.put(("error", str(exc)))
+        return
+    q.put(("done", done, failed))
+
+
+def _feat_poll(ctx, page) -> None:
+    """Apply background aggregate results on the UI thread."""
+    q = getattr(page, "_feat_queue", None)
+    if q is None:
+        return
+    status = getattr(page, "_feat_calc_status", None)
+    done = None
+    failed = None
+    error = None
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+        kind = msg[0]
+        if kind == "log":
+            _feat_log(ctx, page, msg[1])
+        elif kind == "status" and status is not None:
+            status.setText(msg[1])
+        elif kind == "file":
+            path, record = msg[1], msg[2]
+            page._feat_pending_outputs[path] = record
+        elif kind == "done":
+            done, failed = msg[1], msg[2]
+        elif kind == "error":
+            error = msg[1]
+
+    if done is None and error is None:
+        return
+
+    timer = getattr(page, "_feat_calc_timer", None)
+    if timer is not None:
+        timer.stop()
+        page._feat_calc_timer = None
+    page._feat_queue = None
+    page._feat_running = False
+    button = getattr(page, "_feat_calc_btn", None)
+    if button is not None:
+        button.setEnabled(True)
+
+    if error is not None:
+        if status is not None:
+            status.setText("Calculation failed")
+        _feat_log(ctx, page, f"✗ {error}")
+        ctx.statusBar().showMessage("Feature Down calculation failed")
+        return
+
+    params = page._feat_params
+    outputs = params.get("outputs") or {}
+    for path, record in (page._feat_pending_outputs or {}).items():
+        previous = outputs.get(path)
+        rel = record.get("path")
+        # A renamed output (e.g. after this file's name scheme changed)
+        # leaves its old parquet behind; remove it.
+        if isinstance(previous, dict) and previous.get("path"):
+            if previous["path"] != rel and ctx.project is not None:
+                try:
+                    (ctx.project.path / previous["path"]).unlink(
+                        missing_ok=True
+                    )
+                except OSError:
+                    pass
+        outputs[path] = record
+    page._feat_pending_outputs = {}
 
     # Drop stale mappings for files that are no longer selected.
+    selected_now = set(params.get("files") or [])
     for path in list(outputs.keys()):
-        if path not in selected:
+        if path not in selected_now:
             outputs.pop(path, None)
     params["outputs"] = outputs
     page._feat_task_def["output"] = {"saved": bool(outputs)}
     page._feat_task_def["params"] = params
     if ctx.project is not None:
         ctx.project.save()
+
+    current_settings = {
+        key: copy.deepcopy(value)
+        for key, value in params.items()
+        if key not in ("outputs", "log")
+    }
+    changed = current_settings != getattr(page, "_feat_run_settings", None)
     page._feat_snapshot = copy.deepcopy(params)
-    page._feat_dirty = False
+    page._feat_dirty = bool(changed)
     _feat_update_save_btn(ctx, page)
     _feat_refresh_files(ctx, page)
 
     summary = f"Calculated {done} file(s)."
     if failed:
         summary += f" {len(failed)} failed — see the log."
+    if changed:
+        summary += " Settings changed during the run; Save to keep them."
     if status is not None:
         status.setText(summary)
     _feat_log(ctx, page, summary)
@@ -1744,12 +1851,12 @@ def _feat_calculate(ctx, page) -> None:
     ctx._module_saved(page)
 
 
-def _feat_compute_file(ctx, page, parquet_path):
+def _feat_compute_file(ctx, page, parquet_path, params=None):
     """Aggregate one source file; return (relative path, columns, warnings)."""
     import numpy as np
     import pandas as pd
 
-    params = page._feat_params
+    params = params or page._feat_params
     feature = params["feature"]
     rules = params.get("rules") or []
     count_name = _feat_count_name(ctx, params)

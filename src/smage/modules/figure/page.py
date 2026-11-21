@@ -3041,11 +3041,20 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
         else:
             point_fixed.setChecked(bool(fixed_val))
         point_fixed.setEnabled(enabled)
+        point_fixed.setToolTip(
+            "Use the size below, in screen pixels. Points stay the same size "
+            "when you zoom."
+        )
 
         ps_val = common(scatter_plots, "point_size", 4)
+        if ps_val is not _MIXED:
+            ps_val = _widgets_plot_renderer._point_size_px(ps_val)
 
         def on_point_size(v):
-            apply(scatter_plots, "point_size", float(v))
+            apply(
+                scatter_plots, "point_size",
+                _widgets_plot_renderer._point_size_px(v),
+            )
             _figure_apply_change_multi(ctx, page)
 
         point_spin = _LogStepSpinBox(None if ps_val is _MIXED else ps_val, on_point_size)
@@ -3202,7 +3211,7 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
 def _figure_point_size_settings(ctx, layout, plot_dict, plot_widget, enabled, on_change) -> None:
     """Point-size row shared by scatter and overlay-scatter settings."""
     def on_point_size(v):
-        plot_dict["point_size"] = float(v)
+        plot_dict["point_size"] = _widgets_plot_renderer._point_size_px(v)
         on_change()
 
     layout.addWidget(QLabel("Point size"))
@@ -3213,9 +3222,17 @@ def _figure_point_size_settings(ctx, layout, plot_dict, plot_widget, enabled, on
     point_fixed = QCheckBox("Fixed")
     point_fixed.setChecked(plot_dict.get("fixed_point_size", False))
     point_fixed.setEnabled(enabled)
-    point_spin = _LogStepSpinBox(
-        plot_dict.get("point_size", 4), on_point_size
+    point_fixed.setToolTip(
+        "Use the size below, in screen pixels. Points stay the same size "
+        "when you zoom."
     )
+    point_px = _widgets_plot_renderer._point_size_px(
+        plot_dict.get("point_size")
+    )
+    if plot_dict.get("fixed_point_size"):
+        # Migrate a data-unit size saved by an older project.
+        plot_dict["point_size"] = point_px
+    point_spin = _LogStepSpinBox(point_px, on_point_size)
     point_spin.set_enabled(enabled and point_fixed.isChecked())
     ph.addWidget(point_fixed)
     ph.addWidget(point_spin)
@@ -3226,13 +3243,11 @@ def _figure_point_size_settings(ctx, layout, plot_dict, plot_widget, enabled, on
         plot_dict["fixed_point_size"] = toggled
         point_spin.set_enabled(enabled and toggled)
         if toggled:
-            # Seed a sensible data-unit size from the current x-range.
-            xmin = getattr(plot_widget, "_data_xmin", None)
-            xmax = getattr(plot_widget, "_data_xmax", None)
-            if xmin is not None and xmax is not None and xmax > xmin:
-                auto_size = 0.01 * (xmax - xmin)
-                point_spin.set_value(auto_size)
-                plot_dict["point_size"] = auto_size
+            point_px = _widgets_plot_renderer._point_size_px(
+                plot_dict.get("point_size")
+            )
+            point_spin.set_value(point_px)
+            plot_dict["point_size"] = point_px
         on_change()
 
     point_fixed.toggled.connect(on_point_fixed)

@@ -3,6 +3,22 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.3.3 — 2026-11-21
+
+- **Gating** plots can be saved from the right-click menu as an editable PDF,
+  PNG or JPEG, with gates and labels included.
+- **Feature Down**, **Feature Up** and **Gate2Col** calculate in the background,
+  so the window stays responsive; progress appears in the status line and log.
+- Workflow **Copy/Paste** keeps the saved **Data files** selection and remaps it
+  to the equivalent files in the new branch. The workflow view also keeps its
+  scroll position when modules are added or deleted.
+- Scatter **Fixed** point size is now a screen-pixel diameter, so points stay
+  round when the X and Y axes have different scales.
+- **Gating** keeps the Plot settings axes when switching files at the root;
+  selecting a gate still uses that gate's axes.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.3.2 — 2026-11-19
 
 - **Extensions**: **Install dependencies** now upgrades pip in the target

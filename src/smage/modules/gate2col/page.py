@@ -8,7 +8,6 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -38,6 +37,8 @@ from smage.data.image_index import _build_image_index_files
 from smage.widgets.controls import _NoWheelComboBox
 from smage.widgets.resources import _lock_pixmap
 import copy
+import queue
+import threading
 from smage.data import columns as _data_columns
 from smage.data import feature_outputs as _data_feature_outputs
 from smage.data import files as _data_files
@@ -608,63 +609,173 @@ def _g2c_calculate(ctx, page) -> None:
     status = getattr(page, "_g2c_calc_status", None)
     if status is not None:
         status.setText("Converting…")
-    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-    done = 0
-    failed = []
     page._g2c_running = True
     page._g2c_cancel = False
+    button = getattr(page, "_g2c_calc_btn", None)
+    if button is not None:
+        button.setEnabled(False)
+
+    # Snapshot: edits made while the worker runs apply to the next Convert.
+    snapshot = copy.deepcopy(params)
+    selected = list(snapshot.get("files") or [])
+    names = {
+        path: _data_naming._comp_file_name(
+            ctx, path, page._g2c_task_id
+        )
+        for path in selected
+    }
+    page._g2c_pending_outputs = {}
+    page._g2c_pending_drops = set()
+    page._g2c_run_settings = {
+        key: copy.deepcopy(value)
+        for key, value in snapshot.items()
+        if key not in ("outputs", "log")
+    }
+    q = queue.Queue()
+    page._g2c_queue = q
+    page._g2c_thread = threading.Thread(
+        target=_g2c_run_bg,
+        args=(ctx, page, q, snapshot, selected, names),
+        daemon=True,
+    )
+    page._g2c_thread.start()
+    timer = QTimer(ctx.host)
+    timer.setInterval(100)
+    timer.timeout.connect(lambda: _g2c_poll(ctx, page))
+    timer.start()
+    page._g2c_calc_timer = timer
+    _g2c_log(ctx, page, f"Converting {len(selected)} file(s)…")
+
+
+def _g2c_run_bg(ctx, page, q, params, selected, names) -> None:
+    """Convert the selected files off the UI thread."""
+    done = 0
+    failed = []
     try:
-        for path in selected:
+        for index, path in enumerate(selected):
             if getattr(page, "_g2c_cancel", False):
-                _g2c_log(ctx, page, "Conversion cancelled.")
+                q.put(("log", "Conversion cancelled."))
                 break
-            name = _data_naming._comp_file_name(ctx, path, page._g2c_task_id)
-            if status is not None:
-                status.setText(f"Converting… {name}")
-            QApplication.processEvents()
+            name = names.get(path, str(path))
+            q.put((
+                "status",
+                f"Converting {index + 1}/{len(selected)} — {name}",
+            ))
             if not Path(str(path)).is_file():
-                outputs.pop(path, None)
+                q.put(("drop", path))
                 failed.append(f"{name}: file not found")
-                _g2c_log(ctx, page, f"✗ {name}: file not found — skipped")
+                q.put(("log", f"✗ {name}: file not found — skipped"))
                 continue
             try:
-                rel, columns, kind = _g2c_compute_file(ctx, page, path)
+                rel, columns, kind = _g2c_compute_file(
+                    ctx, page, path, params
+                )
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{name}: {exc}")
-                _g2c_log(ctx, page, f"✗ {name}: {exc}")
+                q.put(("log", f"✗ {name}: {exc}"))
                 continue
-            outputs[path] = {
+            q.put(("file", path, {
                 "path": rel,
                 "columns": columns,
                 "kind": kind,
-                "signature": _data_feature_outputs._gate2col_signature(ctx,
-                    params, path, page._g2c_task_id
+                "signature": _data_feature_outputs._gate2col_signature(
+                    ctx, params, path, page._g2c_task_id
                 ),
-            }
+            }))
             done += 1
-            _g2c_log(ctx,
-                page, f"✓ {name} → {Path(rel).name} ({len(columns)} column(s))"
-            )
-    finally:
-        QApplication.restoreOverrideCursor()
-        page._g2c_running = False
+            q.put((
+                "log",
+                f"✓ {name} → {Path(rel).name} ({len(columns)} column(s))",
+            ))
+    except Exception as exc:  # noqa: BLE001
+        q.put(("error", str(exc)))
+        return
+    q.put(("done", done, failed))
 
+
+def _g2c_poll(ctx, page) -> None:
+    """Apply background conversion results on the UI thread."""
+    q = getattr(page, "_g2c_queue", None)
+    if q is None:
+        return
+    status = getattr(page, "_g2c_calc_status", None)
+    done = None
+    failed = None
+    error = None
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+        kind = msg[0]
+        if kind == "log":
+            _g2c_log(ctx, page, msg[1])
+        elif kind == "status" and status is not None:
+            status.setText(msg[1])
+        elif kind == "file":
+            page._g2c_pending_outputs[msg[1]] = msg[2]
+        elif kind == "drop":
+            page._g2c_pending_outputs.pop(msg[1], None)
+            page._g2c_pending_drops.add(msg[1])
+        elif kind == "done":
+            done, failed = msg[1], msg[2]
+        elif kind == "error":
+            error = msg[1]
+
+    if done is None and error is None:
+        return
+
+    timer = getattr(page, "_g2c_calc_timer", None)
+    if timer is not None:
+        timer.stop()
+        page._g2c_calc_timer = None
+    page._g2c_queue = None
+    page._g2c_running = False
+    button = getattr(page, "_g2c_calc_btn", None)
+    if button is not None:
+        button.setEnabled(True)
+
+    if error is not None:
+        if status is not None:
+            status.setText("Conversion failed")
+        _g2c_log(ctx, page, f"✗ {error}")
+        ctx.statusBar().showMessage("Gate2Col conversion failed")
+        return
+
+    params = page._g2c_params
+    outputs = params.get("outputs") or {}
+    for path in getattr(page, "_g2c_pending_drops", ()):
+        outputs.pop(path, None)
+    for path, record in (page._g2c_pending_outputs or {}).items():
+        outputs[path] = record
+    page._g2c_pending_outputs = {}
+    page._g2c_pending_drops = set()
+    selected_now = set(params.get("files") or [])
     for path in list(outputs.keys()):
-        if path not in selected:
+        if path not in selected_now:
             outputs.pop(path, None)
     params["outputs"] = outputs
     page._g2c_task_def["output"] = {"saved": bool(outputs)}
     page._g2c_task_def["params"] = params
     if ctx.project is not None:
         ctx.project.save()
+
+    current_settings = {
+        key: copy.deepcopy(value)
+        for key, value in params.items()
+        if key not in ("outputs", "log")
+    }
+    changed = current_settings != getattr(page, "_g2c_run_settings", None)
     page._g2c_snapshot = copy.deepcopy(params)
-    page._g2c_dirty = False
+    page._g2c_dirty = bool(changed)
     _g2c_update_save_btn(ctx, page)
     _g2c_refresh_files(ctx, page)
 
     summary = f"Converted {done} file(s)."
     if failed:
         summary += f" {len(failed)} failed — see the log."
+    if changed:
+        summary += " Settings changed during the run; Save to keep them."
     if status is not None:
         status.setText(summary)
     _g2c_log(ctx, page, summary)
@@ -676,12 +787,12 @@ def _g2c_row_count(ctx, parquet_path) -> int:
     return _data_columns._data_row_count(ctx, parquet_path)
 
 
-def _g2c_compute_file(ctx, page, parquet_path):
+def _g2c_compute_file(ctx, page, parquet_path, params=None):
     """Convert every rule into a 0/1 column and save them; return (rel, columns, kind)."""
     import numpy as np
     import pandas as pd
 
-    params = page._g2c_params
+    params = params or page._g2c_params
     rules = params.get("rules") or []
     opts = _g2c_gate_options(ctx, page)
     by_key = {(o["gate_task"], o["gate_id"]): o for o in opts}

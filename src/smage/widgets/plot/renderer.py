@@ -1,6 +1,8 @@
 """Figure renderers: scatter, image, histogram, ranges and their settings."""
 from __future__ import annotations
 
+import math
+
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QColor, QFont
@@ -38,6 +40,27 @@ FIGURE_COLOR_MODES = [
     ("Parameter", "parameter"),
     ("Solid", "solid"),
 ]
+
+# Point sizes are screen pixels.  The upper bound keeps a saved value from
+# an older project (where Fixed meant data units) from filling the plot.
+POINT_SIZE_MIN = 0.5
+POINT_SIZE_MAX = 64.0
+POINT_SIZE_DEFAULT = 4.0
+
+
+def _point_size_px(value, default: float = POINT_SIZE_DEFAULT) -> float:
+    """A point diameter in screen pixels, safe for every saved project."""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(size):
+        return float(default)
+    if size > POINT_SIZE_MAX:
+        # Pre-pixel-mode projects stored a data-unit size (often thousands),
+        # which would now be a plot-filling disc.
+        return float(default)
+    return max(POINT_SIZE_MIN, size)
 IMAGE_LAYER_COLORS = [
     (0, 0, 255),      # blue
     (0, 255, 0),      # green
@@ -1469,14 +1492,13 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
     plot_widget._data_ymin = float(y.min())
     plot_widget._data_ymax = float(y.max())
 
+    # Points are always drawn in screen pixels: a data-unit size would turn
+    # into an ellipse whenever the X and Y axes have different scales.
     if plot_dict.get("fixed_point_size"):
-        # Fixed: size is in data units, so points scale with the zoom.
-        size = float(plot_dict.get("point_size", 4))
-        px_mode = False
+        size = _point_size_px(plot_dict.get("point_size"))
     else:
-        # Not fixed: constant on-screen pixel size.
-        size = 4.0
-        px_mode = True
+        size = POINT_SIZE_DEFAULT
+    px_mode = True
 
     # Colours are computed from every visible row (so density stays
     # accurate), then the rows to draw are chosen once.

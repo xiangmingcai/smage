@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-PROJECT_VERSION = "0.3.2"
+PROJECT_VERSION = "0.3.3"
 DATA_DIRNAME = "data"
 MANIFEST_FILENAME = "project.json"
 # Window/UI preferences (tree expansion, …), kept out of the manifest so they

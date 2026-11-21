@@ -8,8 +8,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-from PySide6.QtCore import QPoint, QTimer
+from PySide6.QtCore import QPoint, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -106,6 +107,90 @@ def empty_state() -> None:
         _close(window)
 
 
+@harness.case("mod.gating.plot_export", "L4", "gating", tags=("fast",))
+def plot_export() -> None:
+    """Right-clicking the gating plot saves it with the Figure exporter."""
+    window, _project, page = _open("gating_plot_export")
+    calls = []
+    original = gating_page._widgets_plot_export._plot_export_save
+    try:
+        gating_page._widgets_plot_export._plot_export_save = (
+            lambda widget, parent, name: calls.append((widget, name))
+            or "C:/tmp/gating.pdf"
+        )
+        plot_widget = page._gating_plot_widget
+        expected_name = gating_page._gating_export_name(page._gating_preview)
+        harness.check(
+            not plot_widget.getPlotItem().menuEnabled(),
+            "pyqtgraph's built-in menu is disabled",
+        )
+        harness.check(
+            not plot_widget.getPlotItem().getViewBox().menuEnabled(),
+            "the viewbox's built-in menu is disabled",
+        )
+        gating_page._gating_save_plot_as(window._ctx, page)
+        harness.eq(len(calls), 1)
+        widget, name = calls[0]
+        harness.check(widget is plot_widget, "exports the visible plot")
+        harness.check(" vs " in name, name)
+        harness.eq(name, expected_name)
+
+        # A single right-click through the canvas must reach the plot menu
+        # (forwarding only the left button made the second click necessary).
+        opened = []
+        original_menu = gating_page._gating_plot_context_menu
+        gating_page._gating_plot_context_menu = (
+            lambda ctx, target, pos: opened.append(pos)
+        )
+        try:
+            center = plot_widget.mapToGlobal(
+                QPoint(plot_widget.width() // 2, plot_widget.height() // 2)
+            )
+            canvas_pos = page._gating_plot_canvas.viewport().mapFromGlobal(center)
+            QTest.mouseClick(
+                page._gating_plot_canvas.viewport(),
+                Qt.MouseButton.RightButton,
+                Qt.KeyboardModifier.NoModifier,
+                canvas_pos,
+            )
+            harness.eq(len(opened), 1, "one right-click opens the menu")
+        finally:
+            gating_page._gating_plot_context_menu = original_menu
+    finally:
+        gating_page._widgets_plot_export._plot_export_save = original
+        _close(window)
+
+
+@harness.case("mod.gating.fixed_point_size", "L4", "gating", tags=("fast",))
+def fixed_point_size() -> None:
+    """Fixed point size is a screen-pixel diameter, so points stay round."""
+    window, _project, page = _open("gating_point_size")
+    try:
+        preview = page._gating_preview
+        preview["fixed_point_size"] = True
+        preview["point_size"] = 7
+        _gate_editor._gating_render(window._ctx, page)
+        harness.pump(200)
+        scatter = next(
+            item for item in page._gating_plot_widget.getPlotItem().items
+            if isinstance(item, pg.ScatterPlotItem)
+        )
+        harness.check(scatter.opts["pxMode"], "points use screen pixels")
+        harness.eq(float(scatter.opts["size"]), 7.0)
+
+        # A data-unit size saved by an older project falls back to default.
+        preview["point_size"] = 1000
+        _gate_editor._gating_render(window._ctx, page)
+        harness.pump(200)
+        scatter = next(
+            item for item in page._gating_plot_widget.getPlotItem().items
+            if isinstance(item, pg.ScatterPlotItem)
+        )
+        harness.eq(float(scatter.opts["size"]), 4.0)
+    finally:
+        _close(window)
+
+
 @harness.case("mod.gating.auto_open_first", "L4", "gating", tags=("fast",))
 def auto_open_first_file() -> None:
     """Selecting files opens the first one with its first two channels."""
@@ -171,6 +256,45 @@ def gate_colour_tooltip_is_light() -> None:
             )
         QToolTip.hideText()
         QApplication.processEvents()
+    finally:
+        _close(window)
+
+
+@harness.case("mod.gating.switch_file_root_axes", "L4", "gating",
+              tags=("fast",))
+def switch_file_keeps_configured_axes_at_root() -> None:
+    """At the root, changing files keeps the axes from Plot settings."""
+    window, project, page = _open("gating_switch_axes")
+    try:
+        ctx = window._ctx
+        first = project.data_dir / "case.parquet"
+        second = project.data_dir / "second.parquet"
+        second.write_bytes(first.read_bytes())
+        columns = project.load_columns()
+        columns[second.name] = list(columns.get(first.name) or [])
+        project.save_columns(columns)
+        ctx._column_index = project.load_columns()
+        project.workflow["tasks"][0]["params"]["processed"].append({
+            "name": "second.fcs",
+            "source": str(first),
+            "parquet": str(second),
+            "rows": 80,
+        })
+        project.save()
+
+        page._gating_files = [str(first), str(second)]
+        preview = page._gating_preview
+        preview["x"], preview["y"] = "FL1-A", "FL2-A"
+        page._gating_settings_x = "FL1-A"
+        page._gating_settings_y = "FL2-A"
+        # Simulate axes left over from an earlier channel choice.
+        preview["last_x"], preview["last_y"] = "FSC-A", "SSC-A"
+        harness.eq(page._gating_context_gate_id, None)
+
+        gating_page._gating_switch_file(ctx, page, str(second))
+        harness.eq(preview["file"], str(second))
+        harness.eq(preview["x"], "FL1-A")
+        harness.eq(preview["y"], "FL2-A")
     finally:
         _close(window)
 

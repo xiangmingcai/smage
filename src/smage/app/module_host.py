@@ -795,6 +795,19 @@ class ModuleHostMixin:
                 _region_size_page._rs_cleanup(self._ctx, page)
         except Exception:  # noqa: BLE001 - teardown must never raise
             pass
+        # Calculate workers (Feature Down/Up, Gate2Col) poll through a timer;
+        # stop it and ask the worker to stop before the widgets disappear.
+        for prefix in ("_feat", "_fup", "_g2c"):
+            timer = getattr(page, f"{prefix}_calc_timer", None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                setattr(page, f"{prefix}_calc_timer", None)
+            if hasattr(page, f"{prefix}_cancel"):
+                setattr(page, f"{prefix}_cancel", True)
+            setattr(page, f"{prefix}_queue", None)
         # Feature Down counts values in a background thread regardless of how
         # the page was opened.
         if hasattr(page, "_feat_ignore_requests"):

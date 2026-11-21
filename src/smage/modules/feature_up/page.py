@@ -1,10 +1,9 @@
 """Feature Up module: map aggregated per-class features onto cells."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QApplication,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -31,6 +30,8 @@ from smage.data.image_index import _build_image_index_files
 from smage.widgets.controls import _NoWheelComboBox
 from smage.widgets.resources import _lock_pixmap
 import copy
+import queue
+import threading
 from smage.data import columns as _data_columns
 from smage.data import feature_outputs as _data_feature_outputs
 from smage.data import files as _data_files
@@ -816,57 +817,158 @@ def _fup_calculate(ctx, page) -> None:
     status = getattr(page, "_fup_calc_status", None)
     if status is not None:
         status.setText("Calculating…")
-    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-    done = 0
-    failed = []
-    skipped = len(unmatched)
     page._fup_running = True
     page._fup_cancel = False
+    button = getattr(page, "_fup_calc_btn", None)
+    if button is not None:
+        button.setEnabled(False)
+
+    # Snapshot: edits made while the worker runs apply to the next Calculate.
+    snapshot = copy.deepcopy(params)
+    targets = list(to_targets)
+    names = {
+        to_path: _data_naming._comp_file_name(
+            ctx, to_path, page._fup_task_id
+        )
+        for to_path in targets
+    }
+    page._fup_pending_outputs = {}
+    page._fup_run_settings = {
+        key: copy.deepcopy(value)
+        for key, value in snapshot.items()
+        if key not in ("outputs", "log")
+    }
+    q = queue.Queue()
+    page._fup_queue = q
+    page._fup_thread = threading.Thread(
+        target=_fup_run_bg,
+        args=(ctx, page, q, snapshot, targets, names, len(unmatched)),
+        daemon=True,
+    )
+    page._fup_thread.start()
+    timer = QTimer(ctx.host)
+    timer.setInterval(100)
+    timer.timeout.connect(lambda: _fup_poll(ctx, page))
+    timer.start()
+    page._fup_calc_timer = timer
+    _fup_log(ctx, page, f"Calculating {len(targets)} file(s)…")
+
+
+def _fup_run_bg(ctx, page, q, params, targets, names, skipped) -> None:
+    """Map the matched files off the UI thread."""
+    done = 0
+    failed = []
     try:
-        for to_path in to_targets:
+        for index, to_path in enumerate(targets):
             if getattr(page, "_fup_cancel", False):
-                _fup_log(ctx, page, "Calculation cancelled.")
+                q.put(("log", "Calculation cancelled."))
                 break
-            name = _data_naming._comp_file_name(ctx, to_path, page._fup_task_id)
-            if status is not None:
-                status.setText(f"Calculating… {name}")
-            QApplication.processEvents()
+            name = names.get(to_path, str(to_path))
+            q.put((
+                "status",
+                f"Calculating {index + 1}/{len(targets)} — {name}",
+            ))
             try:
-                rel, columns, kind = _fup_compute_file(ctx, page, to_path)
+                rel, columns, kind, warnings = _fup_compute_file(
+                    ctx, page, to_path, params
+                )
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{name}: {exc}")
-                _fup_log(ctx, page, f"✗ {name}: {exc}")
+                q.put(("log", f"✗ {name}: {exc}"))
                 continue
-            outputs[to_path] = {
+            for warning in warnings:
+                q.put(("log", warning))
+            q.put(("file", to_path, {
                 "path": rel,
                 "columns": columns,
                 "kind": kind,
-                "signature": _data_feature_outputs._feature_up_signature(ctx,
-                    params, to_path, page._fup_task_id
+                "signature": _data_feature_outputs._feature_up_signature(
+                    ctx, params, to_path, page._fup_task_id
                 ),
-            }
+            }))
             done += 1
             # The stored output name starts with the To file's hash; show the
             # name the user knows instead.
             out_name = f"{Path(name).stem}_mapped.parquet"
-            _fup_log(ctx,
-                page,
+            q.put((
+                "log",
                 f"✓ {name} → {out_name} ({len(columns)} channel(s))",
-            )
-    finally:
-        QApplication.restoreOverrideCursor()
-        page._fup_running = False
+            ))
+    except Exception as exc:  # noqa: BLE001
+        q.put(("error", str(exc)))
+        return
+    q.put(("done", done, failed, skipped))
 
+
+def _fup_poll(ctx, page) -> None:
+    """Apply background mapping results on the UI thread."""
+    q = getattr(page, "_fup_queue", None)
+    if q is None:
+        return
+    status = getattr(page, "_fup_calc_status", None)
+    done = None
+    failed = None
+    skipped = 0
+    error = None
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+        kind = msg[0]
+        if kind == "log":
+            _fup_log(ctx, page, msg[1])
+        elif kind == "status" and status is not None:
+            status.setText(msg[1])
+        elif kind == "file":
+            page._fup_pending_outputs[msg[1]] = msg[2]
+        elif kind == "done":
+            done, failed, skipped = msg[1], msg[2], msg[3]
+        elif kind == "error":
+            error = msg[1]
+
+    if done is None and error is None:
+        return
+
+    timer = getattr(page, "_fup_calc_timer", None)
+    if timer is not None:
+        timer.stop()
+        page._fup_calc_timer = None
+    page._fup_queue = None
+    page._fup_running = False
+    button = getattr(page, "_fup_calc_btn", None)
+    if button is not None:
+        button.setEnabled(True)
+
+    if error is not None:
+        if status is not None:
+            status.setText("Calculation failed")
+        _fup_log(ctx, page, f"✗ {error}")
+        ctx.statusBar().showMessage("Feature Up calculation failed")
+        return
+
+    params = page._fup_params
+    outputs = params.get("outputs") or {}
+    outputs.update(page._fup_pending_outputs or {})
+    page._fup_pending_outputs = {}
+    live_targets = set((params.get("matches") or {}).values())
     for to_path in list(outputs.keys()):
-        if to_path not in to_targets:
+        if to_path not in live_targets:
             outputs.pop(to_path, None)
     params["outputs"] = outputs
     page._fup_task_def["output"] = {"saved": bool(outputs)}
     page._fup_task_def["params"] = params
     if ctx.project is not None:
         ctx.project.save()
+
+    current_settings = {
+        key: copy.deepcopy(value)
+        for key, value in params.items()
+        if key not in ("outputs", "log")
+    }
+    changed = current_settings != getattr(page, "_fup_run_settings", None)
     page._fup_snapshot = copy.deepcopy(params)
-    page._fup_dirty = False
+    page._fup_dirty = bool(changed)
     _fup_update_save_btn(ctx, page)
     _fup_rebuild_matches(ctx, page)
 
@@ -875,6 +977,8 @@ def _fup_calculate(ctx, page) -> None:
         summary += f" {skipped} skipped (no match)."
     if failed:
         summary += f" {len(failed)} failed — see the log."
+    if changed:
+        summary += " Settings changed during the run; Save to keep them."
     if status is not None:
         status.setText(summary)
     _fup_log(ctx, page, summary)
@@ -882,12 +986,15 @@ def _fup_calculate(ctx, page) -> None:
     ctx._module_saved(page)
 
 
-def _fup_compute_file(ctx, page, to_path):
-    """Map features from the matched From file onto `to_path`; return (rel, columns, kind)."""
+def _fup_compute_file(ctx, page, to_path, params=None):
+    """Map features from the matched From file onto `to_path`.
+
+    Returns ``(rel, columns, kind, warnings)``.
+    """
     import numpy as np
     import pandas as pd
 
-    params = page._fup_params
+    params = params or page._fup_params
     from_path = _fup_matched_from(ctx, params, to_path)
     if not from_path:
         raise ValueError("no matched From file")
@@ -912,11 +1019,11 @@ def _fup_compute_file(ctx, page, to_path):
     })
     lf = lf[lf["__fup_key"].notna()]
     dup = int(len(lf) - lf.drop_duplicates(subset="__fup_key", keep="first").shape[0])
+    warnings = []
     if dup:
-        _fup_log(ctx,
-            page,
-            f"{_data_naming._comp_file_name(ctx, from_path, page._fup_task_id)}: {dup} duplicate key value(s) "
-            f"— kept the first row.",
+        warnings.append(
+            f"{_data_naming._comp_file_name(ctx, from_path, page._fup_task_id)}: "
+            f"{dup} duplicate key value(s) — kept the first row."
         )
     lf = lf.drop_duplicates(subset="__fup_key", keep="first")
 
@@ -977,7 +1084,7 @@ def _fup_compute_file(ctx, page, to_path):
     else:
         pd.DataFrame(row_vals).to_parquet(path, index=False)
         kind = "table"
-    return rel, names, kind
+    return rel, names, kind, warnings
 
 
 def _fup_mark_dirty(ctx, page) -> None:
