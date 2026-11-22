@@ -71,6 +71,7 @@ from smage.core.settings import (
     _debug_log,
     _default_palette,
     _log_exception,
+    _plot_background,
     _setting,
 )
 from smage.widgets.colormap import _palette_names
@@ -2556,6 +2557,606 @@ def _figure_rebuild_settings_single(ctx, page) -> None:
         _figure_mark_dirty(ctx, page)
 
 
+def _figure_multi_image_settings(ctx, page, layout, image_plots, enabled,
+                                 common, apply) -> None:
+    """Channels / legend rows for a multi-selection of image plots.
+
+    Rows are the union of the selected images' colour layers.  A value is
+    shown when every image containing that channel agrees; edits apply to
+    every image where the channel exists.  Images that do not contain a
+    channel are skipped and the row tooltip reports how many are missing.
+    """
+    import numpy as np
+    import pyqtgraph as pg
+
+    from smage.core.formatting import _format_level, _round_level
+
+    layer_colors = _widgets_plot_renderer.IMAGE_LAYER_COLORS
+
+    def columns_for(plot):
+        rec = _widgets_plot_renderer._figure_record(ctx, plot.get("file"))
+        if not rec:
+            return []
+        return list(_data_columns._columns_for(
+            ctx, rec.get("parquet"), page._fig_task_id
+        ))
+
+    infos = []
+    channels = []
+    all_columns = []
+    for plot in image_plots:
+        cols = columns_for(plot)
+        layers = _widgets_plot_renderer._figure_image_layers(plot)
+        plot["layers"] = layers
+        infos.append({"plot": plot, "cols": cols, "layers": layers})
+        for col in cols:
+            if col not in all_columns:
+                all_columns.append(col)
+        for layer in layers:
+            param = layer.get("parameter")
+            if param and param not in channels:
+                channels.append(param)
+
+    def layer_for(info, channel):
+        return next(
+            (l for l in info["layers"] if l.get("parameter") == channel),
+            None,
+        )
+
+    def present_infos(channel):
+        return [
+            info for info in infos
+            if layer_for(info, channel) is not None
+            or channel in info["cols"]
+        ]
+
+    def missing_count(channel):
+        return sum(1 for info in infos if channel not in info["cols"])
+
+    def configs_for(info, channel):
+        return _widgets_plot_renderer._figure_axis_scale_configs(
+            ctx, page._fig_task_id, info["plot"].get("file"), channel,
+            page._fig_column_transforms,
+        )
+
+    def save_layers():
+        for info in infos:
+            info["plot"]["layers"] = info["layers"]
+
+    def show_state(channel):
+        states = []
+        for info in present_infos(channel):
+            layer = layer_for(info, channel)
+            states.append(bool(layer.get("visible", True)) if layer else False)
+        if not states:
+            return Qt.CheckState.Unchecked
+        if all(states):
+            return Qt.CheckState.Checked
+        if not any(states):
+            return Qt.CheckState.Unchecked
+        return Qt.CheckState.PartiallyChecked
+
+    def common_value(channel, key):
+        """(value, kind) for a layer key; kind is value/auto/mixed."""
+        values = []
+        for info in infos:
+            layer = layer_for(info, channel)
+            if layer is None:
+                continue
+            value = layer.get(key)
+            if value is not None:
+                configs = configs_for(info, channel)
+                if configs:
+                    value = _inverse_scale_value(value, configs)
+            values.append(value)
+        if not values or all(v is None for v in values):
+            return None, "auto"
+        first = values[0]
+        if first is None or any(v != first for v in values):
+            return None, "mixed"
+        return first, "value"
+
+    def common_color(channel):
+        colors = []
+        for info in infos:
+            layer = layer_for(info, channel)
+            if layer is not None:
+                colors.append(tuple(layer.get("color", (255, 255, 255))))
+        if not colors or any(c != colors[0] for c in colors):
+            return None
+        return colors[0]
+
+    def common_name(channel):
+        names = []
+        for info in infos:
+            layer = layer_for(info, channel)
+            if layer is not None:
+                names.append(str(layer.get("name") or channel))
+        if not names or any(n != names[0] for n in names):
+            return None
+        return names[0]
+
+    title = "Channels"
+    if len(image_plots) != len(page._fig_selected):
+        suffix = "image" if len(image_plots) == 1 else "images"
+        title += f" ({len(image_plots)} {suffix})"
+    layout.addWidget(QLabel(title))
+    hint = QLabel(
+        "Channels shown here are the union of the selected images. "
+        "Operations skip images that do not contain a channel."
+    )
+    hint.setStyleSheet("color: gray;")
+    hint.setWordWrap(True)
+    layout.addWidget(hint)
+
+    table = QTableWidget(0, 6)
+    table.setHorizontalHeaderLabels(
+        ["Show", "Parameter", "Color", "Min", "Max", "Name"]
+    )
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+    header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+    header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+    header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+    table.setColumnWidth(0, 44)
+    table.setColumnWidth(2, 48)
+    table.setColumnWidth(3, 72)
+    table.setColumnWidth(4, 72)
+    table.verticalHeader().setVisible(False)
+    table.verticalHeader().setDefaultSectionSize(30)
+    table.setMinimumHeight(150)
+    table.setMaximumHeight(330)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setStyleSheet(
+        "QTableWidget { background: #ffffff; border: none; }"
+        "QTableWidget::item:selected { background: #dbeafa; }"
+    )
+    layout.addWidget(table)
+
+    row_channels = []
+    row_edits = {}
+    row_paints = {}
+
+    def refresh_bounds(channel):
+        edits = row_edits.get(channel)
+        if edits is None:
+            return
+        for key, edit in zip(("min", "max"), edits):
+            value, kind = common_value(channel, key)
+            edit.setText("" if value is None else _format_level(value))
+            edit.setPlaceholderText(
+                "Auto" if kind == "auto" else "Mixed"
+            )
+
+    def on_show_changed(item):
+        if item.column() != 0:
+            return
+        row = item.row()
+        if not (0 <= row < len(row_channels)):
+            return
+        state = item.checkState()
+        if state == Qt.CheckState.PartiallyChecked:
+            return
+        visible = state == Qt.CheckState.Checked
+        channel = row_channels[row]
+        for info in infos:
+            layer = layer_for(info, channel)
+            if layer is not None:
+                layer["visible"] = visible
+            elif visible and channel in info["cols"]:
+                used = {
+                    tuple(l.get("color", (255, 255, 255)))
+                    for l in info["layers"]
+                }
+                color = next(
+                    (c for c in layer_colors if tuple(c) not in used),
+                    layer_colors[len(info["layers"]) % len(layer_colors)],
+                )
+                info["layers"].append({
+                    "parameter": channel,
+                    "color": tuple(color),
+                    "name": str(channel),
+                    "visible": True,
+                })
+        save_layers()
+        refresh_bounds(channel)
+        paint = row_paints.get(channel)
+        if paint is not None:
+            paint(common_color(channel))
+        _figure_apply_change_multi(ctx, page)
+        _figure_mark_dirty(ctx, page)
+
+    def make_color_button(channel):
+        btn = QPushButton()
+        btn.setFixedSize(40, 20)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setEnabled(enabled)
+        btn.setObjectName("figureColorButton")
+
+        def paint(color):
+            if color is None:
+                btn.setStyleSheet(
+                    "QPushButton#figureColorButton { "
+                    "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+                    "stop:0 #cccccc, stop:1 #999999); "
+                    "border: 1px solid #555; }"
+                )
+                btn.setToolTip("Colors differ")
+            else:
+                btn.setStyleSheet(
+                    "QPushButton#figureColorButton { "
+                    f"background-color: rgb({color[0]},{color[1]},"
+                    f"{color[2]}); border: 1px solid #555; }}"
+                )
+                btn.setToolTip("")
+
+        row_paints[channel] = paint
+        paint(common_color(channel))
+
+        def on_pick(_=False):
+            current = common_color(channel) or (255, 255, 255)
+            chosen = QColorDialog.getColor(
+                QColor(*current), ctx.host, "Choose color"
+            )
+            if not chosen.isValid():
+                return
+            color = (chosen.red(), chosen.green(), chosen.blue())
+            for info in infos:
+                layer = layer_for(info, channel)
+                if layer is not None:
+                    layer["color"] = color
+            save_layers()
+            paint(color)
+            _figure_apply_change_multi(ctx, page)
+            _figure_mark_dirty(ctx, page)
+
+        btn.clicked.connect(on_pick)
+        return btn
+
+    def make_bounds_edit(channel, key):
+        edit = QLineEdit()
+        edit.setPlaceholderText("Auto")
+        edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        edit.setEnabled(enabled)
+        edit.setStyleSheet(
+            "QLineEdit { background: #ffffff; border: 1px solid #d0d7e2; "
+            "border-radius: 3px; padding: 1px 4px; }"
+        )
+
+        def commit(_=False):
+            text = edit.text().strip()
+            for info in infos:
+                layer = layer_for(info, channel)
+                if layer is None:
+                    continue
+                if text == "":
+                    layer.pop(key, None)
+                    continue
+                rounded = _round_level(text)
+                if rounded is None:
+                    return
+                configs = configs_for(info, channel)
+                layer[key] = (
+                    _forward_scale_value(rounded, configs)
+                    if configs else rounded
+                )
+            save_layers()
+            _figure_apply_change_multi(ctx, page)
+            _figure_mark_dirty(ctx, page)
+
+        edit.editingFinished.connect(commit)
+        return edit
+
+    def make_name_edit(channel):
+        edit = QLineEdit()
+        edit.setPlaceholderText("Mixed")
+        edit.setEnabled(enabled)
+        edit.setStyleSheet(
+            "QLineEdit { background: #ffffff; border: 1px solid #d0d7e2; "
+            "border-radius: 3px; padding: 1px 4px; }"
+        )
+
+        def commit(_=False):
+            text = edit.text().strip() or str(channel)
+            for info in infos:
+                layer = layer_for(info, channel)
+                if layer is not None:
+                    layer["name"] = text
+            save_layers()
+            _figure_apply_change_multi(ctx, page)
+            _figure_mark_dirty(ctx, page)
+
+        edit.editingFinished.connect(commit)
+        return edit
+
+    table.blockSignals(True)
+    table.setRowCount(len(channels))
+    for row, channel in enumerate(channels):
+        row_channels.append(channel)
+        show = QTableWidgetItem()
+        show.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+        show.setCheckState(show_state(channel))
+        table.setItem(row, 0, show)
+
+        param = QTableWidgetItem(str(channel))
+        param.setFlags(
+            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        )
+        missing = missing_count(channel)
+        if missing:
+            param.setToolTip(
+                f"Missing in {missing} of {len(infos)} selected images"
+            )
+        else:
+            param.setToolTip("Available in every selected image")
+        table.setItem(row, 1, param)
+
+        table.setCellWidget(row, 2, make_color_button(channel))
+        min_edit = make_bounds_edit(channel, "min")
+        max_edit = make_bounds_edit(channel, "max")
+        row_edits[channel] = (min_edit, max_edit)
+        table.setCellWidget(row, 3, min_edit)
+        table.setCellWidget(row, 4, max_edit)
+        refresh_bounds(channel)
+
+        name_edit = make_name_edit(channel)
+        name = common_name(channel)
+        if name is not None:
+            name_edit.setText(name)
+        table.setCellWidget(row, 5, name_edit)
+    table.blockSignals(False)
+    table.itemChanged.connect(on_show_changed)
+
+    buttons = QHBoxLayout()
+    add_btn = QPushButton("Add channels…")
+    add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    add_btn.setEnabled(enabled)
+    remove_btn = QPushButton("Remove")
+    remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    remove_btn.setEnabled(enabled)
+    buttons.addWidget(add_btn)
+    buttons.addWidget(remove_btn)
+    buttons.addStretch()
+    layout.addLayout(buttons)
+
+    def on_add(_=False):
+        existing = {channel for channel in channels}
+        available = [c for c in all_columns if c not in existing]
+        picked = _widgets_picker._pick_items_dialog(
+            ctx, "Add channels", available, [], "Filter parameters..."
+        )
+        if picked is None:
+            return
+        for channel in picked:
+            for info in infos:
+                if channel not in info["cols"]:
+                    continue
+                if layer_for(info, channel) is not None:
+                    continue
+                used = {
+                    tuple(l.get("color", (255, 255, 255)))
+                    for l in info["layers"]
+                }
+                color = next(
+                    (c for c in layer_colors if tuple(c) not in used),
+                    layer_colors[len(info["layers"]) % len(layer_colors)],
+                )
+                info["layers"].append({
+                    "parameter": channel,
+                    "color": tuple(color),
+                    "name": str(channel),
+                    "visible": True,
+                })
+        save_layers()
+        _figure_apply_change_multi(ctx, page)
+        _figure_mark_dirty(ctx, page)
+        _figure_rebuild_settings_multi(ctx, page)
+
+    def on_remove(_=False):
+        row = table.currentRow()
+        if not (0 <= row < len(row_channels)):
+            return
+        channel = row_channels[row]
+        for info in infos:
+            info["layers"] = [
+                l for l in info["layers"]
+                if l.get("parameter") != channel
+            ]
+        save_layers()
+        _figure_apply_change_multi(ctx, page)
+        _figure_mark_dirty(ctx, page)
+        _figure_rebuild_settings_multi(ctx, page)
+
+    add_btn.clicked.connect(on_add)
+    remove_btn.clicked.connect(on_remove)
+
+    # Channel histogram.  With several source files, a preview file picks
+    # which image's values the curve shows; Auto/Reset still use each image's
+    # own values.
+    files = []
+    for info in infos:
+        path = info["plot"].get("file")
+        if path and path not in [p for _n, p in files]:
+            files.append((
+                info["plot"].get("file_name") or Path(str(path)).name,
+                path,
+            ))
+    preview_combo = None
+    if len(files) > 1:
+        layout.addWidget(QLabel("Preview file"))
+        preview_combo = _NoWheelComboBox()
+        for name, path in files:
+            preview_combo.addItem(name, path)
+        preview_combo.setEnabled(enabled)
+        layout.addWidget(preview_combo)
+
+    hist_plot = pg.PlotWidget()
+    hist_plot.setBackground(_plot_background())
+    hist_plot.showGrid(x=True, y=True, alpha=0.2)
+    hist_plot.setMinimumHeight(110)
+    hist_plot.setMaximumHeight(170)
+    hist_plot.setMouseEnabled(False, False)
+    hist_plot.setMenuEnabled(False)
+    hist_plot.hideAxis("left")
+    layout.addWidget(hist_plot)
+
+    def preview_path():
+        if preview_combo is not None:
+            return preview_combo.currentData()
+        return files[0][1] if files else None
+
+    def current_channel():
+        row = table.currentRow()
+        if 0 <= row < len(row_channels):
+            return row_channels[row]
+        return None
+
+    def update_histogram(*_args):
+        channel = current_channel()
+        path = preview_path()
+        hist_plot.clear()
+        if not channel or not path:
+            return
+        if channel not in columns_for(
+            next((i["plot"] for i in infos
+                  if i["plot"].get("file") == path), {})
+        ):
+            hist_plot.setTitle(
+                f"{channel} is not in this file",
+                color="#8a94a6", size="8pt",
+            )
+            return
+        configs = _widgets_plot_renderer._figure_axis_scale_configs(
+            ctx, page._fig_task_id, path, channel,
+            page._fig_column_transforms,
+        )
+        values = ctx._figure_channel_values(
+            page._fig_task_id, path, channel
+        )
+        if values is None or values.size == 0:
+            return
+        values = _apply_scale_transforms(values, configs)
+        hist, edges = np.histogram(values, bins=200)
+        hist_plot.plot(
+            edges, hist, stepMode="center",
+            fillLevel=0, brush=(90, 140, 220, 120),
+            pen=pg.mkPen((50, 90, 160), width=1),
+        )
+        hist_plot.setTitle(str(channel), color="#5a6673", size="8pt")
+
+    def user_percentiles(channel):
+        for info in infos:
+            layer = layer_for(info, channel)
+            if layer is None:
+                continue
+            values = ctx._figure_channel_values(
+                page._fig_task_id, info["plot"].get("file"), channel
+            )
+            if values is None or values.size == 0:
+                continue
+            configs = configs_for(info, channel)
+            values = _apply_scale_transforms(values, configs)
+            lo, hi = np.percentile(values, [0.5, 99.5])
+            layer["min"] = _round_level(lo)
+            layer["max"] = _round_level(hi)
+
+    def reset_bounds(channel):
+        for info in infos:
+            layer = layer_for(info, channel)
+            if layer is None:
+                continue
+            bounds = ctx._channel_full_range(
+                page._fig_task_id, info["plot"].get("file"), channel
+            )
+            if bounds is None:
+                layer.pop("min", None)
+                layer.pop("max", None)
+                continue
+            configs = configs_for(info, channel)
+            layer["min"] = _forward_scale_value(
+                _round_level(bounds[0]), configs
+            )
+            layer["max"] = _forward_scale_value(
+                _round_level(bounds[1]), configs
+            )
+
+    def on_auto_set(_=False):
+        channel = current_channel()
+        if not channel:
+            return
+        user_percentiles(channel)
+        save_layers()
+        refresh_bounds(channel)
+        _figure_apply_change_multi(ctx, page)
+        _figure_mark_dirty(ctx, page)
+
+    def on_reset(_=False):
+        channel = current_channel()
+        if not channel:
+            return
+        reset_bounds(channel)
+        save_layers()
+        refresh_bounds(channel)
+        _figure_apply_change_multi(ctx, page)
+        _figure_mark_dirty(ctx, page)
+
+    auto_btn = QPushButton("Auto set")
+    auto_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    auto_btn.setEnabled(enabled)
+    auto_btn.setToolTip(
+        "Set Min/Max to each image's channel 0.5% and 99.5% percentiles"
+    )
+    reset_btn = QPushButton("Reset")
+    reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    reset_btn.setEnabled(enabled)
+    reset_btn.setToolTip("Set Min/Max to each image's full channel range")
+    btn_row = QHBoxLayout()
+    btn_row.addWidget(auto_btn)
+    btn_row.addWidget(reset_btn)
+    btn_row.addStretch()
+    layout.addLayout(btn_row)
+
+    show_legend = QCheckBox("Show legend")
+    legend_val = common(image_plots, "show_legend", True)
+    if legend_val is _MIXED:
+        show_legend.setTristate(True)
+        show_legend.setCheckState(Qt.CheckState.PartiallyChecked)
+    else:
+        show_legend.setChecked(bool(legend_val))
+    show_legend.setEnabled(enabled)
+    layout.addWidget(show_legend)
+
+    def on_show_legend(_=0):
+        state = show_legend.checkState()
+        if state == Qt.CheckState.PartiallyChecked:
+            return
+        apply(
+            image_plots, "show_legend",
+            state == Qt.CheckState.Checked,
+        )
+        _figure_apply_change_multi(ctx, page)
+
+    show_legend.stateChanged.connect(on_show_legend)
+    auto_btn.clicked.connect(on_auto_set)
+    reset_btn.clicked.connect(on_reset)
+    if preview_combo is not None:
+        preview_combo.currentIndexChanged.connect(update_histogram)
+    table.currentCellChanged.connect(
+        lambda *_args: update_histogram()
+    )
+    if channels:
+        table.setCurrentCell(0, 0)
+        update_histogram()
+
+
 def _figure_rebuild_settings_multi(ctx, page) -> None:
     """Rebuild the settings panel for a multi-selection of plots.
 
@@ -2588,6 +3189,12 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
 
     scatter_plots = [p for p in plots if p.get("type") == "scatter"]
     hist_plots = [p for p in plots if p.get("type") == "histogram"]
+    image_plots = [p for p in plots if p.get("type") == "image"]
+    image_indices = [
+        i for i in indices
+        if 0 <= i < len(page._fig_plots)
+        and page._fig_plots[i].get("type") == "image"
+    ]
 
     def common(ps, key, default=None):
         vals = [p.get(key, default) for p in ps]
@@ -2719,21 +3326,10 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
             return row
 
         # Three-mode row for scatter / overlay / histogram.
-        modes = []
-        for p in ps:
-            p_mode = _widgets_plot_renderer._figure_axis_mode(
-                p, axis, p.get("type")
-            )
-            if p_mode == "scale":
-                if (
-                    p.get("type") == "histogram" and axis == "y"
-                    or _widgets_plot_renderer._figure_scale_axis_bounds(
-                        ctx, page._fig_task_id, p.get("file"), p.get(axis),
-                        page._fig_column_transforms,
-                    ) is None
-                ):
-                    p_mode = "auto"
-            modes.append(p_mode)
+        modes = [
+            _widgets_plot_renderer._figure_axis_mode(p, axis, p.get("type"))
+            for p in ps
+        ]
         mode = modes[0] if modes and all(m == modes[0] for m in modes) else None
         combo = _NoWheelComboBox()
         if mode is None:
@@ -2951,6 +3547,11 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
 
     filter_combo.currentIndexChanged.connect(on_filter_changed)
 
+    if image_plots:
+        _figure_multi_image_settings(
+            ctx, page, layout, image_plots, enabled, common, apply
+        )
+
     # Y parameter (scatter only).
     y_combo = None
     if scatter_plots:
@@ -3115,6 +3716,10 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
     if scatter_plots:
         layout.addWidget(QLabel("Y range"))
         layout.addWidget(make_range_row(scatter_plots, "y"))
+    if image_plots:
+        label = "Y range (images)" if scatter_plots or hist_plots else "Y range"
+        layout.addWidget(QLabel(label))
+        layout.addWidget(make_range_row(image_plots, "y"))
 
     # Size (width/height in canvas units).
     layout.addWidget(QLabel("Size (px)"))
@@ -3147,6 +3752,118 @@ def _figure_rebuild_settings_multi(ctx, page) -> None:
     sh.addWidget(height_field)
     sh.addStretch()
     layout.addWidget(size_row)
+
+    if image_plots:
+        def image_resolution(plot):
+            size = plot.get("size") or [440, 340]
+            return int(round(size[0] / 10.0)) if size[0] else None
+
+        res_values = [image_resolution(p) for p in image_plots]
+        res_common = (
+            res_values[0]
+            if res_values and all(v == res_values[0] for v in res_values)
+            else None
+        )
+
+        def legend_extra(index):
+            try:
+                widget = page._fig_cards[index].plot_widget()
+            except (IndexError, RuntimeError):
+                return 0
+            legend = getattr(widget, "_legend_widget", None)
+            if legend is not None and legend.isVisible():
+                return legend.width() + 4
+            return 0
+
+        def sync_size_fields():
+            sizes = [tuple(p.get("size") or [440, 340]) for p in plots]
+            if sizes and all(s == sizes[0] for s in sizes):
+                width_field.set_value(sizes[0][0])
+                height_field.set_value(sizes[0][1])
+            else:
+                width_field.set_value(None)
+                height_field.set_value(None)
+            values = [image_resolution(p) for p in image_plots]
+            res_field.set_value(
+                values[0]
+                if values and all(v == values[0] for v in values)
+                else None
+            )
+
+        def on_resolution_changed(_=None):
+            resolution = res_field.value()
+            if resolution is None:
+                return
+            for i in image_indices:
+                plot = page._fig_plots[i]
+                size = plot.get("size") or [440, 340]
+                w_old, h_old = int(size[0]), int(size[1])
+                w_new = int(resolution) * 10
+                h_new = (
+                    int(round(h_old * w_new / w_old))
+                    if w_old > 0 and h_old
+                    else int(round(w_new * 0.77))
+                )
+                _figure_resize_card(ctx, page, i, w_new, h_new)
+            sync_size_fields()
+            _figure_mark_dirty(ctx, page)
+
+        def on_origin_multi(_=False):
+            for i in image_indices:
+                plot = page._fig_plots[i]
+                widget = page._fig_cards[i].plot_widget()
+                extent = getattr(widget, "_img_extent", None)
+                if not extent:
+                    continue
+                size = plot.get("size") or [440, 340]
+                img_w = extent[1] - extent[0] + 1
+                img_h = extent[3] - extent[2] + 1
+                height = int(size[1])
+                if height <= 0 or img_w <= 0 or img_h <= 0:
+                    continue
+                width = int(round(height * img_h / img_w)) + legend_extra(i)
+                width = max(200, min(4000, width))
+                _figure_resize_card(ctx, page, i, width, height)
+            sync_size_fields()
+            _figure_mark_dirty(ctx, page)
+
+        def on_square_multi(_=False):
+            for i in image_indices:
+                plot = page._fig_plots[i]
+                size = plot.get("size") or [440, 340]
+                height = int(size[1])
+                if height <= 0:
+                    continue
+                width = max(200, min(4000, height + legend_extra(i)))
+                _figure_resize_card(ctx, page, i, width, height)
+            sync_size_fields()
+            _figure_mark_dirty(ctx, page)
+
+        layout.addWidget(QLabel("Resolution"))
+        res_row = QWidget()
+        rh = QHBoxLayout(res_row)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.setSpacing(4)
+        res_field = _SizeField(
+            res_common, lambda v: on_resolution_changed(),
+            minimum=20, maximum=400,
+        )
+        res_field.set_enabled(enabled)
+        rh.addWidget(res_field)
+        origin_btn = QPushButton("Origin")
+        origin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        origin_btn.setEnabled(enabled)
+        origin_btn.setToolTip("Match each image's original aspect ratio")
+        origin_btn.clicked.connect(on_origin_multi)
+        rh.addWidget(origin_btn)
+        square_btn = QPushButton("Square")
+        square_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        square_btn.setEnabled(enabled)
+        square_btn.setToolTip("Make each image card square")
+        square_btn.clicked.connect(on_square_multi)
+        rh.addWidget(square_btn)
+        rh.addStretch()
+        layout.addWidget(res_row)
 
     # Display options.
     layout.addWidget(QLabel("Display"))

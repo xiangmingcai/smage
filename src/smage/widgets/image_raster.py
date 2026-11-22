@@ -25,8 +25,12 @@ def _image_raster_raw(ctx, parquet_path, manifest, bbox, channel, mask_ent=None,
         wanted = [c for c in needed if c not in ("x", "y")]
     else:
         needed = {channel}
-        if channel is None or channel not in color_cols:
+        if channel is None:
             channel = color_cols[0] if color_cols else None
+        elif channel not in color_cols:
+            # Never substitute another column: a missing channel would then
+            # be drawn as that column (often x, a left-to-right gradient).
+            return None, None, None
         wanted = [channel] if channel else []
     x0, x1, y0, y1 = bbox
     cols = list(dict.fromkeys(["x", "y"] + wanted))
@@ -159,8 +163,12 @@ def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel, mask_ent=
             if frac_level is not None:
                 frac = frac_level[j0:j1, i0:i1]
         return evaluated[channel], rect, frac
-    if channel is None or channel not in color_cols:
+    if channel is None:
         channel = color_cols[0] if color_cols else None
+    elif channel not in color_cols:
+        # A requested channel that is not in this pyramid must be reported,
+        # not silently replaced by color_cols[0] (usually x, a gradient).
+        return None, None, None
     cidx = color_cols.index(channel) if channel else 0
     x0, x1, y0, y1 = bbox
     xmin = manifest["xmin"]

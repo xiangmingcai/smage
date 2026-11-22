@@ -4,6 +4,40 @@ All notable changes to Smage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [0.3.4] — 2026-11-23
+
+### Added
+
+- **Figure**: selecting several image plots now shows a multi-image
+  **Channels** table with Show / Parameter / Color / Min / Max / Name,
+  **Add channels…** / **Remove**, a channel histogram with **Auto set** /
+  **Reset**, **Show legend**, an image **Y range**, and **Resolution** /
+  **Origin** / **Square** controls. Channels are the union of the selected
+  images; operations skip images that do not contain a channel.
+
+### Changed
+
+- **Unmix**: clicking **Unmix for image** after deselecting files that were
+  already unmixed now asks for confirmation. Continuing deletes their saved
+  parquet/pyramid outputs, removes those channels from downstream image plots
+  and releases the module's upstream lock when no image output remains;
+  cancelling leaves everything unchanged.
+
+### Fixed
+
+- **Figure**: switching a plot (including an **N×N** card) to a file that has
+  no fully configured Scale no longer changes an axis from **From scale** to
+  **Auto**. The chosen mode is kept; the data extent is used until a Scale is
+  available again. Older plots saved as Auto with the internal fallback flag
+  are treated as From scale again.
+- **Figure image plots** now refresh a generated image pyramid when an
+  upstream module rewrites the same output file (for example **Gate2Col**
+  after a gate is renamed). The old in-memory index could no longer contain
+  the renamed channel, so the image silently fell back to the first column
+  (`x`) and appeared as a left-to-right gradient instead of a 0/1 mask.
+  A requested channel that is missing from the pyramid is now reported as
+  unavailable instead of drawing another column.
+
 ## [0.3.3] — 2026-11-21
 
 ### Added

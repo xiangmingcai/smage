@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QLabel,
     QLineEdit,
     QMenu,
     QPushButton,
@@ -90,15 +91,15 @@ def add_plots() -> None:
     "mod.figure.range_fallback", "L4", "figure", tags=("fast",)
 )
 def range_fallback() -> None:
-    """Without a fully configured Scale, From scale falls back to Auto."""
+    """From scale stays selected without a Scale and uses the data extent."""
     window, _project, page = _open("figure_range_fallback")
     try:
         ctx = window._ctx
         _figure_page._figure_add_plot(ctx, page, "scatter")
         harness.pump(300)
         plot = page._fig_plots[0]
-        harness.eq(plot.get("x_range_mode"), "auto")
-        harness.eq(plot.get("y_range_mode"), "auto")
+        harness.eq(plot.get("x_range_mode"), "scale")
+        harness.eq(plot.get("y_range_mode"), "scale")
 
         combos = [
             combo for combo in page._fig_settings_layout.parentWidget()
@@ -108,12 +109,99 @@ def range_fallback() -> None:
         ]
         harness.eq(len(combos), 2)
         harness.check(
-            all(combo.findData("scale") < 0 for combo in combos),
-            "From scale is hidden when no Scale provides both sides",
+            all(combo.findData("scale") >= 0 for combo in combos),
+            "From scale remains an option without a Scale",
         )
         harness.check(
-            all(combo.currentData() == "auto" for combo in combos),
-            "the fallback is Auto",
+            all(combo.currentData() == "scale" for combo in combos),
+            "the user's From scale choice is kept",
+        )
+        hints = [
+            label.text()
+            for label in page._fig_settings_layout.parentWidget()
+            .findChildren(QLabel)
+        ]
+        harness.check(
+            any("using the data extent" in text for text in hints),
+            f"the fallback explains the data extent: {hints}",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case(
+    "mod.figure.range_kept_on_file_switch", "L4", "figure", tags=("fast",)
+)
+def range_kept_on_file_switch() -> None:
+    """Switching to a file without a Scale keeps the From scale choice."""
+    import pandas as pd
+
+    project = harness.new_project("figure_range_file_switch", rows=60)
+    first = project.data_dir / "case.parquet"
+    second = project.data_dir / "second.parquet"
+    frame = pd.read_parquet(first)
+    frame.to_parquet(second, index=False)
+    columns = project.load_columns()
+    columns[second.name] = list(columns[first.name])
+    project.save_columns(columns)
+    processed = project.workflow["tasks"][0]["params"]["processed"]
+    processed.append({
+        "name": "second.fcs",
+        "source": "C:/data/second.fcs",
+        "parquet": str(second),
+        "rows": int(len(frame)),
+    })
+    figure = harness.task_def("figure", task_id="fig-1", name="Figure")
+    scale = harness.task_def(
+        "scale", task_id="s-1", name="Scale",
+        params={
+            "files": [str(first)],
+            "columns": [
+                {"name": "FSC-A", "method": "linear", "param": None,
+                 "min": 10_000.0, "max": 90_000.0},
+                {"name": "SSC-A", "method": "linear", "param": None,
+                 "min": 10_000.0, "max": 50_000.0},
+            ],
+        },
+        children=[figure],
+    )
+    project.workflow["tasks"][0]["children"].append(scale)
+    project.save()
+
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("fig-1", "figure", "Figure")
+    harness.pump(400)
+    try:
+        ctx = window._ctx
+        page = window.tabs.currentWidget()
+        _figure_page._figure_add_plot(ctx, page, "scatter")
+        harness.pump(300)
+        plot = page._fig_plots[0]
+        harness.eq(plot.get("x_range_mode"), "scale")
+        harness.eq(plot.get("y_range_mode"), "scale")
+
+        settings = page._fig_settings_layout.parentWidget()
+        file_combo = next(
+            combo for combo in settings.findChildren(QComboBox)
+            if combo.findData(str(second)) >= 0
+        )
+        file_combo.setCurrentIndex(file_combo.findData(str(second)))
+        harness.pump(300)
+        harness.eq(plot.get("file"), str(second))
+        harness.eq(
+            plot.get("x_range_mode"), "scale",
+            "switching files must not turn From scale into Auto",
+        )
+        harness.eq(plot.get("y_range_mode"), "scale")
+        combos = [
+            combo for combo in settings.findChildren(QComboBox)
+            if combo.findData("auto") >= 0
+            and combo.findData("manual") >= 0
+        ]
+        harness.check(
+            all(combo.currentData() == "scale" for combo in combos),
+            "the range dropdowns still show From scale",
         )
     finally:
         _close(window)
@@ -632,6 +720,125 @@ def image_overlay() -> None:
         harness.eq(page._fig_plots[1]["type"], "overlay")
         harness.eq(page._fig_plots[1]["color_mode"], "overlay")
         harness.eq(len(page._fig_cards), 2)
+    finally:
+        e2e.close_window(window)
+
+
+@harness.case("mod.figure.multi_image_channels", "L4", "figure",
+              tags=("fast",))
+def multi_image_channels() -> None:
+    """Two selected images share a Channels table and batch edits apply."""
+    import pandas as pd
+
+    from smage.data.image_index import _build_image_index_files
+
+    figure = harness.task_def("figure", task_id="fig-1", name="Figure")
+    project, parquet = e2e.image_project(
+        "figure_multi_image", tasks=[figure]
+    )
+    frame = pd.read_parquet(parquet)
+    frame["Channel 2"] = (frame["Channel 1"] > 0).astype("uint8") * 100
+    frame.to_parquet(parquet, index=False)
+    columns = project.load_columns()
+    columns[Path(parquet).name] = list(frame.columns)
+    project.save_columns(columns)
+    project.save()
+    _build_image_index_files(parquet)
+    window = e2e.open_window(project)
+    try:
+        page = e2e.open_page(window, "fig-1", "figure", "Figure")
+        ctx = window._ctx
+        _figure_page._figure_add_plot(ctx, page, "image")
+        harness.pump(250)
+        _figure_page._figure_add_plot(ctx, page, "image")
+        harness.pump(250)
+        _figure_page._figure_set_selection(ctx, page, [0, 1])
+        harness.pump(200)
+
+        settings = page._fig_settings_layout.parentWidget()
+        tables = [
+            table for table in settings.findChildren(QTableWidget)
+            if table.columnCount() == 6
+        ]
+        harness.eq(len(tables), 1, "multi image shows one Channels table")
+        table = tables[0]
+        harness.eq(
+            [table.horizontalHeaderItem(i).text() for i in range(6)],
+            ["Show", "Parameter", "Color", "Min", "Max", "Name"],
+        )
+        harness.eq(table.rowCount(), 1)
+        harness.eq(table.item(0, 1).text(), "Channel 1")
+
+        table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+        harness.pump(150)
+        for plot in page._fig_plots[:2]:
+            layer = plot["layers"][0]
+            harness.check(not layer.get("visible"), "hide applied to both")
+        table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        harness.pump(150)
+        for plot in page._fig_plots[:2]:
+            harness.check(plot["layers"][0].get("visible"), "show applied")
+
+        min_edit = table.cellWidget(0, 3)
+        min_edit.setText("5")
+        min_edit.editingFinished.emit()
+        harness.pump(150)
+        for plot in page._fig_plots[:2]:
+            harness.eq(plot["layers"][0].get("min"), 5.0)
+
+        auto_btn = next(
+            button for button in settings.findChildren(QPushButton)
+            if button.text() == "Auto set"
+        )
+        auto_btn.click()
+        harness.pump(200)
+        for plot in page._fig_plots[:2]:
+            harness.check(plot["layers"][0].get("min") is not None)
+            harness.check(plot["layers"][0].get("max") is not None)
+
+        original_picker = _widgets_picker._pick_items_dialog
+        _widgets_picker._pick_items_dialog = lambda *a, **k: ["Channel 2"]
+        try:
+            add_btn = next(
+                button for button in settings.findChildren(QPushButton)
+                if button.text() == "Add channels…"
+            )
+            add_btn.click()
+            harness.pump(250)
+        finally:
+            _widgets_picker._pick_items_dialog = original_picker
+        tables = [
+            table for table in settings.findChildren(QTableWidget)
+            if table.columnCount() == 6
+        ]
+        table = tables[0]
+        harness.eq(table.rowCount(), 2, "add channels grew the union")
+        for plot in page._fig_plots[:2]:
+            harness.eq(len(plot["layers"]), 2)
+            harness.eq(plot["layers"][1]["parameter"], "Channel 2")
+
+        row = next(
+            index for index in range(table.rowCount())
+            if table.item(index, 1).text() == "Channel 2"
+        )
+        table.setCurrentCell(row, 0)
+        remove_btn = next(
+            button for button in settings.findChildren(QPushButton)
+            if button.text() == "Remove"
+        )
+        remove_btn.click()
+        harness.pump(250)
+        tables = [
+            table for table in settings.findChildren(QTableWidget)
+            if table.columnCount() == 6
+        ]
+        harness.eq(tables[0].rowCount(), 1, "remove dropped the channel")
+        for plot in page._fig_plots[:2]:
+            harness.eq(len(plot["layers"]), 1)
+
+        labels = {label.text() for label in settings.findChildren(QLabel)}
+        harness.check("Y range" in labels, "image Y range is exposed")
+        harness.check("Resolution" in labels, "multi image resolution is exposed")
     finally:
         e2e.close_window(window)
 

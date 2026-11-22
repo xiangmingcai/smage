@@ -12,7 +12,7 @@ histogram and image plots, several per module.
 | Plot type | Scatter, histogram or image. |
 | File | The data file plotted by this figure. |
 | Filter | Restrict the plotted events or pixels to an upstream Gating gate. [Regions](region.md) are not filters; once converted they appear as ordinary 0/1 channels in the Channels table. Image plots keep a gate filter on every channel, including unmixed and other generated channels. |
-| X/Y range | Each axis has three modes. **Manual** uses the entered Min/Max. **From scale** (default) uses the nearest upstream [Scale](scale.md) that sets **both** Min and Max for that channel; if none does, it switches to **Auto**. **Auto** uses the extent of the drawn data and ignores Scale. The mode applies to scatter, overlay and histogram plots; a histogram's Y axis (counts) offers Manual/Auto only. Image plots keep the Auto checkbox. |
+| X/Y range | Each axis has three modes. **Manual** uses the entered Min/Max. **From scale** (default) uses the nearest upstream [Scale](scale.md) that sets **both** Min and Max for that channel; when none does, it keeps From scale selected and uses the data extent until a Scale is available. **Auto** uses the extent of the drawn data and ignores Scale. The mode applies to scatter, overlay and histogram plots; a histogram's Y axis (counts) offers Manual/Auto only. Image plots show both X and Y ranges, with an Auto checkbox. |
 | X / Y parameter | The axes (Y is hidden for histograms). |
 | Color mode | Density, a parameter value, or a solid color. |
 | Color parameter / palette / point size | Appearance of the points. |
@@ -22,9 +22,9 @@ histogram and image plots, several per module.
 | Display toggles | Axes, axis names, tick indices and sample name. |
 
 For **From scale**, a Scale module counts only when it sets both Min and Max
-for that channel. When no such module exists, the axis falls back to Auto; it
-returns to From scale automatically if the axis is later changed to a channel
-with a usable Scale. Explicitly choosing Auto keeps it on Auto.
+for that channel. When no such module exists, the axis keeps From scale and
+draws the data extent until a usable Scale is available. Explicitly choosing
+Auto keeps it on Auto.
 
 Range settings are remembered **per channel**: each X/Y channel keeps its own
 mode and manual Min/Max, so switching away and back restores them. A channel
@@ -46,6 +46,16 @@ below zero. Image plots keep their exact pixel extent.
 A Figure module can hold several plots; each has its own settings and its own
 place in the export. Plots are listed in the module and can be removed
 individually.
+
+When several plots are selected, the settings panel edits them together and
+shows a value only where all selected plots agree. For image plots the
+**Channels** table lists the union of their layers: Show, Parameter, Color,
+Min, Max and Name, plus **Add channels…**, **Remove**, **Auto set**,
+**Reset** and **Show legend**. Editing a row applies it to every selected
+image that contains that channel; images without the channel are skipped and
+the row tooltip reports how many are missing. A **Preview file** selector
+chooses which image feeds the channel histogram. Multi-image settings also
+include the image **Y range**, **Resolution**, **Origin** and **Square**.
 
 ## Saving a plot
 

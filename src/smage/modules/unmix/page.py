@@ -84,6 +84,7 @@ import copy
 import hashlib
 import json
 import math
+import shutil
 import pyqtgraph as pg
 import threading
 from functools import partial
@@ -841,6 +842,100 @@ def _unmix_write_image_output(ctx, task_id, parquet_path, config) -> dict:
     }
 
 
+def _unmix_removed_image_outputs(ctx, page, samples) -> list:
+    """Saved image outputs whose source file is no longer selected."""
+    selected = {str(path) for path in samples or [] if path}
+    removed = []
+    for path, rec in (page._unmix_params.get("outputs") or {}).items():
+        if str(path) in selected:
+            continue
+        if not isinstance(rec, dict) or not rec.get("path"):
+            continue
+        try:
+            label = _data_naming._comp_file_name(
+                ctx, path, page._unmix_task_id
+            )
+        except Exception:  # noqa: BLE001 - a removed file may not resolve
+            label = Path(str(path)).name
+        removed.append({"source": path, "rec": rec, "label": label})
+    return removed
+
+
+def _unmix_confirm_remove_image_outputs(ctx, page, samples):
+    """Ask before dropping outputs of deselected files.
+
+    Returns the removed records (possibly an empty list) when the run may
+    continue, or None when the user cancels.
+    """
+    removed = _unmix_removed_image_outputs(ctx, page, samples)
+    if not removed:
+        return []
+    shown = "\n".join(f"  - {item['label']}" for item in removed[:8])
+    if len(removed) > 8:
+        shown += f"\n  … and {len(removed) - 8} more"
+    text = (
+        f"{len(removed)} previously unmixed file(s) are no longer selected:\n\n"
+        f"{shown}\n\n"
+        "Continuing will delete their unmixed outputs and remove these "
+        "channels from downstream image plots.\n\nContinue?"
+    )
+    reply = QMessageBox.question(
+        ctx.host, "Unmix for image", text,
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+        return None
+    outputs = dict(page._unmix_params.get("outputs") or {})
+    for item in removed:
+        outputs.pop(item["source"], None)
+    page._unmix_params["outputs"] = outputs
+    page._unmix_task_def["params"] = page._unmix_params
+    # With no image outputs left, the module no longer locks its inputs.
+    page._unmix_task_def["output"] = {"saved": bool(outputs)}
+    _unmix_save_now(ctx, page)
+    return removed
+
+
+def _unmix_output_abs_path(ctx, rec):
+    """A generated output path, only when it stays inside the project."""
+    if ctx.project is None or not isinstance(rec, dict):
+        return None
+    rel = rec.get("path")
+    if not rel:
+        return None
+    try:
+        root = Path(ctx.project.path).resolve()
+        path = (Path(ctx.project.path) / rel).resolve()
+    except (OSError, ValueError):
+        return None
+    if path == root or not path.is_relative_to(root):
+        return None
+    if path.suffix.lower() != ".parquet":
+        return None
+    return path
+
+
+def _unmix_delete_image_output(ctx, rec) -> tuple[bool, str]:
+    """Delete one unmix parquet and its image pyramid. Return (ok, error)."""
+    path = _unmix_output_abs_path(ctx, rec)
+    if path is None:
+        return False, "invalid output path"
+    errors = []
+    if path.exists():
+        try:
+            path.unlink()
+        except OSError as exc:
+            errors.append(str(exc))
+    index_dir = Path(str(path) + ".imgidx")
+    if index_dir.exists():
+        try:
+            shutil.rmtree(index_dir)
+        except OSError as exc:
+            errors.append(str(exc))
+    return (not errors), "; ".join(errors)
+
+
 def _unmix_start_image(ctx, page) -> None:
     """Save, then generate the unmixed image channels of every sample."""
     import queue as queue_module
@@ -869,6 +964,9 @@ def _unmix_start_image(ctx, page) -> None:
             or "Add at least one complete signature to the matrix first.",
         )
         return
+    removed = _unmix_confirm_remove_image_outputs(ctx, page, samples)
+    if removed is None:
+        return
     page._unmix_running = True
     page._unmix_cancel = False
     if getattr(page, "_unmix_image_btn", None) is not None:
@@ -885,7 +983,7 @@ def _unmix_start_image(ctx, page) -> None:
     page._unmix_queue = q
     page._unmix_thread = threading.Thread(
         target=partial(_unmix_image_worker, ctx),
-        args=(page, q, config, samples, labels),
+        args=(page, q, config, samples, labels, removed),
         daemon=True,
     )
     page._unmix_thread.start()
@@ -910,13 +1008,25 @@ def _unmix_output_is_current(ctx, task_id, parquet_path, config, rec) -> bool:
     return _data_image_index._image_load_manifest(ctx, str(path)) is not None
 
 
-def _unmix_image_worker(ctx, page, q, config, files, labels=None) -> None:
-    """Background: generate one image pyramid per selected image file."""
+def _unmix_image_worker(ctx, page, q, config, files, labels=None,
+                        removed=None) -> None:
+    """Background: delete stale outputs, then generate the selected files."""
     task_id = page._unmix_task_id
     labels = labels or {}
+    removed = list(removed or [])
     outputs = dict(page._unmix_params.get("outputs") or {})
     done = failed = skipped = unchanged = 0
     try:
+        for item in removed:
+            label = item.get("label") or str(item.get("source") or "")
+            ok, error = _unmix_delete_image_output(ctx, item.get("rec"))
+            if ok:
+                q.put(("log", f"✓ removed: {label}"))
+            else:
+                q.put((
+                    "log",
+                    f"✗ could not delete unmix output: {label}: {error}",
+                ))
         for i, path in enumerate(files):
             if getattr(page, "_unmix_cancel", False):
                 q.put(("log", "Cancelled."))
@@ -942,7 +1052,8 @@ def _unmix_image_worker(ctx, page, q, config, files, labels=None) -> None:
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 q.put(("log", f"✗ {label}: {exc}"))
-        q.put(("done", outputs, done, failed, skipped, unchanged))
+        q.put(("done", outputs, done, failed, skipped, unchanged,
+               len(removed)))
     except Exception as exc:  # noqa: BLE001
         q.put(("error", str(exc)))
 
@@ -953,7 +1064,7 @@ def _unmix_image_poll(ctx, page) -> None:
         return
     finished = False
     error = None
-    counts = (0, 0, 0, 0)
+    counts = (0, 0, 0, 0, 0)
     outputs = None
     while True:
         try:
@@ -965,7 +1076,7 @@ def _unmix_image_poll(ctx, page) -> None:
             _unmix_log(ctx, page, msg[1])
         elif kind == "done":
             outputs = msg[1]
-            counts = (msg[2], msg[3], msg[4], msg[5])
+            counts = (msg[2], msg[3], msg[4], msg[5], msg[6])
             finished = True
         elif kind == "error":
             error = msg[1]
@@ -982,9 +1093,9 @@ def _unmix_image_poll(ctx, page) -> None:
     if outputs is not None:
         page._unmix_params["outputs"] = outputs
         page._unmix_task_def["params"] = page._unmix_params
-        if counts[0] or counts[3]:
-            # Generated data exists: lock the upstream modules.
-            page._unmix_task_def["output"] = {"saved": True}
+        # Image outputs lock the upstream modules; removing the last one
+        # releases that lock.
+        page._unmix_task_def["output"] = {"saved": bool(outputs)}
         if ctx.project is not None:
             ctx.project.save()
         page._unmix_snapshot = copy.deepcopy(page._unmix_params)
@@ -996,12 +1107,14 @@ def _unmix_image_poll(ctx, page) -> None:
         _unmix_log(ctx, page, f"✗ {error}")
         QMessageBox.warning(ctx.host, "Unmix for image", error)
     else:
-        done, failed, skipped, unchanged = counts
-        _unmix_log(ctx,
-            page,
+        done, failed, skipped, unchanged, removed = counts
+        summary = (
             f"— Done: {done} generated, {unchanged} already up to date, "
-            f"{failed} failed, {skipped} skipped (not images) —",
+            f"{failed} failed, {skipped} skipped (not images)"
         )
+        if removed:
+            summary += f", {removed} removed"
+        _unmix_log(ctx, page, summary + " —")
 
 
 def _unmix_highlight_spectrum(ctx, page, spectrum_id) -> None:

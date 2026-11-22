@@ -6,7 +6,7 @@ into a common tabular representation and lets you compose analysis pipelines
 from interactive modules — gating, compensation, unmixing, segmentation,
 feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.3.3`; modules and
+> **Status:** early development. The current release is `0.3.4`; modules and
 > file formats may still change between releases.
 
 > **Intended use:** research software, not a medical device. Not for clinical
@@ -17,18 +17,18 @@ feature aggregation, clustering, dimensionality reduction and export.
 📦 **Releases:** <https://github.com/xiangmingcai/smage/releases><br>
 🐛 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
-## What's new in 0.3.3
+## What's new in 0.3.4
 
-- **Gating**: right-click the plot and choose **Save plot as…** to export the
-  current view — with gates and labels — as an editable PDF, PNG or JPEG.
-- **Feature Down**, **Feature Up** and **Gate2Col** now calculate in the
-  background, keeping the window responsive on large files.
-- Workflow **Copy/Paste** keeps the saved **Data files** selection and maps it
-  to the equivalent files in the new branch. The workflow view also stays where
-  it was when modules are added or deleted.
-- Scatter **Fixed** point size is now a screen-pixel diameter, so points stay
-  round even when the X and Y axes have different scales.
-- **Gating**: switching files at the root keeps the Plot settings axes.
+- **Figure**: selecting several image plots now opens a shared **Channels**
+  table (Show / Parameter / Color / Min / Max / Name) with Add/Remove,
+  histogram, Auto set/Reset, Show legend, Y range and Resolution/Origin/Square.
+- **Unmix**: after deselecting files that were already unmixed, **Unmix for
+  image** asks before deleting their saved outputs and downstream channels.
+- **Figure image plots** refresh a generated image pyramid when an upstream
+  module rewrites it, so renamed Gate2Col channels show their 0/1 mask instead
+  of falling back to the x gradient.
+- **From scale** stays selected after switching to a file without a Scale and
+  uses the data extent until a Scale is available.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -70,7 +70,7 @@ Optional analysis methods run in a separate Python environment created from
 | PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
 
 The Extension Manager installs the current pip release; the versions above
-were current when Smage 0.3.3 was released. Use a **Python 3.11** environment
+were current when Smage 0.3.4 was released. Use a **Python 3.11** environment
 for these extensions, matching the Python version Smage is built with. Each
 environment may need extra packages (for example PyTorch for Cellpose or
 TensorFlow for StarDist) — see the extension's repository for its

@@ -3,6 +3,23 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.3.4 — 2026-11-23
+
+- **Figure**: multi-selected image plots now share a **Channels** table with
+  Show / Parameter / Color / Min / Max / Name, Add/Remove, a channel histogram
+  with Auto set/Reset, Show legend, an image Y range, and Resolution / Origin /
+  Square controls.
+- **Unmix**: after deselecting files that were already unmixed, **Unmix for
+  image** asks for confirmation before deleting their saved outputs and
+  removing the channels from downstream image plots.
+- **Figure image plots** reload a generated image pyramid when an upstream
+  module rewrites the same output file, so a renamed Gate2Col channel is shown
+  as its 0/1 mask instead of falling back to the x gradient.
+- **From scale** remains selected when the current file has no Scale and uses
+  the data extent until one is available.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.3.3 — 2026-11-21
 
 - **Gating** plots can be saved from the right-click menu as an editable PDF,

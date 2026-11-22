@@ -44,6 +44,67 @@ def _add_file(project, name: str, rows: int = 20) -> str:
     return str(path)
 
 
+@harness.case("data.image_index.rebuilt", "L2", "data", tags=("fast",))
+def image_index_rebuilt() -> None:
+    """A rewritten output parquet replaces its cached image pyramid."""
+    import numpy as np
+    import pandas as pd
+
+    from smage.data.image_index import (
+        _build_image_index_files,
+        _ensure_image_index,
+    )
+
+    window, project = _open("data_index_rebuilt")
+    try:
+        path = project.data_dir / "generated.parquet"
+        grid = np.arange(32 * 32)
+        base = {
+            "x": (grid % 32).astype("int32"),
+            "y": (grid // 32).astype("int32"),
+        }
+        pd.DataFrame({**base, "old": np.zeros(grid.size, dtype="int8")}) \
+            .to_parquet(path, index=False)
+        _build_image_index_files(str(path))
+        ctx = window._ctx
+        ent = _ensure_image_index(ctx, str(path))
+        harness.eq(
+            ent["manifest"]["color_cols"], ["x", "y", "old"]
+        )
+        harness.eq(ctx._image_level_2d(str(path), 2).shape[2], 3)
+        crop, _rect, _frac = ctx._image_raster(
+            str(path), ent["manifest"], (0, 31, 0, 31), 2, "missing",
+            None, None,
+        )
+        harness.check(
+            crop is None,
+            "a missing channel is not silently replaced by x",
+        )
+
+        # A generate module rewrites the same path after a gate/channel rename.
+        import os
+
+        pd.DataFrame({**base, "new": np.ones(grid.size, dtype="int8")}) \
+            .to_parquet(path, index=False)
+        # Make sure the mtime clearly differs from the cached manifest.
+        stamp = path.stat().st_mtime + 1.0
+        os.utime(path, (stamp, stamp))
+        _build_image_index_files(str(path))
+        ent = _ensure_image_index(ctx, str(path))
+        harness.eq(
+            ent["manifest"]["color_cols"], ["x", "y", "new"],
+            "the cached manifest is replaced by the rebuilt one",
+        )
+        level = ctx._image_level_2d(str(path), 2)
+        harness.eq(level.shape[2], 3)
+        harness.eq(
+            round(float(level[:, :, 2].mean()), 3), 1.0,
+            "level arrays are reloaded from the rebuilt pyramid",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("data.files.chain", "L2", "data", tags=("smoke",))
 def task_chain() -> None:
     tasks = [harness.task_def(

@@ -286,7 +286,14 @@ def _ensure_image_index(ctx, parquet_path):
         ctx._image_index_cache = cache
     ent = cache.get(parquet_path)
     if ent is not None and ent.get("manifest") is not None:
-        return ent
+        # A generate module (Gate2Col, Feature Up, Unmix, …) can rewrite the
+        # same output parquet and rebuild its pyramid.  Returning the cached
+        # entry would keep the old manifest and level arrays, so a renamed
+        # channel would silently fall back to the first column (x) and look
+        # like a gradient.  Revalidate against the parquet on every lookup.
+        if ctx._image_index_valid(parquet_path, ent["manifest"]):
+            return ent
+        cache.pop(parquet_path, None)
     manifest = ctx._image_load_manifest(parquet_path)
     if manifest is not None and ctx._image_index_valid(parquet_path, manifest):
         ent = {"manifest": manifest, "levels": {}}

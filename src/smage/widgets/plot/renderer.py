@@ -308,28 +308,15 @@ def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: boo
         ) is not None
     fallback_key = f"{axis}_range_auto_fallback"
     mode = _figure_axis_mode(plot_dict, axis, ptype)
+    # The mode is the user's choice and survives a file switch: From scale
+    # without a fully configured Scale simply uses the data extent until a
+    # Scale is available again.  Never rewrite it to Auto here.
+    scale_missing = not count_axis and mode == "scale" and not scale_ok
+    plot_dict.pop(fallback_key, None)
     if count_axis:
         mode = "manual" if mode == "manual" else "auto"
-        plot_dict.pop(fallback_key, None)
-    elif scale_ok:
-        # If From scale had to fall back earlier, resume it now that this
-        # channel has a fully configured Scale (e.g. after switching axes).
-        if mode == "auto" and plot_dict.get(fallback_key):
-            mode = "scale"
-        plot_dict.pop(fallback_key, None)
-    else:
-        if mode == "scale":
-            mode = "auto"
-            plot_dict[fallback_key] = True
-        elif mode == "auto" and plot_dict.get(fallback_key):
-            pass  # keep waiting for a Scale on this axis
-        else:
-            # An explicit Auto/Manual choice must not be overridden later.
-            plot_dict.pop(fallback_key, None)
     plot_dict[f"{axis}_range_mode"] = mode
-    _figure_save_range_record(
-        plot_dict, axis, mode, bool(plot_dict.get(fallback_key))
-    )
+    _figure_save_range_record(plot_dict, axis, mode, False)
 
     state = {"updating": False}
     box = QWidget()
@@ -341,7 +328,9 @@ def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: boo
     h.setSpacing(4)
     combo = _NoWheelComboBox()
     combo.addItem("Manual", "manual")
-    if scale_ok:
+    if not count_axis:
+        # Keep the option visible even when the current file has no Scale:
+        # the choice must not silently change when another file is opened.
         combo.addItem("From scale", "scale")
     combo.addItem("Auto", "auto")
     combo.setCurrentIndex(max(0, combo.findData(mode)))
@@ -349,7 +338,8 @@ def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: boo
     combo.setMinimumWidth(104)
     combo.setToolTip(
         "Manual: use the Min/Max below.\n"
-        "From scale: the nearest upstream Scale with both Min and Max.\n"
+        "From scale: the nearest upstream Scale with both Min and Max;\n"
+        "without one, the data extent is used.\n"
         "Auto: the extent of the drawn data.\n"
         "Every mode leaves a 5 % border around the range."
     )
@@ -433,10 +423,10 @@ def _figure_range_row(ctx, plot_dict: dict, axis: str, plot_widget, enabled: boo
     h.addWidget(max_spin)
     h.addStretch()
     v.addLayout(h)
-    if plot_dict.get(fallback_key) and not count_axis:
+    if scale_missing:
         hint = QLabel(
             "No upstream Scale sets both Min and Max for this channel; "
-            "using Auto."
+            "using the data extent until one does."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #6b7785;")
@@ -2122,6 +2112,10 @@ def _figure_axis_mode(plot_dict: dict, axis: str, ptype=None) -> str:
         ):
             return "manual"
         return "auto"
+    # Older builds wrote Auto and set this flag when From scale had no
+    # bounds.  Treat it as the From scale choice the user actually made.
+    if mode == "auto" and plot_dict.get(f"{axis}_range_auto_fallback"):
+        return "scale"
     if mode in ("manual", "scale", "auto"):
         return mode
     if (
@@ -2156,22 +2150,12 @@ def _figure_active_range_record(plot_dict, axis) -> dict:
     """The current axis range as a per-channel record."""
     min_key = f"{axis}min"
     max_key = f"{axis}max"
-    mode = plot_dict.get(f"{axis}_range_mode")
-    if mode is None:
-        mode = (
-            "manual"
-            if plot_dict.get(min_key) is not None
-            or plot_dict.get(max_key) is not None
-            else "scale"
-        )
-    fallback = bool(
-        plot_dict.get(f"{axis}_range_auto_fallback")
-    ) and mode == "auto"
+    mode = _figure_axis_mode(plot_dict, axis)
     return {
         "mode": mode,
         "min": plot_dict.get(min_key) if mode == "manual" else None,
         "max": plot_dict.get(max_key) if mode == "manual" else None,
-        "fallback": fallback,
+        "fallback": False,
     }
 
 

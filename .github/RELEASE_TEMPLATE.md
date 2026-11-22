@@ -2,17 +2,15 @@
 
 ## Highlights
 
-- **Gating**: right-click the plot and choose **Save plot as…** to export the
-  current view (gates and labels included) as an editable PDF, PNG or JPEG.
-- **Feature Down**, **Feature Up** and **Gate2Col** calculate in the
-  background, so the window stays responsive on large files.
-- Workflow **Copy/Paste** keeps the saved **Data files** selection and maps it
-  to the equivalent files in the new branch; the workflow view also keeps its
-  scroll position when modules are added or deleted.
-- Scatter **Fixed** point size is now a screen-pixel diameter, keeping points
-  round when the X and Y axes have different scales.
-- **Gating** keeps the Plot settings axes when switching files at the root;
-  selecting a gate still uses that gate's axes.
+- **Figure**: multi-selected image plots now share a **Channels** table with
+  Show / Parameter / Color / Min / Max / Name, Add/Remove, histogram,
+  Auto set/Reset, Show legend, Y range and Resolution / Origin / Square.
+- **Unmix**: after deselecting previously unmixed files, **Unmix for image**
+  asks before deleting their saved outputs and downstream channels.
+- **Figure image plots** refresh a generated image pyramid when an upstream
+  module rewrites it, so renamed Gate2Col channels keep showing their 0/1 mask.
+- **From scale** stays selected when a file has no Scale and uses the data
+  extent until one is available.
 
 ## Downloads
 

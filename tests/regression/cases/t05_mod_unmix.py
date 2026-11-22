@@ -575,6 +575,85 @@ def manual_edit() -> None:
         _close(window)
 
 
+@harness.case("mod.unmix.deselected_outputs", "L4", "unmix",
+              tags=("fast",))
+def deselected_outputs() -> None:
+    """Deselecting unmixed files prompts before deleting their outputs."""
+    window, project, page = _open("unmix_deselected_outputs")
+    try:
+        ctx = window._ctx
+        folder = project.path / "Module" / "u-1"
+        folder.mkdir(parents=True, exist_ok=True)
+        first = str(project.data_dir / "first.parquet")
+        second = str(project.data_dir / "second.parquet")
+        outputs = {}
+        for source, name in ((first, "first"), (second, "second")):
+            out = folder / f"{name}_unmix.parquet"
+            out.write_bytes(b"x")
+            index = Path(str(out) + ".imgidx")
+            index.mkdir()
+            (index / "manifest.json").write_text("{}", encoding="utf-8")
+            outputs[source] = {
+                "path": f"Module/u-1/{name}_unmix.parquet",
+                "columns": [name],
+                "kind": "image",
+                "signature": "sig",
+            }
+        page._unmix_params["outputs"] = outputs
+        page._unmix_params["samples"] = [first]
+        page._unmix_task_def["params"] = page._unmix_params
+        page._unmix_task_def["output"] = {"saved": True}
+
+        with harness.patch_dialogs(
+            _unmix_page, question=QMessageBox.StandardButton.No
+        ):
+            result = _unmix_page._unmix_confirm_remove_image_outputs(
+                ctx, page, [first]
+            )
+        harness.eq(result, None, "No cancels the run")
+        harness.eq(len(page._unmix_params["outputs"]), 2)
+        removed = page._unmix_params["outputs"][second]
+        harness.check(
+            (project.path / removed["path"]).is_file(),
+            "No keeps the deselected output file",
+        )
+
+        with harness.patch_dialogs(
+            _unmix_page, question=QMessageBox.StandardButton.Yes
+        ):
+            result = _unmix_page._unmix_confirm_remove_image_outputs(
+                ctx, page, [first]
+            )
+        harness.eq(len(result), 1)
+        harness.eq(list(page._unmix_params["outputs"]), [first])
+        harness.check(
+            (project.path / removed["path"]).is_file(),
+            "the mapping is removed first; the worker deletes the file",
+        )
+
+        ok, error = _unmix_page._unmix_delete_image_output(
+            ctx, result[0]["rec"]
+        )
+        harness.check(ok, error)
+        harness.check(not (project.path / removed["path"]).exists())
+        harness.check(
+            not Path(str(project.path / removed["path"]) + ".imgidx").exists()
+        )
+
+        # Removing the last output unlocks the upstream modules.
+        with harness.patch_dialogs(
+            _unmix_page, question=QMessageBox.StandardButton.Yes
+        ):
+            result = _unmix_page._unmix_confirm_remove_image_outputs(
+                ctx, page, []
+            )
+        harness.eq(len(result), 1)
+        harness.eq(page._unmix_params["outputs"], {})
+        harness.eq(page._unmix_task_def["output"], {"saved": False})
+    finally:
+        _close(window)
+
+
 @harness.case("mod.unmix.manual_channels", "L4", "unmix", tags=("fast",))
 def manual_channels() -> None:
     """Changing the spectrum channels keeps the paste but blocks unmixing."""
