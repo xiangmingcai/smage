@@ -395,6 +395,8 @@ def open_project(window, project):
     window.project = Project.load(project.path)
     runlog.start(window.project.path, window._log_environment())
     window.setWindowTitle(f"Smage — {window.project.name}")
+    window._update_project_actions()
+    window._clear_project_runtime_caches()
     window._column_index = window.project.load_columns()
     window._reset_module_tabs()
     _import_page._load_import_files(window._ctx)

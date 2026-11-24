@@ -36,6 +36,7 @@ from pathlib import Path
 from smage.core.constants import MODULE_STATE_MODIFIED
 from smage.core.image_ops import (
     _otsu_threshold,
+    _otsu_threshold_chunked,
     _relabel_sequential,
 )
 from smage.core.settings import (
@@ -63,9 +64,20 @@ from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
 from smage.data import outputs as _data_outputs
+from smage.data import scratch as _data_scratch
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
 from smage.widgets.plot import renderer as _widgets_plot_renderer
+
+
+# Image batches: at most this many rasterized inputs and pending outputs are
+# allowed on disk at once. Mask parquet is written in bounded row chunks so a
+# large label grid never has to be duplicated as a DataFrame.
+SEG_PREFETCH = 2
+SEG_INPUT_TIMEOUT = 1800.0
+SEG_WRITE_CHUNK = 2_000_000
+SEG_EXPAND_TILE = 1024
+SEG_UINT16_MAX = 65535
 
 
 def _seg_params_for(ctx, task_def) -> dict:
@@ -145,29 +157,36 @@ def _seg_load_mask(ctx, mask_path):
 
 
 def _seg_temp_dir(ctx):
-    """Shared temp folder for this project's segmentation caches."""
-    import hashlib
-    import tempfile
+    """Disposable working files for segmentation."""
+    return _data_scratch._scratch_area(ctx, "segmentation")
 
-    key = "no-project"
-    if ctx.project is not None:
-        key = hashlib.md5(
-            str(ctx.project.path.resolve()).encode("utf-8")
-        ).hexdigest()[:12]
-    return Path(tempfile.gettempdir()) / "smage" / "segmentation" / key
+
+def _seg_edges_dir(ctx):
+    return _seg_temp_dir(ctx) / "edges"
+
+
+def _seg_runs_dir(ctx):
+    return _seg_temp_dir(ctx) / "runs"
 
 
 def _seg_clear_edge_cache(ctx) -> None:
     """Drop this project's cached mask-edge images (temp data only)."""
-    import shutil
-
     cache = getattr(ctx, "_seg_edge_cache", None)
     if cache is not None:
         cache.clear()
-    try:
-        shutil.rmtree(_seg_temp_dir(ctx), ignore_errors=True)
-    except Exception:  # noqa: BLE001
-        pass
+    _data_scratch._scratch_remove(_seg_edges_dir(ctx))
+
+
+def _seg_cleanup_runs(ctx) -> None:
+    """Remove batch folders left behind by an interrupted process."""
+    _data_scratch._scratch_remove(_seg_runs_dir(ctx))
+
+
+def _seg_cleanup_temp(ctx) -> None:
+    """Remove every disposable segmentation file for the current project."""
+    _seg_clear_edge_cache(ctx)
+    _seg_cleanup_runs(ctx)
+    _data_scratch._scratch_cleanup_area(ctx, "segmentation")
 
 
 def _seg_edge_map(ctx, mask_path):
@@ -186,7 +205,7 @@ def _seg_edge_map(ctx, mask_path):
     hit = cache.get(key)
     if hit is not None and hit[0] == sign:
         return hit[1]
-    path = _seg_temp_dir(ctx) / f"{Path(str(mask_path)).stem}.{sign}.npy"
+    path = _seg_edges_dir(ctx) / f"{Path(str(mask_path)).stem}.{sign}.npy"
     edge = None
     if path.is_file():
         try:
@@ -269,6 +288,24 @@ def _build_segmentation_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     page._seg_mask_cache = {}
     page._seg_ext_running = False
     page._seg_calc_running = False
+    page._seg_calc_cancel = False
+    page._seg_calc_finished = False
+    page._seg_nuclear_queue = None
+    page._seg_nuclear_timer = None
+    page._seg_ext_queue = None
+    page._seg_ext_timer = None
+    page._seg_ext_writer = None
+    page._seg_ext_cancelled = False
+    page._seg_ext_aborted = False
+    page._seg_ext_proc_finished = False
+    page._seg_ext_feeder_done = False
+    page._seg_ext_pending_writes = 0
+    page._seg_ext_prepared = 0
+    page._seg_ext_written = 0
+    page._seg_import_running = False
+    page._seg_import_cancel = False
+    page._seg_import_queue = None
+    page._seg_import_timer = None
     # The calculation log belongs to the module: it is saved with the task
     # params, restored when the page reopens, and never cleared by a rerun.
     page._seg_log_lines = list(params.get("log") or [])
@@ -667,6 +704,31 @@ def _seg_otsu_value(ctx, page, parquet_path, channel):
     return value
 
 
+def _seg_run_controls(ctx, page, enabled: bool) -> QWidget:
+    """Calculate + Cancel row shared by every segmentation method."""
+    row = QWidget()
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
+    calc_btn = QPushButton("Calculate")
+    calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    calc_btn.setEnabled(
+        enabled
+        and not getattr(page, "_seg_calc_running", False)
+        and not getattr(page, "_seg_import_running", False)
+    )
+    cancel_btn = QPushButton("Cancel")
+    cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    cancel_btn.setEnabled(getattr(page, "_seg_calc_running", False))
+    cancel_btn.setToolTip("Stop after the current file (or kill the external run)")
+    cancel_btn.clicked.connect(lambda _=False: _seg_cancel_run(ctx, page))
+    lay.addWidget(calc_btn, 1)
+    lay.addWidget(cancel_btn)
+    page._seg_calc_btn = calc_btn
+    page._seg_cancel_btn = cancel_btn
+    return row
+
+
 def _seg_method_params_panel(ctx, page, host) -> None:
     """Nuclear Expansion parameters + Calculate."""
     lay = host.layout()
@@ -783,16 +845,12 @@ def _seg_method_params_panel(ctx, page, host) -> None:
     ))
     page._seg_split_separation = sep_spin
 
-    calc_btn = QPushButton("Calculate")
-    calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    calc_btn.setEnabled(enabled)
-    lay.addWidget(calc_btn)
+    lay.addWidget(_seg_run_controls(ctx, page, enabled))
     status = QLabel("")
     status.setStyleSheet("color: #6b7785;")
     status.setWordWrap(True)
     lay.addWidget(status)
     lay.addStretch(1)
-    page._seg_calc_btn = calc_btn
     page._seg_calc_status = status
 
     def refresh_otsu():
@@ -843,7 +901,9 @@ def _seg_method_params_panel(ctx, page, host) -> None:
     exp_spin.valueChanged.connect(on_expand)
     split_check.toggled.connect(on_split)
     sep_spin.valueChanged.connect(on_separation)
-    calc_btn.clicked.connect(lambda _=False: _seg_calculate(ctx, page))
+    page._seg_calc_btn.clicked.connect(
+        lambda _=False: _seg_calculate(ctx, page)
+    )
 
 
 def _seg_channel_columns(ctx, page) -> list:
@@ -1001,17 +1061,13 @@ def _seg_external_method_panel(ctx, page, host) -> None:
             "tiles to the image size. 0 = let StarDist choose."
         ))
 
-    calc_btn = QPushButton("Calculate")
-    calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    calc_btn.setEnabled(enabled and ready)
-    lay.addWidget(calc_btn)
+    lay.addWidget(_seg_run_controls(ctx, page, enabled and ready))
     status = QLabel("")
     status.setStyleSheet("color: #6b7785;")
     status.setWordWrap(True)
     lay.addWidget(status)
     # The log box is created once by _seg_method_panel (below the Calculate
     # button) and shared by every method.
-    page._seg_calc_btn = calc_btn
     page._seg_calc_status = status
 
     def on_channel(_=0):
@@ -1043,7 +1099,9 @@ def _seg_external_method_panel(ctx, page, host) -> None:
         nms_spin.valueChanged.connect(on_nms)
     if tile_size_spin is not None:
         tile_size_spin.valueChanged.connect(on_tile_size)
-    calc_btn.clicked.connect(lambda _=False: _seg_calculate(ctx, page))
+    page._seg_calc_btn.clicked.connect(
+        lambda _=False: _seg_calculate(ctx, page)
+    )
 
 
 def _seg_mask_input_panel(ctx, page, host) -> None:
@@ -1066,10 +1124,27 @@ def _seg_mask_input_panel(ctx, page, host) -> None:
     lay.addWidget(table, 1)
     page._seg_input_table = table
 
+    button_row = QWidget()
+    button_lay = QHBoxLayout(button_row)
+    button_lay.setContentsMargins(0, 0, 0, 0)
+    button_lay.setSpacing(6)
     import_btn = QPushButton("Import")
     import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    import_btn.setEnabled(not page._seg_locked)
-    lay.addWidget(import_btn)
+    import_btn.setEnabled(
+        not page._seg_locked
+        and not getattr(page, "_seg_import_running", False)
+        and not getattr(page, "_seg_calc_running", False)
+    )
+    cancel_btn = QPushButton("Cancel")
+    cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    cancel_btn.setEnabled(getattr(page, "_seg_import_running", False))
+    cancel_btn.setToolTip("Stop after the current mask file")
+    cancel_btn.clicked.connect(lambda _=False: _seg_cancel_run(ctx, page))
+    button_lay.addWidget(import_btn, 1)
+    button_lay.addWidget(cancel_btn)
+    lay.addWidget(button_row)
+    page._seg_import_btn = import_btn
+    page._seg_import_cancel_btn = cancel_btn
     hint = QLabel(
         "Masks must be TIFF images whose width and height match the data file."
     )
@@ -1190,8 +1265,17 @@ def _seg_delete_mask(ctx, page, parquet_path) -> None:
 
 
 def _seg_import_masks(ctx, page) -> None:
-    import numpy as np
-    import tifffile
+    """Import queued mask TIFFs on a background thread."""
+    if getattr(page, "_seg_import_running", False):
+        status = getattr(page, "_seg_import_status", None)
+        if status is not None:
+            status.setText("A mask import is already running.")
+        return
+    if getattr(page, "_seg_calc_running", False):
+        status = getattr(page, "_seg_import_status", None)
+        if status is not None:
+            status.setText("Wait for the running calculation to finish.")
+        return
 
     rows = _seg_file_rows(ctx, page)
     if not rows:
@@ -1206,7 +1290,11 @@ def _seg_import_masks(ctx, page) -> None:
             continue
         if not rec.get("input"):
             continue
-        pending.append((path, rec))
+        pending.append((
+            str(path),
+            str(rec.get("input")),
+            _data_naming._comp_file_name(ctx, path, page._seg_task_id),
+        ))
     if not pending:
         QMessageBox.information(
             ctx.host, "Import",
@@ -1214,70 +1302,184 @@ def _seg_import_masks(ctx, page) -> None:
         )
         return
 
+    page._seg_import_running = True
+    page._seg_import_cancel = False
+    page._seg_import_done = 0
+    page._seg_import_errors = []
+    import_btn = getattr(page, "_seg_import_btn", None)
+    if import_btn is not None:
+        import_btn.setEnabled(False)
+    cancel_btn = getattr(page, "_seg_import_cancel_btn", None)
+    if cancel_btn is not None:
+        cancel_btn.setEnabled(True)
+    status = getattr(page, "_seg_import_status", None)
+    if status is not None:
+        status.setText(f"Importing {len(pending)} mask(s)…")
+    _seg_log(ctx, page, f"===== Mask import — {len(pending)} file(s) =====")
+
+    q = queue.Queue()
+    page._seg_import_queue = q
+    thread = threading.Thread(
+        target=_seg_run_mask_import,
+        args=(ctx, page, q, pending),
+        daemon=True,
+    )
+    page._seg_import_thread = thread
+    thread.start()
+    timer = QTimer(ctx.host)
+    timer.setInterval(100)
+    timer.timeout.connect(lambda: _seg_poll_mask_import(ctx, page))
+    timer.start()
+    page._seg_import_timer = timer
+
+
+def _seg_run_mask_import(ctx, page, q, pending) -> None:
+    """Read and validate TIFF masks; write each one on this worker thread."""
+    import numpy as np
+    import tifffile
+
     done = 0
     errors = []
-    _seg_log(ctx, page, f"===== Mask import — {len(pending)} file(s) =====")
-    for i, (parquet_path, rec) in enumerate(pending):
-        name = _data_naming._comp_file_name(
-            ctx, parquet_path, page._seg_task_id
-        )
-        _seg_log(ctx, page, f"→ Importing {i + 1}/{len(pending)}: {name}…")
-        ent = _data_image_index._ensure_image_index(ctx, parquet_path)
-        if ent is None or ent.get("manifest") is None:
-            rec["state"] = SEG_IMPORT_UNKNOWN
-            errors.append(f"{name}: no image index")
-            _seg_log(ctx, page, f"✗ {name}: no image index")
-            continue
-        man = ent["manifest"]
-        height = int(round(man["ymax"] - man["ymin"])) + 1
-        width = int(round(man["xmax"] - man["xmin"])) + 1
-        src = str(rec.get("input") or "")
-        suffix = Path(src).suffix.lower()
-        if suffix not in (".tif", ".tiff", ".ome.tif", ".ome.tiff"):
-            rec["state"] = SEG_IMPORT_FORMAT
-            _seg_log(ctx, page, f"✗ {name}: not a TIFF file")
-            continue
-        try:
-            arr = tifffile.imread(src)
-        except Exception:  # noqa: BLE001
-            rec["state"] = SEG_IMPORT_FORMAT
-            _seg_log(ctx, page, f"✗ {name}: could not read the TIFF file")
-            continue
-        arr = np.asarray(arr)
-        while arr.ndim > 2:
-            arr = arr[0]
-        if arr.ndim != 2:
-            rec["state"] = SEG_IMPORT_FORMAT
-            _seg_log(ctx, page, f"✗ {name}: the mask is not a 2-D image")
-            continue
-        if arr.shape[0] != height or arr.shape[1] != width:
-            rec["state"] = SEG_IMPORT_SIZE
-            _seg_log(ctx,
-                page,
-                f"✗ {name}: mask is {arr.shape[1]}×{arr.shape[0]} but the "
-                f"image is {width}×{height}",
-            )
-            continue
-        try:
-            rel = _seg_write_mask(ctx, page._seg_task_id, parquet_path, arr)
-        except Exception:  # noqa: BLE001
-            rec["state"] = SEG_IMPORT_UNKNOWN
-            _seg_log(ctx, page, f"✗ {name}: could not save the mask")
-            continue
-        rec["path"] = rel
-        rec["source"] = "import"
-        rec["state"] = SEG_IMPORT_DONE
-        done += 1
-        _seg_log(ctx, page, f"✓ {name}: {int(arr.max())} object(s)")
+    cancelled = False
+    total = len(pending)
+    try:
+        for i, (parquet_path, src, name) in enumerate(pending):
+            if getattr(page, "_seg_import_cancel", False):
+                cancelled = True
+                q.put(("log", "Mask import cancelled."))
+                break
+            q.put(("status", f"Importing {i + 1}/{total}: {name}…"))
+            q.put(("log", f"→ Importing {i + 1}/{total}: {name}…"))
+            ent = _data_image_index._ensure_image_index(ctx, parquet_path)
+            if ent is None or ent.get("manifest") is None:
+                errors.append(f"{name}: no image index")
+                q.put(("file_error", parquet_path,
+                       SEG_IMPORT_UNKNOWN, name, "no image index"))
+                continue
+            man = ent["manifest"]
+            height = int(round(man["ymax"] - man["ymin"])) + 1
+            width = int(round(man["xmax"] - man["xmin"])) + 1
+            suffix = Path(src).suffix.lower()
+            if suffix not in (".tif", ".tiff", ".ome.tif", ".ome.tiff"):
+                errors.append(f"{name}: not a TIFF file")
+                q.put(("file_error", parquet_path,
+                       SEG_IMPORT_FORMAT, name, "not a TIFF file"))
+                continue
+            try:
+                arr = tifffile.imread(src)
+            except Exception:  # noqa: BLE001
+                errors.append(f"{name}: could not read the TIFF file")
+                q.put(("file_error", parquet_path,
+                       SEG_IMPORT_FORMAT, name,
+                       "could not read the TIFF file"))
+                continue
+            arr = np.asarray(arr)
+            while arr.ndim > 2:
+                arr = arr[0]
+            if arr.ndim != 2:
+                errors.append(f"{name}: the mask is not a 2-D image")
+                q.put(("file_error", parquet_path,
+                       SEG_IMPORT_FORMAT, name,
+                       "the mask is not a 2-D image"))
+                continue
+            if arr.shape[0] != height or arr.shape[1] != width:
+                reason = (
+                    f"mask is {arr.shape[1]}×{arr.shape[0]} but the "
+                    f"image is {width}×{height}"
+                )
+                errors.append(f"{name}: {reason}")
+                q.put(("file_error", parquet_path,
+                       SEG_IMPORT_SIZE, name, reason))
+                continue
+            try:
+                rel = _seg_write_mask(
+                    ctx, page._seg_task_id, parquet_path, arr
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: could not save the mask")
+                q.put(("file_error", parquet_path,
+                       SEG_IMPORT_UNKNOWN, name, str(exc)))
+                continue
+            done += 1
+            q.put(("file", parquet_path, rel, int(arr.max()), name))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(str(exc))
+    finally:
+        q.put(("done", done, errors, cancelled))
 
+
+def _seg_poll_mask_import(ctx, page) -> None:
+    """Apply background mask-import events on the UI thread."""
+    q = getattr(page, "_seg_import_queue", None)
+    if q is None:
+        return
+    status = getattr(page, "_seg_import_status", None)
+    done = getattr(page, "_seg_import_done", 0)
+    errors = getattr(page, "_seg_import_errors", [])
+    finished = None
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+        kind = msg[0]
+        if kind == "log":
+            _seg_log(ctx, page, msg[1])
+        elif kind == "status":
+            if status is not None:
+                status.setText(msg[1])
+        elif kind == "file":
+            parquet_path, rel, count, name = msg[1], msg[2], msg[3], msg[4]
+            rec = _seg_mask_record_live(
+                ctx, page, parquet_path, create=True
+            )
+            rec["path"] = rel
+            rec["source"] = "import"
+            rec["state"] = SEG_IMPORT_DONE
+            done += 1
+            _seg_log(ctx, page, f"✓ {name}: {count} object(s)")
+        elif kind == "file_error":
+            parquet_path, state, name, reason = (
+                msg[1], msg[2], msg[3], msg[4]
+            )
+            rec = _seg_mask_record_live(
+                ctx, page, parquet_path, create=True
+            )
+            rec["state"] = state
+            _seg_log(ctx, page, f"✗ {name}: {reason}")
+        elif kind == "done":
+            done, errors, cancelled = msg[1], msg[2], msg[3]
+            finished = (done, errors, bool(cancelled))
+    page._seg_import_done = done
+    page._seg_import_errors = errors
+    if finished is None:
+        return
+
+    timer = getattr(page, "_seg_import_timer", None)
+    if timer is not None:
+        timer.stop()
+    page._seg_import_queue = None
+    page._seg_import_running = False
+    done, errors, cancelled = finished
     _seg_log(ctx, page, f"Imported {done} mask(s).")
     _seg_after_masks_changed(ctx, page)
     _seg_refresh_input_table(ctx, page)
     _seg_refresh_files(ctx, page)
-    msg = f"Imported {done} mask(s)."
+    import_btn = getattr(page, "_seg_import_btn", None)
+    if import_btn is not None:
+        import_btn.setEnabled(not page._seg_locked)
+    cancel_btn = getattr(page, "_seg_import_cancel_btn", None)
+    if cancel_btn is not None:
+        cancel_btn.setEnabled(False)
+    if cancelled:
+        msg = f"Mask import cancelled after {done} file(s)."
+    else:
+        msg = f"Imported {done} mask(s)."
     if errors:
         msg += "\n" + "\n".join(errors)
-    page._seg_import_status.setText(msg)
+    status = getattr(page, "_seg_import_status", None)
+    if status is not None:
+        status.setText(msg)
     ctx.statusBar().showMessage(msg.splitlines()[0])
 
 
@@ -1290,7 +1492,8 @@ def _seg_write_mask(ctx, task_id, parquet_path, array) -> str:
     relative path of the mask parquet.
     """
     import numpy as np
-    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
     if ctx.project is None:
         raise RuntimeError("no project")
@@ -1311,17 +1514,126 @@ def _seg_write_mask(ctx, task_id, parquet_path, array) -> str:
     rel = _data_files._module_rel(ctx, task_id, f"{stem}_mask.parquet")
     path = ctx.project.path / rel
     path.parent.mkdir(parents=True, exist_ok=True)
-    xx = np.tile(np.arange(width, dtype=np.int32), height) + xmin
-    yy = np.repeat(np.arange(height, dtype=np.int32), width) + ymin
-    pd.DataFrame({"x": xx, "y": yy, "mask": arr.ravel()}).to_parquet(
-        path, index=False
-    )
+    total = int(arr.size)
+    max_label = int(arr.max()) if total else 0
+    # Label counts normally fit in uint16; fall back for very large images.
+    mask_dtype = np.uint16 if max_label <= SEG_UINT16_MAX else np.int32
+    field_type = pa.uint16() if mask_dtype is np.uint16 else pa.int32()
+    schema = pa.schema([
+        ("x", pa.int32()),
+        ("y", pa.int32()),
+        ("mask", field_type),
+    ])
+    flat = arr.ravel()
+    chunk = max(1, min(int(SEG_WRITE_CHUNK), max(total, 1)))
+    with pq.ParquetWriter(
+        path, schema, compression="zstd", compression_level=1
+    ) as writer:
+        for start in range(0, total, chunk):
+            end = min(total, start + chunk)
+            index = np.arange(start, end, dtype=np.int64)
+            x = (index % width + xmin).astype(np.int32)
+            y = (index // width + ymin).astype(np.int32)
+            values = flat[start:end]
+            if values.dtype != np.dtype(mask_dtype):
+                values = values.astype(mask_dtype, copy=False)
+            table = pa.Table.from_arrays(
+                [
+                    pa.array(x, type=pa.int32()),
+                    pa.array(y, type=pa.int32()),
+                    pa.array(values, type=field_type),
+                ],
+                schema=schema,
+            )
+            writer.write_table(table)
     _build_label_index(
         path, arr, xmin, xmin + width - 1, ymin, ymin + height - 1
     )
-    ctx._seg_mask_cache = {}
-    ctx._seg_value_cache = {}
+    # Cache invalidation happens on the UI thread when the writer reports the
+    # finished file; _seg_write_mask itself may run on a worker.
     return rel
+
+
+class _SegMaskWriter:
+    """Serialize mask parquet + pyramid writes on a background thread.
+
+    External segmentation produces masks in a subprocess; writing them on the
+    UI thread froze the window for every finished file. This writer accepts
+    either an in-memory mask or a temporary ``.npy`` output (Cellpose /
+    StarDist), and reports results through ``poll()``. The caller can attach a
+    ``release`` callback (the batch's input semaphore) so a finished write
+    allows the feeder to prepare the next input.
+    """
+
+    def __init__(self, ctx, max_queue=3) -> None:
+        self._ctx = ctx
+        self._queue = queue.Queue(maxsize=max(1, int(max_queue)))
+        self._results = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, task_id, parquet_path, *, array=None, npy_path=None,
+               n_cells=0, meta=None, release=None) -> None:
+        self._queue.put({
+            "task_id": task_id,
+            "parquet_path": str(parquet_path),
+            "array": array,
+            "npy_path": str(npy_path) if npy_path else None,
+            "n_cells": int(n_cells or 0),
+            "meta": dict(meta or {}),
+            "release": release,
+        })
+
+    def poll(self) -> list:
+        out = []
+        while True:
+            try:
+                out.append(self._results.get_nowait())
+            except queue.Empty:
+                return out
+
+    def close(self) -> None:
+        """Wait for queued writes, then stop the worker."""
+        self._queue.put(None)
+        self._thread.join(timeout=30)
+
+    def _run(self) -> None:
+        import numpy as np
+
+        while True:
+            job = self._queue.get()
+            if job is None:
+                return
+            result = None
+            try:
+                mask = job["array"]
+                if mask is None and job["npy_path"]:
+                    try:
+                        mask = np.load(job["npy_path"])
+                    finally:
+                        Path(job["npy_path"]).unlink(missing_ok=True)
+                if mask is None:
+                    raise ValueError("no mask output was produced")
+                rel = _seg_write_mask(
+                    self._ctx, job["task_id"], job["parquet_path"], mask
+                )
+                result = (
+                    "written", job["parquet_path"], rel,
+                    job["n_cells"], job["meta"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                result = (
+                    "write_error", job["parquet_path"], str(exc),
+                    job["meta"],
+                )
+            finally:
+                release = job.get("release")
+                if release is not None:
+                    try:
+                        release()
+                    except Exception:  # noqa: BLE001
+                        pass
+            self._results.put(result)
 
 
 def _seg_after_masks_changed(ctx, page) -> None:
@@ -1360,6 +1672,11 @@ def _seg_calculate_nuclear(ctx, page) -> None:
             "Segmentation: a calculation is already running"
         )
         return
+    if getattr(page, "_seg_import_running", False):
+        ctx.statusBar().showMessage(
+            "Segmentation: wait for the mask import to finish"
+        )
+        return
     rows = _seg_file_rows(ctx, page)
     params = _seg_map_params(ctx, page)
     status = getattr(page, "_seg_calc_status", None)
@@ -1379,6 +1696,9 @@ def _seg_calculate_nuclear(ctx, page) -> None:
     if btn is not None:
         page._seg_calc_btn_prev_enabled = btn.isEnabled()
         btn.setEnabled(False)
+    cancel = getattr(page, "_seg_cancel_btn", None)
+    if cancel is not None:
+        cancel.setEnabled(True)
     if status is not None:
         status.setText(f"Starting Nuclear Expansion on {len(rows)} file(s)…")
 
@@ -1498,16 +1818,43 @@ def _seg_poll_nuclear(ctx, page) -> None:
         _seg_restore_calc_btn(ctx, page)
         return
 
-    _seg_log(ctx, page, f"Calculated {done} mask(s) · {cells} nucleus(s).")
+    cancelled = getattr(page, "_seg_calc_cancel", False)
+    if cancelled:
+        summary = f"Cancelled after {done} mask(s) · {cells} nucleus(s)."
+    else:
+        summary = f"Calculated {done} mask(s) · {cells} nucleus(s)."
+    _seg_log(ctx, page, summary)
     _seg_after_masks_changed(ctx, page)
     _seg_refresh_files(ctx, page)
     # The refresh rebuilds the parameter panel, so re-read its status label.
     status = getattr(page, "_seg_calc_status", status)
     if status is not None:
-        msg = f"Calculated {done} mask(s) · {cells} nucleus(s)."
+        msg = summary
         if errors:
             msg += "\n" + "\n".join(errors)
         status.setText(msg)
+
+
+def _seg_cancel_run(ctx, page) -> None:
+    """Request cancellation of whichever segmentation operation is running."""
+    if getattr(page, "_seg_import_running", False):
+        page._seg_import_cancel = True
+        status = getattr(page, "_seg_import_status", None)
+        if status is not None:
+            status.setText("Cancelling mask import…")
+        return
+    if not getattr(page, "_seg_calc_running", False):
+        return
+    page._seg_calc_cancel = True
+    if getattr(page, "_seg_ext_running", False):
+        page._seg_ext_cancelled = True
+        try:
+            ctx._ext_worker().kill()
+        except Exception:  # noqa: BLE001
+            pass
+    status = getattr(page, "_seg_calc_status", None)
+    if status is not None:
+        status.setText("Cancelling…")
 
 
 def _seg_restore_calc_btn(ctx, page) -> None:
@@ -1518,6 +1865,9 @@ def _seg_restore_calc_btn(ctx, page) -> None:
             bool(getattr(page, "_seg_calc_btn_prev_enabled", True))
             and not page._seg_locked
         )
+    cancel = getattr(page, "_seg_cancel_btn", None)
+    if cancel is not None:
+        cancel.setEnabled(False)
 
 
 def _seg_raster_stack(ctx, parquet_path, channels, task_id=None):
@@ -1543,14 +1893,28 @@ def _seg_raster_stack(ctx, parquet_path, channels, task_id=None):
 def _seg_calculate_external(ctx, page) -> None:
     """Run Cellpose / StarDist on the selected files in one subprocess.
 
-    Rasterizing the channels is done on a worker thread so the window stays
-    responsive; the subprocess itself is already asynchronous.
+    Inputs are rasterized just ahead of the subprocess (bounded by
+    :data:`SEG_PREFETCH`), the runner consumes each input as it appears, and
+    finished masks are written by a separate writer thread. This keeps both
+    the UI responsive and the project's temporary disk use bounded.
     """
-    import tempfile
+    import json
+    import os
+    import uuid
 
     if getattr(page, "_seg_calc_running", False):
         ctx.statusBar().showMessage(
             "Segmentation: a calculation is already running"
+        )
+        return
+    if getattr(page, "_seg_import_running", False):
+        ctx.statusBar().showMessage(
+            "Segmentation: wait for the mask import to finish"
+        )
+        return
+    if ctx.project is None:
+        QMessageBox.information(
+            ctx.host, "Calculate", "Open a project before running segmentation."
         )
         return
     method = page._seg_params.get("method")
@@ -1587,38 +1951,108 @@ def _seg_calculate_external(ctx, page) -> None:
         )
         return
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="smage-seg-"))
+    run_id = (
+        f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-"
+        f"{uuid.uuid4().hex[:6]}"
+    )
+    tmpdir = _seg_runs_dir(ctx) / run_id
+    try:
+        tmpdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        QMessageBox.warning(
+            ctx.host, "Calculate",
+            f"Could not create the segmentation temporary folder:\n{exc}",
+        )
+        return
     nucleus = params.get("channel")
     cyto = params.get("cyto_channel") if entry["family"] == "cellpose" else None
+
+    jobs = []
+    manifest = []
+    for i, parquet_path in enumerate(rows):
+        image_npy = tmpdir / f"in_{i:04d}.npy"
+        output_npy = tmpdir / f"out_{i:04d}.npy"
+        name = _data_naming._comp_file_name(
+            ctx, parquet_path, page._seg_task_id
+        )
+        jobs.append({
+            "index": i,
+            "parquet": str(parquet_path),
+            "image": str(image_npy),
+            "output": str(output_npy),
+            "name": name,
+        })
+        manifest.append({
+            "image": str(image_npy),
+            "output": str(output_npy),
+        })
+    manifest_path = tmpdir / "jobs.json"
+    try:
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    except OSError as exc:
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        QMessageBox.warning(
+            ctx.host, "Calculate",
+            f"Could not write the segmentation job list:\n{exc}",
+        )
+        return
 
     page._seg_calc_running = True
     page._seg_calc_cancel = False
     page._seg_calc_finished = False
     page._seg_ext_running = True
+    page._seg_ext_cancelled = False
+    page._seg_ext_aborted = False
     page._seg_ext_entry = entry
     page._seg_ext_method = method
     page._seg_ext_params = copy.deepcopy(params)
     page._seg_ext_python = ctx._ext_python(method)
     page._seg_ext_runner = str(ctx._ext_runner_path(method))
     page._seg_ext_tmpdir = tmpdir
+    page._seg_ext_nucleus_idx = 1 if cyto else 0
+    page._seg_ext_cyto_idx = 0 if cyto else None
+    page._seg_ext_jobs = jobs
+    page._seg_ext_done = set()
+    page._seg_ext_errors = []
+    page._seg_ext_cells = 0
+    page._seg_ext_report = []
+    page._seg_ext_tile = None
+    page._seg_ext_activity = ""
+    page._seg_ext_proc_finished = False
+    page._seg_ext_feeder_done = False
+    page._seg_ext_pending_writes = 0
+    page._seg_ext_prepared = 0
+    page._seg_ext_written = 0
+    page._seg_ext_slots = threading.Semaphore(SEG_PREFETCH)
+    page._seg_ext_writer = _SegMaskWriter(
+        ctx, max_queue=SEG_PREFETCH + 1
+    )
     btn = getattr(page, "_seg_calc_btn", None)
     if btn is not None:
         page._seg_calc_btn_prev_enabled = btn.isEnabled()
         btn.setEnabled(False)
+    cancel = getattr(page, "_seg_cancel_btn", None)
+    if cancel is not None:
+        cancel.setEnabled(True)
     if status is not None:
         status.setText(f"Preparing {len(rows)} file(s)…")
 
     q = queue.Queue()
     page._seg_ext_queue = q
     thread = threading.Thread(
-        target=_seg_prepare_external,
-        args=(ctx, page, q, rows, nucleus, cyto, tmpdir),
+        target=_seg_feed_external_inputs,
+        args=(ctx, page, q, jobs, nucleus, cyto, page._seg_ext_slots),
         daemon=True,
     )
     page._seg_ext_thread = thread
     thread.start()
 
-    # Stop a previous run's poll timer (defensive; normally already stopped).
+    # The runner waits for each input file, so it can start (and load its
+    # model) while the first file is still being rasterized.
+    _seg_ext_launch(ctx, page, jobs, str(manifest_path))
+
     old_timer = getattr(page, "_seg_ext_timer", None)
     if old_timer is not None:
         old_timer.stop()
@@ -1629,121 +2063,107 @@ def _seg_calculate_external(ctx, page) -> None:
     page._seg_ext_timer = timer
 
 
-def _seg_prepare_external(ctx, page, q, rows, nucleus, cyto,
-                          tmpdir) -> None:
-    """Rasterize the channels for Cellpose / StarDist on a worker thread."""
-    import json
+def _seg_ext_failed_marker(image_path):
+    """Marker written next to an input that could not be rasterized."""
+    return Path(str(image_path)).with_suffix(".failed")
 
+
+def _seg_slot_acquire(slots, page) -> bool:
+    """Take an input slot, waking periodically to notice cancel/finish."""
+    while (
+        not getattr(page, "_seg_calc_cancel", False)
+        and not getattr(page, "_seg_ext_aborted", False)
+        and not getattr(page, "_seg_ext_proc_finished", False)
+    ):
+        if slots.acquire(timeout=0.2):
+            return True
+    return False
+
+
+def _seg_feed_external_inputs(ctx, page, q, jobs, nucleus, cyto,
+                              slots) -> None:
+    """Rasterize inputs just ahead of the runner, bounded by ``slots``."""
     import numpy as np
 
-    jobs = []
-    manifest = []
-    nucleus_idx, cyto_idx = 0, None
+    total = len(jobs)
     try:
-        q.put(("log", f"Rasterizing {len(rows)} file(s)…"))
-        for i, parquet_path in enumerate(rows):
+        q.put(("log",
+               f"Rasterizing up to {SEG_PREFETCH} file(s) ahead of "
+               f"{_seg_method_label(page._seg_ext_method)}…"))
+        for i, job in enumerate(jobs):
+            if not _seg_slot_acquire(slots, page):
+                break
             if getattr(page, "_seg_calc_cancel", False):
-                q.put(("cancelled", "Calculation cancelled."))
-                return
-            name = _data_naming._comp_file_name(
-                ctx, parquet_path, page._seg_task_id
-            )
+                slots.release()
+                break
+            name = job.get("name") or Path(job["parquet"]).name
+            image_npy = Path(job["image"])
+            q.put(("status", f"Rasterizing {i + 1}/{total}: {name}…"))
             q.put(("log", f"  rasterizing {name}…"))
-            q.put(("status", f"Rasterizing {i + 1}/{len(rows)}: {name}…"))
-            if cyto:
-                stack, err = _seg_raster_stack(
-                    ctx, parquet_path, [cyto, nucleus], page._seg_task_id
-                )
-                nucleus_idx, cyto_idx = 1, 0
-            else:
-                stack, err = _seg_raster_stack(
-                    ctx, parquet_path, [nucleus], page._seg_task_id
-                )
-                nucleus_idx, cyto_idx = 0, None
+            try:
+                if cyto:
+                    stack, err = _seg_raster_stack(
+                        ctx, job["parquet"], [cyto, nucleus],
+                        page._seg_task_id,
+                    )
+                else:
+                    stack, err = _seg_raster_stack(
+                        ctx, job["parquet"], [nucleus],
+                        page._seg_task_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                stack, err = None, str(exc)
             if stack is None:
+                marker = _seg_ext_failed_marker(image_npy)
+                try:
+                    marker.write_text(str(err or "rasterization failed"),
+                                      encoding="utf-8")
+                except OSError as exc:
+                    q.put(("feeder_error",
+                           f"could not write failure marker: {exc}"))
+                    return
+                q.put(("input_failed", i, name, str(err or "failed")))
                 q.put(("log", f"✗ {name}: {err}"))
                 continue
-            image_npy = tmpdir / f"in_{i}.npy"
-            output_npy = tmpdir / f"out_{i}.npy"
-            np.save(image_npy, stack)
-            manifest.append(
-                {"image": str(image_npy), "output": str(output_npy)}
-            )
-            jobs.append(
-                {"parquet": parquet_path, "output": str(output_npy)}
-            )
-        if not jobs:
-            q.put(("cancelled",
-                   "No file could be rasterized — see the lines above."))
-            return
-        manifest_path = tmpdir / "jobs.json"
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        q.put(("ready", jobs, str(manifest_path), nucleus_idx, cyto_idx))
+            try:
+                part = Path(str(image_npy) + ".part")
+                with open(part, "wb") as file:
+                    np.save(file, stack)
+                part.replace(image_npy)
+            except Exception as exc:  # noqa: BLE001
+                marker = _seg_ext_failed_marker(image_npy)
+                try:
+                    marker.write_text(str(exc), encoding="utf-8")
+                except OSError as marker_exc:
+                    q.put(("feeder_error",
+                           f"could not write failure marker: {marker_exc}"))
+                    return
+                q.put(("input_failed", i, name, str(exc)))
+                q.put(("log", f"✗ {name}: {exc}"))
+                continue
+            q.put(("prepared", i, name))
     except Exception as exc:  # noqa: BLE001
-        q.put(("error", str(exc)))
-
-
-def _seg_ext_prepare_poll(ctx, page, q) -> None:
-    """Drain rasterizing events; launch the subprocess once ready."""
-    status = getattr(page, "_seg_calc_status", None)
-    ready = None
-    problem = None
-    while True:
-        try:
-            msg = q.get_nowait()
-        except queue.Empty:
-            break
-        kind = msg[0]
-        if kind == "log":
-            _seg_log(ctx, page, msg[1])
-        elif kind == "status":
-            if status is not None:
-                status.setText(msg[1])
-        elif kind == "ready":
-            ready = msg
-        elif kind == "cancelled":
-            problem = msg[1] if len(msg) > 1 else "Calculation cancelled."
-        elif kind == "error":
-            problem = f"✗ Calculation failed: {msg[1]}"
-    if ready is None and problem is None:
-        return
-
-    page._seg_ext_queue = None
-    if problem is not None:
-        _seg_log(ctx, page, problem)
-        if status is not None:
-            status.setText(problem)
-        page._seg_calc_running = False
-        page._seg_ext_running = False
-        timer = getattr(page, "_seg_ext_timer", None)
-        if timer is not None:
-            timer.stop()
-        _seg_restore_calc_btn(ctx, page)
-        tmpdir = getattr(page, "_seg_ext_tmpdir", None)
-        if tmpdir is not None:
-            import shutil
-
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        return
-
-    _jobs, manifest_path, nucleus_idx, cyto_idx = (
-        ready[1], ready[2], ready[3], ready[4]
-    )
-    page._seg_ext_nucleus_idx = nucleus_idx
-    page._seg_ext_cyto_idx = cyto_idx
-    _seg_ext_launch(ctx, page, _jobs, manifest_path)
+        q.put(("feeder_error", str(exc)))
+    finally:
+        q.put(("feeder_done",))
 
 
 def _seg_ext_launch(ctx, page, jobs, manifest_path) -> None:
     """Start the Cellpose / StarDist subprocess (it already streams)."""
+    import os
+
     entry = page._seg_ext_entry
     params = page._seg_ext_params
+    threads = max(1, min(8, os.cpu_count() or 1))
     argv = [
         page._seg_ext_python, page._seg_ext_runner, "segment",
         "--manifest", manifest_path,
         "--nucleus", str(page._seg_ext_nucleus_idx),
         "--model", entry["model"],
         "--device", entry["device"],
+        "--threads", str(threads),
+        "--wait-inputs",
+        "--input-timeout", str(SEG_INPUT_TIMEOUT),
     ]
     if page._seg_ext_cyto_idx is not None:
         argv += ["--cyto", str(page._seg_ext_cyto_idx)]
@@ -1761,7 +2181,7 @@ def _seg_ext_launch(ctx, page, jobs, manifest_path) -> None:
     page._seg_ext_report = []
     page._seg_ext_tile = None
     page._seg_ext_activity = ""
-    page._seg_ext_finished = False
+    page._seg_ext_proc_finished = False
     page._seg_ext_start_time = time.monotonic()
     _seg_log(ctx,
         page,
@@ -1852,20 +2272,11 @@ def _seg_log_tile(ctx, page, i, total) -> None:
 
 
 def _seg_ext_poll(ctx, page) -> None:
-    """Collect finished external segmentations and finalize the masks."""
+    """Collect external segmentation events and finalize the masks."""
     import shutil
 
-    import numpy as np
-
-    # While the channels are still being rasterized, only the prepare queue
-    # has events; the subprocess starts once it reports "ready".
-    prep = getattr(page, "_seg_ext_queue", None)
-    if prep is not None:
-        _seg_ext_prepare_poll(ctx, page, prep)
-        return
-
-    worker = ctx._ext_worker()
     status = getattr(page, "_seg_calc_status", None)
+    writer = getattr(page, "_seg_ext_writer", None)
     jobs = getattr(page, "_seg_ext_jobs", None) or []
     done = getattr(page, "_seg_ext_done", None) or set()
     errors = getattr(page, "_seg_ext_errors", [])
@@ -1873,11 +2284,91 @@ def _seg_ext_poll(ctx, page) -> None:
     report = getattr(page, "_seg_ext_report", None) or []
     tile = getattr(page, "_seg_ext_tile", None)
     activity = getattr(page, "_seg_ext_activity", "") or ""
-    finished = getattr(page, "_seg_ext_finished", False)
+    prepared = getattr(page, "_seg_ext_prepared", 0)
+    written = getattr(page, "_seg_ext_written", 0)
+    pending = getattr(page, "_seg_ext_pending_writes", 0)
+    cancelled = getattr(page, "_seg_ext_cancelled", False)
     out_to_job = {job["output"]: job for job in jobs}
+    slots = getattr(page, "_seg_ext_slots", None)
+    if (cancelled or getattr(page, "_seg_ext_aborted", False)) and not getattr(
+        page, "_seg_ext_proc_finished", False
+    ):
+        # Cancellation or a feeder failure can race the worker thread starting
+        # the process; keep killing it until the process-done event arrives.
+        try:
+            ctx._ext_worker().kill()
+        except Exception:  # noqa: BLE001
+            pass
 
+    # Input feeder events.
+    q = getattr(page, "_seg_ext_queue", None)
+    if q is not None:
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            kind = msg[0]
+            if kind == "log":
+                _seg_log(ctx, page, msg[1])
+            elif kind == "status":
+                if status is not None:
+                    status.setText(msg[1])
+            elif kind == "prepared":
+                prepared += 1
+            elif kind == "input_failed":
+                _name, err = msg[2], msg[3]
+                _seg_log(ctx, page, f"✗ {_name}: {err}")
+            elif kind == "feeder_error":
+                errors.append(str(msg[1]))
+                _seg_log(ctx, page, f"✗ Input preparation failed: {msg[1]}")
+                page._seg_ext_feeder_done = True
+                page._seg_ext_aborted = True
+                # The runner would otherwise wait for an input that will
+                # never appear until its timeout.
+                try:
+                    ctx._ext_worker().kill()
+                except Exception:  # noqa: BLE001
+                    pass
+            elif kind == "feeder_done":
+                page._seg_ext_feeder_done = True
+
+    # Mask writer events (parquet + pyramid completed off the UI thread).
+    if writer is not None:
+        for result in writer.poll():
+            kind = result[0]
+            parquet_path = result[1]
+            meta = result[-1] if isinstance(result[-1], dict) else {}
+            name = meta.get("name") or _data_naming._comp_file_name(
+                ctx, parquet_path, page._seg_task_id
+            )
+            if kind == "written":
+                rel, n_cells = result[2], result[3]
+                rec = _seg_mask_record_live(
+                    ctx, page, parquet_path, create=True
+                )
+                rec["path"] = rel
+                rec["source"] = "builtin"
+                rec["state"] = SEG_IMPORT_DONE
+                written += 1
+                cells += int(n_cells or 0)
+                seconds = float(meta.get("seconds") or 0.0)
+                report.append(f"{name}: {n_cells} cells, {seconds:.1f}s")
+                _seg_log(
+                    ctx, page, f"✓ {name}: {n_cells} cells, "
+                    f"{seconds:.1f}s"
+                )
+                ctx._seg_mask_cache = {}
+                ctx._seg_value_cache = {}
+            else:
+                errors.append(f"{name}: {result[2]}")
+                _seg_log(ctx, page, f"✗ {name}: {result[2]}")
+            pending = max(0, pending - 1)
+
+    # Subprocess streaming events.
+    worker = ctx._ext_worker()
     for item in worker.poll():
-        if item[1] == "line":
+        if len(item) >= 3 and item[1] == "line":
             line = item[2]
             if line.startswith("tile: "):
                 info = line[len("tile: "):].strip()
@@ -1890,11 +2381,11 @@ def _seg_ext_poll(ctx, page) -> None:
                         pass
             elif line.startswith("done:"):
                 body = line[len("done:"):].strip()
-                out_path, sep, meta = body.partition("|")
+                out_path, _sep, meta_text = body.partition("|")
                 out_path = out_path.strip()
                 n_cells = 0
                 seconds = 0.0
-                for part in meta.split("|"):
+                for part in meta_text.split("|"):
                     if part.startswith("cells="):
                         try:
                             n_cells = int(part[len("cells="):])
@@ -1908,34 +2399,49 @@ def _seg_ext_poll(ctx, page) -> None:
                 job = out_to_job.get(out_path)
                 if job is None or out_path in done:
                     continue
-                parquet_path = job["parquet"]
+                done.add(out_path)
+                pending += 1
                 try:
-                    arr = np.load(out_path)
-                    if arr.ndim != 2:
-                        raise ValueError("bad mask shape")
-                    rel = _seg_write_mask(ctx,
-                        page._seg_task_id, parquet_path, arr
-                    )
-                    rec = _seg_mask_record_live(ctx,
-                        page, parquet_path, create=True
-                    )
-                    rec["path"] = rel
-                    rec["source"] = "builtin"
-                    rec["state"] = SEG_IMPORT_DONE
-                    cells += int(arr.max())
-                    report.append(
-                        f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: "
-                        f"{n_cells} cells, {seconds:.1f}s"
-                    )
-                    _seg_log(ctx,
-                        page,
-                        f"✓ {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: "
-                        f"{n_cells} cells, {seconds:.1f}s",
+                    writer.submit(
+                        page._seg_task_id,
+                        job["parquet"],
+                        npy_path=out_path,
+                        n_cells=n_cells,
+                        meta={
+                            "index": job.get("index"),
+                            "name": job.get("name"),
+                            "seconds": seconds,
+                            "output": out_path,
+                        },
+                        release=slots.release if slots is not None else None,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {exc}")
-                    _seg_log(ctx, page, f"✗ {_data_naming._comp_file_name(ctx, parquet_path, page._seg_task_id)}: {exc}")
-                done.add(out_path)
+                    pending = max(0, pending - 1)
+                    errors.append(f"{job.get('name')}: {exc}")
+                    _seg_log(
+                        ctx, page, f"✗ {job.get('name')}: {exc}"
+                    )
+                    if slots is not None:
+                        slots.release()
+            elif line.startswith("failed:"):
+                body = line[len("failed:"):].strip()
+                out_path, _sep, meta_text = body.partition("|")
+                out_path = out_path.strip()
+                job = out_to_job.get(out_path)
+                if job is None:
+                    continue
+                reason = "input could not be prepared"
+                if meta_text.startswith("reason="):
+                    reason = meta_text[len("reason="):].strip() or reason
+                if out_path not in done:
+                    done.add(out_path)
+                    name = job.get("name") or _data_naming._comp_file_name(
+                        ctx, job["parquet"], page._seg_task_id
+                    )
+                    errors.append(f"{name}: {reason}")
+                    _seg_log(ctx, page, f"✗ {name}: {reason}")
+                if slots is not None:
+                    slots.release()
             else:
                 # Non-progress output (e.g. TensorFlow/model loading lines):
                 # remember the latest for the status, and record it in the
@@ -1949,21 +2455,22 @@ def _seg_ext_poll(ctx, page) -> None:
         key, _tag, code, text = item[0], item[1], item[2], item[3]
         if not (isinstance(key, tuple) and key[0] == "seg-batch"):
             continue
-        finished = True
+        page._seg_ext_proc_finished = True
         for job in jobs:
             if job["output"] in done:
                 continue
-            if code != 0:
-                errors.append(
-                    f"{_data_naming._comp_file_name(ctx, job['parquet'], page._seg_task_id)}: "
-                    f"{text.strip()[-200:]}"
-                )
-            else:
-                errors.append(
-                    f"{_data_naming._comp_file_name(ctx, job['parquet'], page._seg_task_id)}: no output produced"
-                )
             done.add(job["output"])
-        if text and code != 0:
+            if not cancelled:
+                name = job.get("name") or _data_naming._comp_file_name(
+                    ctx, job["parquet"], page._seg_task_id
+                )
+                if code != 0:
+                    errors.append(
+                        f"{name}: {text.strip()[-200:]}"
+                    )
+                else:
+                    errors.append(f"{name}: no output produced")
+        if text and code != 0 and not cancelled:
             _seg_log(ctx, page, text.rstrip())
 
     page._seg_ext_done = done
@@ -1972,11 +2479,13 @@ def _seg_ext_poll(ctx, page) -> None:
     page._seg_ext_report = report
     page._seg_ext_tile = tile
     page._seg_ext_activity = activity
-    page._seg_ext_finished = finished
-    if finished:
-        page._seg_ext_running = False
+    page._seg_ext_prepared = prepared
+    page._seg_ext_written = written
+    page._seg_ext_pending_writes = pending
 
-    if not finished:
+    proc_finished = getattr(page, "_seg_ext_proc_finished", False)
+    feeder_done = getattr(page, "_seg_ext_feeder_done", False)
+    if not (proc_finished and feeder_done and pending == 0):
         if status is not None:
             start = getattr(page, "_seg_ext_start_time", None)
             elapsed = int(time.monotonic() - start) if start else 0
@@ -1985,7 +2494,13 @@ def _seg_ext_poll(ctx, page) -> None:
                 f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
             )
             stamp = f"[{datetime.now().strftime('%H:%M:%S')} · {elapsed_str}]"
-            msg = f"{stamp} Running… {len(done)}/{len(jobs)} file(s) done"
+            msg = (
+                f"{stamp} Prepared {prepared}/{len(jobs)} · "
+                f"Segmented {len(done)}/{len(jobs)} · "
+                f"Written {written}/{len(jobs)}"
+            )
+            if pending:
+                msg += f" · Writing {pending}"
             if tile is not None:
                 msg += f" — tile {tile[0]}/{tile[1]}"
             elif activity:
@@ -1996,25 +2511,40 @@ def _seg_ext_poll(ctx, page) -> None:
     timer = getattr(page, "_seg_ext_timer", None)
     if timer is not None:
         timer.stop()
+    if writer is not None:
+        writer.close()
+    page._seg_ext_writer = None
+    page._seg_ext_queue = None
+    page._seg_ext_running = False
     page._seg_calc_running = False
     page._seg_calc_finished = True
-    shutil.rmtree(page._seg_ext_tmpdir, ignore_errors=True)
-    ok_count = len(jobs) - len(errors)
+    tmpdir = getattr(page, "_seg_ext_tmpdir", None)
+    if tmpdir is not None:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     start = getattr(page, "_seg_ext_start_time", None)
     elapsed = int(time.monotonic() - start) if start else 0
     minutes, seconds = divmod(elapsed, 60)
     elapsed_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
-    _seg_log(ctx,
-        page,
-        f"Calculated {ok_count} mask(s) · {cells} cell(s) in {elapsed_str}.",
-    )
+    aborted = getattr(page, "_seg_ext_aborted", False)
+    if cancelled:
+        summary = f"Cancelled after {written} mask(s) in {elapsed_str}."
+    elif aborted:
+        summary = (
+            f"Stopped after {written} mask(s): input preparation failed."
+        )
+    else:
+        summary = (
+            f"Calculated {written} mask(s) · {cells} cell(s) in "
+            f"{elapsed_str}."
+        )
+    _seg_log(ctx, page, summary)
     for err in errors:
         _seg_log(ctx, page, f"✗ {err}")
     _seg_after_masks_changed(ctx, page)
     _seg_refresh_files(ctx, page)
     status = getattr(page, "_seg_calc_status", None)
     if status is not None:
-        msg = f"Calculated {ok_count} mask(s) · {cells} cell(s) in {elapsed_str}."
+        msg = summary
         if report:
             msg += "\n" + "\n".join(report)
         if errors:
@@ -2182,6 +2712,52 @@ def _seg_split_touching_nuclei(labels, min_area: int, separation: int = 0):
     return _relabel_sequential(out, int(min_area))
 
 
+def _seg_expand_labels(labels, radius: int, tile_size: int = SEG_EXPAND_TILE):
+    """Grow labels by ``radius`` pixels using tiles + a halo.
+
+    The whole-image distance transform needs one float64 distance map plus two
+    int32 index maps. Expansion is local (a pixel can only change if a label is
+    within ``radius``), so each output tile is computed from a padded tile. The
+    halo contains every label that can affect the tile, making the result
+    identical to the full-image transform while keeping peak memory bounded.
+    """
+    import numpy as np
+    from scipy import ndimage
+
+    radius = max(0, int(radius))
+    if radius <= 0 or labels.size == 0:
+        return labels
+    height, width = labels.shape
+    out = labels.copy()
+    tile = max(128, int(tile_size))
+    for y0 in range(0, height, tile):
+        y1 = min(height, y0 + tile)
+        py0 = max(0, y0 - radius)
+        py1 = min(height, y1 + radius)
+        for x0 in range(0, width, tile):
+            x1 = min(width, x0 + tile)
+            px0 = max(0, x0 - radius)
+            px1 = min(width, x1 + radius)
+            block = labels[py0:py1, px0:px1]
+            background = block == 0
+            if not background.any():
+                continue
+            distance, (iy, ix) = ndimage.distance_transform_edt(
+                background, return_indices=True
+            )
+            cy0, cy1 = y0 - py0, y1 - py0
+            cx0, cx1 = x0 - px0, x1 - px0
+            grown = distance[cy0:cy1, cx0:cx1] <= radius
+            if not grown.any():
+                continue
+            nearest = block[
+                iy[cy0:cy1, cx0:cx1], ix[cy0:cy1, cx0:cx1]
+            ]
+            patch = out[y0:y1, x0:x1]
+            patch[grown] = nearest[grown]
+    return out
+
+
 def _seg_nuclear_expansion(ctx, parquet_path, params, task_id=None):
     """Threshold → label → filter → (split) → expand. Returns (mask, error)."""
     import numpy as np
@@ -2199,7 +2775,7 @@ def _seg_nuclear_expansion(ctx, parquet_path, params, task_id=None):
     if params.get("threshold_mode") == "manual":
         threshold = float(params.get("threshold", 0.0))
     else:
-        threshold = _otsu_threshold(image)
+        threshold = _otsu_threshold_chunked(image)
     binary = image > threshold
     if not binary.any():
         return None, "threshold produced an empty mask"
@@ -2214,11 +2790,7 @@ def _seg_nuclear_expansion(ctx, parquet_path, params, task_id=None):
         )
     expand = int(params.get("expand", 0))
     if expand > 0 and labels.any():
-        distance, (iy, ix) = ndimage.distance_transform_edt(
-            labels == 0, return_indices=True
-        )
-        grown = distance <= expand
-        labels = np.where(grown, labels[iy, ix], labels)
+        labels = _seg_expand_labels(labels, expand)
     return labels.astype(np.int32), None
 
 
@@ -2278,20 +2850,24 @@ def _seg_save_now(ctx, page) -> None:
 
 
 def _seg_close(ctx, page) -> None:
-    if getattr(page, "_seg_ext_running", False) or getattr(
-        page, "_seg_calc_running", False
+    if (
+        getattr(page, "_seg_ext_running", False)
+        or getattr(page, "_seg_calc_running", False)
+        or getattr(page, "_seg_import_running", False)
     ):
         reply = QMessageBox.question(
             ctx.host,
             "Close Segmentation",
-            "A calculation is still running.\n"
+            "A calculation or import is still running.\n"
             "Closing the module now will interrupt it. Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._seg_calc_cancel = True
+        page._seg_import_cancel = True
         if getattr(page, "_seg_ext_running", False):
+            page._seg_ext_cancelled = True
             ctx._ext_worker().kill()
     if page._seg_dirty:
         reply = QMessageBox.question(
@@ -2303,10 +2879,20 @@ def _seg_close(ctx, page) -> None:
         if reply != QMessageBox.StandardButton.Yes:
             return
         page._seg_task_def["params"] = page._seg_snapshot
-    for name in ("_seg_overlay_timer", "_seg_ext_timer", "_seg_nuclear_timer"):
+    for name in (
+        "_seg_overlay_timer", "_seg_ext_timer", "_seg_nuclear_timer",
+        "_seg_import_timer",
+    ):
         timer = getattr(page, name, None)
         if timer is not None:
             timer.stop()
+    # The module is closing: its batch folder is disposable.
+    tmpdir = getattr(page, "_seg_ext_tmpdir", None)
+    if tmpdir is not None:
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    _seg_clear_edge_cache(ctx)
     ctx._close_module_page(page)
 
 

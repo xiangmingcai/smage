@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from smage.core.region_detection import region_parts_pixel_count
+from smage.data import project_paths as _project_paths
 
 
 def _region_store_path(ctx, task_def) -> Path | None:
@@ -51,8 +52,7 @@ def _region_store_load(ctx, task_def) -> dict:
     store = _empty_store()
     if path is not None and path.is_file():
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = _project_paths._load_json(path, ctx.project.path)
             store["files"] = [str(p) for p in data.get("files") or []]
             store["gates"] = list(data.get("gates") or [])
             store["per_file"] = dict(data.get("per_file") or {})
@@ -83,8 +83,7 @@ def _region_store_save(ctx, task_def, store: dict) -> None:
         "per_file": dict(store.get("per_file") or {}),
         "regions": list(store.get("regions") or []),
     }
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh)
+    _project_paths._save_json(path, payload, ctx.project.path)
     # Downstream adapters must see the file that was just written, not a
     # cached copy from before this save.
     ctx._region_store_cache = {}

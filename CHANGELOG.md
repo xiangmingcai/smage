@@ -4,6 +4,85 @@ All notable changes to Smage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.4.1] — 2026-11-24
+
+### Added
+
+- **Rename Project…** in the File menu renames an open project folder and
+  updates its name. It is disabled while no project is open.
+
+### Changed
+
+- **Projects are now portable.** Paths inside `data/` and `Module/` are stored
+  relative to the project (`project://…`), so copying the whole `.smage` folder
+  to another folder or computer and opening it there works without repairing
+  paths. Existing projects are migrated when opened; saved output signatures
+  and Subsample choices stay stable.
+- **Save Project As** now copies the complete project (`data/` and `Module/`)
+  instead of only the data folder.
+- **Unmix is now a pure generate module.** **Run unmix** writes a companion
+  unmixed-column parquet for table files and the existing parquet + image
+  pyramid for image files. Downstream modules read those generated outputs;
+  there is no on-demand matrix computation. Without generated output no
+  unmixed channels are exposed, so older projects need one **Run unmix**
+  after upgrading. Removing outputs unlocks the upstream modules as before.
+- **Segmentation** batches now keep their temporary files under
+  `<project>/tmp/segmentation/` instead of the system temp folder. The folder
+  is disposable and is cleaned when a run or the project ends.
+- **Cellpose / StarDist** batches now use a bounded pipeline: only a couple of
+  rasterized inputs are prepared ahead of the external process, and finished
+  masks are written by a background writer. Temporary disk use no longer
+  grows with the number of selected files, and the UI no longer blocks while
+  each mask is saved.
+- **Segmentation** has a **Cancel** button for Nuclear Expansion, Cellpose,
+  StarDist and Mask Input. Completed masks are kept.
+- **Mask Input** now reads and writes masks in the background instead of
+  blocking the window.
+- **Cluster** and **Batch Alignment** now exchange FlowSOM / PARC training
+  matrices and results through `<project>/tmp/cluster/runs/` and
+  `<project>/tmp/batch_align/runs/` instead of the system temp folder. Each
+  run is removed when it finishes, fails or is cancelled; stale runs are
+  cleaned when the project opens, and scratch data is removed when it closes.
+- **Segmentation** writes mask Parquet in bounded chunks and uses `uint16`
+  labels when they fit, reducing peak memory for large masks. The label
+  pyramid skips the per-pixel mode operation when its finest block is 1×1.
+- **Nuclear Expansion** computes Otsu from a streaming histogram and performs
+  expansion in tiles with a halo, so large images no longer need a full
+  float64 distance map plus two full index maps.
+- **Figure** no longer clears the shared sampled-column pool when the Figure
+  itself is saved; its plot settings cannot change data values.
+- **Figure** now reads all requested generated Unmix channels from one
+  companion parquet in a single grouped read instead of opening that file
+  once per channel.
+- The sampled-column pool now records build, hit, miss, failure and eviction
+  events in the session log, making large-file performance diagnosable.
+- **Figure** pool sampling now follows each plot's own point limit: 20x the
+  drawn points, capped at 300k. N×N cards therefore sample far fewer rows
+  than full-size scatters, and the pool tier is part of the column-cache key.
+- **Figure** scatter, overlay and histogram renders now evaluate upstream map
+  stages (including Compensation) on the pooled rows only. The sampled stage
+  cache stays at plot size instead of retaining full-file compensation
+  arrays. Gate statistics keep their independent 300k/full sampling path.
+- **Scale** preview Min/Max autofill now uses the shared pooled sample before
+  falling back to a full column read.
+
+### Fixed
+
+- **Figure** no longer leaves **Loading data…** on a scatter or histogram
+  after its data has arrived. Temporary status titles now invalidate the
+  display-options signature, so the final sample-name title is applied.
+- **Unmix for image** now uses the same least-squares solution
+  (`X · pinv(matrix)`) as table files instead of a direct projection
+  (`X · matrixᵀ`), so the generated image channels match the virtual Unmix
+  columns and no longer leak signal between signatures.
+- **Unmix for image** now applies upstream map stages — Compensation, a
+  previous Unmix, Illumination, Batch Align, Rename and Calculation — while
+  reading each batch, matching the table-data pipeline. The saved output
+  signature includes those stages, so changing an upstream module regenerates
+  the image outputs instead of reusing a stale pyramid.
+
 ## [0.3.4] — 2026-11-23
 
 ### Added

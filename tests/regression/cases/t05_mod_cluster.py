@@ -1,6 +1,7 @@
 """L4: Cluster — validation, k-means labels, output column and extension guard."""
 from __future__ import annotations
 
+import queue
 import sys
 from pathlib import Path
 
@@ -54,6 +55,49 @@ def kmeans_fit() -> None:
         )
         again = cluster_page._cluster_fit(ctx, "kmeans", {"k": 2}, matrix, 42)
         harness.check(np.array_equal(labels, again), "k-means is reproducible")
+    finally:
+        _close(window)
+
+
+@harness.case("mod.cluster.scratch", "L4", "cluster", tags=("fast",))
+def extension_scratch() -> None:
+    """FlowSOM exchanges its files under the project tmp folder."""
+    window, project, page, _parquet = _open("cluster_scratch")
+    try:
+        captured = {}
+
+        def fake_run(_page, _q, argv, _cancel_flag, name):
+            matrix = Path(argv[argv.index("--input") + 1])
+            result = Path(argv[argv.index("--output") + 1])
+            captured["matrix"] = matrix
+            values = np.load(matrix)
+            np.savez(
+                result,
+                cell_cluster=np.ones(values.shape[0], dtype=np.int64),
+                node_cluster=np.array([1], dtype=np.int32),
+                codes=np.zeros((1, values.shape[1]), dtype=np.float32),
+                n_clusters=1,
+            )
+
+        window._ext_ready = lambda _name: True
+        window._ext_python = lambda _name: "python"
+        window._ext_runner_path = lambda _name: Path("runner.py")
+        window._run_extension_process = fake_run
+        values = np.zeros((6, 2), dtype="float32")
+        result = window._flowsom_external(
+            page, queue.Queue(), values, 1, 1, 1, 42,
+            cancel_flag="_cluster_cancel", area="cluster",
+        )
+        harness.eq(len(result["cell_cluster"]), 6)
+        matrix = captured["matrix"]
+        harness.check(
+            (project.path / "tmp" / "cluster" / "runs") in matrix.parents,
+            f"scratch path: {matrix}",
+        )
+        harness.check(
+            not matrix.parent.exists(),
+            "the scratch run is removed after FlowSOM finishes",
+        )
     finally:
         _close(window)
 

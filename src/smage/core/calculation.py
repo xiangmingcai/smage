@@ -92,7 +92,7 @@ def _source_name(source, by_id):
     return str(name) if name else None
 
 
-def _calculation_stage(params) -> dict | None:
+def _calculation_stage(params, path_key=None) -> dict | None:
     """Compile a Calculation module's params into a pipeline stage.
 
     Invalid or incomplete rows are skipped (the page prevents saving them,
@@ -203,7 +203,11 @@ def _calculation_stage(params) -> dict | None:
     signature_data = [
         [
             row["id"], row["type"], row["output"], row["visible"],
-            sorted(row["files"]), row["sources"],
+            sorted(
+                path_key(item) if path_key else str(item)
+                for item in row["files"]
+            ),
+            row["sources"],
             [
                 [term["source"], round(float(term["weight"]), 9)]
                 for term in row["payload"].get("terms", [])

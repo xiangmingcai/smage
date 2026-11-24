@@ -1061,7 +1061,7 @@ def _ba_fit_cytonorm(ctx, page, q):
                   f"{want_clusters} cluster(s)"))
     result = ctx._flowsom_external(
         page, q, train, xdim, ydim, want_clusters, seed,
-        cancel_flag="_ba_cancel",
+        cancel_flag="_ba_cancel", area="batch_align",
     )
     codes = result["codes"]
     node_cluster = result["node_cluster"]

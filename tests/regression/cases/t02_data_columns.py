@@ -10,6 +10,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 from smage.data import columns as _data_columns
+from smage.data import pool as _data_pool
 
 
 def _open(case_id: str, tasks=(), rows: int = 60):
@@ -66,6 +67,48 @@ def columns_lookup() -> None:
 
         harness.eq(_data_columns._data_row_count(ctx, parquet), 40)
         harness.eq(_data_columns._data_row_count(ctx, str(project.data_dir / "missing.parquet")), 0)
+    finally:
+        _close(window)
+
+
+@harness.case("data.columns.sample_rows", "L2", "data", tags=("fast",))
+def sampled_rows() -> None:
+    """sample_indices reduces source rows before stages are evaluated."""
+    project = harness.new_project("data_columns_sample", rows=20)
+    parquet = str(project.data_dir / "case.parquet")
+    window = harness.new_window()
+    harness.open_project(window, project)
+    try:
+        ctx = window._ctx
+        full = _data_columns._column_data(
+            ctx, None, parquet, ["FL1-A"]
+        )["FL1-A"]
+        picked = np.array([0, 7, 19], dtype=np.int64)
+        sampled = _data_columns._column_data(
+            ctx, None, parquet, ["FL1-A"], sample_indices=picked
+        )["FL1-A"]
+        harness.check(np.array_equal(sampled, full[picked]))
+        harness.check(
+            not ctx._stage_cache,
+            "sampled reads do not populate the full stage cache",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("data.pool.tiers", "L2", "data", tags=("fast",))
+def pool_tiers() -> None:
+    """Pool size uses 20x the draw limit, capped at 300k."""
+    project = harness.new_project("data_pool_tiers", rows=1)
+    window = harness.new_window()
+    harness.open_project(window, project)
+    try:
+        ctx = window._ctx
+        harness.eq(_data_pool._pool_tier(ctx, 1000), 20_000)
+        harness.eq(_data_pool._pool_tier(ctx, 10_000), 200_000)
+        harness.eq(_data_pool._pool_tier(ctx, 50_000), 300_000)
+        harness.eq(_data_pool._pool_tier(ctx, 500_000), 500_000)
+        harness.eq(_data_pool._pool_stats_tier(ctx), 300_000)
     finally:
         _close(window)
 
@@ -211,16 +254,24 @@ def map_stages() -> None:
         _close(window)
 
 
-@harness.case("data.columns.unmix_file_scope", "L2", "data", tags=("fast",))
-def unmix_stage_file_scope() -> None:
-    """An Unmix matrix is not built for files outside its sample list.
-
-    Building it recomputes gate statistics over whole images, which made
-    every axis change on a downstream Gating module slow.
-    """
+@harness.case("data.columns.unmix_generated_scope", "L2", "data",
+              tags=("fast",))
+def unmix_generated_column_scope() -> None:
+    """Unmix contributes an inert marker from its generated outputs only."""
     unmix = harness.task_def(
         "unmix", task_id="u-1", name="Unmix",
-        params={"samples": ["/image.parquet"], "matrix": []},
+        params={
+            "samples": ["/image.parquet"],
+            "matrix": [],
+            "outputs": {
+                "/image.parquet": {
+                    "path": "Module/u-1/image_unmix.parquet",
+                    "columns": ["U1"],
+                    "kind": "image",
+                    "signature": "sig",
+                },
+            },
+        },
         children=[harness.task_def("gating", task_id="g-1", name="Gating")],
     )
     scale = harness.task_def(
@@ -246,13 +297,24 @@ def unmix_stage_file_scope() -> None:
             stages = _data_columns._map_stages(
                 ctx, "g-1", parquet_path="/other.parquet"
             )
-            harness.eq(stages, [], "scale stays out; unmatched Unmix is skipped")
-            harness.eq(calls["n"], 0, "the Unmix matrix is not built")
+            harness.eq(
+                stages, [],
+                "scale stays out; a file without an output gets no marker",
+            )
+            harness.eq(calls["n"], 0, "no matrix is built while reading")
 
-            _data_columns._map_stages(
+            stages = _data_columns._map_stages(
                 ctx, "g-1", parquet_path="/image.parquet"
             )
-            harness.eq(calls["n"], 1, "a matching file still resolves the matrix")
+            harness.eq(len(stages), 1)
+            kind, stage = stages[0]
+            harness.eq(kind, "unmix")
+            harness.check(stage.get("generated"), "the stage is a marker")
+            harness.eq(stage.get("names"), ["U1"])
+            harness.eq(
+                calls["n"], 0,
+                "the generated output does not rebuild the matrix",
+            )
         finally:
             ctx.__dict__.pop("_unmix_flow_config", None)
     finally:

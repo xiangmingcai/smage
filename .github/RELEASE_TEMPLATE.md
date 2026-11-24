@@ -2,15 +2,18 @@
 
 ## Highlights
 
-- **Figure**: multi-selected image plots now share a **Channels** table with
-  Show / Parameter / Color / Min / Max / Name, Add/Remove, histogram,
-  Auto set/Reset, Show legend, Y range and Resolution / Origin / Square.
-- **Unmix**: after deselecting previously unmixed files, **Unmix for image**
-  asks before deleting their saved outputs and downstream channels.
-- **Figure image plots** refresh a generated image pyramid when an upstream
-  module rewrites it, so renamed Gate2Col channels keep showing their 0/1 mask.
-- **From scale** stays selected when a file has no Scale and uses the data
-  extent until one is available.
+- **Portable projects**: paths inside a project are stored relative, so the
+  whole `.smage` folder can be copied to another folder or computer and opened
+  directly. Existing projects are migrated on first open.
+- **Rename Project…** in the File menu renames the project folder and project
+  name together.
+- **Save Project As** copies the complete project, including `Module/`.
+- **Unmix** is now a generate module: **Run unmix** writes companion unmixed
+  columns, and downstream modules read those generated outputs.
+- **Segmentation** batches use a bounded background pipeline with **Cancel**,
+  and keep disposable files under the project `tmp/` folder.
+- **Figure** uses per-plot sampled pools and no longer retains full-file
+  Compensation arrays, reducing memory use when switching large files.
 
 ## Downloads
 

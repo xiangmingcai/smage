@@ -753,8 +753,23 @@ def _scaling_config_for(ctx, page, column):
     return None
 
 
+def _scaling_apply_minmax(page, row_idx, config, vals) -> None:
+    config["min"] = int(vals.min())
+    config["max"] = int(vals.max())
+    min_edit = page._scaling_min_edits.get(row_idx)
+    max_edit = page._scaling_max_edits.get(row_idx)
+    if min_edit is not None:
+        min_edit.setText(_format_number(config["min"]))
+    if max_edit is not None:
+        max_edit.setText(_format_number(config["max"]))
+
+
 def _scaling_autofill_minmax(ctx, page, row_idx) -> None:
-    """Fill a row's min/max from the preview sample's data (once)."""
+    """Fill a row's min/max from the preview sample's data (once).
+
+    Prefer the shared pool sample; fall back to a full column only when the
+    pool cannot serve this file/column.
+    """
     if row_idx in page._scaling_minmax_filled:
         return
     page._scaling_minmax_filled.add(row_idx)
@@ -768,25 +783,39 @@ def _scaling_autofill_minmax(ctx, page, row_idx) -> None:
         return
     import numpy as np
 
-    # Real values (upstream data stages applied); the Scale transform itself
-    # is display-only and does not change the stored Min/Max range.
-    data = _data_columns._column_data(
-        ctx, page._scaling_task_id, rec["parquet"], [name]
-    ).get(name)
-    if data is None:
-        return  # column not in this file -> leave empty
-    vals = np.asarray(data, dtype="float64")
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return
-    config["min"] = int(vals.min())
-    config["max"] = int(vals.max())
-    min_edit = page._scaling_min_edits.get(row_idx)
-    max_edit = page._scaling_max_edits.get(row_idx)
-    if min_edit is not None:
-        min_edit.setText(_format_number(config["min"]))
-    if max_edit is not None:
-        max_edit.setText(_format_number(config["max"]))
+    token = int(getattr(page, "_scaling_minmax_token", 0)) + 1
+    page._scaling_minmax_token = token
+
+    def apply_values(data):
+        if token != getattr(page, "_scaling_minmax_token", token):
+            return
+        vals = np.asarray(data, dtype="float64")
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            _scaling_apply_minmax(page, row_idx, config, vals)
+
+    def use_pool():
+        if token != getattr(page, "_scaling_minmax_token", token):
+            return
+        ready = ctx._pool_ready(
+            rec["parquet"], page._scaling_task_id, [name]
+        )
+        if ready is not None:
+            apply_values(ready[1].get(name))
+            return
+        pending = ctx._pool_pending_keys(
+            rec["parquet"], page._scaling_task_id, [name]
+        )
+        if pending and not any(k in ctx._pool_failed for k in pending):
+            ctx._pool_register(pending[0], use_pool)
+            return
+        # Pool unavailable: keep the old exact fallback.
+        data = _data_columns._column_data(
+            ctx, page._scaling_task_id, rec["parquet"], [name]
+        ).get(name)
+        apply_values(data)
+
+    use_pool()
 
 
 def _scaling_render_preview(ctx, page) -> None:

@@ -16,10 +16,10 @@ own settings, and passes the result down.
   be changed until the output is removed or the module is unlocked. Smage
   shows a lock badge in the workflow tree.
 - **Generated files.** Only some modules write files: Data Import writes the
-  normalized table, Segmentation writes masks, Unmix writes unmixed image
-  channels, Region writes converted 0/1 channels, and Feature Down/Up and
-  Gate2Col write new tables. Other modules compute on demand and are always
-  up to date with the saved settings above them.
+  normalized table, Segmentation writes masks, Unmix writes unmixed columns
+  for tables and unmixed image channels, Region writes converted 0/1 channels,
+  and Feature Down/Up and Gate2Col write new tables. Other modules compute on
+  demand and are always up to date with the saved settings above them.
 - **Display-only steps.** The Scale module never changes values — it only
   changes how they are drawn.
 
@@ -32,8 +32,6 @@ own settings, and passes the result down.
 | Input | [Subsample](subsample.md) | Keep a fixed random number of events per file |
 | Input | [Subset](subset.md) | Restrict which files and columns downstream modules see |
 | Map values | [Compensation](compensation.md) | Apply a spillover matrix to flow-cytometry channels |
-| Map values | [Unmix — Spectrum Extraction](unmix.md) | Build reference spectra from single stains |
-| Map values | [Unmix — Matrix Unmixing](unmix-matrix.md) | Signatures, similarity and running the unmixing |
 | Map values | [Illumination Correction](illumination.md) | Correct uneven illumination per channel |
 | Map values | [Batch Align](batch-align.md) | Align batches with CytoNorm (reference-based) or ComBat (reference-free) |
 | Map values | [Calculation](calculation.md) | Build new channels with Clip, Scale, Add or a custom contrast curve |
@@ -42,6 +40,8 @@ own settings, and passes the result down.
 | Image | [Segmentation](segmentation.md) | Cellpose, StarDist or threshold masks |
 | Image | [Region](region.md) | Detect Regions and expose them downstream as 0/1 image channels |
 | Analyse | [Region Size](region-size.md) | Pixel area of each Region in each image file |
+| Generate | [Unmix — Spectrum Extraction](unmix.md) | Build reference spectra from single stains |
+| Generate | [Unmix — Matrix Unmixing](unmix-matrix.md) | Signatures, similarity and generated unmixed channels |
 | Features | [Feature Down](feature-down.md) | Aggregate values per class into a feature table |
 | Features | [Feature Up](feature-up.md) | Map feature-table columns back to events |
 | Features | [Gate2Col](gate2col.md) | Turn gate membership into 0/1 columns |

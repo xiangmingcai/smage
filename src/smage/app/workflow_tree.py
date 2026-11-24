@@ -437,8 +437,8 @@ MODULE_KINDS = {
     "rename": "map",
     "compensation": "map",
     "illumination": "map",
-    # Unmix can now generate image pyramids ("Unmix for image"), which locks
-    # its upstream modules; the parameter-only behaviour still works.
+    # Unmix always writes its unmixed channels; table files get a companion
+    # column file, image files also get an image pyramid.
     "unmix": "generate",
     "segmentation": "generate",
     "region": "map",

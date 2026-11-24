@@ -16,6 +16,10 @@ MyExperiment.smage\
 ├── Module\
 │   ├── gating-abc123\  # per-module data (gates.json, masks, feature tables)
 │   └── segmentation-…\
+├── tmp\                # disposable working files; safe to delete
+│   ├── segmentation\   # batch input/output and preview caches
+│   ├── cluster\        # FlowSOM / PARC scratch
+│   └── batch_align\    # CytoNorm / FlowSOM training scratch
 └── log\
     └── smage_20260101_120000_p1234.log
 ```
@@ -28,13 +32,31 @@ MyExperiment.smage\
 | Gating | `gates.json` (files, gates, per-file overrides) |
 | Segmentation | Mask files (one per image) |
 | Illumination Correction | Estimated correction masks |
+| Unmix | Generated unmixed-column tables and image pyramids |
 | Feature Down / Feature Up / Gate2Col | Generated Parquet tables |
 | Everything else | Only settings, inside `project.json` |
 
+## Temporary files
+
+`tmp\` holds disposable working files, such as the rasterized inputs and
+masks used by a large Segmentation batch. Smage removes them when the
+operation ends or the project closes; deleting `tmp\` by hand is always safe.
+It is not part of the saved project and is not copied by **Save Project As**.
+The `log\` folder is not copied either; the copy starts a fresh session log.
+**Save Project As** copies the rest of the project, including `Module\`.
+
 ## Paths
 
-Paths inside a project are stored **relative to the project folder**, so a
-project can be copied or moved to another disk or computer without breaking.
+Paths to files inside a project are stored **relative to the project folder**
+(using an internal `project://…` form), so a project can be copied or moved to
+another disk or computer without breaking. When a project is opened from a
+new location, Smage resolves those paths against the folder you opened.
+
+Only the original source files recorded by Data Import stay absolute. The
+normalized data inside `data\` is what the analysis uses, so a project still
+works when the original FCS/CSV/TIFF files are not available on the new
+computer.
+
 Do not rename the `data\` or `Module\` folders by hand.
 
 ## Logs
@@ -60,8 +82,13 @@ environment has to be created again from the **Extension Manager**.
 2. Copy the whole `<name>.smage` folder.
 3. Open it on the other computer with `File → Open Project…`.
 
-There is no database and no lock file that survives a normal close, so a
-folder copy is a complete backup.
+Project files are self-contained and use relative paths, so the copied folder
+can be opened directly from any location. There is no database and no lock
+file that survives a normal close, so a folder copy is a complete backup.
+
+Use **File → Rename Project…** to rename a project. This moves the project
+folder and updates the project name together; the project does not need to be
+saved under a new name first.
 
 ## Privacy
 

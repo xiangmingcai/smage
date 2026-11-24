@@ -5,10 +5,12 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import harness  # noqa: E402
 
+from smage.data import scratch as _scratch  # noqa: E402
 from smage.project import Project  # noqa: E402
 
 
@@ -41,6 +43,75 @@ def roundtrip() -> None:
     )
     harness.check((project.path / "project.json").is_file())
     harness.check(project.data_dir.is_dir())
+
+
+@harness.case("project.portable_paths", "L3", "project", tags=("smoke",))
+def portable_paths() -> None:
+    project = _new("project_portable", "orig")
+    parquet = project.data_dir / "case.parquet"
+    parquet.write_bytes(b"data")
+    project.workflow["tasks"][0]["params"]["processed"] = [
+        {
+            "name": "case.fcs",
+            "source": "C:/raw/case.fcs",
+            "parquet": str(parquet),
+            "rows": 1,
+        }
+    ]
+    project.save()
+
+    raw = json.loads((project.path / "project.json").read_text(encoding="utf-8"))
+    stored = raw["workflow"]["tasks"][0]["params"]["processed"][0]["parquet"]
+    harness.eq(stored, "project://data/case.parquet")
+
+    # A module store written with an absolute path is migrated too.
+    gates = project.path / "Module" / "g-1" / "gates.json"
+    gates.parent.mkdir(parents=True, exist_ok=True)
+    gates.write_text(
+        json.dumps({"files": [str(parquet)], "gates": [], "per_file": {}}),
+        encoding="utf-8",
+    )
+    # Make the manifest look like an older project: Module stores may still
+    # contain absolute paths, and there is no path_format marker yet.
+    legacy = json.loads(
+        (project.path / "project.json").read_text(encoding="utf-8")
+    )
+    legacy.pop("path_format", None)
+    legacy.pop("identity_root", None)
+    (project.path / "project.json").write_text(
+        json.dumps(legacy), encoding="utf-8"
+    )
+
+    copy = project.path.parent / "copy.smage"
+    shutil.copytree(project.path, copy)
+    loaded = Project.load(copy)
+    copied_parquet = loaded.workflow["tasks"][0]["params"]["processed"][0][
+        "parquet"
+    ]
+    harness.check(Path(copied_parquet).is_file(), "copied parquet resolves")
+    harness.check(
+        Path(copied_parquet).is_relative_to(copy),
+        "the copied project uses its own data folder",
+    )
+    copied_gates = json.loads(gates.read_text(encoding="utf-8"))
+    # The original store is untouched; the copy was migrated on load.
+    harness.eq(copied_gates["files"], [str(parquet)])
+    copied_store = json.loads(
+        (copy / "Module" / "g-1" / "gates.json").read_text(encoding="utf-8")
+    )
+    harness.eq(copied_store["files"], ["project://data/case.parquet"])
+
+    renamed = copy.parent / "renamed.smage"
+    loaded.move_to(renamed, "renamed")
+    harness.check((renamed / "project.json").is_file())
+    harness.check(not copy.exists(), "rename moved the folder")
+    reloaded = Project.load(renamed)
+    harness.check(
+        Path(
+            reloaded.workflow["tasks"][0]["params"]["processed"][0]["parquet"]
+        ).is_file(),
+        "renamed project still resolves its data",
+    )
 
 
 @harness.case("project.columns", "L3", "project", tags=("smoke",))
@@ -108,6 +179,39 @@ def masks() -> None:
         missing.workflow["tasks"][0]["children"][0]["params"]["submodules"][0]
     )
     harness.eq(restored["mask"], None, "a missing mask file is tolerated")
+
+
+@harness.case("project.scratch", "L3", "project", tags=("fast",))
+def scratch_dirs() -> None:
+    """Module scratch runs live in the project tmp folder and clean up."""
+    project = _new("project_scratch")
+    ctx = SimpleNamespace(project=project)
+    run = _scratch._scratch_run_dir(ctx, "cluster")
+    harness.eq(
+        run.parent, project.path / "tmp" / "cluster" / "runs"
+    )
+    (run / "matrix.npy").write_bytes(b"x")
+    _scratch._scratch_remove(run)
+    harness.check(not run.exists(), "a finished scratch run is removed")
+
+    with _scratch._scratch_run(ctx, "batch_align") as run:
+        harness.check(run.is_dir())
+        (run / "result.npz").write_bytes(b"x")
+    harness.check(not run.exists(), "the run context removes its folder")
+
+    stale = _scratch._scratch_run_dir(ctx, "cluster")
+    _scratch._scratch_cleanup_stale(ctx)
+    harness.check(not stale.exists(), "stale run folders are removed")
+    harness.check(
+        (project.path / "tmp" / "cluster").is_dir(),
+        "cleanup keeps the area folder",
+    )
+
+    _scratch._scratch_cleanup_all(ctx)
+    harness.check(
+        not (project.path / "tmp").exists(),
+        "closing a project removes all scratch data",
+    )
 
 
 @harness.case("project.errors", "L3", "project", tags=("smoke",))

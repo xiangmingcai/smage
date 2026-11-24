@@ -245,8 +245,32 @@ def unmix_values() -> None:
         harness.check(np.allclose(config["matrix"], expected),
                       f"{config['matrix']} vs {expected}")
 
-        harness.eq(_unmix_page._unmix_output_names(ctx, "g-1", parquet), ["Signal"])
-        values = _data_columns._column_data(ctx, "g-1", parquet, ["Signal"])["Signal"]
+        # Strict generate: nothing is exposed before the output exists.
+        harness.eq(
+            _unmix_page._unmix_output_names(ctx, "g-1", parquet), []
+        )
+        record = _unmix_page._unmix_write_output(
+            ctx, "u-1", parquet, config
+        )
+        harness.eq(record["kind"], "table")
+        output_frame = pd.read_parquet(project.path / record["path"])
+        harness.eq(
+            list(output_frame.columns), ["Signal"],
+            "table outputs hold only the unmixed columns",
+        )
+        task = window._find_task_by_id("u-1")
+        task["params"]["outputs"] = {parquet: record}
+        task["output"] = {"saved": True}
+        project.save()
+        _data_columns._bump_stages_revision(ctx)
+
+        harness.eq(
+            _unmix_page._unmix_output_names(ctx, "g-1", parquet),
+            ["Signal"],
+        )
+        values = _data_columns._column_data(
+            ctx, "g-1", parquet, ["Signal"]
+        )["Signal"]
         weights = np.linalg.pinv(config["matrix"]).T
         expected_values = (
             raw[["FL1-A", "FL2-A"]].to_numpy(dtype=float) @ weights[0]
@@ -575,6 +599,79 @@ def manual_edit() -> None:
         _close(window)
 
 
+@harness.case("mod.unmix.image_values", "L4", "unmix", tags=("fast",))
+def image_values() -> None:
+    """Image unmix uses pinv and the same upstream stages as table data."""
+    from smage.data import columns as data_columns
+    from smage.data.image_index import _build_image_index_files
+
+    unmix = harness.task_def("unmix", task_id="u-1", name="Unmix")
+    compensation = harness.task_def(
+        "compensation", task_id="c-1", name="Compensation",
+        params={
+            "params": ["FL1-A", "FL2-A"],
+            "matrix": [[100, 10], [0, 100]],
+            "files": [],
+        },
+        children=[unmix],
+    )
+    project = harness.new_project(
+        "unmix_image_values", rows=120, tasks=[compensation]
+    )
+    parquet = str(project.data_dir / "case.parquet")
+    compensation["params"]["files"] = [parquet]
+    project.save()
+    _build_image_index_files(parquet)
+
+    window = harness.new_window()
+    harness.open_project(window, project)
+    try:
+        ctx = window._ctx
+        matrix = np.array([[1.0, 0.5], [0.2, 1.0]])
+        config = {
+            "task_id": "u-1",
+            "names": ["U1", "U2"],
+            "columns": ["FL1-A", "FL2-A"],
+            "matrix": matrix,
+            "method": "ols",
+            "samples": {parquet},
+        }
+        record = _unmix_page._unmix_write_output(
+            ctx, "u-1", parquet, config
+        )
+        output = project.path / record["path"]
+        frame = pd.read_parquet(output)
+        harness.eq(list(frame.columns), ["x", "y", "U1", "U2"])
+        harness.check(
+            (Path(str(output) + ".imgidx")).is_dir(),
+            "the output pyramid is built",
+        )
+
+        source = ctx._column_data("u-1", parquet, ["FL1-A", "FL2-A"])
+        expected = (
+            np.column_stack([source["FL1-A"], source["FL2-A"]])
+            @ np.linalg.pinv(matrix)
+        )
+        harness.check(
+            np.allclose(frame[["U1", "U2"]].to_numpy(), expected),
+            "image unmix matches X · pinv(matrix)",
+        )
+
+        signature = record["signature"]
+        ct = window._find_task_by_id("c-1")
+        ct["params"]["matrix"] = [[100, 20], [0, 100]]
+        data_columns._bump_stages_revision(ctx)
+        changed = _unmix_page._unmix_output_signature(
+            ctx, "u-1", parquet, config
+        )
+        harness.check(
+            changed != signature,
+            "an upstream stage change invalidates the image output",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("mod.unmix.deselected_outputs", "L4", "unmix",
               tags=("fast",))
 def deselected_outputs() -> None:
@@ -607,7 +704,7 @@ def deselected_outputs() -> None:
         with harness.patch_dialogs(
             _unmix_page, question=QMessageBox.StandardButton.No
         ):
-            result = _unmix_page._unmix_confirm_remove_image_outputs(
+            result = _unmix_page._unmix_confirm_remove_outputs(
                 ctx, page, [first]
             )
         harness.eq(result, None, "No cancels the run")
@@ -621,7 +718,7 @@ def deselected_outputs() -> None:
         with harness.patch_dialogs(
             _unmix_page, question=QMessageBox.StandardButton.Yes
         ):
-            result = _unmix_page._unmix_confirm_remove_image_outputs(
+            result = _unmix_page._unmix_confirm_remove_outputs(
                 ctx, page, [first]
             )
         harness.eq(len(result), 1)
@@ -631,7 +728,7 @@ def deselected_outputs() -> None:
             "the mapping is removed first; the worker deletes the file",
         )
 
-        ok, error = _unmix_page._unmix_delete_image_output(
+        ok, error = _unmix_page._unmix_delete_output(
             ctx, result[0]["rec"]
         )
         harness.check(ok, error)
@@ -644,7 +741,7 @@ def deselected_outputs() -> None:
         with harness.patch_dialogs(
             _unmix_page, question=QMessageBox.StandardButton.Yes
         ):
-            result = _unmix_page._unmix_confirm_remove_image_outputs(
+            result = _unmix_page._unmix_confirm_remove_outputs(
                 ctx, page, []
             )
         harness.eq(len(result), 1)
@@ -684,7 +781,7 @@ def manual_channels() -> None:
         with harness.patch_dialogs(
             _unmix_page, information=QMessageBox.StandardButton.Ok
         ):
-            _unmix_page._unmix_start_image(ctx, page)
+            _unmix_page._unmix_start_run(ctx, page)
         harness.check(
             not getattr(page, "_unmix_running", False),
             "unmixing is refused until the channels match again",

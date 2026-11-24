@@ -48,7 +48,8 @@ def menu_actions() -> None:
             return []
 
         harness.eq(action_texts("File"),
-                   ["New Project", "Open Project…", "Save Project As…"])
+                   ["New Project", "Open Project…", "Rename Project…",
+                    "Save Project As…"])
         harness.eq(action_texts("Extension"), ["Manage Extension…"])
         harness.eq(action_texts("Settings"), ["Global Settings…"])
         harness.eq(action_texts("Help"), ["About Smage"])
@@ -491,9 +492,54 @@ def project_new_open() -> None:
         _close(window)
 
 
+@harness.case("shell.project.rename", "L5", "shell", tags=("smoke",))
+def project_rename() -> None:
+    window, project = _open("shell_rename")
+    old_path = project.path
+    target = old_path.parent / "renamed.smage"
+
+    class FakeRenameDialog:
+        def __init__(self, _parent, _current):
+            pass
+
+        def exec(self):
+            return project_io.QDialog.DialogCode.Accepted
+
+        def project_name(self):
+            return "renamed"
+
+    original = project_io._RenameProjectDialog
+    project_io._RenameProjectDialog = FakeRenameDialog
+    try:
+        window._rename_project()
+    finally:
+        project_io._RenameProjectDialog = original
+    try:
+        harness.check(window._rename_project_action.isEnabled())
+        harness.check(not old_path.exists(), "the old folder moved")
+        harness.check(target.is_dir(), "the new folder exists")
+        harness.eq(window.project.name, "renamed")
+        harness.check(
+            str(window.project.path).endswith("renamed.smage"),
+            "the project path follows the folder",
+        )
+        processed = window.project.workflow["tasks"][0]["params"]["processed"]
+        harness.check(
+            Path(processed[0]["parquet"]).is_file(),
+            "imported data still resolves after the rename",
+        )
+    finally:
+        _close(window)
+
+
 @harness.case("shell.project.save_as", "L5", "shell", tags=("smoke",))
 def project_save_as() -> None:
     window, project = _open("shell_save_as")
+    module_file = project.path / "Module" / "g-1" / "gates.json"
+    module_file.parent.mkdir(parents=True, exist_ok=True)
+    module_file.write_text(
+        '{"files": [], "gates": [], "per_file": {}}', encoding="utf-8"
+    )
     try:
         parent = harness.RUN_DIR / "cases" / "shell_save_as" / "out"
         parent.mkdir(parents=True, exist_ok=True)
@@ -510,6 +556,8 @@ def project_save_as() -> None:
         harness.check((copy / "project.json").is_file())
         harness.check((copy / "data" / "case.parquet").is_file(),
                       "the data files are copied")
+        harness.check((copy / "Module" / "g-1" / "gates.json").is_file(),
+                      "the module stores are copied")
         from smage.project import Project
 
         loaded = Project.load(copy)

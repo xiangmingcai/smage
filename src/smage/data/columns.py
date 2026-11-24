@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 
+from smage.data import project_paths as _project_paths
 from smage.data.files import _subset_visible_columns
 from smage.core.calculation import (
     _calculation_outputs,
@@ -131,8 +132,9 @@ def _columns_for(ctx, parquet_path, task_id=None) -> list:
     return columns
 
 
-def _stage_cached_values(ctx, stages, parquet_path, names, expected_rows) -> dict:
-    """Values whose final form is already in ``ctx._stage_cache``.
+def _stage_cached_values(ctx, stages, parquet_path, names, expected_rows,
+                         cache=None) -> dict:
+    """Values whose final form is already in the supplied stage cache.
 
     Compensation and Unmix store their complete output columns there.  When
     the *last* stage that touches a requested column is one of them, the
@@ -140,7 +142,8 @@ def _stage_cached_values(ctx, stages, parquet_path, names, expected_rows) -> dic
     need to be read again.  Arrays whose length does not match the rows this
     caller expects (a different Subsample scope) are ignored.
     """
-    cache = getattr(ctx, "_stage_cache", None)
+    if cache is None:
+        cache = getattr(ctx, "_stage_cache", None)
     if not cache:
         return {}
     last = {}
@@ -190,11 +193,17 @@ def _stage_cached_values(ctx, stages, parquet_path, names, expected_rows) -> dic
     return found
 
 
-def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filter=True, numeric=True) -> dict:
+def _column_data(ctx, task_id, parquet_path, names, extra_stages=None,
+                 row_filter=True, numeric=True, sample_indices=None) -> dict:
     """Column values as seen at `task_id`, with upstream map stages applied.
 
     When an upstream Subsample module samples this file, the returned
     arrays hold only the sampled rows (unless `row_filter` is off).
+
+    With ``sample_indices`` the source columns are reduced to those raw row
+    positions before the map stages run, so the stage cache holds sampled
+    arrays (plot-pool size) instead of full-file compensation results.  The
+    caller must not combine it with an upstream Subsample row filter.
 
     With ``numeric=False`` the values keep their stored dtype and only
     rename stages apply — for identifier columns (matching keys, names)
@@ -205,6 +214,18 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
     if not parquet_path or not names:
         return {}
     names = list(names)
+    if sample_indices is not None and task_id and row_filter:
+        if ctx._subsample_row_index(task_id, parquet_path) is not None:
+            # Pool rows are raw row numbers; an upstream Subsample changes
+            # which raw rows are visible.  Let the caller's full-read
+            # fallback handle that combination.
+            sample_indices = None
+    stage_cache = ctx._stage_cache if sample_indices is None else None
+    if sample_indices is not None:
+        stage_cache = getattr(ctx, "_pool_stage_cache", None)
+        if stage_cache is None:
+            stage_cache = {}
+            ctx._pool_stage_cache = stage_cache
     stages = (
         ctx._map_stages(task_id, parquet_path=parquet_path) if task_id else []
     )
@@ -235,13 +256,17 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
         # After an upstream save the pool is rebuilt; the compensation/unmix
         # outputs are already cached, so avoid re-reading the parquet for
         # every requested column.
-        expected_rows = ctx._data_row_count(parquet_path)
-        if row_filter and task_id:
-            sampled = ctx._subsample_row_index(task_id, parquet_path)
-            if sampled is not None:
-                expected_rows = len(sampled)
+        if sample_indices is not None:
+            expected_rows = len(sample_indices)
+        else:
+            expected_rows = ctx._data_row_count(parquet_path)
+            if row_filter and task_id:
+                sampled = ctx._subsample_row_index(task_id, parquet_path)
+                if sampled is not None:
+                    expected_rows = len(sampled)
         cached = _stage_cached_values(
-            ctx, stages, parquet_path, names, expected_rows
+            ctx, stages, parquet_path, names, expected_rows,
+            cache=stage_cache,
         )
         if all(name in cached for name in names):
             return {name: cached[name] for name in names}
@@ -299,6 +324,18 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
                 arr = ctx._gate2col_column_values(parquet_path, rec, name)
                 if arr is not None:
                     values[name] = arr
+        # Generated Unmix columns from upstream Unmix modules.  Read all
+        # requested columns of one companion parquet together; N×N image
+        # plots routinely ask for a dozen channels at once.
+        unmix_cols = ctx._unmix_applied_columns(task_id, parquet_path)
+        wanted_unmix = [
+            name for name in needed
+            if name in unmix_cols and name not in values
+        ]
+        if wanted_unmix:
+            values.update(ctx._unmix_column_values_many(
+                parquet_path, unmix_cols, wanted_unmix
+            ))
         # Feature Up mapped columns from upstream Feature Up modules.
         for name, rec in ctx._feature_up_applied_columns(
             task_id, parquet_path
@@ -331,7 +368,16 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
                 arr = ctx._dc_column_values(parquet_path, rec, name)
                 if arr is not None:
                     values[name] = arr
-    if row_filter and task_id:
+    if sample_indices is not None:
+        # Reduce before evaluating stages: Compensation then works on the
+        # plot-pool rows only and its stage-cache entry is correspondingly
+        # small.
+        total = ctx._data_row_count(parquet_path)
+        values = {
+            name: (arr[sample_indices] if len(arr) == total else arr)
+            for name, arr in values.items()
+        }
+    elif row_filter and task_id:
         # Keep only the rows an upstream Subsample module lets through.
         # Every array here is row-aligned to the source file, so one index
         # applies to base and virtual columns alike.
@@ -346,7 +392,7 @@ def _column_data(ctx, task_id, parquet_path, names, extra_stages=None, row_filte
         return {n: values[n] for n in names if n in values}
     evaluated = _evaluate_stages(
         stages, values, names, parquet_path=parquet_path,
-        cache=ctx._stage_cache,
+        cache=stage_cache,
     )
     return {n: evaluated[n] for n in names if n in evaluated}
 
@@ -460,16 +506,28 @@ def _map_stages(ctx, task_id, after=None, include_scale=False, parquet_path=None
                     "matrix": np.asarray(matrix, dtype="float64") / 100.0,
                 }))
         elif task_type == "unmix":
-            if (
-                parquet_path is not None
-                and parquet_path not in (params.get("samples") or [])
-            ):
-                # The unmix stage never applies to this file; building its
-                # matrix (gate statistics over the source image) is costly.
+            # Unmix is a generate module: its values come from the saved
+            # companion output, not from a matrix computed during reads.
+            # Keep a lightweight marker so downstream transforms can still
+            # be ordered relative to the Unmix task.
+            if parquet_path not in (params.get("samples") or []):
                 continue
-            config = ctx._unmix_flow_config(task)
-            if config is not None:
-                stages.append(("unmix", config))
+            rec = (
+                (params.get("outputs") or {}).get(parquet_path)
+                if parquet_path else None
+            )
+            names = (
+                list(rec.get("columns") or [])
+                if isinstance(rec, dict) else []
+            )
+            if names:
+                stages.append(("unmix", {
+                    "task_id": task.get("id"),
+                    "generated": True,
+                    "names": names,
+                    "samples": set(params.get("samples") or []),
+                    "signature": rec.get("signature"),
+                }))
         elif task_type == "illumination":
             submodules = [
                 item for item in (
@@ -498,7 +556,10 @@ def _map_stages(ctx, task_id, after=None, include_scale=False, parquet_path=None
             if stage is not None:
                 stages.append(("rename", stage))
         elif task_type == "calculation":
-            stage = _calculation_stage(params)
+            stage = _calculation_stage(
+                params,
+                path_key=lambda item: _project_paths._stable_path_key(ctx, item),
+            )
             if stage is not None:
                 # Skip the stage entirely for files no row applies to.
                 if parquet_path is None or any(
@@ -510,7 +571,7 @@ def _map_stages(ctx, task_id, after=None, include_scale=False, parquet_path=None
     return list(stages)
 
 
-def _map_stage_token(ctx, task_id) -> str:
+def _map_stage_token(ctx, task_id, parquet_path=None) -> str:
     """A short digest of the upstream map stages that shape the values."""
     import numpy as np
 
@@ -521,18 +582,31 @@ def _map_stage_token(ctx, task_id) -> str:
         except Exception:  # noqa: BLE001
             return str(value)[:64]
 
-    stages = ctx._map_stages(task_id) if task_id else []
+    stages = (
+        ctx._map_stages(task_id, parquet_path=parquet_path)
+        if task_id else []
+    )
     parts = []
     for kind, stage in stages:
         if kind == "compensation":
             parts.append([
-                "comp", stage.get("id"), sorted(stage.get("files") or []),
+                "comp", stage.get("id"),
+                sorted(
+                    _project_paths._stable_path_key(ctx, item)
+                    for item in (stage.get("files") or [])
+                ),
                 list(stage.get("names") or []),
                 _array_token(stage.get("matrix")),
             ])
         elif kind == "unmix":
             parts.append([
-                "unmix", stage.get("task_id"), sorted(stage.get("samples") or []),
+                "unmix", stage.get("task_id"),
+                bool(stage.get("generated")),
+                stage.get("signature"),
+                sorted(
+                    _project_paths._stable_path_key(ctx, item)
+                    for item in (stage.get("samples") or [])
+                ),
                 list(stage.get("names") or []),
                 _array_token(stage.get("matrix")),
             ])
@@ -540,7 +614,16 @@ def _map_stage_token(ctx, task_id) -> str:
             parts.append([
                 "illum", stage.get("task_id"),
                 [
-                    [sub.get("channel"), sorted(sub.get("files") or []), sub.get("T")]
+                    [
+                        sub.get("channel"),
+                        sorted(
+                            _project_paths._stable_path_key(ctx, item)
+                            for item in (sub.get("files") or [])
+                        ),
+                        sub.get("x"), sub.get("y"),
+                        sub.get("tile_w"), sub.get("tile_h"),
+                        sub.get("T"), _array_token(sub.get("mask")),
+                    ]
                     for sub in stage.get("submodules") or []
                 ],
             ])
@@ -548,7 +631,13 @@ def _map_stage_token(ctx, task_id) -> str:
             parts.append([
                 "batch_align", stage.get("id"), stage.get("method"),
                 stage.get("model_id"), list(stage.get("columns") or []),
-                sorted((stage.get("files") or {}).items()),
+                sorted(
+                    (
+                        _project_paths._stable_path_key(ctx, item),
+                        value,
+                    )
+                    for item, value in (stage.get("files") or {}).items()
+                ),
             ])
         elif kind == "rename":
             parts.append(["rename", dict(stage.get("map") or {})])
@@ -574,23 +663,3 @@ def _upstream_scale_transforms(ctx, task_id) -> dict:
                 if col.get("name"):
                     transforms.setdefault(col["name"], []).append(col)
     return transforms
-
-
-def _upstream_unmix_configs(ctx, task_id, parquet_path) -> list:
-    """Return the Unmix matrix configs upstream of `task_id` that apply to
-    this file, in chain order (root first)."""
-    configs = []
-    if not task_id or not parquet_path or ctx.project is None:
-        return configs
-    for task in ctx._task_chain(task_id):
-        if task.get("id") == task_id:
-            continue  # exclude the module itself
-        if task.get("type") != "unmix":
-            continue
-        params = task.get("params") or {}
-        if parquet_path not in (params.get("samples") or []):
-            continue
-        config = ctx._unmix_flow_config(task)
-        if config is not None:
-            configs.append(config)
-    return configs

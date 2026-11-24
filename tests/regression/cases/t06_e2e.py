@@ -21,6 +21,7 @@ from smage.modules.scale import page as scale_page  # noqa: E402
 from smage.data import columns as _data_columns
 from smage.data import feature_outputs as _data_feature_outputs
 from smage.data import files as _data_files
+from smage.data import project_paths as _project_paths
 from smage.data import sampling as _data_sampling
 from smage.data import stores as _data_stores
 from smage.modules.export import page as _export_page
@@ -369,10 +370,13 @@ def subsample_heatmap() -> None:
         _heatmap_page._heatmap_calculate(ctx, page)
         harness.wait_for(lambda: not page._heatmap_running, timeout=30,
                          message="sampled heatmap")
-        payload = json.loads(
-            (project.path / "Module" / "h-1" / "heatmap.json").read_text(
-                encoding="utf-8"
-            )
+        payload = _project_paths._decode_paths(
+            json.loads(
+                (project.path / "Module" / "h-1" / "heatmap.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            project.path,
         )
         harness.eq(payload["used_rows"][parquet], 10)
         harness.eq(payload["row_counts"][parquet], 10,

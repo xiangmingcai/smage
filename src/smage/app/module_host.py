@@ -61,6 +61,35 @@ from smage.modules.unmix import page as _unmix_page
 from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
 
 
+# Close handlers used when the whole project changes (rename / Save As).
+# They are the pages' normal Close paths, so page workers and timers stop in
+# exactly the same way as when the user clicks Close.
+_PROJECT_CLOSE_HANDLERS = {
+    "batch_align": _batch_align_page._ba_close,
+    "calculation": _calculation_page._calc_close,
+    "cluster": _cluster_page._cluster_close,
+    "compensation": _compensation_page._comp_close,
+    "data_clean": _data_clean_page._dc_close,
+    "dimred": _dimred_page._dimred_close,
+    "export": _export_page._export_close,
+    "feature": _feature_page._feat_close,
+    "feature_up": _feature_up_page._fup_close,
+    "figure": _figure_page._figure_close,
+    "gate2col": _gate2col_page._g2c_close,
+    "gating": _gating_page._gating_close,
+    "heatmap": _heatmap_page._heatmap_close,
+    "illumination": _illumination_page._illum_close,
+    "region": _region_page._region_close,
+    "region_size": _region_size_page._rs_close,
+    "rename": _rename_page._rename_close,
+    "scale": _scale_page._scaling_close,
+    "segmentation": _segmentation_page._seg_close,
+    "subsample": _subsample_page._subs_close,
+    "subset": _subset_page._subset_close,
+    "unmix": _unmix_page._unmix_close,
+}
+
+
 class _DraftSaveGuard(QObject):
     """Keeps a draft module's Save button disabled.
 
@@ -99,6 +128,9 @@ class ModuleHostMixin:
                 or getattr(widget, "_unmix_dirty", False)
                 or getattr(widget, "_comp_dirty", False)
                 or getattr(widget, "_illum_dirty", False)
+                or getattr(widget, "_calc_dirty", False)
+                or getattr(widget, "_export_dirty", False)
+                or getattr(widget, "_heatmap_dirty", False)
                 or getattr(widget, "_seg_dirty", False)
                 or getattr(widget, "_feat_dirty", False)
                 or getattr(widget, "_g2c_dirty", False)
@@ -516,9 +548,16 @@ class ModuleHostMixin:
         """Mark a module as saved and push updates to its open downstream modules."""
         _data_stores._write_draft_params(self._ctx, page)
         saved_id = page.property("task_id")
+        task_def = (
+            (self._find_task_by_id(saved_id) or {}) if saved_id else {}
+        )
         # Any saved change can alter the data flowing downstream.
         _data_columns._bump_stages_revision(self._ctx)
-        _data_pool._pool_clear(self._ctx)
+        # Figure only stores plot settings; its save cannot change any data
+        # column.  Keeping the sampled column pool avoids re-reading large
+        # image/Unmix files merely because the user pressed Save.
+        if task_def.get("type") != "figure":
+            _data_pool._pool_clear(self._ctx)
         self._channel_range_cache = {}
         # Rebuilding an Unmix matrix recomputes gate statistics over whole
         # images, so keep the cached matrices of branches this save cannot
@@ -549,7 +588,6 @@ class ModuleHostMixin:
         self._region_store_cache = {}
         self._module_set_state(page, MODULE_STATE_SAVED)
         if saved_id:
-            task_def = self._find_task_by_id(saved_id) or {}
             runlog.info(
                 "module.saved", id=str(saved_id),
                 type=str(task_def.get("type") or ""),
@@ -742,6 +780,49 @@ class ModuleHostMixin:
             seconds=round(_time.perf_counter() - started, 3),
         )
 
+    def _project_transition_busy(self) -> bool:
+        """Whether an open module still has a running background job."""
+        flags = (
+            "_seg_ext_running", "_seg_calc_running", "_seg_import_running",
+            "_cluster_running", "_ba_running", "_ba_reporting",
+            "_dimred_running", "_dc_running", "_feat_running",
+            "_fup_running", "_g2c_running", "_unmix_running",
+            "_heatmap_running",
+        )
+        for index in range(1, self.tabs.count()):
+            page = self.tabs.widget(index)
+            if any(getattr(page, name, False) for name in flags):
+                return True
+            task_id = page.property("task_id")
+            task = self._find_task_by_id(task_id) if task_id else None
+            task_type = (task or {}).get("type")
+            if task_type == "region" and _region_page._region_detect_running(page):
+                return True
+            if task_type == "region_size" and getattr(page, "_rs_pending", None) is not None:
+                return True
+        return False
+
+    def _close_all_modules_for_transition(self) -> bool:
+        """Close every module tab before a project switch.
+
+        Returns False when a Close handler chose to stay open (for example
+        the user declined a running-job prompt).
+        """
+        while self.tabs.count() > 1:
+            page = self.tabs.widget(self.tabs.count() - 1)
+            task_id = page.property("task_id")
+            task = self._find_task_by_id(task_id) if task_id else None
+            task_type = (task or {}).get("type")
+            before = self.tabs.count()
+            handler = _PROJECT_CLOSE_HANDLERS.get(task_type)
+            if handler is not None:
+                handler(self._ctx, page)
+            else:
+                self._close_module_page(page)
+            if self.tabs.count() >= before:
+                return False
+        return True
+
     def _close_module_page(self, page: QWidget) -> None:
         """Close a module page's tab (never the Workflow tab)."""
         task_id = page.property("task_id")
@@ -822,3 +903,25 @@ class ModuleHostMixin:
             except Exception:  # noqa: BLE001
                 pass
             page._fig_filter_timer = None
+        # Long-running module pages own their poll timers on the host window,
+        # so removing the tab alone does not stop them.
+        for name in (
+            "_cluster_timer", "_ba_timer", "_ba_report_timer",
+            "_dimred_timer", "_dc_timer", "_unmix_timer",
+            "_seg_overlay_timer", "_seg_ext_timer",
+            "_seg_nuclear_timer", "_seg_import_timer",
+        ):
+            timer = getattr(page, name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                setattr(page, name, None)
+        for name in (
+            "_cluster_cancel", "_ba_cancel", "_dimred_cancel",
+            "_dc_cancel", "_unmix_cancel", "_seg_calc_cancel",
+            "_seg_import_cancel",
+        ):
+            if hasattr(page, name):
+                setattr(page, name, True)

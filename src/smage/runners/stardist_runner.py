@@ -10,7 +10,8 @@ Usage:
   python stardist_runner.py download-model --model 2D_versatile_fluo
   python stardist_runner.py segment --manifest jobs.json --nucleus 0 \
       --prob 0.5 --nms 0.3 [--tile-size 0] [--device cpu] \
-      [--model 2D_versatile_fluo] [--threads 8]
+      [--model 2D_versatile_fluo] [--threads 8] \
+      [--wait-inputs] [--input-timeout 1800]
 """
 import argparse
 import json
@@ -146,7 +147,31 @@ def download_model(model, threads):
     print("model ready:", model)
 
 
-def segment(manifest_path, nucleus, model, prob, nms, threads, tile_size=0, device="cpu"):
+def _failed_marker(image_path):
+    """Path of the marker Smage writes when rasterization fails."""
+    return image_path[:-4] + ".failed" if image_path.endswith(".npy") else image_path + ".failed"
+
+
+def _wait_for_input(image_path, timeout):
+    """Wait for an atomically published input, or a failure marker."""
+    marker = _failed_marker(image_path)
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        if os.path.exists(image_path):
+            return True, ""
+        if os.path.exists(marker):
+            try:
+                with open(marker, "r", encoding="utf-8") as fh:
+                    return False, fh.read().strip() or "input preparation failed"
+            except OSError:
+                return False, "input preparation failed"
+        if time.monotonic() >= deadline:
+            return False, "timed out waiting for the input image"
+        time.sleep(0.1)
+
+
+def segment(manifest_path, nucleus, model, prob, nms, threads, tile_size=0,
+            device="cpu", wait_inputs=False, input_timeout=1800.0):
     if device == "cpu":
         # Force CPU even if a GPU-capable TensorFlow is installed; the env var
         # must be set before TensorFlow is imported below.
@@ -162,37 +187,52 @@ def segment(manifest_path, nucleus, model, prob, nms, threads, tile_size=0, devi
     with open(manifest_path, "r", encoding="utf-8") as fh:
         jobs = json.load(fh)
     for job in jobs:
-        img = np.load(job["image"])  # (C, H, W) or (H, W) float array
-        if img.ndim == 3:
-            img = img[nucleus]
-        # StarDist's pretrained models expect percentile-normalised input;
-        # raw intensities would otherwise segment into a few bogus shapes.
-        img = normalize(img, 1, 99.8).astype("float32")
-        # Tile large images (the default n_tiles=None means "no tiling", which
-        # processes the whole image in one slow forward pass). Tiling is also
-        # what produces the per-tile progress. n_tiles is a per-axis tuple
-        # (rows, columns). With a target tile_size we split each image into
-        # roughly size×size tiles by deriving the counts from its dimensions;
-        # otherwise we use StarDist's own auto guess.
-        if tile_size > 0:
-            h, w = img.shape[:2]
-            tiles_y = max(1, int(np.ceil(h / tile_size)))
-            tiles_x = max(1, int(np.ceil(w / tile_size)))
-        else:
-            tiles_y, tiles_x = model._guess_n_tiles(img)
-        t0 = time.perf_counter()
-        masks, _detail = model.predict_instances(
-            img, prob_thresh=prob, nms_thresh=nms,
-            n_tiles=(tiles_y, tiles_x),
-            show_tile_progress=_tile_progress,
-        )
-        elapsed = time.perf_counter() - t0
-        masks = np.asarray(masks, dtype=np.int32)
-        np.save(job["output"], masks)
-        print(
-            f"done: {job['output']}|cells={int(masks.max())}|time={elapsed:.1f}",
-            flush=True,
-        )
+        image_path = job["image"]
+        if wait_inputs:
+            ready, reason = _wait_for_input(image_path, input_timeout)
+            if not ready:
+                print(
+                    f"failed: {job['output']}|reason={reason}", flush=True
+                )
+                continue
+        try:
+            img = np.load(image_path)  # (C, H, W) or (H, W) float array
+            try:
+                os.remove(image_path)
+            except OSError:
+                pass
+            if img.ndim == 3:
+                img = img[nucleus]
+            # StarDist's pretrained models expect percentile-normalised input;
+            # raw intensities would otherwise segment into a few bogus shapes.
+            img = normalize(img, 1, 99.8).astype("float32")
+            # Tile large images (the default n_tiles=None means "no tiling",
+            # which processes the whole image in one slow forward pass).
+            # Tiling is also what produces the per-tile progress. n_tiles is a
+            # per-axis tuple (rows, columns). With a target tile_size we split
+            # each image into roughly size×size tiles by deriving the counts
+            # from its dimensions; otherwise use StarDist's own auto guess.
+            if tile_size > 0:
+                h, w = img.shape[:2]
+                tiles_y = max(1, int(np.ceil(h / tile_size)))
+                tiles_x = max(1, int(np.ceil(w / tile_size)))
+            else:
+                tiles_y, tiles_x = model._guess_n_tiles(img)
+            t0 = time.perf_counter()
+            masks, _detail = model.predict_instances(
+                img, prob_thresh=prob, nms_thresh=nms,
+                n_tiles=(tiles_y, tiles_x),
+                show_tile_progress=_tile_progress,
+            )
+            elapsed = time.perf_counter() - t0
+            masks = np.asarray(masks, dtype=np.int32)
+            np.save(job["output"], masks)
+            print(
+                f"done: {job['output']}|cells={int(masks.max())}|time={elapsed:.1f}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"failed: {job['output']}|reason={exc}", flush=True)
 
 
 def main(argv):
@@ -214,6 +254,9 @@ def main(argv):
     seg.add_argument("--tile-size", type=int, default=0)
     seg.add_argument("--device", default="cpu")
     seg.add_argument("--threads", type=int, default=_DEFAULT_THREADS)
+    seg.add_argument("--wait-inputs", action="store_true",
+                     help="wait for each input file to appear")
+    seg.add_argument("--input-timeout", type=float, default=1800.0)
 
     args = parser.parse_args(argv)
     if args.command == "check":
@@ -224,6 +267,7 @@ def main(argv):
         segment(
             args.manifest, args.nucleus, args.model, args.prob, args.nms,
             args.threads, args.tile_size, args.device,
+            args.wait_inputs, args.input_timeout,
         )
     else:
         parser.print_help()

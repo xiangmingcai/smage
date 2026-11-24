@@ -80,6 +80,7 @@ from functools import partial
 from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import naming as _data_naming
+from smage.data import project_paths as _project_paths
 from smage.data import sampling as _data_sampling
 from smage.data import stores as _data_stores
 from smage.widgets import canvas_export as _widgets_canvas_export
@@ -597,9 +598,8 @@ def _heatmap_store_load(ctx, task_id) -> dict | None:
     if path is None or not path.is_file():
         return None
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
+        data = _project_paths._load_json(path, ctx.project.path)
+    except (OSError, ValueError, TypeError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -609,9 +609,7 @@ def _heatmap_store_save(ctx, task_id, payload: dict) -> None:
     if path is None:
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
+        _project_paths._save_json(path, payload, ctx.project.path)
     except OSError:
         pass
 
@@ -622,11 +620,12 @@ def _heatmap_signature(ctx, page) -> str:
     task_id = page._heatmap_task_id
     files = []
     for path in params.get("files") or []:
+        stable = _project_paths._stable_path_key(ctx, path)
         try:
             st = Path(path).stat()
-            entry = [str(path), int(st.st_size), int(st.st_mtime_ns)]
+            entry = [stable, int(st.st_size), int(st.st_mtime_ns)]
         except OSError:
-            entry = [str(path), 0, 0]
+            entry = [stable, 0, 0]
         sig = _data_sampling._subsample_sig(ctx, task_id, path)
         if sig:
             entry.append(sig)
@@ -636,7 +635,11 @@ def _heatmap_signature(ctx, page) -> str:
             [kind, stage]
             for kind, stage in _data_columns._map_stages(ctx, task_id)
         ]
-        stages_text = json.dumps(stages, sort_keys=True, default=str)
+        stages_text = json.dumps(
+            _project_paths._stable_value(ctx, stages),
+            sort_keys=True,
+            default=str,
+        )
     except Exception:  # noqa: BLE001
         stages_text = ""
     payload = {

@@ -20,7 +20,8 @@ a mask column that downstream modules can use as the feature channel.
 1. Rasterize the nucleus channel into a 2-D image. Values pass through the
    map pipeline, so unmixed, compensated or illumination-corrected channels
    can be segmented directly.
-2. Threshold the image: **Otsu** (default, computed from the histogram) or a
+2. Threshold the image: **Otsu** (default, computed from a streaming
+   256-bin histogram so a large image is never duplicated in memory) or a
    **manual** value.
 3. Remove single-pixel noise with a 3×3 opening, label 4-connected
    components, and discard objects smaller than the **minimum nucleus area**.
@@ -31,7 +32,9 @@ a mask column that downstream modules can use as the feature channel.
    partition). Objects with a single seed are left unchanged.
 5. Optional **Expansion radius**: every background pixel within that distance
    of a nucleus takes the nearest nucleus's label. Expansions never overlap —
-   where two nuclei meet, the boundary is the equidistant line.
+   where two nuclei meet, the boundary is the equidistant line. Expansion is
+   computed in tiles with a halo, so the result matches a whole-image
+   distance transform while peak memory stays bounded.
 
 ## Settings
 
@@ -59,14 +62,26 @@ and running the calculation again appends a new run to the history instead of
 clearing it.
 
 Calculations run in the background. Nuclear Expansion computes masks on a
-worker thread, and Cellpose / StarDist prepare their images on a worker thread
-before running in a separate Python process, so the window stays responsive
-and other modules can be used while masks are being produced.
+worker thread. Cellpose / StarDist use a bounded pipeline: a feeder rasterizes
+only a couple of files ahead of the external Python process, and a separate
+writer thread saves each finished mask, so the window stays responsive and
+temporary disk use does not grow with the number of selected files. Use
+**Cancel** to stop after the current file (or kill the external run); masks
+that were already written are kept.
+
+Mask Input reads, validates and writes TIFF masks on a background thread
+instead of blocking the window.
 
 ## Output
 
 One mask per file, written under `Module/segmentation-<id>/` and exposed to
 downstream modules as a label column (each object has a unique integer).
+
+Scratch data (Cellpose/StarDist input and output `.npy` files, and the cached
+mask-edge images used by the preview) lives under
+`<project>/tmp/segmentation/`. It is disposable and is removed when a batch
+ends, when the project is closed, or when the module is closed. `tmp/` is not
+part of the saved project data and is not copied by **Save Project As**.
 
 ## Notes
 

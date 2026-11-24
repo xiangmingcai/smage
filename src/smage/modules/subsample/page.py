@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import json
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
@@ -21,6 +20,7 @@ from smage.widgets.resources import _lock_pixmap
 from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
+from smage.data import project_paths as _project_paths
 from smage.data import sampling as _data_sampling
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
@@ -39,8 +39,8 @@ def _subsample_saved_mask(ctx, task, parquet_path, manifest):
     if npy is None or not npy.is_file() or not meta_path.is_file():
         return None
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        meta = _project_paths._load_json(meta_path, ctx.project.path)
+    except (OSError, ValueError, TypeError):
         return None
     if meta != _data_sampling._subsample_mask_meta(ctx, task, parquet_path, manifest):
         return None
@@ -87,9 +87,10 @@ def _subsample_write_masks(ctx, page) -> int:
         try:
             folder.mkdir(parents=True, exist_ok=True)
             np.save(npy, mask)
-            meta_path.write_text(
-                json.dumps(_data_sampling._subsample_mask_meta(ctx, task, path, manifest)),
-                encoding="utf-8",
+            _project_paths._save_json(
+                meta_path,
+                _data_sampling._subsample_mask_meta(ctx, task, path, manifest),
+                ctx.project.path,
             )
             written += 1
         except OSError:

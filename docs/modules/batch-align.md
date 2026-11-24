@@ -61,6 +61,10 @@ same names.
   did not distort the biology.
 - Training runs on a bounded number of events per file, so very large files do
   not slow the module down.
+- CytoNorm's FlowSOM training matrix and result are exchanged through
+  `<project>/tmp/batch_align/runs/`. The run folder is deleted when training
+  finishes, fails or is cancelled; stale runs are cleaned when the project
+  opens, and all scratch data is removed when it closes.
 
 ## Related
 

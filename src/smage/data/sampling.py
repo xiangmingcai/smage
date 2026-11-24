@@ -17,6 +17,7 @@ from smage.core.sampling import (
     _stable_sample_selection,
     _subsample_allocate,
 )
+from smage.data import project_paths as _project_paths
 from smage.runlog import runlog
 
 
@@ -358,8 +359,8 @@ def _subsample_load_counts(ctx, task_id) -> dict:
     if key in cache:
         return cache[key]
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = _project_paths._load_json(path, ctx.project.path)
+    except (OSError, ValueError, TypeError):
         return {}
     entries = data.get("entries") if isinstance(data, dict) else None
     result = {
@@ -383,13 +384,9 @@ def _subsample_write_counts(ctx, task_def, counts) -> None:
             "count": int(count),
         }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps({"version": 1, "entries": entries}),
-            encoding="utf-8",
+        _project_paths._save_json(
+            path, {"version": 1, "entries": entries}, ctx.project.path
         )
-        tmp.replace(path)
     except OSError as error:
         runlog.error("subsample.counts_write", exc=error)
         return
@@ -413,7 +410,10 @@ def _subsample_seed(ctx, task_id, parquet_path) -> int:
     Derived from the ids only (never Python's `hash()`), so the selection
     does not change between sessions or when other files are added.
     """
-    payload = f"smage-subsample-v1|{task_id}|{parquet_path}"
+    payload = (
+        f"smage-subsample-v1|{task_id}|"
+        f"{_project_paths._stable_path_key(ctx, parquet_path)}"
+    )
     return int(hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16], 16)
 
 
@@ -527,7 +527,10 @@ def _subsample_sig(ctx, task_id, parquet_path) -> str:
         if params.get("basis") == "total":
             # A total is split across the selected files, so their set and
             # in-gate sizes are part of the decision.
-            part["files"] = sorted(files)
+            part["files"] = sorted(
+                _project_paths._stable_path_key(ctx, item)
+                for item in files
+            )
         parts.append(part)
     if not parts:
         return ""
@@ -669,7 +672,8 @@ def _subsample_coverage_paths(ctx, task, parquet_path):
     folder = ctx._subsample_coverage_dir(task.get("id"))
     if folder is None:
         return None, None
-    key = hashlib.sha1(str(parquet_path).encode("utf-8")).hexdigest()[:16]
+    stable = _project_paths._stable_path_key(ctx, parquet_path)
+    key = hashlib.sha1(stable.encode("utf-8")).hexdigest()[:16]
     stem = f"{_feature_safe_stem(Path(str(parquet_path)).stem)}.{key}"
     return folder / f"{stem}.npy", folder / f"{stem}.json"
 

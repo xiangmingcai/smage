@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from pathlib import Path
+from smage.data import scratch as _data_scratch
 from smage.data.workers import _ProcessWorker
 from smage.extensions_registry import (
     EXTENSION_DEFS,
@@ -955,15 +956,14 @@ class ExtensionsMixin:
             raise ValueError(f"{name} exited with code {code}")
 
     def _flowsom_external(self, page, q, X, xdim, ydim, k, seed,
-                          cancel_flag="_cluster_cancel") -> dict:
+                          cancel_flag="_cluster_cancel",
+                          area: str = "cluster") -> dict:
         """Run FlowSOM in the extension environment; return its arrays.
 
         Shared by Cluster (FlowSOM method) and Batch Alignment (CytoNorm
-        training). Smage never imports flowsom itself.
+        training). Smage never imports flowsom itself. ``area`` selects the
+        project scratch subfolder (``tmp/<area>/runs/<run-id>/``).
         """
-        import tempfile
-        from pathlib import Path as _Path
-
         import numpy as np
 
         if not self._ext_ready("flowsom"):
@@ -975,9 +975,10 @@ class ExtensionsMixin:
         runner = self._ext_runner_path("flowsom")
         q.put(("log", f"FlowSOM external run: grid {xdim}×{ydim}, k={k}, "
                       f"python={python}"))
-        with tempfile.TemporaryDirectory(prefix="smage-flowsom-") as tmp:
-            matrix = _Path(tmp) / "matrix.npy"
-            result = _Path(tmp) / "result.npz"
+        scratch_ctx = getattr(self, "_ctx", self)
+        with _data_scratch._scratch_run(scratch_ctx, area) as tmp:
+            matrix = tmp / "matrix.npy"
+            result = tmp / "result.npz"
             # Keep the caller's dtype: Cluster passes float64 and CytoNorm
             # float32, exactly as the previous in-process calls did.
             np.save(matrix, np.ascontiguousarray(X))
@@ -1005,11 +1006,9 @@ class ExtensionsMixin:
                 }
 
     def _parc_external(self, page, q, X, knn, resolution, seed,
-                       cancel_flag="_cluster_cancel"):
+                       cancel_flag="_cluster_cancel",
+                       area: str = "cluster"):
         """Run PARC in the extension environment; return 1-based labels."""
-        import tempfile
-        from pathlib import Path as _Path
-
         import numpy as np
 
         if not self._ext_ready("parc"):
@@ -1021,9 +1020,10 @@ class ExtensionsMixin:
         runner = self._ext_runner_path("parc")
         q.put(("log", f"PARC external run: knn={knn}, resolution={resolution}, "
                       f"python={python}"))
-        with tempfile.TemporaryDirectory(prefix="smage-parc-") as tmp:
-            matrix = _Path(tmp) / "matrix.npy"
-            result = _Path(tmp) / "result.npz"
+        scratch_ctx = getattr(self, "_ctx", self)
+        with _data_scratch._scratch_run(scratch_ctx, area) as tmp:
+            matrix = tmp / "matrix.npy"
+            result = tmp / "result.npz"
             np.save(matrix, np.ascontiguousarray(X))
             argv = [
                 python, str(runner), "run",

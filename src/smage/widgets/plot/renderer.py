@@ -61,6 +61,17 @@ def _point_size_px(value, default: float = POINT_SIZE_DEFAULT) -> float:
         # which would now be a plot-filling disc.
         return float(default)
     return max(POINT_SIZE_MIN, size)
+def _figure_status_title(plot_widget, text, **kwargs) -> None:
+    """Set a transient/error title and force display options to reapply later.
+
+    The display-options cache includes the sample-name title.  Without this
+    invalidation, a successful render could skip re-applying the title and
+    leave "Loading data…" on a plot whose points are already drawn.
+    """
+    plot_widget.setTitle(text, **kwargs)
+    plot_widget._display_signature = None
+
+
 IMAGE_LAYER_COLORS = [
     (0, 0, 255),      # blue
     (0, 255, 0),      # green
@@ -202,7 +213,7 @@ def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, ta
     mask, error = ctx._figure_filter_mask(plot_dict, task_id)
     if error:
         plot_widget.clear()
-        plot_widget.setTitle(error, color="#c0392b", size="10pt")
+        _figure_status_title(plot_widget, error, color="#c0392b", size="10pt")
         return
     if plot_dict.get("type") == "histogram":
         ctx._figure_render_histogram(
@@ -609,7 +620,7 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
     if not rec:
         plot_widget.clear()
         plot_widget._img_fitted = False
-        plot_widget.setTitle("No data file", color="#c0392b", size="10pt")
+        _figure_status_title(plot_widget, "No data file", color="#c0392b", size="10pt")
         return
     parquet_path = rec.get("parquet")
     # Display-only scale transforms (never modify the data itself).
@@ -626,7 +637,7 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
     if ent is None or ent.get("manifest") is None:
         plot_widget.clear()
         plot_widget._img_fitted = False
-        plot_widget.setTitle(
+        _figure_status_title(plot_widget,
             "No image index — re-import if this is an image",
             color="#c0392b", size="10pt",
         )
@@ -688,7 +699,7 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
         if key not in cache:
             err = ctx._figure_image_filter_error(f, parquet_path)
             if err:
-                plot_widget.setTitle(err, color="#c0392b", size="10pt")
+                _figure_status_title(plot_widget, err, color="#c0392b", size="10pt")
                 return
             worker = ctx._image_filter_worker()
             pending = getattr(ctx, "_image_filter_pending", {})
@@ -712,14 +723,14 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                     stages, base_columns, height, width, blocks,
                     origin=(manifest["xmin"], manifest["ymin"]),
                 )
-            plot_widget.setTitle("Applying filter…", color="#b58900", size="10pt")
+            _figure_status_title(plot_widget, "Applying filter…", color="#b58900", size="10pt")
             return
         mask_ent = cache[key]
         if isinstance(mask_ent, str):
-            plot_widget.setTitle(mask_ent, color="#c0392b", size="10pt")
+            _figure_status_title(plot_widget, mask_ent, color="#c0392b", size="10pt")
             return
         if mask_ent is None:
-            plot_widget.setTitle(
+            _figure_status_title(plot_widget,
                 "Filter could not be applied", color="#c0392b", size="10pt"
             )
             return
@@ -752,7 +763,7 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
         if default_channel is None:
             plot_widget.clear()
             plot_widget._img_fitted = False
-            plot_widget.setTitle(
+            _figure_status_title(plot_widget,
                 "No channels available", color="#c0392b", size="10pt",
             )
             ctx._figure_update_image_legend(plot_widget, [])
@@ -958,7 +969,11 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                 # module (the raster pipeline maps the name back to the
                 # stored column).
                 produced = any(
-                    (kind == "unmix" and channel in stage["names"])
+                    (
+                        kind == "unmix"
+                        and not stage.get("generated")
+                        and channel in stage["names"]
+                    )
                     or (
                         kind == "calculation"
                         and any(
@@ -1070,14 +1085,14 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
         _figure_hide_cursor_readout(plot_widget)
         ctx._figure_update_image_legend(plot_widget, [])
         if missing_pyramid:
-            plot_widget.setTitle(
+            _figure_status_title(plot_widget,
                 "Image pyramid not found for: "
                 + ", ".join(missing_pyramid)
                 + " — please check",
                 color="#c0392b", size="10pt",
             )
         elif unavailable:
-            plot_widget.setTitle(
+            _figure_status_title(plot_widget,
                 "Parameter not available in this file: " + ", ".join(unavailable),
                 color="#c0392b", size="10pt",
             )
@@ -1126,7 +1141,7 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
         ctx._figure_set_original_ticks(plot_widget, axis, None)
     if missing_pyramid:
         # Some channels could not be drawn: say so in the plot itself.
-        plot_widget.setTitle(
+        _figure_status_title(plot_widget,
             "Image pyramid not found for: "
             + ", ".join(missing_pyramid)
             + " — please check",
@@ -1360,10 +1375,10 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
     x_name = plot_dict.get("x")
     y_name = plot_dict.get("y")
     if not rec:
-        plot_widget.setTitle("No data file", color="#c0392b", size="10pt")
+        _figure_status_title(plot_widget, "No data file", color="#c0392b", size="10pt")
         return
     if not x_name or not y_name:
-        plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
+        _figure_status_title(plot_widget, "Parameter not in this file", color="#c0392b", size="10pt")
         return
 
     # Display transforms (upstream Scale + this module's live scale edits).
@@ -1400,10 +1415,12 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
     indices = None
     arrays = None
     if extra_stages is None:
-        ready = ctx._pool_ready(rec["parquet"], task_id, columns)
+        ready = ctx._pool_ready(
+            rec["parquet"], task_id, columns, max_points=max_points
+        )
         if ready is None:
             pending = ctx._pool_pending_keys(
-                rec["parquet"], task_id, columns
+                rec["parquet"], task_id, columns, max_points=max_points
             )
             if pending and not any(k in ctx._pool_failed for k in pending):
                 ctx._pool_register(
@@ -1415,7 +1432,7 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
                         p, w, t, m, tid, es, tk
                     ),
                 )
-                plot_widget.setTitle(
+                _figure_status_title(plot_widget,
                     "Loading data…", color="#6b7785", size="10pt"
                 )
                 return
@@ -1461,7 +1478,7 @@ def _figure_render_scatter(ctx, plot_dict: dict, plot_widget, column_transforms=
         except Exception:
             return
         if x_name not in df.columns or y_name not in df.columns:
-            plot_widget.setTitle(
+            _figure_status_title(plot_widget,
                 "Parameter not in this file", color="#c0392b", size="10pt"
             )
             return
@@ -2375,10 +2392,10 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
     rec = ctx._figure_record(plot_dict.get("file"))
     x_name = plot_dict.get("x")
     if not rec:
-        plot_widget.setTitle("No data file", color="#c0392b", size="10pt")
+        _figure_status_title(plot_widget, "No data file", color="#c0392b", size="10pt")
         return
     if not x_name:
-        plot_widget.setTitle("Parameter not in this file", color="#c0392b", size="10pt")
+        _figure_status_title(plot_widget, "Parameter not in this file", color="#c0392b", size="10pt")
         return
     display_cache = {}
 
@@ -2390,15 +2407,22 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
         return display_cache[name]
 
     # Same pooled data as the scatter views: one column is plenty for a
-    # histogram, and the pool is already in memory for this file.
+    # histogram, and the pool is already in memory for this file.  A
+    # histogram has no per-plot point limit, so use the global scatter limit.
+    limit = plot_dict.get("max_points") or _setting(
+        "plot", "max_points", 50000
+    )
+    max_points = max(1000, int(limit or 50000))
     pooled_mode = False
     indices = None
     arrays = None
     if extra_stages is None:
-        ready = ctx._pool_ready(rec["parquet"], task_id, [x_name])
+        ready = ctx._pool_ready(
+            rec["parquet"], task_id, [x_name], max_points=max_points
+        )
         if ready is None:
             pending = ctx._pool_pending_keys(
-                rec["parquet"], task_id, [x_name]
+                rec["parquet"], task_id, [x_name], max_points=max_points
             )
             if pending and not any(k in ctx._pool_failed for k in pending):
                 ctx._pool_register(
@@ -2410,7 +2434,7 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
                         p, w, t, m, tid, es, tk
                     ),
                 )
-                plot_widget.setTitle(
+                _figure_status_title(plot_widget,
                     "Loading data…", color="#6b7785", size="10pt"
                 )
                 return
@@ -2439,7 +2463,7 @@ def _figure_render_histogram(ctx, plot_dict: dict, plot_widget, column_transform
         except Exception:
             return
         if x_name not in df.columns:
-            plot_widget.setTitle(
+            _figure_status_title(plot_widget,
                 "Parameter not in this file", color="#c0392b", size="10pt"
             )
             return

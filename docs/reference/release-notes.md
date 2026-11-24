@@ -3,6 +3,24 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.4.1 — 2026-11-24
+
+- **Portable projects**: project-internal paths are stored relative to the
+  `.smage` folder, so the whole folder can be copied to another folder or
+  computer and opened directly. Existing projects migrate on first open.
+- **Rename Project…** in the File menu renames the project folder and project
+  name together; it is available only while a project is open.
+- **Save Project As** copies the complete project, including `Module/`, instead
+  of only the data folder.
+- **Unmix** is now a pure generate module: **Run unmix** writes companion
+  unmixed columns, and downstream modules read those generated outputs.
+- **Segmentation** batches run through a bounded background pipeline with
+  **Cancel**, and disposable files live under the project `tmp/` folder.
+- **Figure** uses per-plot sampled pools and no longer retains full-file
+  Compensation arrays, reducing memory use when switching large files.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.3.4 — 2026-11-23
 
 - **Figure**: multi-selected image plots now share a **Channels** table with

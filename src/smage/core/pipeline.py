@@ -81,7 +81,10 @@ def _pipeline_dependencies(stages, names, parquet_path=None) -> set:
             if needed & set(stage.get("columns") or []):
                 needed |= set(stage["columns"])
         elif kind == "unmix":
-            if needed & set(stage["names"]):
+            if (
+                not stage.get("generated")
+                and needed & set(stage["names"])
+            ):
                 needed |= set(stage["columns"])
         elif kind == "illumination":
             for sub in stage.get("submodules", []):
@@ -174,6 +177,10 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
             values.update(out)
             continue
         if kind == "unmix":
+            if stage.get("generated"):
+                # The values were already loaded from the saved companion
+                # output; the stage only marks pipeline order.
+                continue
             if parquet_path is not None and parquet_path not in stage["samples"]:
                 continue
             sources = stage["columns"]

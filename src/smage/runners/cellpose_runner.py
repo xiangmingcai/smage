@@ -9,7 +9,8 @@ Usage:
   python cellpose_runner.py check
   python cellpose_runner.py download-model --model cpsam
   python cellpose_runner.py segment --manifest jobs.json --nucleus 0 \
-      [--cyto 1] [--model cpsam] [--device cpu] [--threads 8]
+      [--cyto 1] [--model cpsam] [--device cpu] [--threads 8] \
+      [--wait-inputs] [--input-timeout 1800]
 """
 import argparse
 import json
@@ -71,7 +72,34 @@ def download_model(model, threads):
     print("model ready:", model)
 
 
-def segment(manifest_path, nucleus, cyto, model, threads, device="cpu"):
+def _failed_marker(image_path):
+    """Path of the marker Smage writes when rasterization fails."""
+    return image_path[:-4] + ".failed" if image_path.endswith(".npy") else image_path + ".failed"
+
+
+def _wait_for_input(image_path, timeout):
+    """Wait for an atomically published input, or a failure marker.
+
+    Returns ``(ready, reason)``; ``ready`` is False on failure/timeout.
+    """
+    marker = _failed_marker(image_path)
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        if os.path.exists(image_path):
+            return True, ""
+        if os.path.exists(marker):
+            try:
+                with open(marker, "r", encoding="utf-8") as fh:
+                    return False, fh.read().strip() or "input preparation failed"
+            except OSError:
+                return False, "input preparation failed"
+        if time.monotonic() >= deadline:
+            return False, "timed out waiting for the input image"
+        time.sleep(0.1)
+
+
+def segment(manifest_path, nucleus, cyto, model, threads, device="cpu",
+            wait_inputs=False, input_timeout=1800.0):
     import torch
     torch.set_num_threads(max(1, int(threads)))
     from cellpose import models
@@ -80,20 +108,36 @@ def segment(manifest_path, nucleus, cyto, model, threads, device="cpu"):
     m = models.CellposeModel(model_type=model, gpu=(device == "gpu"))
     print(f"device: {m.device}", flush=True)
     for job in jobs:
-        img = np.load(job["image"])  # (C, H, W) float array
-        if cyto is not None:
-            stack = img[[cyto, nucleus]]
-        else:
-            stack = img[nucleus:nucleus + 1]
-        t0 = time.perf_counter()
-        masks, _flows, _styles = m.eval(stack)
-        elapsed = time.perf_counter() - t0
-        masks = np.asarray(masks, dtype=np.int32)
-        np.save(job["output"], masks)
-        print(
-            f"done: {job['output']}|cells={int(masks.max())}|time={elapsed:.1f}",
-            flush=True,
-        )
+        image_path = job["image"]
+        if wait_inputs:
+            ready, reason = _wait_for_input(image_path, input_timeout)
+            if not ready:
+                print(
+                    f"failed: {job['output']}|reason={reason}", flush=True
+                )
+                continue
+        try:
+            img = np.load(image_path)  # (C, H, W) float array
+            # The input is no longer needed once it is in memory.
+            try:
+                os.remove(image_path)
+            except OSError:
+                pass
+            if cyto is not None:
+                stack = img[[cyto, nucleus]]
+            else:
+                stack = img[nucleus:nucleus + 1]
+            t0 = time.perf_counter()
+            masks, _flows, _styles = m.eval(stack)
+            elapsed = time.perf_counter() - t0
+            masks = np.asarray(masks, dtype=np.int32)
+            np.save(job["output"], masks)
+            print(
+                f"done: {job['output']}|cells={int(masks.max())}|time={elapsed:.1f}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"failed: {job['output']}|reason={exc}", flush=True)
 
 
 def main(argv):
@@ -113,6 +157,9 @@ def main(argv):
     seg.add_argument("--model", default="cpsam")
     seg.add_argument("--device", default="cpu")
     seg.add_argument("--threads", type=int, default=_DEFAULT_THREADS)
+    seg.add_argument("--wait-inputs", action="store_true",
+                     help="wait for each input file to appear")
+    seg.add_argument("--input-timeout", type=float, default=1800.0)
 
     args = parser.parse_args(argv)
     if args.command == "check":
@@ -120,8 +167,10 @@ def main(argv):
     elif args.command == "download-model":
         download_model(args.model, args.threads)
     elif args.command == "segment":
-        segment(args.manifest, args.nucleus, args.cyto, args.model, args.threads,
-                args.device)
+        segment(
+            args.manifest, args.nucleus, args.cyto, args.model, args.threads,
+            args.device, args.wait_inputs, args.input_timeout,
+        )
     else:
         parser.print_help()
         sys.exit(1)

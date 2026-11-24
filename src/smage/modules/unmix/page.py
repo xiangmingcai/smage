@@ -1,4 +1,4 @@
-"""Unmix module: spectral unmixing and unmix-for-image pyramids."""
+"""Unmix module: spectral unmixing and generated unmix outputs."""
 from __future__ import annotations
 
 import queue
@@ -58,6 +58,10 @@ from smage.core.gates import (
     _compute_gate_filter_mask,
     _gate_needed_columns,
 )
+from smage.core.pipeline import (
+    _evaluate_stages,
+    _pipeline_dependencies,
+)
 from smage.core.settings import (
     _default_palette,
     _plot_background,
@@ -92,6 +96,7 @@ from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
+from smage.data import project_paths as _project_paths
 from smage.widgets import canvas_export as _widgets_canvas_export
 from smage.widgets import colormap as _widgets_colormap
 from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
@@ -101,13 +106,10 @@ from smage.widgets.plot import export as _widgets_plot_export
 
 
 def _unmix_output_names(ctx, task_id, parquet_path) -> list:
-    """Names of the parameters an upstream Unmix module adds to this file."""
-    names = []
-    for config in _data_columns._upstream_unmix_configs(ctx, task_id, parquet_path):
-        for name in config["names"]:
-            if name not in names:
-                names.append(name)
-    return names
+    """Generated Unmix columns exposed to a downstream module."""
+    if not task_id or not parquet_path:
+        return []
+    return list(ctx._unmix_applied_columns(task_id, parquet_path))
 
 
 def _unmix_flow_config(ctx, task_def) -> dict | None:
@@ -751,7 +753,7 @@ def _unmix_reorder_spectra(ctx, page) -> None:
 
 
 def _unmix_log(ctx, page, text: str) -> None:
-    """Append a line to the Unmix-for-image log (saved with the module)."""
+    """Append a line to the Unmix run log (saved with the module)."""
     log = getattr(page, "_unmix_image_log", None)
     if log is not None:
         log.appendPlainText(text)
@@ -761,26 +763,44 @@ def _unmix_log(ctx, page, text: str) -> None:
 
 
 def _unmix_output_signature(ctx, task_id, parquet_path, config) -> str:
-    """Fingerprint of the unmixing config an image output was made from."""
+    """Fingerprint of the config and inputs an Unmix output was made from."""
     import numpy as np
 
+    try:
+        st = Path(str(parquet_path)).stat()
+        source_stat = f"{int(st.st_size)}-{int(st.st_mtime_ns)}"
+    except OSError:
+        source_stat = ""
     payload = {
         "task": task_id,
-        "file": str(parquet_path),
+        "file": _project_paths._stable_path_key(ctx, parquet_path),
+        "source": source_stat,
+        "kind": (
+            "image"
+            if _data_image_index._image_load_manifest(
+                ctx, parquet_path
+            ) is not None else "table"
+        ),
         "columns": list(config.get("columns") or []),
         "names": list(config.get("names") or []),
         "matrix": np.round(
             np.asarray(config.get("matrix"), dtype="float64"), 6
         ).tolist(),
         "method": config.get("method"),
+        # Upstream map stages (Compensation, Illumination, previous Unmix,
+        # Batch Align, Rename, Calculation) change the source values without
+        # changing the source file, so they must invalidate the output.
+        "stages": _data_columns._map_stage_token(
+            ctx, task_id, parquet_path
+        ),
     }
     return hashlib.md5(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 
-def _unmix_write_image_output(ctx, task_id, parquet_path, config) -> dict:
-    """Write one file's unmixed channels + their image pyramid."""
+def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
+    """Write one file's unmixed channels (and image pyramid for images)."""
     import numpy as np
     import pandas as pd
     import pyarrow as pa
@@ -791,59 +811,152 @@ def _unmix_write_image_output(ctx, task_id, parquet_path, config) -> dict:
     matrix = np.asarray(config.get("matrix"), dtype="float64")
     if not names or not columns:
         raise ValueError("no unmixing signatures")
-    pf = pq.ParquetFile(parquet_path)
-    available = set(pf.schema_arrow.names)
-    missing = [c for c in columns if c not in available]
-    if missing:
-        raise ValueError("channel(s) not in this file: " + ", ".join(missing))
+    if (
+        matrix.ndim != 2
+        or matrix.shape[0] != len(names)
+        or matrix.shape[1] != len(columns)
+    ):
+        raise ValueError("the unmixing matrix does not match its columns")
+    # The same least-squares solution the pipeline uses for table files.
+    pinv = config.get("_pinv")
+    if pinv is None:
+        pinv = np.linalg.pinv(matrix)
+        config["_pinv"] = pinv
+
+    manifest = _data_image_index._image_load_manifest(ctx, parquet_path)
+    is_image = manifest is not None
+    origin = (
+        (float(manifest["xmin"]), float(manifest["ymin"]))
+        if is_image else None
+    )
     stem = Path(str(parquet_path)).stem
     rel = _data_files._module_rel(ctx, task_id, f"{stem}_unmix.parquet")
     out_path = ctx.project.path / rel
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    stages = ctx._map_stages(task_id, parquet_path=parquet_path)
+    needed = (
+        _pipeline_dependencies(stages, columns, parquet_path)
+        if stages else set(columns)
+    )
+    pf = pq.ParquetFile(parquet_path)
+    available = set(pf.schema_arrow.names)
+    virtual = sorted(c for c in needed if c not in available)
+    # Virtual columns (Gate2Col, masks, ...) cannot be read from the source
+    # parquet in chunks.  The full pipeline is the fallback and applies the
+    # same stages plus those generated columns.
+    fallback = bool(virtual) or ctx._feature_output(parquet_path) is not None
+    if not is_image and any(kind == "illumination" for kind, _ in stages):
+        # The illumination factor uses the file-wide x/y origin; loading the
+        # full table is the only way to reproduce that for non-image data.
+        fallback = True
+
     writer = None
+
+    def write_frame(x_values, y_values, unmixed) -> None:
+        nonlocal writer
+        data = {}
+        if is_image:
+            data["x"] = np.asarray(x_values, dtype="float64")
+            data["y"] = np.asarray(y_values, dtype="float64")
+        for j, name in enumerate(names):
+            data[name] = unmixed[:, j]
+        table = pa.Table.from_pandas(
+            pd.DataFrame(data), preserve_index=False
+        )
+        if writer is None:
+            writer = pq.ParquetWriter(str(out_path), table.schema)
+        writer.write_table(table)
+
     try:
-        for batch in pf.iter_batches(
-            batch_size=500_000, columns=["x", "y"] + columns
-        ):
-            df = batch.to_pandas()
-            values = np.column_stack([
-                np.nan_to_num(
-                    pd.to_numeric(df[c], errors="coerce").to_numpy(
-                        dtype="float64"
-                    ),
-                    nan=0.0, posinf=0.0, neginf=0.0,
-                )
-                for c in columns
-            ])
-            unmixed = values @ matrix.T
-            data = {
-                "x": df["x"].to_numpy(dtype="float64"),
-                "y": df["y"].to_numpy(dtype="float64"),
-            }
-            for j, name in enumerate(names):
-                data[name] = unmixed[:, j]
-            table = pa.Table.from_pandas(
-                pd.DataFrame(data), preserve_index=False
+        if fallback:
+            requested = list(dict.fromkeys(
+                (["x", "y"] if is_image else []) + columns
+            ))
+            full = ctx._column_data(
+                task_id, parquet_path, requested, row_filter=False
             )
-            if writer is None:
-                writer = pq.ParquetWriter(str(out_path), table.schema)
-            writer.write_table(table)
+            if is_image and ("x" not in full or "y" not in full):
+                raise ValueError("the source file has no x/y columns")
+            missing = [c for c in columns if c not in full]
+            if missing:
+                raise ValueError(
+                    "channel(s) could not be computed: " + ", ".join(missing)
+                )
+            stacked = np.column_stack([
+                np.asarray(full[c], dtype="float64") for c in columns
+            ])
+            unmixed = stacked @ pinv
+            for start in range(0, len(unmixed), 500_000):
+                end = min(start + 500_000, len(unmixed))
+                write_frame(
+                    full.get("x", [])[start:end] if is_image else None,
+                    full.get("y", [])[start:end] if is_image else None,
+                    unmixed[start:end],
+                )
+        else:
+            read_cols = list(dict.fromkeys(
+                (["x", "y"] if is_image else []) + list(needed)
+            ))
+            for batch in pf.iter_batches(
+                batch_size=500_000, columns=read_cols
+            ):
+                df = batch.to_pandas()
+                values = {
+                    c: pd.to_numeric(df[c], errors="coerce").to_numpy(
+                        dtype="float64"
+                    )
+                    for c in read_cols if c in df.columns
+                }
+                if stages:
+                    evaluated = _evaluate_stages(
+                        stages, values, columns,
+                        parquet_path=parquet_path,
+                        cache=None,
+                        origin=origin,
+                    )
+                else:
+                    evaluated = {
+                        c: values[c] for c in columns if c in values
+                    }
+                missing = [c for c in columns if c not in evaluated]
+                if missing:
+                    raise ValueError(
+                        "channel(s) could not be computed: "
+                        + ", ".join(missing)
+                    )
+                stacked = np.column_stack([
+                    np.asarray(evaluated[c], dtype="float64")
+                    for c in columns
+                ])
+                unmixed = stacked @ pinv
+                if is_image and ("x" not in values or "y" not in values):
+                    raise ValueError("the source file has no x/y columns")
+                write_frame(
+                    values.get("x") if is_image else None,
+                    values.get("y") if is_image else None,
+                    unmixed,
+                )
     finally:
         if writer is not None:
             writer.close()
-    _build_image_index_files(str(out_path))
+    if is_image:
+        _build_image_index_files(str(out_path))
+    else:
+        # A table output may reuse the path of an older image output.
+        shutil.rmtree(str(out_path) + ".imgidx", ignore_errors=True)
     return {
         "path": rel,
         "columns": names,
-        "kind": "image",
+        "kind": "image" if is_image else "table",
         "signature": _unmix_output_signature(ctx,
             task_id, parquet_path, config
         ),
     }
 
 
-def _unmix_removed_image_outputs(ctx, page, samples) -> list:
-    """Saved image outputs whose source file is no longer selected."""
+def _unmix_removed_outputs(ctx, page, samples) -> list:
+    """Saved outputs whose source file is no longer selected."""
     selected = {str(path) for path in samples or [] if path}
     removed = []
     for path, rec in (page._unmix_params.get("outputs") or {}).items():
@@ -861,13 +974,13 @@ def _unmix_removed_image_outputs(ctx, page, samples) -> list:
     return removed
 
 
-def _unmix_confirm_remove_image_outputs(ctx, page, samples):
+def _unmix_confirm_remove_outputs(ctx, page, samples):
     """Ask before dropping outputs of deselected files.
 
     Returns the removed records (possibly an empty list) when the run may
     continue, or None when the user cancels.
     """
-    removed = _unmix_removed_image_outputs(ctx, page, samples)
+    removed = _unmix_removed_outputs(ctx, page, samples)
     if not removed:
         return []
     shown = "\n".join(f"  - {item['label']}" for item in removed[:8])
@@ -877,10 +990,10 @@ def _unmix_confirm_remove_image_outputs(ctx, page, samples):
         f"{len(removed)} previously unmixed file(s) are no longer selected:\n\n"
         f"{shown}\n\n"
         "Continuing will delete their unmixed outputs and remove these "
-        "channels from downstream image plots.\n\nContinue?"
+        "channels from downstream modules.\n\nContinue?"
     )
     reply = QMessageBox.question(
-        ctx.host, "Unmix for image", text,
+        ctx.host, "Run unmix", text,
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         QMessageBox.StandardButton.No,
     )
@@ -891,7 +1004,7 @@ def _unmix_confirm_remove_image_outputs(ctx, page, samples):
         outputs.pop(item["source"], None)
     page._unmix_params["outputs"] = outputs
     page._unmix_task_def["params"] = page._unmix_params
-    # With no image outputs left, the module no longer locks its inputs.
+    # With no outputs left, the module no longer locks its inputs.
     page._unmix_task_def["output"] = {"saved": bool(outputs)}
     _unmix_save_now(ctx, page)
     return removed
@@ -916,8 +1029,8 @@ def _unmix_output_abs_path(ctx, rec):
     return path
 
 
-def _unmix_delete_image_output(ctx, rec) -> tuple[bool, str]:
-    """Delete one unmix parquet and its image pyramid. Return (ok, error)."""
+def _unmix_delete_output(ctx, rec) -> tuple[bool, str]:
+    """Delete one unmix parquet and, if present, its image pyramid."""
     path = _unmix_output_abs_path(ctx, rec)
     if path is None:
         return False, "invalid output path"
@@ -936,8 +1049,8 @@ def _unmix_delete_image_output(ctx, rec) -> tuple[bool, str]:
     return (not errors), "; ".join(errors)
 
 
-def _unmix_start_image(ctx, page) -> None:
-    """Save, then generate the unmixed image channels of every sample."""
+def _unmix_start_run(ctx, page) -> None:
+    """Save, then generate the unmixed channels of every selected sample."""
     import queue as queue_module
 
     if getattr(page, "_unmix_running", False):
@@ -946,33 +1059,33 @@ def _unmix_start_image(ctx, page) -> None:
     samples = [p for p in (params.get("samples") or []) if p]
     if not samples:
         QMessageBox.information(
-            ctx.host, "Unmix for image",
+            ctx.host, "Run unmix",
             "Select at least one sample under “Samples to be unmixed”.",
         )
         return
     problem = _unmix_manual_problem(ctx, page)
     if problem:
-        QMessageBox.information(ctx.host, "Unmix for image", problem)
+        QMessageBox.information(ctx.host, "Run unmix", problem)
         return
     # The matrix that gets applied is the saved one.
     _unmix_save_now(ctx, page)
     config = _unmix_flow_config(ctx, page._unmix_task_def)
     if config is None:
         QMessageBox.information(
-            ctx.host, "Unmix for image",
+            ctx.host, "Run unmix",
             _unmix_manual_problem(ctx, page)
             or "Add at least one complete signature to the matrix first.",
         )
         return
-    removed = _unmix_confirm_remove_image_outputs(ctx, page, samples)
+    removed = _unmix_confirm_remove_outputs(ctx, page, samples)
     if removed is None:
         return
     page._unmix_running = True
     page._unmix_cancel = False
-    if getattr(page, "_unmix_image_btn", None) is not None:
-        page._unmix_image_btn.setEnabled(False)
+    if getattr(page, "_unmix_run_btn", None) is not None:
+        page._unmix_run_btn.setEnabled(False)
     _unmix_log(ctx,
-        page, f"— Unmix for image: {len(samples)} file(s) selected —"
+        page, f"— Run unmix: {len(samples)} file(s) selected —"
     )
     # Resolve the user-facing names here (the worker runs off the UI thread).
     labels = {
@@ -982,14 +1095,14 @@ def _unmix_start_image(ctx, page) -> None:
     q = queue_module.Queue()
     page._unmix_queue = q
     page._unmix_thread = threading.Thread(
-        target=partial(_unmix_image_worker, ctx),
+        target=partial(_unmix_output_worker, ctx),
         args=(page, q, config, samples, labels, removed),
         daemon=True,
     )
     page._unmix_thread.start()
     timer = QTimer(ctx.host)
     timer.setInterval(100)
-    timer.timeout.connect(lambda: _unmix_image_poll(ctx, page))
+    timer.timeout.connect(lambda: _unmix_output_poll(ctx, page))
     timer.start()
     page._unmix_timer = timer
 
@@ -1005,12 +1118,20 @@ def _unmix_output_is_current(ctx, task_id, parquet_path, config, rec) -> bool:
     path = ctx.project.path / rec["path"]
     if not path.is_file():
         return False
-    return _data_image_index._image_load_manifest(ctx, str(path)) is not None
+    if rec.get("kind", "image") == "image":
+        return _data_image_index._image_load_manifest(
+            ctx, str(path)
+        ) is not None
+    return True
 
 
-def _unmix_image_worker(ctx, page, q, config, files, labels=None,
+def _unmix_output_worker(ctx, page, q, config, files, labels=None,
                         removed=None) -> None:
-    """Background: delete stale outputs, then generate the selected files."""
+    """Background: delete stale outputs, then generate the selected files.
+
+    Both table and image samples are written; image files additionally get
+    an image pyramid.
+    """
     task_id = page._unmix_task_id
     labels = labels or {}
     removed = list(removed or [])
@@ -1019,7 +1140,7 @@ def _unmix_image_worker(ctx, page, q, config, files, labels=None,
     try:
         for item in removed:
             label = item.get("label") or str(item.get("source") or "")
-            ok, error = _unmix_delete_image_output(ctx, item.get("rec"))
+            ok, error = _unmix_delete_output(ctx, item.get("rec"))
             if ok:
                 q.put(("log", f"✓ removed: {label}"))
             else:
@@ -1032,10 +1153,6 @@ def _unmix_image_worker(ctx, page, q, config, files, labels=None,
                 q.put(("log", "Cancelled."))
                 break
             label = labels.get(path) or Path(str(path)).name
-            if _data_image_index._image_load_manifest(ctx, path) is None:
-                q.put(("log", f"• skipped (not an image): {label}"))
-                skipped += 1
-                continue
             if _unmix_output_is_current(ctx,
                 task_id, path, config, outputs.get(path)
             ):
@@ -1044,7 +1161,7 @@ def _unmix_image_worker(ctx, page, q, config, files, labels=None,
                 unchanged += 1
                 continue
             try:
-                outputs[path] = _unmix_write_image_output(ctx,
+                outputs[path] = _unmix_write_output(ctx,
                     task_id, path, config
                 )
                 done += 1
@@ -1058,7 +1175,7 @@ def _unmix_image_worker(ctx, page, q, config, files, labels=None,
         q.put(("error", str(exc)))
 
 
-def _unmix_image_poll(ctx, page) -> None:
+def _unmix_output_poll(ctx, page) -> None:
     q = getattr(page, "_unmix_queue", None)
     if q is None:
         return
@@ -1088,12 +1205,12 @@ def _unmix_image_poll(ctx, page) -> None:
     if timer is not None:
         timer.stop()
         page._unmix_timer = None
-    if getattr(page, "_unmix_image_btn", None) is not None:
-        page._unmix_image_btn.setEnabled(not page._unmix_locked)
+    if getattr(page, "_unmix_run_btn", None) is not None:
+        page._unmix_run_btn.setEnabled(not page._unmix_locked)
     if outputs is not None:
         page._unmix_params["outputs"] = outputs
         page._unmix_task_def["params"] = page._unmix_params
-        # Image outputs lock the upstream modules; removing the last one
+        # Generated outputs lock the upstream modules; removing the last one
         # releases that lock.
         page._unmix_task_def["output"] = {"saved": bool(outputs)}
         if ctx.project is not None:
@@ -1105,12 +1222,12 @@ def _unmix_image_poll(ctx, page) -> None:
         ctx._module_saved(page)
     if error:
         _unmix_log(ctx, page, f"✗ {error}")
-        QMessageBox.warning(ctx.host, "Unmix for image", error)
+        QMessageBox.warning(ctx.host, "Run unmix", error)
     else:
-        done, failed, skipped, unchanged, removed = counts
+        done, failed, _skipped, unchanged, removed = counts
         summary = (
             f"— Done: {done} generated, {unchanged} already up to date, "
-            f"{failed} failed, {skipped} skipped (not images)"
+            f"{failed} failed"
         )
         if removed:
             summary += f", {removed} removed"
@@ -2642,7 +2759,7 @@ def _unmix_sample_panel(ctx, page) -> QWidget:
 
 
 def _unmix_image_panel(ctx, page) -> QWidget:
-    """Unmixing method, the "Unmix for image" action and its log."""
+    """Unmixing method, the Run unmix action and its log."""
     panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
@@ -2664,16 +2781,16 @@ def _unmix_image_panel(ctx, page) -> QWidget:
     method_row.addWidget(method_combo, 1)
     lay.addLayout(method_row)
 
-    run_btn = QPushButton("Unmix for image")
+    run_btn = QPushButton("Run unmix")
     run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     run_btn.setEnabled(not page._unmix_locked)
     run_btn.setToolTip(
-        "Precompute the unmixed channels of every selected image file "
-        "and save them as image pyramids for downstream image plots"
+        "Generate the unmixed channels of every selected sample and save "
+        "them for downstream modules; image files also get image pyramids"
     )
-    run_btn.clicked.connect(lambda _=False: _unmix_start_image(ctx, page))
+    run_btn.clicked.connect(lambda _=False: _unmix_start_run(ctx, page))
     lay.addWidget(run_btn)
-    page._unmix_image_btn = run_btn
+    page._unmix_run_btn = run_btn
 
     log = QPlainTextEdit()
     log.setReadOnly(True)

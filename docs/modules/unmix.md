@@ -38,8 +38,9 @@ button. The gate shape is stored per file.
 
 ## Output
 
-The spectra and their gates feed the second tab. After running the unmixing
-(see [Matrix Unmixing](unmix-matrix.md)), the module exposes one unmixed
+The spectra and their gates feed the second tab. **Run unmix** generates the
+unmixed channels for every selected table and image file (see
+[Matrix Unmixing](unmix-matrix.md)); the module then exposes one unmixed
 channel per signature to downstream modules.
 
 ## Saving plots
@@ -52,7 +53,8 @@ the screen resolution.
 
 ## Notes
 
-- Unmixing is the most expensive stage; the matrix is cached per file and
-  task, and files outside the module's sample list are skipped.
+- Unmix is a generate module, so it has no unmixed channels downstream until
+  **Run unmix** has written them. Unchanged outputs are skipped on later
+  runs.
 - Negative controls are subtracted per signature in the Matrix Unmixing tab;
   leaving them empty means no autofluorescence subtraction.

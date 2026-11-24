@@ -95,6 +95,20 @@ def mask_io() -> None:
             (Path(str(path) + ".imgidx") / "manifest.json").is_file(),
             "the mask label pyramid is built",
         )
+        import json
+
+        manifest = json.loads(
+            (Path(str(path) + ".imgidx") / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        finest = manifest["levels"][0]
+        harness.eq(finest["block"], 1, "a 32×32 mask uses block size 1")
+        level = np.load(Path(str(path) + ".imgidx") / finest["file"])
+        harness.check(
+            np.array_equal(level[..., 0], mask),
+            "the block-1 level is the mask itself",
+        )
 
         loaded = seg_page._seg_load_mask(ctx, str(path))
         harness.check(loaded is not None)
@@ -103,6 +117,87 @@ def mask_io() -> None:
         harness.eq(int(np.count_nonzero(loaded)), int(np.count_nonzero(mask)))
     finally:
         _close(window)
+
+
+@harness.case("mod.segmentation.temp", "L4", "segmentation", tags=("fast",))
+def temp_location() -> None:
+    """Segmentation scratch files live in the project's tmp folder."""
+    window, project, _page, parquet = _open("seg_temp")
+    try:
+        ctx = window._ctx
+        mask = np.zeros((32, 32), dtype=np.int32)
+        mask[5:10, 5:10] = 1
+        rel = seg_page._seg_write_mask(ctx, "seg-1", parquet, mask)
+        mask_path = project.path / rel
+        edge = seg_page._seg_edge_map(ctx, str(mask_path))
+        harness.check(edge is not None)
+        edges = project.path / "tmp" / "segmentation" / "edges"
+        harness.check(
+            edges.is_dir() and any(edges.glob("*.npy")),
+            "mask edge cache is written under <project>/tmp/segmentation/edges",
+        )
+        seg_page._seg_cleanup_temp(ctx)
+        harness.check(
+            not (project.path / "tmp" / "segmentation").exists(),
+            "segmentation scratch files are disposable",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.segmentation.writer", "L4", "segmentation", tags=("fast",))
+def background_writer() -> None:
+    """The mask writer serializes writes off the UI thread."""
+    window, project, _page, parquet = _open("seg_writer")
+    try:
+        ctx = window._ctx
+        mask = np.zeros((32, 32), dtype=np.int32)
+        mask[5:10, 5:10] = 1
+        released = []
+        writer = seg_page._SegMaskWriter(ctx, max_queue=1)
+        try:
+            writer.submit(
+                "seg-1", parquet, array=mask, n_cells=1,
+                release=lambda: released.append(True),
+            )
+            results = []
+            harness.wait_for(
+                lambda: bool(results.extend(writer.poll()) or results),
+                timeout=30,
+                message="background mask write",
+            )
+            harness.eq(results[0][0], "written")
+            rel = results[0][2]
+            harness.check((project.path / rel).is_file())
+            harness.eq(len(released), 1, "the write releases its input slot")
+        finally:
+            writer.close()
+    finally:
+        _close(window)
+
+
+@harness.case("mod.segmentation.expand_tiles", "L1", "segmentation",
+              tags=("fast",))
+def expand_tiles() -> None:
+    """Tiled expansion is identical to a whole-image distance transform."""
+    import numpy as np
+    from scipy import ndimage
+
+    labels = np.zeros((40, 47), dtype=np.int32)
+    labels[3:8, 4:9] = 1
+    labels[20:27, 30:36] = 2
+    labels[12:15, 20:23] = 3
+    expected = labels.copy()
+    distance, (iy, ix) = ndimage.distance_transform_edt(
+        labels == 0, return_indices=True
+    )
+    grown = distance <= 3
+    expected = np.where(grown, labels[iy, ix], labels)
+    got = seg_page._seg_expand_labels(labels, 3, tile_size=9)
+    harness.check(
+        np.array_equal(got, expected),
+        "tiled expansion matches the whole-image expansion",
+    )
 
 
 @harness.case("mod.segmentation.errors", "L4", "segmentation", tags=("fast",))
@@ -144,6 +239,11 @@ def import_mask() -> None:
         record = seg_page._seg_mask_record_live(ctx, page, parquet, create=True)
         record["input"] = str(source)
         seg_page._seg_import_masks(ctx, page)
+        harness.wait_for(
+            lambda: not getattr(page, "_seg_import_running", False),
+            timeout=30,
+            message="background mask import",
+        )
 
         harness.eq(record["state"], seg_page.SEG_IMPORT_DONE)
         harness.check("Imported 1 mask" in page._seg_import_status.text(),

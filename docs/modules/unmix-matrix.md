@@ -1,8 +1,8 @@
 # Unmix — Matrix Unmixing
 
 The second tab of the [Unmix](unmix.md) module: it turns spectra into
-signatures, checks how separable they are, and runs the unmixing on the
-selected images.
+signatures, checks how separable they are, and generates unmixed channels for
+the selected table and image files.
 
 ![Unmix — Matrix Unmixing](../assets/screenshots/unmix-matrix.png)
 
@@ -48,7 +48,7 @@ wide, value columns 5) and any divider can be dragged to widen them; long
 channel names are elided until you do.
 
 If the channel selection changes after pasting, the matrix is kept but marked
-with a warning, and **Unmix for image** refuses to run until the paste matches
+with a warning, and **Run unmix** refuses to run until the paste matches
 the selection again (a channel reorder is fine).
 
 **Copy matrix to clipboard** writes the values with one decimal. A matrix
@@ -80,22 +80,38 @@ clipboard**.
 
 ## Samples to be unmixed
 
-Click **Select files…** to choose the images that should be unmixed in the
-shared multi-select dialog. Only these files get unmixed channels downstream.
+Click **Select files…** to choose the table and image files that should be
+unmixed in the shared multi-select dialog. Only these files get unmixed
+channels downstream.
+If a file that was already unmixed is removed from the selection, the next
+**Run unmix** asks before deleting its saved output and removing those
+channels from downstream modules.
 
 ## Running
 
 1. Choose the **Unmixing method** (`OLS` — ordinary least squares — is the
    default).
-2. Press **Unmix for image**. The log shows progress per file and a summary
-   (`generated`, `already up to date`, `failed`, `skipped`).
-3. Save the module so downstream modules see the unmixed channels.
+2. Press **Run unmix**. The log shows progress per file and a summary
+   (`generated`, `already up to date`, `failed`, `removed`).
+3. **Run unmix** saves the generated outputs automatically. **Save** without
+   running stores only the module settings; downstream modules do not see
+   unmixed channels until the module is run.
+
+Table files produce a companion parquet containing only the unmixed columns,
+row-aligned to the source. Image files produce `x`, `y` and the unmixed
+columns plus an image pyramid.
 
 ## Notes
 
 - A signature with an empty positive spectrum is ignored; the log warns when
-  a file has no usable image data.
-- Unmixed outputs are cached per file; changing a signature invalidates only
-  the affected outputs.
+  a file has no usable source data.
+- Unmix is a generate module: without a saved output there are no unmixed
+  channels for downstream modules. Opening an older project therefore
+  requires **Run unmix** once.
+- Unmixed outputs are cached per file; changing a signature, the source file,
+  or an upstream map module (Compensation, Unmix, Illumination, Batch Align,
+  Rename, Calculation) invalidates the affected outputs.
+- Image and table outputs use the same least-squares solution and upstream map
+  stages.
 - The unmixed channels are ordinary columns, so they can be plotted, gated,
   segmented or aggregated like any other channel.

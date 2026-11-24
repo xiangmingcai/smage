@@ -43,6 +43,7 @@ from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
+from smage.data import project_paths as _project_paths
 from smage.data import sampling as _data_sampling
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
@@ -80,7 +81,7 @@ def _cluster_signature(ctx, params, parquet_path, task_id=None) -> str:
         "dbscan": params.get("dbscan") or {},
         "hierarchical": params.get("hierarchical") or {},
         "parc": params.get("parc") or {},
-        "source": str(parquet_path),
+        "source": _project_paths._stable_path_key(ctx, parquet_path),
         "stat": stat,
     }
     # FlowSOM and PARC run in the user's extension environment; a new
@@ -869,7 +870,7 @@ def _cluster_fit_parc(ctx, page, q, cfg, X, seed):
     return ctx._parc_external(
         page, q, X, int(cfg.get("knn", 30)),
         float(cfg.get("resolution", 1.0)), seed,
-        cancel_flag="_cluster_cancel",
+        cancel_flag="_cluster_cancel", area="cluster",
     )
 
 
@@ -884,7 +885,7 @@ def _cluster_fit_flowsom(ctx, page, q, cfg, X, seed):
     ydim = max(1, math.ceil(nodes / xdim))
     result = ctx._flowsom_external(
         page, q, X, xdim, ydim, int(cfg.get("k", 20)), seed,
-        cancel_flag="_cluster_cancel",
+        cancel_flag="_cluster_cancel", area="cluster",
     )
     labels = result["cell_cluster"]
     if labels.size != X.shape[0]:

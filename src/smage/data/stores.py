@@ -5,10 +5,10 @@ Qt-free: paths and JSON only.
 from __future__ import annotations
 
 import copy
-import json
 import shutil
 
 from smage.core.gates import _resolve_gates_for_file
+from smage.data import project_paths as _project_paths
 
 
 def _attach_gating_stores(ctx, task: dict) -> None:
@@ -134,10 +134,12 @@ def _write_draft_params(ctx, page) -> None:
     if not isinstance(task_def, dict) or folder is None:
         return
     try:
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / "params.json").write_text(
-            json.dumps(task_def.get("params") or {}, indent=2, default=str),
-            encoding="utf-8",
+        _project_paths._save_json(
+            folder / "params.json",
+            task_def.get("params") or {},
+            ctx.project.path,
+            indent=2,
+            default=str,
         )
     except (OSError, TypeError):
         pass

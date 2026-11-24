@@ -219,6 +219,8 @@ class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin, ExtensionsMixi
         self._pool_col_order = []
         self._pool_col_bytes = 0
         self._pool_queued = set()
+        self._pool_hit_logged = set()
+        self._pool_stage_cache = {}
         self._pool_waiters = []
         self._pool_generation = 0
         self._channel_range_cache = {}
@@ -290,7 +292,10 @@ class MainWindow(QMainWindow, WorkflowTreeMixin, ModuleHostMixin, ExtensionsMixi
     # order), so density and the drawn points can be computed on ~1M rows
     # instead of tens of millions. Column values are pooled in the
     # background, once per file + task + column, and shared by every view.
-    _POOL_TIERS = (300_000, 1_000_000, 2_000_000)
+    _POOL_TIERS = (
+        20_000, 50_000, 100_000, 200_000, 300_000,
+        500_000, 1_000_000, 2_000_000,
+    )
     _POOL_MAX_BYTES = 600 * 1024 * 1024
 
 

@@ -42,6 +42,7 @@ from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
 from smage.data import outputs as _data_outputs
+from smage.data import project_paths as _project_paths
 from smage.data import sampling as _data_sampling
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
@@ -71,7 +72,7 @@ def _dc_signature(ctx, params, parquet_path, task_id=None) -> str:
         "min_cells": params.get("min_cells"),
         "remove_zeros": params.get("remove_zeros"),
         "name": params.get("name"),
-        "source": str(parquet_path),
+        "source": _project_paths._stable_path_key(ctx, parquet_path),
         "stat": stat,
         "stages": _data_columns._map_stage_token(ctx, task_id),
     }

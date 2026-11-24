@@ -18,6 +18,7 @@ from smage.core.heatmap import (  # noqa: E402
 from smage.core.image_ops import (  # noqa: E402
     _mode_pool,
     _otsu_threshold,
+    _otsu_threshold_chunked,
     _pool_mask,
     _relabel_sequential,
     _row_mode,
@@ -135,6 +136,17 @@ def otsu() -> None:
         _otsu_threshold(np.array([np.nan, 2.0, 2.0])),
         2.0,
         "non-finite values are ignored",
+    )
+    image = np.array([
+        [0.0] * 8,
+        [10.0] * 8,
+        [0.0] * 8,
+        [10.0] * 8,
+    ])
+    harness.eq(
+        _otsu_threshold_chunked(image, chunk_rows=1),
+        _otsu_threshold(image),
+        "chunked Otsu matches the whole-array result",
     )
 
 

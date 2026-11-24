@@ -229,7 +229,10 @@ def _build_label_index(parquet_path, mask_2d, xmin, xmax, ymin, ymax):
     b0 = block
 
     levels = []
-    level = _mode_pool(mask_2d, b0)
+    # At block size 1 the level is the mask itself; pooling would pad the
+    # whole image and run a per-pixel mode, which is pure overhead for the
+    # common sub-2 MP image.
+    level = mask_2d if b0 == 1 else _mode_pool(mask_2d, b0)
     fname = f"level_{b0}.npy"
     np.save(idx_dir / fname, level[..., None].astype(np.int32))
     levels.append({"block": int(b0), "file": fname})

@@ -8,6 +8,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from smage.data import project_paths as _project_paths
+
 
 def _feature_signature_rules(params) -> list:
     """Rules as they affect the aggregated output, for the change signature.
@@ -49,7 +51,7 @@ def _feature_signature(ctx, params, parquet_path, task_id=None) -> str:
     payload = {
         "feature": params.get("feature"),
         "rules": _feature_signature_rules(params),
-        "source": str(parquet_path),
+        "source": _project_paths._stable_path_key(ctx, parquet_path),
         "stat": stat,
     }
     # Ignored feature values change the aggregated rows. Projects saved
@@ -167,7 +169,10 @@ def _feature_up_signature(ctx, params, to_path, task_id=None) -> str:
         "key_from": params.get("key_from"),
         "key_to": params.get("key_to"),
         "features": params.get("features") or [],
-        "from_path": from_path,
+        "from_path": (
+            _project_paths._stable_path_key(ctx, from_path)
+            if from_path else from_path
+        ),
         "from_stat": from_stat,
         "to_stat": to_stat,
     }
@@ -300,7 +305,7 @@ def _gate2col_signature(ctx, params, parquet_path, task_id=None) -> str:
         stat = ""
     payload = {
         "rules": params.get("rules") or [],
-        "source": str(parquet_path),
+        "source": _project_paths._stable_path_key(ctx, parquet_path),
         "stat": stat,
     }
     sample = ctx._subsample_sig(task_id, parquet_path)

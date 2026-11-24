@@ -43,6 +43,7 @@ from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
+from smage.data import project_paths as _project_paths
 from smage.data import sampling as _data_sampling
 from smage.widgets import image_raster as _widgets_image_raster
 from smage.widgets import panels as _widgets_panels
@@ -71,7 +72,7 @@ def _dimred_signature(ctx, params, parquet_path, task_id=None) -> str:
         "names": params.get("names") or [],
         "umap": params.get("umap") or {},
         "tsne": params.get("tsne") or {},
-        "source": str(parquet_path),
+        "source": _project_paths._stable_path_key(ctx, parquet_path),
         "stat": stat,
     }
     sample = _data_sampling._subsample_sig(ctx, task_id, parquet_path)

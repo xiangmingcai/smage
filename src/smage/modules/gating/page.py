@@ -75,6 +75,7 @@ from smage.data import feature_outputs as _data_feature_outputs
 from smage.data import files as _data_files
 from smage.data import naming as _data_naming
 from smage.data import outputs as _data_outputs
+from smage.data import project_paths as _project_paths
 from smage.data import sampling as _data_sampling
 from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
 from smage.widgets import picker as _widgets_picker
@@ -307,8 +308,7 @@ def _gating_store_load(ctx, task_def) -> dict:
     loaded = False
     if path is not None and path.is_file():
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = _project_paths._load_json(path, ctx.project.path)
             store["files"] = list(data.get("files") or [])
             store["gates"] = list(data.get("gates") or [])
             store["per_file"] = dict(data.get("per_file") or {})
@@ -346,8 +346,7 @@ def _gating_store_save(ctx, task_def, store) -> None:
         "gates": list(store.get("gates") or []),
         "per_file": dict(store.get("per_file") or {}),
     }
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh)
+    _project_paths._save_json(path, payload, ctx.project.path)
     cache = getattr(ctx, "_gating_store_cache", None)
     if cache is not None:
         cache.pop(str(path), None)
@@ -3022,7 +3021,7 @@ def _gating_add_boolean_gate(ctx, page, idx, op) -> None:
     _gating_mark_dirty(ctx, page)
 
 
-def _gating_stage_signature(stages) -> str:
+def _gating_stage_signature(ctx, stages) -> str:
     """Digest of the data pipeline (so gate edits reuse its cached output)."""
     import hashlib
     import json
@@ -3040,14 +3039,21 @@ def _gating_stage_signature(stages) -> str:
     for kind, stage in stages:
         if kind == "compensation":
             payload.append([
-                kind, stage.get("id"), sorted(stage.get("files") or []),
+                kind, stage.get("id"),
+                sorted(
+                    _project_paths._stable_path_key(ctx, item)
+                    for item in (stage.get("files") or [])
+                ),
                 list(stage.get("names") or []),
                 array_token(stage.get("matrix")),
             ])
         elif kind == "unmix":
             payload.append([
                 kind, stage.get("task_id"),
-                sorted(stage.get("samples") or []),
+                sorted(
+                    _project_paths._stable_path_key(ctx, item)
+                    for item in (stage.get("samples") or [])
+                ),
                 list(stage.get("names") or []),
                 array_token(stage.get("matrix")),
             ])
@@ -3055,21 +3061,36 @@ def _gating_stage_signature(stages) -> str:
             payload.append([
                 kind, stage.get("task_id"),
                 [
-                    [sub.get("channel"), sorted(sub.get("files") or []),
-                     sub.get("T"), array_token(sub.get("mask"))]
+                    [
+                        sub.get("channel"),
+                        sorted(
+                            _project_paths._stable_path_key(ctx, item)
+                            for item in (sub.get("files") or [])
+                        ),
+                        sub.get("T"), array_token(sub.get("mask")),
+                    ]
                     for sub in stage.get("submodules") or []
                 ],
             ])
         elif kind == "batch_align":
             payload.append([
                 kind, stage.get("id"), stage.get("model_id"),
-                sorted((stage.get("files") or {}).items()),
+                sorted(
+                    (
+                        _project_paths._stable_path_key(ctx, item),
+                        value,
+                    )
+                    for item, value in (stage.get("files") or {}).items()
+                ),
                 array_token(stage.get("codes")),
             ])
         elif kind == "rename":
             payload.append([
                 kind, sorted((stage.get("map") or {}).items()),
-                sorted(stage.get("files") or []),
+                sorted(
+                    _project_paths._stable_path_key(ctx, item)
+                    for item in (stage.get("files") or [])
+                ),
             ])
         elif kind == "calculation":
             payload.append([
@@ -3164,7 +3185,7 @@ def _gating_request_stats(ctx, page, affected=None, full=False) -> None:
         # distinction only applies above it.
         row_index = subsample
     elif not full:
-        tier = ctx._pool_tier()
+        tier = ctx._pool_stats_tier()
         pool = ctx._pool_rows_cache.get((str(parquet_path), int(tier)))
         if pool is not None and len(pool):
             total = total_rows or len(pool)
@@ -3195,7 +3216,7 @@ def _gating_request_stats(ctx, page, affected=None, full=False) -> None:
         page._gating_stat_generation,
         parquet_path, gates, stages, base_columns, affected, virtual,
         row_index,
-        _gating_stage_signature(stages),
+        _gating_stage_signature(ctx, stages),
     )
 
 

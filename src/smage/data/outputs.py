@@ -304,6 +304,103 @@ def _g2c_raster(ctx, rec, bbox, spacing):
     return crop, rect
 
 
+def _unmix_applied_columns(ctx, task_id, parquet_path) -> dict:
+    """{column_name: record} exposed by upstream generated Unmix outputs.
+
+    Table outputs hold only the unmixed columns; image outputs hold x/y and
+    the channels plus an image pyramid.  Only outputs whose saved signature
+    still matches are exposed.
+    """
+    if not task_id or not parquet_path or ctx.project is None:
+        return {}
+    out = {}
+    for task in ctx._task_chain(task_id):
+        if task.get("id") == task_id or task.get("type") != "unmix":
+            continue
+        params = task.get("params") or {}
+        if parquet_path not in (params.get("samples") or []):
+            continue
+        rec = (params.get("outputs") or {}).get(parquet_path)
+        if not isinstance(rec, dict) or not rec.get("path"):
+            continue
+        config = ctx._unmix_flow_config(task)
+        if config is None:
+            continue
+        if rec.get("signature") != ctx._unmix_output_signature(
+            task.get("id"), parquet_path, config
+        ):
+            continue
+        path = ctx.project.path / rec["path"]
+        if not path.is_file():
+            continue
+        kind = rec.get("kind", "image")
+        if kind == "image" and ctx._image_load_manifest(str(path)) is None:
+            continue
+        for name in rec.get("columns") or []:
+            out.setdefault(name, {
+                "parquet": str(path),
+                "channel": name,
+                "kind": kind,
+                "task_id": task.get("id"),
+            })
+    return out
+
+
+def _unmix_column_values(ctx, parquet_path, rec, name):
+    """Row-aligned values of one generated Unmix column."""
+    import pandas as pd
+
+    if not isinstance(rec, dict) or not rec.get("parquet"):
+        return None
+    try:
+        frame = pd.read_parquet(rec["parquet"], columns=[name])
+    except Exception:  # noqa: BLE001
+        return None
+    return pd.to_numeric(
+        frame[name], errors="coerce"
+    ).to_numpy(dtype="float64")
+
+
+def _unmix_column_values_many(ctx, parquet_path, records, names):
+    """Read several generated Unmix columns, grouping by companion parquet.
+
+    N×N plots often request every unmixed channel of one file at once.  The
+    old per-column helper opened the same 1–2 GB companion parquet once per
+    channel; grouping the read keeps that to a single pass.
+    """
+    import pandas as pd
+
+    if not isinstance(records, dict) or not names:
+        return {}
+    groups = {}
+    for name in names:
+        rec = records.get(name)
+        if isinstance(rec, dict) and rec.get("parquet"):
+            groups.setdefault(str(rec["parquet"]), []).append(name)
+    out = {}
+    for path, columns in groups.items():
+        try:
+            frame = pd.read_parquet(path, columns=columns)
+        except Exception:  # noqa: BLE001 - fall back per column below
+            for name in columns:
+                arr = _unmix_column_values(
+                    ctx, parquet_path, records.get(name), name
+                )
+                if arr is not None:
+                    out[name] = arr
+            continue
+        for name in columns:
+            if name not in frame.columns:
+                continue
+            series = frame[name]
+            if not pd.api.types.is_numeric_dtype(series):
+                series = pd.to_numeric(series, errors="coerce")
+            # Numeric parquet columns can be returned as views of the one
+            # DataFrame read above instead of copying every full column.
+            out[name] = series.to_numpy(dtype="float64", copy=False)
+    return out
+
+
 def _unmix_image_outputs(ctx, task_id, parquet_path):
     """Precomputed unmixed channels: (usable, stale names) for a file."""
     if not task_id or not parquet_path or ctx.project is None:
@@ -314,8 +411,12 @@ def _unmix_image_outputs(ctx, task_id, parquet_path):
         if task.get("id") == task_id or task.get("type") != "unmix":
             continue
         params = task.get("params") or {}
+        if parquet_path not in (params.get("samples") or []):
+            continue
         rec = (params.get("outputs") or {}).get(parquet_path)
         if not isinstance(rec, dict) or not rec.get("path"):
+            continue
+        if rec.get("kind", "image") != "image":
             continue
         names = list(rec.get("columns") or [])
         config = ctx._unmix_flow_config(task)

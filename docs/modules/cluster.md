@@ -35,6 +35,10 @@ A cluster label per event, exposed as a column to downstream modules.
 
 - FlowSOM and PARC are not bundled; install them from the
   **Extension Manager** into a separate Python environment.
+- FlowSOM and PARC exchange their training matrix and result through
+  `<project>/tmp/cluster/runs/`. The folder is removed when the calculation
+  finishes, fails or is cancelled; stale runs are cleaned when the project
+  opens, and all scratch data is removed when it closes.
 - Cluster labels are integers; use them as the **feature channel** in
   [Feature Down](feature-down.md) to build per-cluster feature tables.
 

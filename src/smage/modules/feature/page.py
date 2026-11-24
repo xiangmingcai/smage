@@ -53,6 +53,7 @@ from smage.data import feature_outputs as _data_feature_outputs
 from smage.data import files as _data_files
 from smage.data import naming as _data_naming
 from smage.data import outputs as _data_outputs
+from smage.data import project_paths as _project_paths
 from smage.data import sampling as _data_sampling
 from smage.widgets import panels as _widgets_panels
 from smage.widgets import picker as _widgets_picker
@@ -485,7 +486,8 @@ def _feat_ignore_cache_key(ctx, page, feature, path) -> str:
     except Exception:  # noqa: BLE001
         stages = ""
     payload = [
-        str(path), _feat_file_stat(ctx, path), str(feature),
+        _project_paths._stable_path_key(ctx, path),
+        _feat_file_stat(ctx, path), str(feature),
         hashlib.sha1(stages.encode("utf-8")).hexdigest(),
         _data_sampling._subsample_sig(ctx, page._feat_task_id, path) or "",
         _feat_feature_source_sig(ctx,

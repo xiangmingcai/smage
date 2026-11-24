@@ -5,6 +5,33 @@ No Qt: these operate on numpy arrays only.
 from __future__ import annotations
 
 
+def _otsu_from_hist(hist, edges, vmin) -> float:
+    """Otsu threshold from a 256-bin histogram (shared by both variants)."""
+    import numpy as np
+
+    hist = np.asarray(hist, dtype="float64")
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    weight = np.cumsum(hist)
+    total = weight[-1]
+    if total <= 0:
+        return float(vmin)
+    mean_bg = np.cumsum(hist * centers)
+    mean_total = mean_bg[-1]
+    # Between-class variance for every split (ignore empty sides).
+    w0 = weight[:-1]
+    w1 = total - w0
+    valid = (w0 > 0) & (w1 > 0)
+    if not valid.any():
+        return float(vmin)
+    m0 = np.zeros_like(w0)
+    m0[valid] = mean_bg[:-1][valid] / w0[valid]
+    m1 = np.zeros_like(w1)
+    m1[valid] = (mean_total - mean_bg[:-1][valid]) / w1[valid]
+    between = np.zeros_like(w0)
+    between[valid] = w0[valid] * w1[valid] * (m0[valid] - m1[valid]) ** 2
+    return float(centers[int(np.argmax(between))])
+
+
 def _otsu_threshold(values) -> float:
     """Return an Otsu threshold for a finite 1-D array (0.0 when undecidable)."""
     import numpy as np
@@ -17,27 +44,47 @@ def _otsu_threshold(values) -> float:
     if not vmax > vmin:
         return vmin
     hist, edges = np.histogram(v, bins=256, range=(vmin, vmax))
-    hist = hist.astype("float64")
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    weight = np.cumsum(hist)
-    total = weight[-1]
-    if total <= 0:
+    return _otsu_from_hist(hist, edges, vmin)
+
+
+def _otsu_threshold_chunked(values, chunk_rows=2048) -> float:
+    """Otsu threshold for a large 2-D image without a full float64 copy.
+
+    A rasterized image can be hundreds of megabytes; converting it to a 1-D
+    float64 array and filtering its finite values doubles that peak. The same
+    histogram is accumulated row-block by row-block here. The result matches
+    :func:`_otsu_threshold` for the same values.
+    """
+    import numpy as np
+
+    arr = np.asarray(values)
+    if arr.ndim != 2 or arr.size == 0:
+        return _otsu_threshold(arr)
+    rows = max(1, int(chunk_rows))
+    vmin = float("inf")
+    vmax = float("-inf")
+    found = False
+    for start in range(0, arr.shape[0], rows):
+        block = np.asarray(arr[start:start + rows], dtype="float64").ravel()
+        block = block[np.isfinite(block)]
+        if block.size:
+            found = True
+            vmin = min(vmin, float(block.min()))
+            vmax = max(vmax, float(block.max()))
+    if not found:
+        return 0.0
+    if not vmax > vmin:
         return vmin
-    mean_bg = np.cumsum(hist * centers)
-    mean_total = mean_bg[-1]
-    # Between-class variance for every split (ignore empty sides).
-    w0 = weight[:-1]
-    w1 = total - w0
-    valid = (w0 > 0) & (w1 > 0)
-    if not valid.any():
-        return vmin
-    m0 = np.zeros_like(w0)
-    m0[valid] = mean_bg[:-1][valid] / w0[valid]
-    m1 = np.zeros_like(w1)
-    m1[valid] = (mean_total - mean_bg[:-1][valid]) / w1[valid]
-    between = np.zeros_like(w0)
-    between[valid] = w0[valid] * w1[valid] * (m0[valid] - m1[valid]) ** 2
-    return float(centers[int(np.argmax(between))])
+    hist = np.zeros(256, dtype="int64")
+    for start in range(0, arr.shape[0], rows):
+        block = np.asarray(arr[start:start + rows], dtype="float64").ravel()
+        block = block[np.isfinite(block)]
+        if block.size:
+            hist += np.histogram(
+                block, bins=256, range=(vmin, vmax)
+            )[0]
+    edges = np.linspace(vmin, vmax, 257, dtype="float64")
+    return _otsu_from_hist(hist, edges, vmin)
 
 
 def _relabel_sequential(labels, min_area=1):
