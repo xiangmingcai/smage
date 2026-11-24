@@ -85,8 +85,8 @@ Region Size module then shows **NA**. See [Region](../modules/region.md).
 In the source module press **Copy matrix to clipboard** (in the matrix
 settings), then in the target module choose **Signature source → Manual
 input** and press **Paste matrix**. The channels must match the target's
-Spectrum Extraction selection; the pasted values are written with one
-decimal, so results are close to, but not bit-identical with, the source.
+Spectrum Extraction selection; the copied values use 17 significant digits,
+so a copy → paste round-trip preserves the float64 matrix exactly.
 See [Unmix — Matrix Unmixing](../modules/unmix-matrix.md).
 
 ## How do I save a heatmap or a plot as a file?

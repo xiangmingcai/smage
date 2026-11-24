@@ -6,6 +6,14 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-11-24
+
+### Changed
+
+- **Unmix**: **Copy matrix to clipboard** now writes 17 significant digits,
+  so a matrix copied and pasted into another Unmix module reproduces the
+  float64 values exactly instead of being rounded to one decimal.
+
 ## [0.4.1] — 2026-11-24
 
 ### Added

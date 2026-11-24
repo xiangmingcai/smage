@@ -487,11 +487,29 @@ def manual_paste() -> None:
         harness.eq(columns, ["FL2-A", "FL1-A"])
         harness.eq(len(rows), 2)
 
-        # Copy matrix keeps one decimal and the same TSV shape.
+        # Copy matrix keeps the same TSV shape and enough precision to
+        # round-trip every float64 value exactly.
         _unmix_page._unmix_copy_matrix(ctx, page)
         copied = QApplication.clipboard().text().splitlines()
         harness.eq(copied[0], "Signature\tFL2-A\tFL1-A")
-        harness.eq(copied[1], "Sig A\t0.4\t1.0")
+        cells = copied[1].split("\t")
+        harness.eq(cells[0], "Sig A")
+        harness.eq(float(cells[1]), 0.4)
+        harness.eq(float(cells[2]), 1.0)
+        roundtrip, error = _unmix_page._unmix_parse_matrix_text(
+            ctx, page, QApplication.clipboard().text()
+        )
+        harness.eq(error, "")
+        harness.check(
+            np.array_equal(
+                np.asarray(
+                    [row["values"] for row in roundtrip["rows"]],
+                    dtype="float64",
+                ),
+                np.asarray([[0.4, 1.0], [0.8, 0.3]], dtype="float64"),
+            ),
+            "copy → paste reproduces the matrix exactly",
+        )
     finally:
         _close(window)
 

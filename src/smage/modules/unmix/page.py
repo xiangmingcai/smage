@@ -2581,7 +2581,11 @@ def _unmix_copy_matrix(ctx, page) -> None:
     for row, values in rows:
         cells = [str(row.get("name", ""))]
         cells += [
-            f"{v:.1f}" if np.isfinite(v) else "" for v in values
+            # 17 significant digits round-trip every float64 value, so a
+            # matrix pasted into another Unmix module reproduces the source
+            # matrix exactly.
+            format(float(v), ".17g") if np.isfinite(v) else ""
+            for v in values
         ]
         lines.append("\t".join(cells))
     QApplication.clipboard().setText("\n".join(lines))

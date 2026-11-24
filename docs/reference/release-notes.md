@@ -3,6 +3,15 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.4.2 — 2026-11-24
+
+- **Unmix**: **Copy matrix to clipboard** now writes 17 significant digits,
+  enough to round-trip every float64 value. A matrix copied and pasted into
+  another Unmix module reproduces the source values exactly, so unmixed
+  results stay identical.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.4.1 — 2026-11-24
 
 - **Portable projects**: project-internal paths are stored relative to the

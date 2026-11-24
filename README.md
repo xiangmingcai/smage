@@ -6,7 +6,7 @@ into a common tabular representation and lets you compose analysis pipelines
 from interactive modules — gating, compensation, unmixing, segmentation,
 feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.4.1`; modules and
+> **Status:** early development. The current release is `0.4.2`; modules and
 > file formats may still change between releases.
 
 > **Intended use:** research software, not a medical device. Not for clinical
@@ -17,20 +17,11 @@ feature aggregation, clustering, dimensionality reduction and export.
 📦 **Releases:** <https://github.com/xiangmingcai/smage/releases><br>
 🐛 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
-## What's new in 0.4.1
+## What's new in 0.4.2
 
-- **Projects are now portable**: paths inside a project are stored relative,
-  so the whole `.smage` folder can be copied to another folder or computer and
-  opened directly. Existing projects are migrated on first open.
-- **Rename Project…** in the File menu renames the project folder and project
-  name together.
-- **Save Project As** now copies the complete project, including `Module/`.
-- **Unmix** is now a generate module: **Run unmix** writes companion unmixed
-  columns, and downstream modules read those generated outputs.
-- **Segmentation** batches use a bounded background pipeline with **Cancel**,
-  and keep disposable working files under the project `tmp/` folder.
-- **Figure** uses per-plot sampled pools and no longer keeps full-file
-  Compensation arrays, improving large-file switching and memory use.
+- **Unmix**: **Copy matrix to clipboard** now writes 17 significant digits,
+  enough to round-trip every float64 value. Copy → paste into another Unmix
+  module now reproduces the matrix exactly, so unmixed results stay identical.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -73,7 +64,7 @@ Optional analysis methods run in a separate Python environment created from
 | PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
 
 The Extension Manager installs the current pip release; the versions above
-were current when Smage 0.4.1 was released. Use a **Python 3.11** environment
+were current when Smage 0.4.2 was released. Use a **Python 3.11** environment
 for these extensions, matching the Python version Smage is built with. Each
 environment may need extra packages (for example PyTorch for Cellpose or
 TensorFlow for StarDist) — see the extension's repository for its

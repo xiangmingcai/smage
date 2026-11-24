@@ -51,9 +51,9 @@ If the channel selection changes after pasting, the matrix is kept but marked
 with a warning, and **Run unmix** refuses to run until the paste matches
 the selection again (a channel reorder is fine).
 
-**Copy matrix to clipboard** writes the values with one decimal. A matrix
-copied to another module is therefore close to, but not bit-identical with,
-the source when that source was built from full-precision spectra.
+**Copy matrix to clipboard** writes each value with 17 significant digits,
+enough to round-trip a float64 exactly. Copy → paste therefore reproduces the
+matrix values exactly, subject to the same channel selection.
 
 ## Matrix views
 
