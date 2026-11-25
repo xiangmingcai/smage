@@ -103,17 +103,22 @@ outputs:
   Integer results use the smallest fitting integer type; fractional or
   non-finite results use the smallest fitting float type.
 
-Image `x` and `y` columns keep the source integer dtype. Files that need a
-temporary result for the negative/adapt modes are staged under
-`<project>/tmp/unmix/` and cleaned up automatically.
+Image `x` and `y` columns keep the source integer dtype. Modes that decide
+the dtype from the results (`Keep type (float if negative)` on integer
+sources and `Adapt to results`) first scan the values without writing, then
+write the final dtype directly, so no full-size temporary copy is created and
+the output is never read back.
 
 ## Running
 
 1. Choose the **Unmixing method** (`OLS` — ordinary least squares — is the
    default).
-2. Press **Run unmix**. The log shows progress per file and a summary
-   (`generated`, `already up to date`, `failed`, `removed`).
-3. **Run unmix** saves the generated outputs automatically. **Save** without
+2. Press **Run unmix**. The status bar shows the current file and percentage;
+   the log shows each file with its size, output dtype and elapsed time, and
+   a summary (`generated`, `already up to date`, `failed`, `removed`).
+3. **Cancel** stops the run after the current chunk; the partial output of
+   the file being written is removed.
+4. **Run unmix** saves the generated outputs automatically. **Save** without
    running stores only the module settings; downstream modules do not see
    unmixed channels until the module is run.
 

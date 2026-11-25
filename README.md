@@ -6,7 +6,7 @@ into a common tabular representation and lets you compose analysis pipelines
 from interactive modules — gating, compensation, unmixing, segmentation,
 feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.4.3`; modules and
+> **Status:** early development. The current release is `0.4.4`; modules and
 > file formats may still change between releases.
 
 > **Intended use:** research software, not a medical device. Not for clinical
@@ -17,19 +17,19 @@ feature aggregation, clustering, dimensionality reduction and export.
 📦 **Releases:** <https://github.com/xiangmingcai/smage/releases><br>
 🐛 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
-## What's new in 0.4.3
+## What's new in 0.4.4
 
-- **Unmix** now has a **Channel data type** setting for generated parquet
-  channels:
-  - **Keep type (float if negative)** — default; keeps the source dtype and
-    switches that file to the smallest fitting float when the rounded result
-    contains negatives.
-  - **Keep data type** — always use the source dtype, rounding decimals,
-    clamping negatives to zero and clipping to the dtype maximum.
-  - **Adapt to results** — choose the smallest dtype per file from the actual
-    unmixed values.
-
-See [CHANGELOG.md](CHANGELOG.md) for the full list.
+- **Unmix** is much faster on large image files:
+  - The **Channel data type** modes that depend on the results
+    (`Keep type (float if negative)` on integer sources and **Adapt to
+    results**) now decide the dtype from a scan that writes nothing, then
+    write the chosen dtype directly. The full-size float64 temporary file is
+    gone, together with its extra read/write pass and disk usage.
+  - Chunks are read and written with Arrow instead of pandas.
+  - The image pyramid is built from the chunks being written instead of
+    reading the new parquet back.
+- **Unmix** now shows progress in the status bar, logs each file's size,
+  output dtype and elapsed time, and has a **Cancel** button.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -72,7 +72,7 @@ Optional analysis methods run in a separate Python environment created from
 | PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
 
 The Extension Manager installs the current pip release; the versions above
-were current when Smage 0.4.3 was released. Use a **Python 3.11** environment
+were current when Smage 0.4.4 was released. Use a **Python 3.11** environment
 for these extensions, matching the Python version Smage is built with. Each
 environment may need extra packages (for example PyTorch for Cellpose or
 TensorFlow for StarDist) — see the extension's repository for its

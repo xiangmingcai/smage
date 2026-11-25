@@ -3,6 +3,19 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.4.4 — 2026-11-25
+
+- **Unmix** is much faster on large image files. Output dtypes that depend on
+  the results are decided by a scan that writes nothing, so the full-size
+  float64 temporary file is gone; chunks are read and written with Arrow
+  instead of pandas; and the image pyramid is built from the chunks being
+  written instead of reading the new parquet back.
+- **Unmix** shows progress in the status bar, logs each file's size, output
+  dtype and elapsed time, and has a **Cancel** button that stops the run
+  after the current chunk and deletes the partial output.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.4.3 — 2026-11-25
 
 - **Unmix** has a **Channel data type** setting: **Keep type (float if

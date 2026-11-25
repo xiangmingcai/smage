@@ -88,17 +88,16 @@ import copy
 import hashlib
 import json
 import math
-import os
 import shutil
 import pyqtgraph as pg
 import threading
+import time
 from functools import partial
 from smage.data import columns as _data_columns
 from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
 from smage.data import project_paths as _project_paths
-from smage.data import scratch as _data_scratch
 from smage.widgets import canvas_export as _widgets_canvas_export
 from smage.widgets import colormap as _widgets_colormap
 from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
@@ -909,24 +908,50 @@ class _UnmixOutputStats:
         self.fractional = False
         self.nonfinite = False
 
-    def update(self, values) -> None:
+    def update(self, values, fractional=True, nonfinite=True) -> None:
+        """Accumulate one chunk's statistics.
+
+        ``fractional`` and ``nonfinite`` can be turned off when they cannot
+        change the decision (an integer source can hold neither); skipping
+        them keeps the statistics pass cheap on very large files.
+        """
         import numpy as np
 
         arr = np.asarray(values, dtype="float64")
-        finite = np.isfinite(arr)
-        if finite.any():
+        if fractional:
+            rounded = _unmix_round_values(arr)
+            if not self.negative_rounded and bool(np.any(rounded < 0)):
+                self.negative_rounded = True
+            if not self.fractional and not np.allclose(
+                arr, rounded, rtol=1e-9, atol=1e-9, equal_nan=True
+            ):
+                self.fractional = True
+        elif not self.negative_rounded:
+            # Integers round half away from zero, so a negative rounded
+            # result exists exactly when a value is at or below -0.5.  This
+            # avoids materialising the rounded array in the common mode.
+            if arr.size and bool(np.min(arr) <= -0.5):
+                self.negative_rounded = True
+        if nonfinite:
+            finite = np.isfinite(arr)
+            if not finite.all():
+                self.nonfinite = True
+            if not finite.any():
+                return
             vals = arr[finite]
             low = float(vals.min())
             high = float(vals.max())
-            self.min_value = low if self.min_value is None else min(self.min_value, low)
-            self.max_value = high if self.max_value is None else max(self.max_value, high)
-            rounded = _unmix_round_values(vals)
-            if np.any(rounded < 0):
-                self.negative_rounded = True
-            if not np.allclose(vals, rounded, rtol=1e-9, atol=1e-9):
-                self.fractional = True
-        if not finite.all():
-            self.nonfinite = True
+        else:
+            if arr.size == 0:
+                return
+            low = float(arr.min())
+            high = float(arr.max())
+        self.min_value = (
+            low if self.min_value is None else min(self.min_value, low)
+        )
+        self.max_value = (
+            high if self.max_value is None else max(self.max_value, high)
+        )
 
 
 def _unmix_float_dtype(stats):
@@ -964,67 +989,85 @@ def _unmix_adapt_dtype(stats):
     return np.dtype("float64")
 
 
+def _unmix_channel_arrays(values, names, target_dtype, negative_to_zero=False):
+    """One chunk's unmixed channels in the output dtype."""
+    import numpy as np
+
+    if target_dtype is None:
+        return {
+            name: np.asarray(values[:, j], dtype="float64")
+            for j, name in enumerate(names)
+        }
+    return {
+        name: _unmix_cast_values(
+            values[:, j], target_dtype, negative_to_zero=negative_to_zero
+        )
+        for j, name in enumerate(names)
+    }
+
+
 def _unmix_write_frame(writer, path, x_values, y_values, values, names,
                        is_image, x_dtype, y_dtype, target_dtype=None,
-                       negative_to_zero=False):
-    """Write one output chunk with a fixed target dtype."""
+                       negative_to_zero=False, image_builder=None):
+    """Write one output chunk with a fixed target dtype.
+
+    The table is built straight from numpy arrays (no pandas round trip), and
+    when ``image_builder`` is given the same chunk feeds the display pyramid.
+    """
     import numpy as np
-    import pandas as pd
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    channels = _unmix_channel_arrays(
+        values, names, target_dtype, negative_to_zero=negative_to_zero
+    )
     data = {}
     if is_image:
         data["x"] = np.asarray(x_values, dtype=x_dtype)
         data["y"] = np.asarray(y_values, dtype=y_dtype)
-    for j, name in enumerate(names):
-        if target_dtype is None:
-            data[name] = np.asarray(values[:, j], dtype="float64")
-        else:
-            data[name] = _unmix_cast_values(
-                values[:, j], target_dtype, negative_to_zero=negative_to_zero
-            )
-    table = pa.Table.from_pandas(
-        pd.DataFrame(data), preserve_index=False
-    )
+    data.update(channels)
+    if image_builder is not None:
+        image_builder.update(data["x"], data["y"], channels)
+    table = pa.table({name: pa.array(col) for name, col in data.items()})
     if writer is None:
-        writer = pq.ParquetWriter(str(path), table.schema)
+        # x/y repeat along the image grid, so dictionary encoding pays off
+        # there; the unmixed values are high-cardinality and are written
+        # plain, which is faster than building a dictionary that is dropped.
+        writer = pq.ParquetWriter(
+            str(path), table.schema, compression="snappy",
+            use_dictionary=["x", "y"] if is_image else [],
+        )
     writer.write_table(table)
     return writer
 
 
-def _unmix_convert_parquet(source, target, names, is_image, x_dtype, y_dtype,
-                           target_dtype, negative_to_zero=False) -> None:
-    """Rewrite a temporary float64 output with the chosen dtype."""
-    import numpy as np
-    import pyarrow.parquet as pq
+class _UnmixCancelled(Exception):
+    """Raised between chunks when the user presses Cancel."""
 
-    writer = None
+
+def _unmix_discard_output(path) -> None:
+    """Remove a half-written output file and its image pyramid."""
     try:
-        for batch in pq.ParquetFile(str(source)).iter_batches(
-            batch_size=500_000
-        ):
-            frame = batch.to_pandas()
-            values = np.column_stack([
-                frame[name].to_numpy(dtype="float64") for name in names
-            ])
-            writer = _unmix_write_frame(
-                writer, target,
-                frame["x"] if is_image else None,
-                frame["y"] if is_image else None,
-                values, names, is_image, x_dtype, y_dtype,
-                target_dtype=target_dtype,
-                negative_to_zero=negative_to_zero,
-            )
-    finally:
-        if writer is not None:
-            writer.close()
+        Path(str(path)).unlink(missing_ok=True)
+    except OSError:
+        pass
+    shutil.rmtree(str(path) + ".imgidx", ignore_errors=True)
 
 
-def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
-    """Write one file's unmixed channels (and image pyramid for images)."""
+def _unmix_write_output(ctx, task_id, parquet_path, config,
+                        progress_cb=None, cancel_cb=None) -> dict:
+    """Write one file's unmixed channels (and image pyramid for images).
+
+    ``progress_cb`` receives a 0..1 fraction and ``cancel_cb`` is polled
+    between chunks.  Cancelling deletes the partial output and raises
+    ``_UnmixCancelled``.
+
+    The output dtype is decided before anything is written: modes that depend
+    on the results run one statistics pass without writing, then a second pass
+    writes the final dtype directly.  That keeps the disk usage at one output
+    file instead of a full-size float64 temporary copy.
+    """
     import numpy as np
-    import pandas as pd
     import pyarrow.parquet as pq
 
     names = list(config.get("names") or [])
@@ -1082,48 +1125,86 @@ def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
         mode == "adapt"
         or (mode == "keep_float_negative" and source_dtype.kind in "iu")
     )
-    stats = _UnmixOutputStats() if needs_stats else None
     target_dtype = source_dtype
     negative_to_zero = mode == "keep" and source_dtype.kind in "iu"
 
-    def run_pipeline(write_frame) -> None:
+    total_rows = int(pf.metadata.num_rows or 0)
+    batch_size = 1_000_000
+    passes = 2 if needs_stats else 1
+    cached = {}
+    last_report = [0.0]
+
+    def check_cancel() -> None:
+        if cancel_cb is not None and cancel_cb():
+            raise _UnmixCancelled()
+
+    def report(pass_index: int, done: int) -> None:
+        if progress_cb is None:
+            return
+        if total_rows > 0:
+            fraction = (pass_index + min(done / total_rows, 1.0)) / passes
+        else:
+            fraction = 1.0
+        now = time.perf_counter()
+        if now - last_report[0] < 0.5 and fraction < 1.0:
+            return
+        last_report[0] = now
+        progress_cb(min(fraction, 1.0))
+
+    def iter_chunks():
+        """Yield ``(x, y, unmixed)`` once per batch, re-reading the source."""
         if fallback:
-            requested = list(dict.fromkeys(
-                (["x", "y"] if is_image else []) + columns
-            ))
-            full = ctx._column_data(
-                task_id, parquet_path, requested, row_filter=False
-            )
-            if is_image and ("x" not in full or "y" not in full):
-                raise ValueError("the source file has no x/y columns")
-            missing = [c for c in columns if c not in full]
-            if missing:
-                raise ValueError(
-                    "channel(s) could not be computed: " + ", ".join(missing)
+            # The full table is loaded once and reused by the second pass.
+            if "unmixed" not in cached:
+                requested = list(dict.fromkeys(
+                    (["x", "y"] if is_image else []) + columns
+                ))
+                full = ctx._column_data(
+                    task_id, parquet_path, requested, row_filter=False
                 )
-            stacked = np.column_stack([
-                np.asarray(full[c], dtype="float64") for c in columns
-            ])
-            unmixed = stacked @ pinv
-            for start in range(0, len(unmixed), 500_000):
-                end = min(start + 500_000, len(unmixed))
-                write_frame(
-                    full.get("x", [])[start:end] if is_image else None,
-                    full.get("y", [])[start:end] if is_image else None,
-                    unmixed[start:end],
+                if is_image and ("x" not in full or "y" not in full):
+                    raise ValueError("the source file has no x/y columns")
+                missing = [c for c in columns if c not in full]
+                if missing:
+                    raise ValueError(
+                        "channel(s) could not be computed: "
+                        + ", ".join(missing)
+                    )
+                stacked = np.empty(
+                    (len(full[columns[0]]), len(columns)), dtype="float64"
+                )
+                for j, c in enumerate(columns):
+                    stacked[:, j] = np.asarray(full[c], dtype="float64")
+                cached["x"] = full.get("x") if is_image else None
+                cached["y"] = full.get("y") if is_image else None
+                cached["unmixed"] = stacked @ pinv
+            x_all = cached["x"]
+            y_all = cached["y"]
+            unmixed_all = cached["unmixed"]
+            for start in range(0, len(unmixed_all), batch_size):
+                check_cancel()
+                end = min(start + batch_size, len(unmixed_all))
+                yield (
+                    x_all[start:end] if is_image else None,
+                    y_all[start:end] if is_image else None,
+                    unmixed_all[start:end],
                 )
             return
+
         read_cols = list(dict.fromkeys(
             (["x", "y"] if is_image else []) + list(needed)
         ))
-        for batch in pf.iter_batches(batch_size=500_000, columns=read_cols):
-            df = batch.to_pandas()
-            values = {
-                c: pd.to_numeric(df[c], errors="coerce").to_numpy(
-                    dtype="float64"
-                )
-                for c in read_cols if c in df.columns
-            }
+        for batch in pf.iter_batches(batch_size=batch_size, columns=read_cols):
+            check_cancel()
+            values = {}
+            for name in read_cols:
+                if name in batch.schema.names:
+                    raw = batch.column(name).to_numpy(zero_copy_only=False)
+                    # Stages work on float64; a plain copy of the source
+                    # columns is stacked as-is (numpy casts on assignment).
+                    values[name] = (
+                        np.asarray(raw, dtype="float64") if stages else raw
+                    )
             if stages:
                 evaluated = _evaluate_stages(
                     stages, values, columns,
@@ -1132,82 +1213,93 @@ def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
                     origin=origin,
                 )
             else:
-                evaluated = {
-                    c: values[c] for c in columns if c in values
-                }
+                evaluated = {c: values[c] for c in columns if c in values}
             missing = [c for c in columns if c not in evaluated]
             if missing:
                 raise ValueError(
                     "channel(s) could not be computed: "
                     + ", ".join(missing)
                 )
-            stacked = np.column_stack([
-                np.asarray(evaluated[c], dtype="float64")
-                for c in columns
-            ])
+            stacked = np.empty(
+                (batch.num_rows, len(columns)), dtype="float64"
+            )
+            for j, c in enumerate(columns):
+                stacked[:, j] = evaluated[c]
             unmixed = stacked @ pinv
             if is_image and ("x" not in values or "y" not in values):
                 raise ValueError("the source file has no x/y columns")
-            write_frame(
+            yield (
                 values.get("x") if is_image else None,
                 values.get("y") if is_image else None,
                 unmixed,
             )
 
     if needs_stats:
-        with _data_scratch._scratch_run(ctx, "unmix") as run_dir:
-            temp_path = run_dir / "unmix_dtype.parquet"
-            writer = None
+        stats = _UnmixOutputStats()
+        # Only "Adapt to results" needs the fractional/non-finite checks; an
+        # integer source can hold neither, so "Keep type (float if negative)"
+        # only tracks the sign and the range.
+        track_all = mode == "adapt"
+        done = 0
+        for _x, _y, unmixed in iter_chunks():
+            stats.update(
+                unmixed, fractional=track_all, nonfinite=track_all
+            )
+            done += len(unmixed)
+            report(0, done)
+        if mode == "adapt":
+            target_dtype = _unmix_adapt_dtype(stats)
+        elif stats.negative_rounded:
+            target_dtype = _unmix_float_dtype(stats)
+        else:
+            target_dtype = source_dtype
+        negative_to_zero = False
 
-            def write_temp(x_values, y_values, unmixed) -> None:
-                nonlocal writer
-                stats.update(unmixed)
-                writer = _unmix_write_frame(
-                    writer, temp_path, x_values, y_values, unmixed,
-                    names, is_image, x_dtype, y_dtype,
-                )
+    # Image pyramids are accumulated from the chunks that are written, so the
+    # new parquet is not read back.  If the geometry cannot be taken from the
+    # source, the pyramid is rebuilt from the output afterwards.
+    image_builder = None
+    if is_image:
+        try:
+            xmin, xmax, ymin, ymax, total, _src_names = (
+                _data_image_index._image_geometry(str(parquet_path))
+            )
+            image_builder = _data_image_index._ImageIndexBuilder(
+                ["x", "y"] + names, xmin, xmax, ymin, ymax, total
+            )
+        except Exception:  # noqa: BLE001 - rebuild from the output instead
+            image_builder = None
 
-            try:
-                run_pipeline(write_temp)
-            finally:
-                if writer is not None:
-                    writer.close()
-
-            if mode == "adapt":
-                target_dtype = _unmix_adapt_dtype(stats)
-            elif stats.negative_rounded:
-                target_dtype = _unmix_float_dtype(stats)
-            else:
-                target_dtype = source_dtype
-            negative_to_zero = False
-            if target_dtype == np.dtype("float64"):
-                os.replace(temp_path, out_path)
-            else:
-                _unmix_convert_parquet(
-                    temp_path, out_path, names, is_image,
-                    x_dtype, y_dtype, target_dtype,
-                    negative_to_zero=negative_to_zero,
-                )
-    else:
-        writer = None
-
-        def write_final(x_values, y_values, unmixed) -> None:
-            nonlocal writer
+    writer = None
+    done = 0
+    try:
+        for x_vals, y_vals, unmixed in iter_chunks():
             writer = _unmix_write_frame(
-                writer, out_path, x_values, y_values, unmixed,
-                names, is_image, x_dtype, y_dtype,
+                writer, out_path, x_vals, y_vals, unmixed, names,
+                is_image, x_dtype, y_dtype,
                 target_dtype=target_dtype,
                 negative_to_zero=negative_to_zero,
+                image_builder=image_builder,
             )
-
-        try:
-            run_pipeline(write_final)
-        finally:
-            if writer is not None:
+            done += len(unmixed)
+            report(1 if needs_stats else 0, done)
+    except BaseException:
+        if writer is not None:
+            try:
                 writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _unmix_discard_output(out_path)
+        raise
+    else:
+        if writer is not None:
+            writer.close()
 
     if is_image:
-        _build_image_index_files(str(out_path))
+        if image_builder is not None:
+            image_builder.finish(str(out_path))
+        else:
+            _build_image_index_files(str(out_path))
     else:
         # A table output may reuse the path of an older image output.
         shutil.rmtree(str(out_path) + ".imgidx", ignore_errors=True)
@@ -1352,6 +1444,8 @@ def _unmix_start_run(ctx, page) -> None:
     page._unmix_cancel = False
     if getattr(page, "_unmix_run_btn", None) is not None:
         page._unmix_run_btn.setEnabled(False)
+    if getattr(page, "_unmix_cancel_btn", None) is not None:
+        page._unmix_cancel_btn.setEnabled(True)
     _unmix_log(ctx,
         page, f"— Run unmix: {len(samples)} file(s) selected —"
     )
@@ -1397,18 +1491,74 @@ def _unmix_output_is_current(ctx, task_id, parquet_path, config, rec) -> bool:
     return True
 
 
+def _unmix_duration_text(seconds: float) -> str:
+    """Human-readable elapsed time for the run log."""
+    if seconds < 1:
+        return f"{seconds * 1000:.0f} ms"
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes, sec = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes} min {sec:02d} s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} min {sec:02d} s"
+
+
+def _unmix_size_text(path) -> str:
+    """Source file size for the run log."""
+    try:
+        nbytes = float(Path(str(path)).stat().st_size)
+    except OSError:
+        return "unknown size"
+    for unit in ("B", "KB", "MB", "GB"):
+        if nbytes < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(nbytes)} B"
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024.0
+    return f"{nbytes:.1f} GB"
+
+
+def _unmix_report_progress(q, label, index, total, fraction) -> None:
+    """Queue a status-bar progress line (throttled by the writer)."""
+    q.put((
+        "progress",
+        f"Unmix {index}/{total} — {label}: {fraction * 100:.0f}%",
+    ))
+
+
+def _unmix_show_status(ctx, text: str) -> None:
+    host = getattr(ctx, "host", None)
+    bar = host.statusBar() if hasattr(host, "statusBar") else None
+    if bar is not None:
+        bar.showMessage(text)
+
+
+def _unmix_cancel_run(ctx, page) -> None:
+    """Ask the run in progress to stop after the current chunk."""
+    if not getattr(page, "_unmix_running", False):
+        return
+    page._unmix_cancel = True
+    _unmix_log(ctx, page, "Cancelling…")
+    if getattr(page, "_unmix_cancel_btn", None) is not None:
+        page._unmix_cancel_btn.setEnabled(False)
+
+
 def _unmix_output_worker(ctx, page, q, config, files, labels=None,
                         removed=None) -> None:
     """Background: delete stale outputs, then generate the selected files.
 
     Both table and image samples are written; image files additionally get
-    an image pyramid.
+    an image pyramid.  Progress goes to the status bar and every generated
+    file is logged with its elapsed time.
     """
     task_id = page._unmix_task_id
     labels = labels or {}
     removed = list(removed or [])
     outputs = dict(page._unmix_params.get("outputs") or {})
     done = failed = skipped = unchanged = 0
+    cancelled = False
+    started = time.perf_counter()
     try:
         for item in removed:
             label = item.get("label") or str(item.get("source") or "")
@@ -1423,6 +1573,7 @@ def _unmix_output_worker(ctx, page, q, config, files, labels=None,
         for i, path in enumerate(files):
             if getattr(page, "_unmix_cancel", False):
                 q.put(("log", "Cancelled."))
+                cancelled = True
                 break
             label = labels.get(path) or Path(str(path)).name
             rec = outputs.get(path)
@@ -1437,20 +1588,39 @@ def _unmix_output_worker(ctx, page, q, config, files, labels=None,
                 q.put(("log", f"• already up to date, skipped: {label}"))
                 unchanged += 1
                 continue
+            q.put((
+                "log",
+                f"• {label} — {_unmix_size_text(path)}, "
+                f"starting ({i + 1}/{len(files)})",
+            ))
+            file_started = time.perf_counter()
             try:
-                result = _unmix_write_output(ctx, task_id, path, config)
-                outputs[path] = result
-                done += 1
+                result = _unmix_write_output(
+                    ctx, task_id, path, config,
+                    progress_cb=partial(
+                        _unmix_report_progress, q, label, i + 1, len(files)
+                    ),
+                    cancel_cb=lambda: getattr(page, "_unmix_cancel", False),
+                )
+            except _UnmixCancelled:
                 q.put((
                     "log",
-                    f"✓ {label}  [{result.get('dtype', '?')}]  "
-                    f"({i + 1}/{len(files)})",
+                    f"✗ {label}: cancelled after "
+                    f"{_unmix_duration_text(time.perf_counter() - file_started)}"
+                    ", partial output removed",
                 ))
-            except Exception as exc:  # noqa: BLE001
-                failed += 1
-                q.put(("log", f"✗ {label}: {exc}"))
+                cancelled = True
+                break
+            outputs[path] = result
+            done += 1
+            q.put((
+                "log",
+                f"✓ {label}  [{result.get('dtype', '?')}]  "
+                f"{_unmix_duration_text(time.perf_counter() - file_started)}  "
+                f"({i + 1}/{len(files)})",
+            ))
         q.put(("done", outputs, done, failed, skipped, unchanged,
-               len(removed)))
+               len(removed), cancelled, time.perf_counter() - started))
     except Exception as exc:  # noqa: BLE001
         q.put(("error", str(exc)))
 
@@ -1463,6 +1633,8 @@ def _unmix_output_poll(ctx, page) -> None:
     error = None
     counts = (0, 0, 0, 0, 0)
     outputs = None
+    cancelled = False
+    elapsed = 0.0
     while True:
         try:
             msg = q.get_nowait()
@@ -1471,9 +1643,13 @@ def _unmix_output_poll(ctx, page) -> None:
         kind = msg[0]
         if kind == "log":
             _unmix_log(ctx, page, msg[1])
+        elif kind == "progress":
+            _unmix_show_status(ctx, msg[1])
         elif kind == "done":
             outputs = msg[1]
             counts = (msg[2], msg[3], msg[4], msg[5], msg[6])
+            cancelled = bool(msg[7])
+            elapsed = float(msg[8])
             finished = True
         elif kind == "error":
             error = msg[1]
@@ -1485,6 +1661,8 @@ def _unmix_output_poll(ctx, page) -> None:
     if timer is not None:
         timer.stop()
         page._unmix_timer = None
+    if getattr(page, "_unmix_cancel_btn", None) is not None:
+        page._unmix_cancel_btn.setEnabled(False)
     if getattr(page, "_unmix_run_btn", None) is not None:
         page._unmix_run_btn.setEnabled(not page._unmix_locked)
     if outputs is not None:
@@ -1501,17 +1679,26 @@ def _unmix_output_poll(ctx, page) -> None:
         ctx._refresh_workflow_tree()
         ctx._module_saved(page)
     if error:
+        _unmix_show_status(ctx, "Unmix failed")
         _unmix_log(ctx, page, f"✗ {error}")
         QMessageBox.warning(ctx.host, "Run unmix", error)
     else:
         done, failed, _skipped, unchanged, removed = counts
         summary = (
-            f"— Done: {done} generated, {unchanged} already up to date, "
-            f"{failed} failed"
+            f"— Done in {_unmix_duration_text(elapsed)}: {done} generated, "
+            f"{unchanged} already up to date, {failed} failed"
         )
         if removed:
             summary += f", {removed} removed"
+        if cancelled:
+            summary += ", cancelled"
         _unmix_log(ctx, page, summary + " —")
+        _unmix_show_status(
+            ctx,
+            ("Unmix cancelled" if cancelled else "Unmix finished")
+            + f" — {done} generated, {failed} failed "
+            + f"in {_unmix_duration_text(elapsed)}",
+        )
 
 
 def _unmix_highlight_spectrum(ctx, page, spectrum_id) -> None:
@@ -3093,6 +3280,7 @@ def _unmix_image_panel(ctx, page) -> QWidget:
     dtype_row.addWidget(dtype_combo, 1)
     lay.addLayout(dtype_row)
 
+    run_row = QHBoxLayout()
     run_btn = QPushButton("Run unmix")
     run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     run_btn.setEnabled(not page._unmix_locked)
@@ -3101,8 +3289,18 @@ def _unmix_image_panel(ctx, page) -> QWidget:
         "them for downstream modules; image files also get image pyramids"
     )
     run_btn.clicked.connect(lambda _=False: _unmix_start_run(ctx, page))
-    lay.addWidget(run_btn)
+    run_row.addWidget(run_btn, 1)
+    cancel_btn = QPushButton("Cancel")
+    cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    cancel_btn.setEnabled(False)
+    cancel_btn.setToolTip(
+        "Stop the run after the current chunk; the partial output is removed"
+    )
+    cancel_btn.clicked.connect(lambda _=False: _unmix_cancel_run(ctx, page))
+    run_row.addWidget(cancel_btn)
+    lay.addLayout(run_row)
     page._unmix_run_btn = run_btn
+    page._unmix_cancel_btn = cancel_btn
 
     log = QPlainTextEdit()
     log.setReadOnly(True)

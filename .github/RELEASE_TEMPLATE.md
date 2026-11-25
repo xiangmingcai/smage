@@ -2,11 +2,15 @@
 
 ## Highlights
 
-- **Unmix** now has a **Channel data type** setting: **Keep type (float if
-  negative)** (default), **Keep data type**, and **Adapt to results**. It
-  controls whether generated parquet channels keep the source dtype, switch
-  to a fitting float when negatives are present, or use the smallest dtype
-  that can store each file's results.
+- **Unmix** is much faster on large image files. The **Channel data type**
+  modes that depend on the results now decide the dtype from a scan that
+  writes nothing and then write the chosen dtype directly, so the full-size
+  float64 temporary file and its extra pass are gone. Chunks are read and
+  written with Arrow instead of pandas, and the image pyramid is built from
+  the chunks being written instead of reading the new parquet back.
+- **Unmix** shows progress in the status bar, logs each file's size, output
+  dtype and elapsed time, and has a **Cancel** button that stops the run
+  after the current chunk.
 
 ## Downloads
 

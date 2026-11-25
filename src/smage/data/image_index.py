@@ -8,10 +8,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from smage.core.image_ops import _mode_pool
-from smage.core.pipeline import (
-    _evaluate_stages,
-    _pipeline_dependencies,
-)
 from smage.data.workers import _ImageFilterWorker
 
 
@@ -81,120 +77,210 @@ def _image_write_level(idx_dir, block, means2d):
     return {"block": int(block), "file": fname}
 
 
+class _ImageIndexBuilder:
+    """Accumulate the finest pyramid level while data is being written.
+
+    Unmix writes its output chunks itself; feeding the same chunks here means
+    the display pyramid is built without reading the new parquet back.  The
+    grid geometry comes from the source file, so only the values are consumed.
+
+    Each level is a 2D array `(H/b, W/b, C)` of per-block channel means.  The
+    finest block size `b0` is chosen so the level fits _IMAGE_FINEST_CAP;
+    coarser levels double the block via 2x2 count-weighted pooling.
+    """
+
+    def __init__(self, columns, xmin, xmax, ymin, ymax, total):
+        import math
+        import numpy as np
+
+        self.columns = list(columns)
+        self.xmin = float(xmin)
+        self.xmax = float(xmax)
+        self.ymin = float(ymin)
+        self.ymax = float(ymax)
+        self.total = int(total)
+        self.width = self.xmax - self.xmin + 1.0
+        self.height = self.ymax - self.ymin + 1.0
+        if self.width < 1 or self.height < 1 or self.total == 0:
+            raise ValueError("image file has no pixels")
+        block = 1
+        while True:
+            nbx = int(math.ceil(self.width / block))
+            nby = int(math.ceil(self.height / block))
+            if nbx * nby <= _IMAGE_FINEST_CAP:
+                break
+            block *= 2
+        self.block = block
+        self.nbx = nbx
+        self.nby = nby
+        self.nblocks = nbx * nby
+        self.ncol = len(self.columns)
+        self.count = np.zeros(self.nblocks, dtype=np.int64)
+        self.sums = np.zeros((self.nblocks, self.ncol), dtype=np.float64)
+        self.ch_min = np.full(self.ncol, np.inf)
+        self.ch_max = np.full(self.ncol, -np.inf)
+
+    def update(self, x_values, y_values, values) -> None:
+        """Accumulate one written chunk.
+
+        ``values`` holds every non-x/y column of ``self.columns``.  Missing
+        columns are treated as all-NaN, which keeps them out of the ranges.
+        """
+        import numpy as np
+
+        x = np.asarray(x_values, dtype="float64")
+        if x.size == 0:
+            return
+        y = np.asarray(y_values, dtype="float64")
+        bi = ((x - self.xmin) // self.block).astype(np.int64)
+        bi += ((y - self.ymin) // self.block).astype(np.int64) * self.nbx
+        np.clip(bi, 0, self.nblocks - 1, out=bi)
+        self.count += np.bincount(bi, minlength=self.nblocks)
+        for j, name in enumerate(self.columns):
+            if name == "x":
+                col = x
+            elif name == "y":
+                col = y
+            elif name in values:
+                col = values[name]
+            else:
+                continue
+            if col.size != x.size:
+                raise ValueError(f"column {name!r} has the wrong length")
+            if col.dtype.kind in "iu":
+                # Integers cannot be NaN: skip the mask and the float copy.
+                self.sums[:, j] += np.bincount(
+                    bi, weights=col, minlength=self.nblocks
+                )
+                self.ch_min[j] = min(self.ch_min[j], float(col.min()))
+                self.ch_max[j] = max(self.ch_max[j], float(col.max()))
+                continue
+            v = np.asarray(col, dtype="float64")
+            if np.isfinite(v).all():
+                self.sums[:, j] += np.bincount(
+                    bi, weights=v, minlength=self.nblocks
+                )
+                self.ch_min[j] = min(self.ch_min[j], float(v.min()))
+                self.ch_max[j] = max(self.ch_max[j], float(v.max()))
+                continue
+            self.sums[:, j] += np.bincount(
+                bi, weights=np.nan_to_num(v), minlength=self.nblocks
+            )
+            finite = np.isfinite(v)
+            if finite.any():
+                vals = v[finite]
+                self.ch_min[j] = min(self.ch_min[j], float(vals.min()))
+                self.ch_max[j] = max(self.ch_max[j], float(vals.max()))
+
+    def finish(self, parquet_path) -> dict:
+        """Write the pyramid levels and manifest for a finished parquet."""
+        import json
+        import math
+        import numpy as np
+
+        means = (self.sums / np.maximum(self.count, 1)[:, None]).reshape(
+            self.nby, self.nbx, self.ncol
+        ).astype(np.float32)
+        idx_dir = _image_index_dir(parquet_path)
+        idx_dir.mkdir(parents=True, exist_ok=True)
+        levels = [_image_write_level(idx_dir, self.block, means)]
+
+        # Coarser levels by 2x2 count-weighted pooling of the previous level.
+        # float32 keeps the temporary padding arrays half the size; the levels
+        # are stored as float32 anyway.
+        prev = means
+        prev_cnt = self.count.reshape(self.nby, self.nbx).astype(np.float32)
+        prev_b = self.block
+        while prev_b < max(self.width, self.height):
+            nb = prev_b * 2
+            h, w = prev.shape[0], prev.shape[1]
+            nbx2 = int(math.ceil(w / 2.0))
+            nby2 = int(math.ceil(h / 2.0))
+            ph, pw = nby2 * 2, nbx2 * 2
+            pad_m = np.zeros((ph, pw, self.ncol), dtype=np.float32)
+            pad_c = np.zeros((ph, pw), dtype=np.float32)
+            pad_m[:h, :w] = prev * prev_cnt[:, :, None]
+            pad_c[:h, :w] = prev_cnt
+            sum_m = pad_m.reshape(nby2, 2, nbx2, 2, self.ncol).sum(
+                axis=(1, 3), dtype=np.float32
+            )
+            sum_c = pad_c.reshape(nby2, 2, nbx2, 2).sum(
+                axis=(1, 3), dtype=np.float32
+            )
+            prev = sum_m / np.maximum(sum_c, 1)[:, :, None]
+            prev_cnt = sum_c
+            levels.append(_image_write_level(idx_dir, nb, prev))
+            prev_b = nb
+            if nby2 * nbx2 <= _IMAGE_COARSEST:
+                break
+
+        color_ranges = {}
+        for j, cc in enumerate(self.columns):
+            color_ranges[cc] = [
+                float(self.ch_min[j]) if np.isfinite(self.ch_min[j]) else 0.0,
+                float(self.ch_max[j]) if np.isfinite(self.ch_max[j]) else 1.0,
+            ]
+        st = Path(parquet_path).stat()
+        manifest = {
+            "version": 2,
+            "file_size": int(st.st_size),
+            "file_mtime": float(st.st_mtime),
+            "xmin": float(self.xmin),
+            "xmax": float(self.xmax),
+            "ymin": float(self.ymin),
+            "ymax": float(self.ymax),
+            "total": int(self.total),
+            "color_cols": list(self.columns),
+            "color_ranges": color_ranges,
+            "levels": levels,
+        }
+        with open(idx_dir / "manifest.json", "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        return manifest
+
+
 def _build_image_index_files(parquet_path, progress_cb=None):
     """Build the multi-level raster pyramid for one image file (disk-cached).
 
-    Each level is a 2D array `(H/b, W/b, C)` of per-block channel means (a
-    downsampled image). The finest level's block size `b0` is chosen so the
-    level fits _IMAGE_FINEST_CAP; coarser levels double the block via 2x2
-    pooling. Only one level is materialised in memory at a time.
+    Reads every column once and feeds ``_ImageIndexBuilder``.  Writers that
+    already have the chunk in memory (Unmix) use the builder directly instead
+    of calling this function.
     """
-    import json
-    import math
     import numpy as np
-    import pandas as pd
     import pyarrow.parquet as pq
 
     xmin, xmax, ymin, ymax, total, names = _image_geometry(parquet_path)
     # Store per-block means for every column (including x/y, so the user may
     # color the image by a coordinate too). The default color parameter is
     # still the first non-x/y column, chosen in _figure_add_plot.
-    color_cols = list(names)
-    width = xmax - xmin + 1.0
-    height = ymax - ymin + 1.0
-    if width < 1 or height < 1 or total == 0:
-        raise ValueError("image file has no pixels")
-
-    block = 1
-    while True:
-        nbx = int(math.ceil(width / block))
-        nby = int(math.ceil(height / block))
-        if nbx * nby <= _IMAGE_FINEST_CAP:
-            break
-        block *= 2
-    b0 = block
-
-    idx_dir = _image_index_dir(parquet_path)
-    idx_dir.mkdir(parents=True, exist_ok=True)
-
+    names = list(names)
+    builder = _ImageIndexBuilder(names, xmin, xmax, ymin, ymax, total)
     pf = pq.ParquetFile(parquet_path)
-    ncol = len(color_cols)
-
-    # Finest level: aggregate raw pixels into b0-sized blocks (single pass).
-    nbx = int(math.ceil(width / b0))
-    nby = int(math.ceil(height / b0))
-    nblocks = nbx * nby
-    cnt = np.zeros(nblocks, dtype=np.int64)
-    sm = np.zeros((nblocks, ncol), dtype=np.float64)
-    ch_min = np.full(ncol, np.inf)
-    ch_max = np.full(ncol, -np.inf)
     processed = 0
     for batch in pf.iter_batches(batch_size=1_000_000, columns=names):
-        tbl = batch.to_pandas()
-        x = tbl["x"].to_numpy(dtype="float64")
-        y = tbl["y"].to_numpy(dtype="float64")
-        bi = ((x - xmin) // b0).astype(np.int64) + ((y - ymin) // b0).astype(np.int64) * nbx
-        np.clip(bi, 0, nblocks - 1, out=bi)
-        cnt += np.bincount(bi, minlength=nblocks)
-        for j, cc in enumerate(color_cols):
-            v = pd.to_numeric(tbl[cc], errors="coerce").to_numpy(dtype="float64")
-            sm[:, j] += np.bincount(bi, weights=np.nan_to_num(v), minlength=nblocks)
-            fin = np.isfinite(v)
-            if fin.any():
-                ch_min[j] = min(ch_min[j], float(v[fin].min()))
-                ch_max[j] = max(ch_max[j], float(v[fin].max()))
-        processed += x.size
+        values = {
+            name: np.asarray(
+                batch.column(name).to_numpy(zero_copy_only=False),
+                dtype="float64",
+            )
+            for name in names
+            if name not in ("x", "y") and name in batch.schema.names
+        }
+        builder.update(
+            np.asarray(
+                batch.column("x").to_numpy(zero_copy_only=False),
+                dtype="float64",
+            ),
+            np.asarray(
+                batch.column("y").to_numpy(zero_copy_only=False),
+                dtype="float64",
+            ),
+            values,
+        )
+        processed += batch.num_rows
         if progress_cb is not None:
-            progress_cb(min(1.0, processed / total))
-
-    means = (sm / np.maximum(cnt, 1)[:, None]).reshape(nby, nbx, ncol)
-    levels = [_image_write_level(idx_dir, b0, means)]
-
-    # Coarser levels by 2x2 count-weighted pooling of the previous level.
-    prev = means
-    prev_cnt = cnt.reshape(nby, nbx)
-    prev_b = b0
-    while prev_b < max(width, height):
-        nb = prev_b * 2
-        h, w = prev.shape[0], prev.shape[1]
-        nbx2 = int(math.ceil(w / 2.0))
-        nby2 = int(math.ceil(h / 2.0))
-        ph, pw = nby2 * 2, nbx2 * 2
-        pad_m = np.zeros((ph, pw, ncol), dtype=np.float64)
-        pad_c = np.zeros((ph, pw), dtype=np.float64)
-        pad_m[:h, :w] = prev * prev_cnt[:, :, None]
-        pad_c[:h, :w] = prev_cnt
-        sum_m = pad_m.reshape(nby2, 2, nbx2, 2, ncol).sum(axis=(1, 3))
-        sum_c = pad_c.reshape(nby2, 2, nbx2, 2).sum(axis=(1, 3))
-        prev = sum_m / np.maximum(sum_c, 1)[:, :, None]
-        prev_cnt = sum_c
-        levels.append(_image_write_level(idx_dir, nb, prev))
-        prev_b = nb
-        if nby2 * nbx2 <= _IMAGE_COARSEST:
-            break
-
-    color_ranges = {}
-    for j, cc in enumerate(color_cols):
-        color_ranges[cc] = [
-            float(ch_min[j]) if np.isfinite(ch_min[j]) else 0.0,
-            float(ch_max[j]) if np.isfinite(ch_max[j]) else 1.0,
-        ]
-
-    manifest = {
-        "version": 2,
-        "file_size": int(Path(parquet_path).stat().st_size),
-        "file_mtime": float(Path(parquet_path).stat().st_mtime),
-        "xmin": float(xmin),
-        "xmax": float(xmax),
-        "ymin": float(ymin),
-        "ymax": float(ymax),
-        "total": int(total),
-        "color_cols": color_cols,
-        "color_ranges": color_ranges,
-        "levels": levels,
-    }
-    with open(idx_dir / "manifest.json", "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh)
+            progress_cb(min(1.0, processed / max(total, 1)))
+    manifest = builder.finish(parquet_path)
     if progress_cb is not None:
         progress_cb(1.0)
     return manifest

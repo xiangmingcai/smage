@@ -6,6 +6,21 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-11-25
+
+### Changed
+
+- **Unmix** is much faster on large image files. Modes that decide the output
+  dtype from the results (`Keep type (float if negative)` on integer sources
+  and `Adapt to results`) now scan the values without writing anything and
+  then write the chosen dtype directly, instead of writing a full-size
+  float64 temporary file and converting it. Chunks are read and written with
+  Arrow rather than pandas, and the image pyramid is accumulated from the
+  chunks being written instead of reading the new parquet back.
+- **Unmix** shows progress in the status bar, logs each file's size, output
+  dtype and elapsed time, and has a **Cancel** button that stops the run
+  after the current chunk and deletes the partial output.
+
 ## [0.4.3] — 2026-11-25
 
 ### Added

@@ -19,8 +19,7 @@ MyExperiment.smage\
 ├── tmp\                # disposable working files; safe to delete
 │   ├── segmentation\   # batch input/output and preview caches
 │   ├── cluster\        # FlowSOM / PARC scratch
-│   ├── batch_align\    # CytoNorm / FlowSOM training scratch
-│   └── unmix\          # temporary values for result-based output dtypes
+│   └── batch_align\    # CytoNorm / FlowSOM training scratch
 └── log\
     └── smage_20260101_120000_p1234.log
 ```
