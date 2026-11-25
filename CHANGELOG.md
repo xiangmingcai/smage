@@ -6,6 +6,16 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-11-25
+
+### Added
+
+- **Unmix** has a **Channel data type** setting: **Keep type (float if
+  negative)** (default), **Keep data type**, and **Adapt to results**. It
+  controls whether generated parquet channels keep the source dtype, switch
+  to a fitting float when negatives are present, or use the smallest dtype
+  that can store each file's results.
+
 ## [0.4.2] — 2026-11-24
 
 ### Changed

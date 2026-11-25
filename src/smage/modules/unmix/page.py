@@ -88,6 +88,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import shutil
 import pyqtgraph as pg
 import threading
@@ -97,6 +98,7 @@ from smage.data import files as _data_files
 from smage.data import image_index as _data_image_index
 from smage.data import naming as _data_naming
 from smage.data import project_paths as _project_paths
+from smage.data import scratch as _data_scratch
 from smage.widgets import canvas_export as _widgets_canvas_export
 from smage.widgets import colormap as _widgets_colormap
 from smage.widgets.gate_editor import editor as _widgets_gate_editor_editor
@@ -110,6 +112,9 @@ def _unmix_output_names(ctx, task_id, parquet_path) -> list:
     if not task_id or not parquet_path:
         return []
     return list(ctx._unmix_applied_columns(task_id, parquet_path))
+
+
+UNMIX_DEFAULT_OUTPUT_DTYPE = "keep_float_negative"
 
 
 def _unmix_flow_config(ctx, task_def) -> dict | None:
@@ -169,6 +174,9 @@ def _unmix_flow_config(ctx, task_def) -> dict | None:
             "columns": pasted_columns,
             "matrix": np.asarray(rows, dtype="float64"),
             "method": params.get("method", "ols"),
+            "output_dtype_mode": params.get(
+                "output_dtype_mode", UNMIX_DEFAULT_OUTPUT_DTYPE
+            ),
             "samples": set(params.get("samples") or []),
         }
         ctx._unmix_flow_cache[task_id] = config
@@ -214,6 +222,9 @@ def _unmix_flow_config(ctx, task_def) -> dict | None:
         "columns": columns,
         "matrix": np.asarray(rows, dtype="float64"),
         "method": params.get("method", "ols"),
+        "output_dtype_mode": params.get(
+            "output_dtype_mode", UNMIX_DEFAULT_OUTPUT_DTYPE
+        ),
         "samples": set(params.get("samples") or []),
     }
     ctx._unmix_flow_cache[task_id] = config
@@ -280,6 +291,9 @@ def _build_unmix_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget:
     page._unmix_params.setdefault("spectra", [])
     page._unmix_params.setdefault("matrix", [])
     page._unmix_params.setdefault("method", "ols")
+    page._unmix_params.setdefault(
+        "output_dtype_mode", UNMIX_DEFAULT_OUTPUT_DTYPE
+    )
     page._unmix_params.setdefault("trees", [])
     page._unmix_params.setdefault("next_spectrum_no", 1)
     # Both signature sources are kept, so switching modes loses nothing.
@@ -762,7 +776,8 @@ def _unmix_log(ctx, page, text: str) -> None:
     del lines[:-500]
 
 
-def _unmix_output_signature(ctx, task_id, parquet_path, config) -> str:
+def _unmix_output_signature(ctx, task_id, parquet_path, config,
+                            legacy=False) -> str:
     """Fingerprint of the config and inputs an Unmix output was made from."""
     import numpy as np
 
@@ -794,21 +809,230 @@ def _unmix_output_signature(ctx, task_id, parquet_path, config) -> str:
             ctx, task_id, parquet_path
         ),
     }
+    mode = str(
+        config.get("output_dtype_mode") or UNMIX_DEFAULT_OUTPUT_DTYPE
+    )
+    if mode != "keep" and not legacy:
+        payload["output_dtype_mode"] = mode
     return hashlib.md5(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _unmix_numeric_dtype(field):
+    """Map an Arrow field to a NumPy numeric dtype, or None."""
+    import numpy as np
+
+    if field is None:
+        return None
+    try:
+        dtype = np.dtype(field.type.to_pandas_dtype())
+    except (TypeError, ValueError):
+        return None
+    if dtype.kind not in "iuf":
+        return None
+    return dtype
+
+
+def _unmix_source_dtype(parquet_file, columns):
+    """Common dtype of the source channels used by an Unmix output."""
+    import numpy as np
+
+    schema = parquet_file.schema_arrow
+    dtypes = []
+    for name in columns:
+        if name in schema.names:
+            dtype = _unmix_numeric_dtype(schema.field(name))
+            if dtype is not None:
+                dtypes.append(dtype)
+    if not dtypes:
+        # Selected columns may all be virtual (masks, gate columns).  Use the
+        # source image/table channels as the representative dtype.
+        for name in schema.names:
+            if name in ("x", "y"):
+                continue
+            dtype = _unmix_numeric_dtype(schema.field(name))
+            if dtype is not None:
+                dtypes.append(dtype)
+    if not dtypes:
+        return np.dtype("float32")
+    return np.dtype(np.result_type(*dtypes))
+
+
+def _unmix_xy_dtype(parquet_file, name):
+    """Source x/y dtype, or int64 when it is unavailable."""
+    import numpy as np
+
+    schema = parquet_file.schema_arrow
+    if name in schema.names:
+        dtype = _unmix_numeric_dtype(schema.field(name))
+        if dtype is not None and dtype.kind in "iu":
+            return dtype
+    return np.dtype("int64")
+
+
+def _unmix_round_values(values):
+    """Round halves away from zero, matching ordinary 四舍五入."""
+    import numpy as np
+
+    arr = np.asarray(values, dtype="float64")
+    out = np.empty_like(arr)
+    positive = arr >= 0
+    out[positive] = np.floor(arr[positive] + 0.5)
+    out[~positive] = np.ceil(arr[~positive] - 0.5)
+    return out
+
+
+def _unmix_cast_values(values, dtype, negative_to_zero=False):
+    """Cast one unmixed channel to an output dtype."""
+    import numpy as np
+
+    target = np.dtype(dtype)
+    arr = np.asarray(values, dtype="float64")
+    if target.kind not in "iu":
+        return arr.astype(target)
+    rounded = _unmix_round_values(arr)
+    rounded[~np.isfinite(arr)] = 0.0
+    info = np.iinfo(target)
+    low = 0 if negative_to_zero else info.min
+    rounded = np.clip(rounded, low, info.max)
+    return rounded.astype(target)
+
+
+class _UnmixOutputStats:
+    """Global statistics used by the per-file dtype modes."""
+
+    def __init__(self) -> None:
+        self.min_value = None
+        self.max_value = None
+        self.negative_rounded = False
+        self.fractional = False
+        self.nonfinite = False
+
+    def update(self, values) -> None:
+        import numpy as np
+
+        arr = np.asarray(values, dtype="float64")
+        finite = np.isfinite(arr)
+        if finite.any():
+            vals = arr[finite]
+            low = float(vals.min())
+            high = float(vals.max())
+            self.min_value = low if self.min_value is None else min(self.min_value, low)
+            self.max_value = high if self.max_value is None else max(self.max_value, high)
+            rounded = _unmix_round_values(vals)
+            if np.any(rounded < 0):
+                self.negative_rounded = True
+            if not np.allclose(vals, rounded, rtol=1e-9, atol=1e-9):
+                self.fractional = True
+        if not finite.all():
+            self.nonfinite = True
+
+
+def _unmix_float_dtype(stats):
+    """Smallest float dtype whose range covers the finite results."""
+    import numpy as np
+
+    if stats.min_value is None:
+        return np.dtype("float32")
+    magnitude = max(abs(stats.min_value), abs(stats.max_value))
+    if magnitude <= float(np.finfo(np.float16).max):
+        return np.dtype("float16")
+    if magnitude <= float(np.finfo(np.float32).max):
+        return np.dtype("float32")
+    return np.dtype("float64")
+
+
+def _unmix_adapt_dtype(stats):
+    """Smallest dtype that can store this file's results."""
+    import numpy as np
+
+    if stats.nonfinite or stats.fractional or stats.min_value is None:
+        return _unmix_float_dtype(stats)
+    low = stats.min_value
+    high = stats.max_value
+    if low >= 0:
+        for dtype in ("uint8", "uint16", "uint32", "uint64"):
+            info = np.iinfo(np.dtype(dtype))
+            if high <= info.max:
+                return np.dtype(dtype)
+        return np.dtype("float64")
+    for dtype in ("int8", "int16", "int32", "int64"):
+        info = np.iinfo(np.dtype(dtype))
+        if low >= info.min and high <= info.max:
+            return np.dtype(dtype)
+    return np.dtype("float64")
+
+
+def _unmix_write_frame(writer, path, x_values, y_values, values, names,
+                       is_image, x_dtype, y_dtype, target_dtype=None,
+                       negative_to_zero=False):
+    """Write one output chunk with a fixed target dtype."""
+    import numpy as np
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    data = {}
+    if is_image:
+        data["x"] = np.asarray(x_values, dtype=x_dtype)
+        data["y"] = np.asarray(y_values, dtype=y_dtype)
+    for j, name in enumerate(names):
+        if target_dtype is None:
+            data[name] = np.asarray(values[:, j], dtype="float64")
+        else:
+            data[name] = _unmix_cast_values(
+                values[:, j], target_dtype, negative_to_zero=negative_to_zero
+            )
+    table = pa.Table.from_pandas(
+        pd.DataFrame(data), preserve_index=False
+    )
+    if writer is None:
+        writer = pq.ParquetWriter(str(path), table.schema)
+    writer.write_table(table)
+    return writer
+
+
+def _unmix_convert_parquet(source, target, names, is_image, x_dtype, y_dtype,
+                           target_dtype, negative_to_zero=False) -> None:
+    """Rewrite a temporary float64 output with the chosen dtype."""
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    writer = None
+    try:
+        for batch in pq.ParquetFile(str(source)).iter_batches(
+            batch_size=500_000
+        ):
+            frame = batch.to_pandas()
+            values = np.column_stack([
+                frame[name].to_numpy(dtype="float64") for name in names
+            ])
+            writer = _unmix_write_frame(
+                writer, target,
+                frame["x"] if is_image else None,
+                frame["y"] if is_image else None,
+                values, names, is_image, x_dtype, y_dtype,
+                target_dtype=target_dtype,
+                negative_to_zero=negative_to_zero,
+            )
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
     """Write one file's unmixed channels (and image pyramid for images)."""
     import numpy as np
     import pandas as pd
-    import pyarrow as pa
     import pyarrow.parquet as pq
 
     names = list(config.get("names") or [])
     columns = list(config.get("columns") or [])
     matrix = np.asarray(config.get("matrix"), dtype="float64")
+    mode = str(
+        config.get("output_dtype_mode") or UNMIX_DEFAULT_OUTPUT_DTYPE
+    )
     if not names or not columns:
         raise ValueError("no unmixing signatures")
     if (
@@ -840,6 +1064,9 @@ def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
         if stages else set(columns)
     )
     pf = pq.ParquetFile(parquet_path)
+    source_dtype = _unmix_source_dtype(pf, columns)
+    x_dtype = _unmix_xy_dtype(pf, "x")
+    y_dtype = _unmix_xy_dtype(pf, "y")
     available = set(pf.schema_arrow.names)
     virtual = sorted(c for c in needed if c not in available)
     # Virtual columns (Gate2Col, masks, ...) cannot be read from the source
@@ -851,24 +1078,15 @@ def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
         # full table is the only way to reproduce that for non-image data.
         fallback = True
 
-    writer = None
+    needs_stats = (
+        mode == "adapt"
+        or (mode == "keep_float_negative" and source_dtype.kind in "iu")
+    )
+    stats = _UnmixOutputStats() if needs_stats else None
+    target_dtype = source_dtype
+    negative_to_zero = mode == "keep" and source_dtype.kind in "iu"
 
-    def write_frame(x_values, y_values, unmixed) -> None:
-        nonlocal writer
-        data = {}
-        if is_image:
-            data["x"] = np.asarray(x_values, dtype="float64")
-            data["y"] = np.asarray(y_values, dtype="float64")
-        for j, name in enumerate(names):
-            data[name] = unmixed[:, j]
-        table = pa.Table.from_pandas(
-            pd.DataFrame(data), preserve_index=False
-        )
-        if writer is None:
-            writer = pq.ParquetWriter(str(out_path), table.schema)
-        writer.write_table(table)
-
-    try:
+    def run_pipeline(write_frame) -> None:
         if fallback:
             requested = list(dict.fromkeys(
                 (["x", "y"] if is_image else []) + columns
@@ -894,52 +1112,100 @@ def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
                     full.get("y", [])[start:end] if is_image else None,
                     unmixed[start:end],
                 )
-        else:
-            read_cols = list(dict.fromkeys(
-                (["x", "y"] if is_image else []) + list(needed)
-            ))
-            for batch in pf.iter_batches(
-                batch_size=500_000, columns=read_cols
-            ):
-                df = batch.to_pandas()
-                values = {
-                    c: pd.to_numeric(df[c], errors="coerce").to_numpy(
-                        dtype="float64"
-                    )
-                    for c in read_cols if c in df.columns
-                }
-                if stages:
-                    evaluated = _evaluate_stages(
-                        stages, values, columns,
-                        parquet_path=parquet_path,
-                        cache=None,
-                        origin=origin,
-                    )
-                else:
-                    evaluated = {
-                        c: values[c] for c in columns if c in values
-                    }
-                missing = [c for c in columns if c not in evaluated]
-                if missing:
-                    raise ValueError(
-                        "channel(s) could not be computed: "
-                        + ", ".join(missing)
-                    )
-                stacked = np.column_stack([
-                    np.asarray(evaluated[c], dtype="float64")
-                    for c in columns
-                ])
-                unmixed = stacked @ pinv
-                if is_image and ("x" not in values or "y" not in values):
-                    raise ValueError("the source file has no x/y columns")
-                write_frame(
-                    values.get("x") if is_image else None,
-                    values.get("y") if is_image else None,
-                    unmixed,
+            return
+        read_cols = list(dict.fromkeys(
+            (["x", "y"] if is_image else []) + list(needed)
+        ))
+        for batch in pf.iter_batches(batch_size=500_000, columns=read_cols):
+            df = batch.to_pandas()
+            values = {
+                c: pd.to_numeric(df[c], errors="coerce").to_numpy(
+                    dtype="float64"
                 )
-    finally:
-        if writer is not None:
-            writer.close()
+                for c in read_cols if c in df.columns
+            }
+            if stages:
+                evaluated = _evaluate_stages(
+                    stages, values, columns,
+                    parquet_path=parquet_path,
+                    cache=None,
+                    origin=origin,
+                )
+            else:
+                evaluated = {
+                    c: values[c] for c in columns if c in values
+                }
+            missing = [c for c in columns if c not in evaluated]
+            if missing:
+                raise ValueError(
+                    "channel(s) could not be computed: "
+                    + ", ".join(missing)
+                )
+            stacked = np.column_stack([
+                np.asarray(evaluated[c], dtype="float64")
+                for c in columns
+            ])
+            unmixed = stacked @ pinv
+            if is_image and ("x" not in values or "y" not in values):
+                raise ValueError("the source file has no x/y columns")
+            write_frame(
+                values.get("x") if is_image else None,
+                values.get("y") if is_image else None,
+                unmixed,
+            )
+
+    if needs_stats:
+        with _data_scratch._scratch_run(ctx, "unmix") as run_dir:
+            temp_path = run_dir / "unmix_dtype.parquet"
+            writer = None
+
+            def write_temp(x_values, y_values, unmixed) -> None:
+                nonlocal writer
+                stats.update(unmixed)
+                writer = _unmix_write_frame(
+                    writer, temp_path, x_values, y_values, unmixed,
+                    names, is_image, x_dtype, y_dtype,
+                )
+
+            try:
+                run_pipeline(write_temp)
+            finally:
+                if writer is not None:
+                    writer.close()
+
+            if mode == "adapt":
+                target_dtype = _unmix_adapt_dtype(stats)
+            elif stats.negative_rounded:
+                target_dtype = _unmix_float_dtype(stats)
+            else:
+                target_dtype = source_dtype
+            negative_to_zero = False
+            if target_dtype == np.dtype("float64"):
+                os.replace(temp_path, out_path)
+            else:
+                _unmix_convert_parquet(
+                    temp_path, out_path, names, is_image,
+                    x_dtype, y_dtype, target_dtype,
+                    negative_to_zero=negative_to_zero,
+                )
+    else:
+        writer = None
+
+        def write_final(x_values, y_values, unmixed) -> None:
+            nonlocal writer
+            writer = _unmix_write_frame(
+                writer, out_path, x_values, y_values, unmixed,
+                names, is_image, x_dtype, y_dtype,
+                target_dtype=target_dtype,
+                negative_to_zero=negative_to_zero,
+            )
+
+        try:
+            run_pipeline(write_final)
+        finally:
+            if writer is not None:
+                writer.close()
+
     if is_image:
         _build_image_index_files(str(out_path))
     else:
@@ -949,6 +1215,8 @@ def _unmix_write_output(ctx, task_id, parquet_path, config) -> dict:
         "path": rel,
         "columns": names,
         "kind": "image" if is_image else "table",
+        "dtype": np.dtype(target_dtype).name,
+        "output_dtype_mode": mode,
         "signature": _unmix_output_signature(ctx,
             task_id, parquet_path, config
         ),
@@ -1111,8 +1379,12 @@ def _unmix_output_is_current(ctx, task_id, parquet_path, config, rec) -> bool:
     """Whether a saved unmix output still matches the current matrix."""
     if not isinstance(rec, dict) or not rec.get("path"):
         return False
-    if rec.get("signature") != _unmix_output_signature(ctx,
-        task_id, parquet_path, config
+    # Outputs saved before the data-type option have no dtype field.  Keep
+    # them usable until the user presses Run unmix again, which rewrites them
+    # with the current output-dtype mode.
+    legacy = not rec.get("dtype")
+    if rec.get("signature") != _unmix_output_signature(
+        ctx, task_id, parquet_path, config, legacy=legacy
     ):
         return False
     path = ctx.project.path / rec["path"]
@@ -1153,19 +1425,27 @@ def _unmix_output_worker(ctx, page, q, config, files, labels=None,
                 q.put(("log", "Cancelled."))
                 break
             label = labels.get(path) or Path(str(path)).name
-            if _unmix_output_is_current(ctx,
-                task_id, path, config, outputs.get(path)
+            rec = outputs.get(path)
+            if (
+                _unmix_output_is_current(ctx, task_id, path, config, rec)
+                and isinstance(rec, dict)
+                and rec.get("dtype")
             ):
-                # Nothing about the matrix changed: keep the saved output.
+                # Nothing about the matrix or output settings changed: keep
+                # the saved output.  Records from before the dtype option
+                # have no dtype and are rewritten once.
                 q.put(("log", f"• already up to date, skipped: {label}"))
                 unchanged += 1
                 continue
             try:
-                outputs[path] = _unmix_write_output(ctx,
-                    task_id, path, config
-                )
+                result = _unmix_write_output(ctx, task_id, path, config)
+                outputs[path] = result
                 done += 1
-                q.put(("log", f"✓ {label}  ({i + 1}/{len(files)})"))
+                q.put((
+                    "log",
+                    f"✓ {label}  [{result.get('dtype', '?')}]  "
+                    f"({i + 1}/{len(files)})",
+                ))
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 q.put(("log", f"✗ {label}: {exc}"))
@@ -2785,6 +3065,34 @@ def _unmix_image_panel(ctx, page) -> QWidget:
     method_row.addWidget(method_combo, 1)
     lay.addLayout(method_row)
 
+    dtype_row = QHBoxLayout()
+    dtype_row.addWidget(QLabel("Channel data type"))
+    dtype_combo = _NoWheelComboBox()
+    dtype_combo.addItem("Keep data type", "keep")
+    dtype_combo.addItem("Keep type (float if negative)", "keep_float_negative")
+    dtype_combo.addItem("Adapt to results", "adapt")
+    dtype_index = dtype_combo.findData(
+        page._unmix_params.get(
+            "output_dtype_mode", UNMIX_DEFAULT_OUTPUT_DTYPE
+        )
+    )
+    dtype_combo.setCurrentIndex(dtype_index if dtype_index >= 0 else 0)
+    dtype_combo.setEnabled(not page._unmix_locked)
+    dtype_combo.setToolTip(
+        "Keep data type: use the source channel dtype, rounding decimals and "
+        "clamping negatives to zero. "
+        "Keep type (float if negative): keep the source dtype unless the "
+        "rounded result contains negatives, then use the smallest fitting "
+        "float type. "
+        "Adapt to results: choose the smallest dtype per file from the "
+        "unmixed values."
+    )
+    dtype_combo.currentIndexChanged.connect(
+        lambda _=0: _unmix_on_output_dtype_changed(ctx, page, dtype_combo)
+    )
+    dtype_row.addWidget(dtype_combo, 1)
+    lay.addLayout(dtype_row)
+
     run_btn = QPushButton("Run unmix")
     run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     run_btn.setEnabled(not page._unmix_locked)
@@ -3505,6 +3813,11 @@ def _unmix_rebuild_sample_list(ctx, page) -> None:
 def _unmix_on_method_changed(ctx, page, combo) -> None:
     page._unmix_params["method"] = combo.currentData()
     _unmix_mark_dirty(ctx, page)
+
+
+def _unmix_on_output_dtype_changed(ctx, page, combo) -> None:
+    page._unmix_params["output_dtype_mode"] = combo.currentData()
+    _unmix_mark_dirty(ctx, page, data=False)
 
 
 def _unmix_matrix_table_values(ctx, page):

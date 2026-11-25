@@ -3,6 +3,16 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.4.3 — 2026-11-25
+
+- **Unmix** has a **Channel data type** setting: **Keep type (float if
+  negative)** (default), **Keep data type**, and **Adapt to results**. It
+  controls whether generated parquet channels keep the source dtype, switch
+  to a fitting float when negatives are present, or use the smallest dtype
+  that can store each file's results.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.4.2 — 2026-11-24
 
 - **Unmix**: **Copy matrix to clipboard** now writes 17 significant digits,

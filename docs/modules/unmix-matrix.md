@@ -87,6 +87,26 @@ If a file that was already unmixed is removed from the selection, the next
 **Run unmix** asks before deleting its saved output and removing those
 channels from downstream modules.
 
+## Channel data type
+
+The **Unmixing** panel has a **Channel data type** setting for generated
+outputs:
+
+- **Keep type (float if negative)** (default): keep the source dtype when
+  the rounded result has no negatives. If a file has negative rounded values,
+  use the smallest float dtype that covers its range (`float16`, `float32` or
+  `float64`).
+- **Keep data type**: always use the source channel dtype. For integer
+  sources, decimals are rounded, negatives become zero and values above the
+  dtype maximum are clipped. Float sources keep their dtype and values.
+- **Adapt to results**: choose the smallest dtype per file by byte width.
+  Integer results use the smallest fitting integer type; fractional or
+  non-finite results use the smallest fitting float type.
+
+Image `x` and `y` columns keep the source integer dtype. Files that need a
+temporary result for the negative/adapt modes are staged under
+`<project>/tmp/unmix/` and cleaned up automatically.
+
 ## Running
 
 1. Choose the **Unmixing method** (`OLS` — ordinary least squares — is the

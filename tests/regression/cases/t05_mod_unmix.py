@@ -8,6 +8,7 @@ import copy
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontMetrics, QImage
@@ -845,6 +846,70 @@ def manual_modes() -> None:
         harness.eq(len(params["matrix"]), 1, "the spectra row is kept too")
     finally:
         _close(window)
+
+
+@harness.case("mod.unmix.output_dtype_modes", "L4", "unmix", tags=("fast",))
+def output_dtype_modes() -> None:
+    """Keep, keep-float-negative and adapt choose the expected dtypes."""
+    project = harness.new_project("unmix_output_dtypes", rows=8)
+    parquet = project.data_dir / "case.parquet"
+    frame = pd.read_parquet(parquet)
+    frame["FL1-A"] = np.full(len(frame), 10, dtype="uint16")
+    frame["FL2-A"] = np.full(len(frame), 20, dtype="uint16")
+    frame.to_parquet(parquet, index=False)
+
+    window = harness.new_window()
+    harness.open_project(window, project)
+    try:
+        ctx = window._ctx
+        base = {
+            "task_id": "u-1",
+            "names": ["U1"],
+            "columns": ["FL1-A", "FL2-A"],
+            "matrix": np.array([[1.0, -1.0]]),
+            "method": "ols",
+        }
+        expected = {
+            "keep": ("uint16", 0),
+            "keep_float_negative": ("float16", -5.0),
+            "adapt": ("int8", -5),
+        }
+        for mode, (dtype, value) in expected.items():
+            config = dict(base, output_dtype_mode=mode)
+            record = _unmix_page._unmix_write_output(
+                ctx, "u-1", str(parquet), config
+            )
+            harness.eq(record["dtype"], dtype)
+            path = project.path / record["path"]
+            harness.eq(
+                str(pq.ParquetFile(path).schema_arrow.field("U1").type),
+                "halffloat" if dtype == "float16" else dtype,
+            )
+            harness.eq(pd.read_parquet(path)["U1"].iloc[0], value)
+
+        # The default mode switches to a fitting float when negatives appear.
+        default_config = dict(base)
+        record = _unmix_page._unmix_write_output(
+            ctx, "u-1", str(parquet), default_config
+        )
+        harness.eq(record["dtype"], "float16")
+
+        # A fractional result is stored as the smallest fitting float.
+        config = dict(
+            base, matrix=np.array([[0.3, 0.7]]),
+            output_dtype_mode="adapt",
+        )
+        record = _unmix_page._unmix_write_output(
+            ctx, "u-1", str(parquet), config
+        )
+        harness.eq(record["dtype"], "float16")
+        harness.check(
+            abs(float(pd.read_parquet(project.path / record["path"])["U1"].iloc[0])
+                - (10 * 0.3 + 20 * 0.7) / (0.3 ** 2 + 0.7 ** 2) * 1.0) < 5e-2,
+            "the fractional result is stored with float16 precision",
+        )
+    finally:
+        harness.close_window(window)
 
 
 if __name__ == "__main__":

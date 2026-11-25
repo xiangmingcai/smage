@@ -2,9 +2,11 @@
 
 ## Highlights
 
-- **Unmix**: **Copy matrix to clipboard** now writes 17 significant digits,
-  enough to round-trip every float64 value. Copy → paste into another Unmix
-  module reproduces the matrix exactly, so unmixed results stay identical.
+- **Unmix** now has a **Channel data type** setting: **Keep type (float if
+  negative)** (default), **Keep data type**, and **Adapt to results**. It
+  controls whether generated parquet channels keep the source dtype, switch
+  to a fitting float when negatives are present, or use the smallest dtype
+  that can store each file's results.
 
 ## Downloads
 

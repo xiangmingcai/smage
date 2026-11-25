@@ -41,7 +41,9 @@ button. The gate shape is stored per file.
 The spectra and their gates feed the second tab. **Run unmix** generates the
 unmixed channels for every selected table and image file (see
 [Matrix Unmixing](unmix-matrix.md)); the module then exposes one unmixed
-channel per signature to downstream modules.
+channel per signature to downstream modules. The **Channel data type** setting
+controls whether those generated parquet columns keep the source dtype or use
+a smaller type chosen from the results.
 
 ## Saving plots
 
