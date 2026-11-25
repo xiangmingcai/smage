@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from datetime import datetime
-from smage.core.constants import MODULE_STATE_MODIFIED
+from smage.core.constants import MODULE_STATE_MODIFIED, _FEATURE_LOG_LIMIT
 from smage.core.pipeline import _apply_batch_align
 from smage.widgets.controls import (
     _NoWheelComboBox,
@@ -270,6 +270,13 @@ def _ba_log(ctx, page, text) -> None:
     for line in str(text).splitlines():
         if line.strip():
             lines.append(f"[{ts}] {line}")
+    if len(lines) > _FEATURE_LOG_LIMIT:
+        del lines[:-_FEATURE_LOG_LIMIT]
+    # Store the log in the module's params as it grows, like the other
+    # modules, so a project save (or closing the app) keeps it.
+    params = getattr(page, "_ba_params", None)
+    if params is not None:
+        params["log"] = list(lines)
     log = getattr(page, "_ba_log", None)
     if log is not None:
         for line in str(text).splitlines():

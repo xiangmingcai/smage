@@ -327,7 +327,10 @@ def _unmix_applied_columns(ctx, task_id, parquet_path) -> dict:
         if config is None:
             continue
         if rec.get("signature") != ctx._unmix_output_signature(
-            task.get("id"), parquet_path, config
+            task.get("id"), parquet_path, config,
+            # Outputs saved before the output-dtype option were written
+            # without that field in the signature; keep them usable.
+            legacy=not rec.get("dtype"),
         ):
             continue
         path = ctx.project.path / rec["path"]
@@ -422,7 +425,10 @@ def _unmix_image_outputs(ctx, task_id, parquet_path):
         config = ctx._unmix_flow_config(task)
         path = ctx.project.path / rec["path"]
         signature = (
-            ctx._unmix_output_signature(task.get("id"), parquet_path, config)
+            ctx._unmix_output_signature(
+                task.get("id"), parquet_path, config,
+                legacy=not rec.get("dtype"),
+            )
             if config is not None else None
         )
         if (

@@ -10,9 +10,10 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QTabWidget,
+    QAbstractItemView, QDialog, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser,
     QVBoxLayout, QWidget,
 )
 
@@ -23,6 +24,7 @@ from smage.core.pipeline import (
 )
 from smage.data.image_index import _image_geometry
 from smage.modules.export.state import (
+    _EXPORT_DTYPE_DEFAULT, _EXPORT_DTYPE_HELP_HTML, _EXPORT_DTYPE_MODES,
     _EXPORT_EXT, _EXPORT_FORMATS, _ExportCancelled, _ExportPane,
 )
 from smage.runlog import runlog
@@ -43,6 +45,7 @@ def _export_params_for(ctx, page, kind: str) -> dict:
     section.setdefault("columns" if kind == "table" else "channels", [])
     section.setdefault("dir", "")
     section.setdefault("format", _EXPORT_FORMATS[kind][0][1])
+    section.setdefault("dtype_mode", _EXPORT_DTYPE_DEFAULT)
     section.setdefault("log", [])
     return section
 
@@ -177,23 +180,60 @@ def _export_files_panel(ctx, page, kind: str) -> QWidget:
     btn.setEnabled(not page._export_locked)
     btn.clicked.connect(lambda _=False: _export_select_files(ctx, page, kind))
     lay.addWidget(btn)
-    box = QListWidget()
-    box.setStyleSheet(
-        "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
-    )
-    lay.addWidget(box, 1)
-    hint = QLabel(
-        "Pick the files to export. Image files can also be exported as "
-        "tables."
-        if kind == "table" else
-        "Only image files are listed here."
-    )
-    hint.setWordWrap(True)
-    hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
-    lay.addWidget(hint)
+
+    if kind == "image":
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["File", "Highest dtype", "Est. size"])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        table.setShowGrid(False)
+        table.verticalHeader().setVisible(False)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.setStyleSheet(
+            "QTableWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(table, 1)
+        summary = QLabel("")
+        summary.setWordWrap(True)
+        summary.setStyleSheet("color: #6b7785;")
+        lay.addWidget(summary)
+        hint = QLabel(
+            "One dtype is used for every channel of a file. The size is "
+            "estimated for an uncompressed TIFF."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        lay.addWidget(hint)
+        help_btn = QPushButton("Know more about data type")
+        help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        help_btn.clicked.connect(
+            lambda _=False: _export_show_dtype_help(ctx, page)
+        )
+        lay.addWidget(help_btn)
+        pane.files_table = table
+        pane.files_summary = summary
+        pane.files_help_btn = help_btn
+        pane.files_box = None
+    else:
+        box = QListWidget()
+        box.setStyleSheet(
+            "QListWidget { background: #ffffff; border: 1px solid #d0d7e2; }"
+        )
+        lay.addWidget(box, 1)
+        hint = QLabel(
+            "Pick the files to export. Image files can also be exported as "
+            "tables."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
+        lay.addWidget(hint)
+        pane.files_box = box
 
     pane.files_btn = btn
-    pane.files_box = box
     pane.files_count = count
     return panel
 
@@ -322,6 +362,26 @@ def _export_settings_panel(ctx, page, kind: str) -> QWidget:
         lambda _i=0: _export_on_format(ctx, page, kind)
     )
     grid.addWidget(fmt_combo, 3, 0, 1, 2)
+    dtype_combo = None
+    if kind == "image":
+        grid.addWidget(QLabel("Data type"), 4, 0, 1, 2)
+        dtype_combo = _NoWheelComboBox()
+        for label, value in _EXPORT_DTYPE_MODES:
+            dtype_combo.addItem(label, value)
+        index = dtype_combo.findData(
+            section.get("dtype_mode", _EXPORT_DTYPE_DEFAULT)
+        )
+        dtype_combo.setCurrentIndex(max(0, index))
+        dtype_combo.setEnabled(not page._export_locked)
+        dtype_combo.setToolTip(
+            "Highest dtype of each file: every file keeps its own highest "
+            "channel dtype. Highest dtype of all files: every file uses the "
+            "highest dtype found across the selected files."
+        )
+        dtype_combo.currentIndexChanged.connect(
+            lambda _i=0: _export_on_dtype_mode(ctx, page)
+        )
+        grid.addWidget(dtype_combo, 5, 0, 1, 2)
     lay.addLayout(grid)
 
     row = QHBoxLayout()
@@ -361,6 +421,7 @@ def _export_settings_panel(ctx, page, kind: str) -> QWidget:
     pane.dir_edit = dir_edit
     pane.browse_btn = browse_btn
     pane.format_combo = fmt_combo
+    pane.dtype_combo = dtype_combo
     pane.export_btn = export_btn
     pane.cancel_btn = cancel_btn
     pane.progress = progress
@@ -407,6 +468,245 @@ def _export_source_column(ctx, task_id, path, name: str) -> str:
         reverse = {v: k for k, v in stage["map"].items()}
         name = reverse.get(name, name)
     return name
+
+
+# Parquet schema lookups only read metadata; keep them for the session.
+_DTYPE_SCHEMA_CACHE = {}
+
+
+def _export_arrow_dtype(field_type):
+    """numpy dtype of a numeric Arrow type, or None for anything else."""
+    import numpy as np
+    import pyarrow as pa
+
+    if not (
+        pa.types.is_integer(field_type) or pa.types.is_floating(field_type)
+    ):
+        return None
+    try:
+        return np.dtype(field_type.to_pandas_dtype())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _export_parquet_dtypes(path) -> dict:
+    """{column: numpy dtype} of one parquet file (metadata only, cached)."""
+    import pyarrow.parquet as pq
+
+    try:
+        stat = Path(str(path)).stat()
+    except OSError:
+        return {}
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    cached = _DTYPE_SCHEMA_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = {}
+    try:
+        schema = pq.ParquetFile(str(path)).schema_arrow
+    except Exception:  # noqa: BLE001
+        schema = None
+    if schema is not None:
+        for field in schema:
+            dtype = _export_arrow_dtype(field.type)
+            if dtype is not None:
+                out[field.name] = dtype
+    if len(_DTYPE_SCHEMA_CACHE) > 256:
+        _DTYPE_SCHEMA_CACHE.clear()
+    _DTYPE_SCHEMA_CACHE[key] = out
+    return out
+
+
+def _export_generated_records(ctx, task_id, path) -> dict:
+    """{column: mask path or output record} for columns stored elsewhere."""
+    out = {}
+    for name in (
+        "_seg_applied_columns", "_region_applied_columns",
+        "_gate2col_applied_columns", "_feature_up_applied_columns",
+        "_dimred_applied_columns", "_cluster_applied_columns",
+        "_dc_applied_columns", "_unmix_applied_columns",
+    ):
+        getter = getattr(ctx, name, None)
+        if getter is None:
+            continue
+        try:
+            items = getter(task_id, path) or {}
+        except Exception:  # noqa: BLE001 - one bad output must not stop this
+            continue
+        for column, rec in items.items():
+            out.setdefault(column, rec)
+    return out
+
+
+def _export_generated_dtype(rec, name):
+    """dtype of a generated column, read from the parquet storing it."""
+    if isinstance(rec, (str, Path)):
+        source = rec
+        column = "mask"
+    elif isinstance(rec, dict):
+        source = rec.get("parquet") or rec.get("path")
+        column = rec.get("channel") or "mask"
+    else:
+        return None
+    if not source:
+        return None
+    dtypes = _export_parquet_dtypes(source)
+    for candidate in (column, name, "mask"):
+        dtype = dtypes.get(candidate)
+        if dtype is not None:
+            return dtype
+    return None
+
+
+def _export_computed_columns(ctx, task_id, path) -> set:
+    """Columns whose values are computed in memory by an upstream stage."""
+    names = set()
+    for kind, stage in _data_columns._map_stages(
+        ctx, task_id, parquet_path=path
+    ):
+        if kind == "compensation":
+            names.update(stage.get("names") or [])
+        elif kind == "illumination":
+            for sub in stage.get("submodules") or []:
+                channel = sub.get("channel")
+                if channel:
+                    names.add(channel)
+        elif kind == "batch_align":
+            names.update(stage.get("columns") or [])
+        elif kind == "calculation":
+            for row in stage.get("rows") or []:
+                output = row.get("output")
+                if output:
+                    names.add(output)
+    return names
+
+
+def _export_channel_dtypes(ctx, page, path, channels) -> dict:
+    """Source dtype of every selected channel of one file."""
+    import numpy as np
+
+    task_id = page._export_task_id
+    physical = _export_parquet_dtypes(path)
+    generated = _export_generated_records(ctx, task_id, path)
+    computed = _export_computed_columns(ctx, task_id, path)
+    out = {}
+    for name in channels:
+        source = _export_source_column(ctx, task_id, path, name)
+        rec = generated.get(source)
+        if rec is None:
+            rec = generated.get(name)
+        dtype = _export_generated_dtype(rec, source) if rec is not None else None
+        if dtype is None and (name in computed or source in computed):
+            # Computed values are float64 arrays, but storing them as float64
+            # would double every file; float32 is the documented choice.
+            dtype = np.dtype("float32")
+        if dtype is None:
+            dtype = physical.get(source)
+        if dtype is None:
+            dtype = np.dtype("float32")
+        out[name] = np.dtype(dtype)
+    return out
+
+
+def _export_highest_dtype(dtypes):
+    """Highest dtype of a mapping of channel dtypes."""
+    import numpy as np
+
+    values = [np.dtype(dtype) for dtype in dtypes.values()]
+    if not values:
+        return None
+    return np.dtype(np.result_type(*values))
+
+
+def _export_target_plan(ctx, page, files, channels, mode) -> tuple:
+    """(per-file channel dtypes, per-file export dtype)."""
+    import numpy as np
+
+    sources = {}
+    targets = {}
+    for path in files:
+        dtypes = (
+            _export_channel_dtypes(ctx, page, path, channels)
+            if channels else {}
+        )
+        sources[path] = dtypes
+        targets[path] = _export_highest_dtype(dtypes)
+    if mode == "all_files":
+        common = [dtype for dtype in targets.values() if dtype is not None]
+        if common:
+            shared = np.dtype(np.result_type(*common))
+            targets = {path: shared for path in files}
+    return sources, targets
+
+
+def _export_estimated_bytes(width, height, channels, dtype) -> int:
+    """Uncompressed TIFF size; linear in pixels x channels x bytes/sample."""
+    import numpy as np
+
+    return (
+        int(width) * int(height) * int(channels)
+        * int(np.dtype(dtype).itemsize)
+    )
+
+
+def _export_format_size(nbytes) -> str:
+    value = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} GB"
+
+
+# These source dtypes are not exactly representable in float32.
+_EXPORT_FLOAT64_SOURCES = {"uint32", "int32", "uint64", "int64", "float64"}
+
+
+def _export_assembly_dtype(source_dtypes, target) -> str:
+    """Working dtype used while the image is assembled in memory."""
+    import numpy as np
+
+    names = {np.dtype(dtype).name for dtype in source_dtypes.values()}
+    if target is not None:
+        names.add(np.dtype(target).name)
+    return "float64" if names & _EXPORT_FLOAT64_SOURCES else "float32"
+
+
+def _export_finalize_array(array, target_dtype):
+    """Convert the assembled image to the export dtype."""
+    import numpy as np
+
+    target = np.dtype(target_dtype)
+    if target.kind == "f":
+        return array if array.dtype == target else array.astype(target)
+    # Both export modes put every value inside the target's range, so this is
+    # a cast; NaN/Inf can only come from nulls and become 0.
+    np.nan_to_num(array, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    info = np.iinfo(target)
+    np.clip(array, info.min, info.max, out=array)
+    return array.astype(target)
+
+
+def _export_show_dtype_help(ctx, page) -> None:
+    """Large read-only dialog with the data type reference."""
+    dialog = QDialog(ctx.host)
+    dialog.setWindowTitle("Data types")
+    dialog.resize(720, 620)
+    lay = QVBoxLayout(dialog)
+    browser = QTextBrowser()
+    browser.setOpenExternalLinks(False)
+    browser.setHtml(_EXPORT_DTYPE_HELP_HTML)
+    lay.addWidget(browser, 1)
+    row = QHBoxLayout()
+    row.addStretch()
+    close = QPushButton("Close")
+    close.setCursor(Qt.CursorShape.PointingHandCursor)
+    close.clicked.connect(dialog.accept)
+    row.addWidget(close)
+    lay.addLayout(row)
+    dialog.exec()
 
 
 def _export_common_columns(ctx, page, kind: str) -> list:
@@ -547,6 +847,19 @@ def _export_on_format(ctx, page, kind: str) -> None:
         _export_update_buttons(ctx, page, kind)
 
 
+def _export_on_dtype_mode(ctx, page) -> None:
+    pane = _export_pane(ctx, page, "image")
+    combo = getattr(pane, "dtype_combo", None)
+    if combo is None:
+        return
+    value = combo.currentData()
+    section = _export_params_for(ctx, page, "image")
+    if value and value != section.get("dtype_mode", _EXPORT_DTYPE_DEFAULT):
+        section["dtype_mode"] = value
+        _export_mark_dirty(ctx, page)
+        _export_refresh_pane(ctx, page, "image")
+
+
 def _export_on_tab(ctx, page, index: int) -> None:
     kind = "image" if index == 1 else "table"
     page._export_params["tab"] = kind
@@ -576,15 +889,18 @@ def _export_refresh_pane(ctx, page, kind: str) -> None:
     common = _export_common_columns(ctx, page, kind)
     section[key] = [c for c in section.get(key) or [] if c in common]
 
-    pane.files_box.blockSignals(True)
-    pane.files_box.clear()
-    for path in section["files"]:
-        item = QListWidgetItem(
-            _data_naming._comp_file_name(ctx, path, page._export_task_id)
-        )
-        item.setToolTip(str(path))
-        pane.files_box.addItem(item)
-    pane.files_box.blockSignals(False)
+    if kind == "image":
+        _export_refresh_files_table(ctx, page, pane, section)
+    else:
+        pane.files_box.blockSignals(True)
+        pane.files_box.clear()
+        for path in section["files"]:
+            item = QListWidgetItem(
+                _data_naming._comp_file_name(ctx, path, page._export_task_id)
+            )
+            item.setToolTip(str(path))
+            pane.files_box.addItem(item)
+        pane.files_box.blockSignals(False)
 
     pane.syncing = True
     scroll = pane.cols_box.verticalScrollBar().value()
@@ -613,6 +929,60 @@ def _export_refresh_pane(ctx, page, kind: str) -> None:
     _export_update_buttons(ctx, page, kind)
 
 
+def _export_refresh_files_table(ctx, page, pane, section) -> None:
+    """Fill the image file table with its dtype and estimated size."""
+    table = pane.files_table
+    if table is None:
+        return
+    files = list(section.get("files") or [])
+    channels = list(section.get("channels") or [])
+    mode = str(section.get("dtype_mode") or _EXPORT_DTYPE_DEFAULT)
+    sources, targets = _export_target_plan(
+        ctx, page, files, channels, mode
+    )
+
+    table.setRowCount(len(files))
+    total = 0
+    sized = 0
+    for row, path in enumerate(files):
+        label = _data_naming._comp_file_name(
+            ctx, path, page._export_task_id
+        )
+        name_item = QTableWidgetItem(label)
+        name_item.setToolTip(str(path))
+        highest = _export_highest_dtype(sources.get(path) or {})
+        dtype_item = QTableWidgetItem(
+            highest.name if highest is not None else "—"
+        )
+        target = targets.get(path)
+        geometry = _export_image_geometry(ctx, path) if channels else None
+        if target is not None and geometry is not None:
+            size = _export_estimated_bytes(
+                geometry[2], geometry[3], len(channels), target
+            )
+            total += size
+            sized += 1
+            size_item = QTableWidgetItem(_export_format_size(size))
+        else:
+            size_item = QTableWidgetItem("—")
+        for column, item in enumerate((name_item, dtype_item, size_item)):
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            table.setItem(row, column, item)
+
+    parts = []
+    if channels and targets:
+        names = {
+            dtype.name for dtype in targets.values() if dtype is not None
+        }
+        if len(names) == 1:
+            parts.append(f"export dtype: {names.pop()}")
+        elif names:
+            parts.append("export dtype: per file")
+    if sized:
+        parts.append(f"estimated total {_export_format_size(total)}")
+    pane.files_summary.setText(" · ".join(parts))
+
+
 def _export_update_buttons(ctx, page, kind: str) -> None:
     pane = _export_pane(ctx, page, kind)
     section = _export_params_for(ctx, page, kind)
@@ -632,6 +1002,8 @@ def _export_update_buttons(ctx, page, kind: str) -> None:
     pane.format_combo.setEnabled(
         editable and len(_EXPORT_FORMATS[kind]) > 1
     )
+    if pane.dtype_combo is not None:
+        pane.dtype_combo.setEnabled(editable)
 
 
 def _export_mark_dirty(ctx, page) -> None:
@@ -768,7 +1140,12 @@ def _export_confirm(ctx, page, kind: str, files, selected, folder: str) -> bool:
         f"{label} ({len(selected)}): {preview}",
     ]
     if kind == "image":
-        lines.append("x and y are written as fixed columns.")
+        mode = str(section.get("dtype_mode") or _EXPORT_DTYPE_DEFAULT)
+        mode_label = next(
+            (label for label, value in _EXPORT_DTYPE_MODES if value == mode),
+            mode,
+        )
+        lines.append(f"Data type: {mode_label}")
     reply = QMessageBox.question(
         ctx.host, "Export", "\n".join(lines),
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -935,14 +1312,21 @@ def _export_image_geometry(ctx, path):
 
 
 def _export_job_image(ctx, page, q, params) -> None:
+    import numpy as np
     import tifffile
 
     files = list(params.get("files") or [])
     channels = list(params.get("channels") or [])
+    mode = str(params.get("dtype_mode") or _EXPORT_DTYPE_DEFAULT)
     out_dir = Path(str(params.get("dir") or "")).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
+    sources, targets = _export_target_plan(
+        ctx, page, files, channels, mode
+    )
     q.put(("log", f"Image export (TIFF) — {len(files)} file(s), "
-                  f"{len(channels)} channel(s)"))
+                  f"{len(channels)} channel(s), "
+                  + ("per-file dtypes" if mode != "all_files"
+                     else "one dtype for all files")))
     items = _export_targets(ctx, page, files, ".tif")
     conflicts = _export_conflicts(ctx, out_dir, items)
     if conflicts:
@@ -958,34 +1342,41 @@ def _export_job_image(ctx, page, q, params) -> None:
             q.put(("progress", index + 1, len(items)))
             continue
         xmin, ymin, width, height = geometry
+        target = targets.get(path) or np.dtype("float32")
+        dtypes = sources.get(path) or {}
         q.put(("log", f"[{index + 1}/{len(items)}] {label} → {name} — "
                       f"{len(channels)} channel(s), {width}×{height}"))
+        for channel in channels:
+            source = dtypes.get(channel)
+            q.put(("log", f"  {channel}  "
+                          f"{source.name if source else '?'} → {target.name}"))
         result = _export_image_data(ctx,
             page, path, channels, geometry, q,
+            target_dtype=target, source_dtypes=dtypes,
         )
         array, missing, duplicates, outside, missing_channels = result
         if missing_channels:
-            q.put(("log", "  not numeric / not found (written as NaN): "
+            q.put(("log", "  not numeric / not found (written as 0): "
                           + ", ".join(missing_channels)))
-        target = out_dir / name
+        target_path = out_dir / name
         try:
             if array.shape[0] == 1:
                 tifffile.imwrite(
-                    target, array[0], photometric="minisblack"
+                    target_path, array[0], photometric="minisblack"
                 )
             else:
                 tifffile.imwrite(
-                    target, array, photometric="minisblack",
+                    target_path, array, photometric="minisblack",
                     metadata={"axes": "CYX"},
                 )
         except Exception:
             try:
-                target.unlink(missing_ok=True)
+                target_path.unlink(missing_ok=True)
             except OSError:
                 pass
             raise
         q.put(("log", f"  wrote {array.shape[0]}×{array.shape[1]}×"
-                      f"{array.shape[2]} (C×H×W), float32"))
+                      f"{array.shape[2]} (C×H×W), {np.dtype(array.dtype)}"))
         if missing:
             q.put(("log", f"  {missing:,} pixel(s) not covered by any row "
                           "— written as 0"))
@@ -999,8 +1390,9 @@ def _export_job_image(ctx, page, q, params) -> None:
     q.put(("done", {"files": len(items), "dir": str(out_dir)}))
 
 
-def _export_image_data(ctx, page, path, channels, geometry, q):
-    """Read one image into a (C, H, W) float32 array, in row batches."""
+def _export_image_data(ctx, page, path, channels, geometry, q,
+                       target_dtype=None, source_dtypes=None):
+    """Read one image into a (C, H, W) array, in row batches."""
     import numpy as np
     import pandas as pd
     import pyarrow.parquet as pq
@@ -1029,7 +1421,9 @@ def _export_image_data(ctx, page, path, channels, geometry, q):
             task_id, path, virtual, row_filter=False
         )
 
-    array = np.zeros((len(channels), height, width), dtype="float32")
+    target = np.dtype(target_dtype) if target_dtype is not None else None
+    assembly = _export_assembly_dtype(source_dtypes or {}, target)
+    array = np.zeros((len(channels), height, width), dtype=assembly)
     filled = np.zeros(height * width, dtype=np.uint8)
     duplicates = 0
     outside = 0
@@ -1093,11 +1487,13 @@ def _export_image_data(ctx, page, path, channels, geometry, q):
                         missing_channels.append(name)
                     continue
                 array[j].reshape(-1)[linear] = np.asarray(
-                    values_j[valid], dtype="float32"
+                    values_j[valid], dtype=assembly
                 )
         offset += rows
 
     missing = int(height * width - int(filled.sum()))
+    if target is not None:
+        array = _export_finalize_array(array, target)
     return array, missing, duplicates, outside, missing_channels
 
 
@@ -1186,6 +1582,13 @@ def _export_finish(ctx, page, kind: str, finished) -> None:
     else:
         pane.status.setText("Export failed")
         QMessageBox.warning(ctx.host, "Export failed", str(payload))
+    # The log is a product of the module: persist it (and the settings the
+    # run used) without requiring a separate Save, like the other modules.
+    if ctx.project is not None:
+        ctx.project.save()
+    page._export_snapshot = copy.deepcopy(page._export_params)
+    page._export_dirty = False
+    _export_update_save_btn(ctx, page)
 
 
 def _export_save_now(ctx, page) -> None:

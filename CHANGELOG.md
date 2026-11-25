@@ -6,6 +6,40 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-26
+
+### Added
+
+- **Export**: **Image Export** lists each selected file with its **Highest
+  dtype** and an **Est. size**, plus a **Know more about data type** reference
+  with the dtype ranges, precision and third-party software support.
+- **Export**: a **Data type** setting for image export with **Highest dtype of
+  each file** (default) and **Highest dtype of all files**. The run log lists
+  every channel as `source dtype → export dtype`.
+- **Segmentation**: the **Expose** column header carries a checkbox that
+  checks or clears every listed file at once (partially checked for a mixed
+  selection).
+
+### Changed
+
+- **Export**: image export writes each channel in the resolved dtype instead
+  of always float32; values are transferred unchanged (no rescaling or
+  clipping).
+- Module logs keep up to 10,000 lines instead of 400 (500 for Unmix and
+  Segmentation, 2,000 for Region), so long runs stay readable.
+
+### Fixed
+
+- **Unmix** outputs created before 0.4.3 (which have no `dtype` field) are
+  again listed by downstream modules. Their saved signature no longer has to
+  match the newer signature that includes the output data type, so the
+  channels reappear in Figure, Gating, Export and the other readers.
+- **Batch Align** and **Data Clean** store their log in the module as lines
+  are written, so the log is saved with the project and does not depend on
+  pressing Save before closing.
+- **Export** saves the project when a run finishes, so its log is persisted
+  without a separate Save.
+
 ## [0.4.4] — 2026-11-25
 
 ### Changed

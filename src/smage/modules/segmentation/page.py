@@ -402,6 +402,51 @@ def _seg_any_mask(ctx, page) -> bool:
     return False
 
 
+class _SegExposeHeaderCheckBox(QCheckBox):
+    """Tristate checkbox pinned over one table header section.
+
+    Clicking it checks or clears every file at once; the partially checked
+    state mirrors a mixed selection.
+    """
+
+    def __init__(self, header, section: int, text: str = "") -> None:
+        super().__init__(text, header)
+        self._header = header
+        self._section = int(section)
+        self.setTristate(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(
+            "Check or clear every file whose mask can be exposed"
+        )
+        header.sectionResized.connect(self._place)
+        header.geometriesChanged.connect(self._place)
+        self._place()
+
+    def nextCheckState(self) -> None:  # noqa: N802 - Qt override
+        """Toggle between checked and unchecked (partial counts as checked)."""
+        if self.checkState() == Qt.CheckState.Checked:
+            self.setCheckState(Qt.CheckState.Unchecked)
+        else:
+            self.setCheckState(Qt.CheckState.Checked)
+
+    def _place(self, *_args) -> None:
+        header = self._header
+        if (
+            self._section >= header.count()
+            or header.isSectionHidden(self._section)
+        ):
+            self.setVisible(False)
+            return
+        x = header.sectionViewportPosition(self._section)
+        width = header.sectionSize(self._section)
+        hint = self.sizeHint()
+        y = max(0, (header.height() - hint.height()) // 2)
+        self.move(x + max(0, (width - hint.width()) // 2), y)
+        self.setVisible(
+            width > 0 and x + width > 0 and x < header.width()
+        )
+
+
 def _seg_files_panel(ctx, page) -> QWidget:
     panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
@@ -446,10 +491,11 @@ def _seg_files_panel(ctx, page) -> QWidget:
 
     table = QTableWidget()
     table.setColumnCount(3)
-    table.setHorizontalHeaderLabels(["File", "Expose", "Status"])
+    # The Expose header carries a checkbox instead of text.
+    table.setHorizontalHeaderLabels(["File", "", "Status"])
     header = table.horizontalHeader()
     header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-    header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
     header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
     table.verticalHeader().setVisible(False)
     table.verticalHeader().setDefaultSectionSize(26)
@@ -462,6 +508,15 @@ def _seg_files_panel(ctx, page) -> QWidget:
     table.itemChanged.connect(lambda item: _seg_expose_changed(ctx, page, item))
     blay.addWidget(table, 1)
     page._seg_files_table = table
+
+    expose_all = _SegExposeHeaderCheckBox(header, 1, "Expose")
+    expose_all.clicked.connect(
+        lambda checked: _seg_set_all_exposed(ctx, page, checked)
+    )
+    table.horizontalScrollBar().valueChanged.connect(expose_all._place)
+    table.setColumnWidth(1, expose_all.sizeHint().width() + 14)
+    page._seg_expose_all = expose_all
+    QTimer.singleShot(0, expose_all._place)
 
     blay.addWidget(QLabel("Mask column"))
     name_edit = QLineEdit(str(page._seg_params.get("column") or "Mask"))
@@ -530,9 +585,68 @@ def _seg_refresh_files(ctx, page) -> None:
             sitem.setForeground(QColor("#9aa0a6"))
         table.setItem(i, 2, sitem)
     table.blockSignals(False)
+    _seg_update_expose_all(ctx, page)
     _seg_rebuild_method_panel(ctx, page)
     _seg_refresh_plot_settings(ctx, page)
     _seg_update_preview_visibility(ctx, page)
+
+
+def _seg_update_expose_all(ctx, page) -> None:
+    """Mirror the row check states on the Expose header checkbox."""
+    box = getattr(page, "_seg_expose_all", None)
+    if box is None:
+        return
+    table = page._seg_files_table
+    states = []
+    for row in range(table.rowCount()):
+        item = table.item(row, 1)
+        if item is None:
+            continue
+        if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            states.append(item.checkState() == Qt.CheckState.Checked)
+    if not states:
+        box.blockSignals(True)
+        box.setCheckState(Qt.CheckState.Unchecked)
+        box.blockSignals(False)
+        box.setEnabled(False)
+        return
+    checked = sum(1 for state in states if state)
+    if checked == len(states):
+        state = Qt.CheckState.Checked
+    elif checked == 0:
+        state = Qt.CheckState.Unchecked
+    else:
+        state = Qt.CheckState.PartiallyChecked
+    box.blockSignals(True)
+    box.setCheckState(state)
+    box.blockSignals(False)
+    box.setEnabled(not page._seg_locked)
+
+
+def _seg_set_all_exposed(ctx, page, checked: bool) -> None:
+    """Check or clear every row whose mask can be exposed."""
+    if page._seg_locked:
+        return
+    table = page._seg_files_table
+    rows = _seg_file_rows(ctx, page)
+    expose = page._seg_params.setdefault("expose", {})
+    table.blockSignals(True)
+    try:
+        for row, path in enumerate(rows):
+            item = table.item(row, 1)
+            if item is None:
+                continue
+            if not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+            expose[path] = bool(checked)
+    finally:
+        table.blockSignals(False)
+    _seg_update_expose_all(ctx, page)
+    _seg_refresh_status(ctx, page)
+    _seg_mark_dirty(ctx, page)
 
 
 def _seg_expose_changed(ctx, page, item) -> None:
@@ -546,6 +660,7 @@ def _seg_expose_changed(ctx, page, item) -> None:
     path = rows[row]
     expose = page._seg_params.setdefault("expose", {})
     expose[path] = item.checkState() == Qt.CheckState.Checked
+    _seg_update_expose_all(ctx, page)
     _seg_refresh_status(ctx, page)
     _seg_mark_dirty(ctx, page)
 
@@ -3213,7 +3328,7 @@ SEG_METHODS = [
 
 
 # Saved history is capped so the project file does not grow without bound.
-SEG_LOG_LIMIT = 500
+SEG_LOG_LIMIT = 10000
 
 
 SEG_STATUS_NO_MASK = "no mask"

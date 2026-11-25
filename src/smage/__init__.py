@@ -1,3 +1,3 @@
 """Smage — image and flow-cytometry data analysis application."""
 
-__version__ = "0.4.4"
+__version__ = "0.5.1"

@@ -82,7 +82,7 @@ _REGION_COLORS = [
 ]
 _GATE_PEN = "#2b6cb0"
 _GATE_SELECTED_PEN = "#e53935"
-_REGION_LOG_LIMIT = 2000
+_REGION_LOG_LIMIT = 10000
 # Above this many vertices, Edit boundary asks before building the handles.
 _REGION_ANCHOR_WARN_LIMIT = 100
 _REGION_DISPLAY_KEYS = (

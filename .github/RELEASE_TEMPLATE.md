@@ -2,15 +2,15 @@
 
 ## Highlights
 
-- **Unmix** is much faster on large image files. The **Channel data type**
-  modes that depend on the results now decide the dtype from a scan that
-  writes nothing and then write the chosen dtype directly, so the full-size
-  float64 temporary file and its extra pass are gone. Chunks are read and
-  written with Arrow instead of pandas, and the image pyramid is built from
-  the chunks being written instead of reading the new parquet back.
-- **Unmix** shows progress in the status bar, logs each file's size, output
-  dtype and elapsed time, and has a **Cancel** button that stops the run
-  after the current chunk.
+- **Export — Image Export** now shows each file's **Highest dtype** and an
+  **Est. size**, plus a **Know more about data type** reference. A **Data
+  type** setting writes each file's own highest dtype or one dtype for the
+  whole batch; the log lists every channel as `source dtype → export dtype`.
+- **Segmentation** has a checkbox in the **Expose** column header that checks
+  or clears every file at once.
+- Module logs keep up to 10,000 lines, are stored as they are written and are
+  restored when a module is reopened.
+- Unmix outputs created before 0.4.3 are visible to downstream modules again.
 
 ## Downloads
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 # Most module logs keep only the newest lines; the exporters use the same cap.
-_FEATURE_LOG_LIMIT = 400
+_FEATURE_LOG_LIMIT = 10000
 
 # Open-module registry states: a module is unmodified, modified-but-
 # unsaved, or just saved (transient).

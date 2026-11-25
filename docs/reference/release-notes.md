@@ -3,6 +3,23 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.5.1 — 2026-11-26
+
+- **Export — Image Export** lists each file's **Highest dtype** and an
+  **Est. size**, with a **Know more about data type** reference. A **Data
+  type** setting writes each file's own highest dtype or one dtype for the
+  whole batch; the log lists every channel's source and export dtype. Values
+  are transferred unchanged.
+- **Segmentation** has a checkbox in the **Expose** column header that checks
+  or clears every file at once.
+- Module logs keep up to 10,000 lines and are stored as they are written, so
+  they survive saving and reopening; **Batch Align**, **Data Clean** and
+  **Export** now persist their logs automatically.
+- **Fixed:** Unmix outputs created before 0.4.3 are visible to downstream
+  modules again.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.4.4 — 2026-11-25
 
 - **Unmix** is much faster on large image files. Output dtypes that depend on

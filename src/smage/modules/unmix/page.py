@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from pathlib import Path
-from smage.core.constants import MODULE_STATE_MODIFIED
+from smage.core.constants import MODULE_STATE_MODIFIED, _FEATURE_LOG_LIMIT
 from smage.core.gates import (
     _compute_gate_filter_mask,
     _gate_needed_columns,
@@ -772,7 +772,7 @@ def _unmix_log(ctx, page, text: str) -> None:
         log.appendPlainText(text)
     lines = page._unmix_params.setdefault("image_log", [])
     lines.append(str(text))
-    del lines[:-500]
+    del lines[:-_FEATURE_LOG_LIMIT]
 
 
 def _unmix_output_signature(ctx, task_id, parquet_path, config,

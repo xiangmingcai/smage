@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 from datetime import datetime
 from pathlib import Path
-from smage.core.constants import MODULE_STATE_MODIFIED
+from smage.core.constants import MODULE_STATE_MODIFIED, _FEATURE_LOG_LIMIT
 from smage.data.image_index import _build_image_index_files
 from smage.widgets.controls import (
     _NoWheelComboBox,
@@ -215,6 +215,13 @@ def _dc_log(ctx, page, text) -> None:
     for line in str(text).splitlines():
         if line.strip():
             lines.append(f"[{ts}] {line}")
+    if len(lines) > _FEATURE_LOG_LIMIT:
+        del lines[:-_FEATURE_LOG_LIMIT]
+    # Store the log in the module's params as it grows, like the other
+    # modules, so a project save (or closing the app) keeps it.
+    params = getattr(page, "_dc_params", None)
+    if params is not None:
+        params["log"] = list(lines)
     log = getattr(page, "_dc_log", None)
     if log is not None:
         for line in str(text).splitlines():

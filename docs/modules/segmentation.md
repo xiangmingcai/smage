@@ -50,6 +50,11 @@ a mask column that downstream modules can use as the feature channel.
 | Mask column | Name of the column that receives the object labels. |
 | Files to calculate | The image files to segment. |
 
+The **Expose** column decides which files publish their mask as a channel to
+downstream modules. The checkbox in the **Expose** header checks or clears
+every listed file at once; it shows a partially checked state when only some
+files are exposed.
+
 The preview shows the mask over the image with configurable mask display,
 colors and opacity.
 
