@@ -3,6 +3,15 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.5.2 — 2026-11-26
+
+- **Illumination Correction** pattern recognition accepts generated **Unmix**
+  channels; the tile calculation reads them from their saved output.
+- A tile size larger than the image now gets a clear message in the calculation
+  result and a hint in the panel, instead of "No tile data was found".
+
+See CHANGELOG.md for the complete list.
+
 ## 0.5.1 — 2026-11-26
 
 - **Export — Image Export** lists each file's **Highest dtype** and an

@@ -24,6 +24,12 @@ the zoom and position of the preview under the pointer to the other one; its
 arrow (**Sync view →** or **Sync view ←**) shows the direction that will be
 used.
 
+The channel can be an imported channel, a channel produced by an upstream map
+module, or a generated **Unmix** channel. The tile calculation reads a
+generated channel from its saved output. The tile width and height must fit
+inside the image: an image smaller than one tile produces no data to estimate
+the pattern from, and the panel shows a hint in that case.
+
 ## Output
 
 Corrected values for the selected channel. Downstream modules see the

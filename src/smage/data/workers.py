@@ -353,10 +353,11 @@ class _IlluminationWorker:
         self._thread.start()
 
     def request(self, key, stages, base_columns, files, channel, x_name,
-                y_name, tile_w, tile_h, bins, resolution):
+                y_name, tile_w, tile_h, bins, resolution, generated=None):
         self._req_q.put((
             key, stages, base_columns, list(files), channel, x_name, y_name,
             int(tile_w), int(tile_h), int(bins), int(resolution),
+            dict(generated or {}),
         ))
 
     def poll(self):
@@ -384,19 +385,24 @@ class _IlluminationWorker:
             self._res_q.put(res)
 
     def _compute(self, key, stages, base_columns, files, channel, x_name,
-                 y_name, tile_w, tile_h, bins, resolution):
+                 y_name, tile_w, tile_h, bins, resolution, generated=None):
         import numpy as np
         import pandas as pd
         from scipy.interpolate import RectBivariateSpline, griddata
 
+        generated = generated or {}
         if not files:
             return (key, None, "No files selected for the calculation.")
         n_blocks = bins * bins
         sums = np.zeros(n_blocks, dtype="float64")
         counts = np.zeros(n_blocks, dtype="float64")
         used_files = 0
+        small_files = 0
         for path in files:
-            needed = {x_name, y_name, channel}
+            gen = generated.get(path)
+            # A generated channel (for example a saved Unmix output) lives in
+            # its own row-aligned parquet; only x/y come from the source.
+            needed = {x_name, y_name} if gen else {x_name, y_name, channel}
             dependencies = _pipeline_dependencies(stages, needed, path)
             base = base_columns.get(path) or set()
             if not base:
@@ -421,7 +427,20 @@ class _IlluminationWorker:
                 continue
             x = np.asarray(values[x_name], dtype="float64")
             y = np.asarray(values[y_name], dtype="float64")
-            v = np.asarray(values[channel], dtype="float64")
+            if gen:
+                try:
+                    gdf = pd.read_parquet(
+                        gen["path"], columns=[gen["column"]]
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                v = pd.to_numeric(
+                    gdf[gen["column"]], errors="coerce"
+                ).to_numpy(dtype="float64")
+                if v.size != x.size:
+                    continue
+            else:
+                v = np.asarray(values[channel], dtype="float64")
             finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
             x, y, v = x[finite], y[finite], v[finite]
             if v.size == 0:
@@ -433,6 +452,7 @@ class _IlluminationWorker:
             ntx = int(width // tile_w)
             nty = int(height // tile_h)
             if ntx < 1 or nty < 1:
+                small_files += 1
                 continue
             ti = np.floor((x - x0) / tile_w).astype(np.int64)
             tj = np.floor((y - y0) / tile_h).astype(np.int64)
@@ -463,6 +483,12 @@ class _IlluminationWorker:
             used_files += 1
 
         if used_files == 0 or not (counts > 0).any():
+            if small_files and small_files == len(files):
+                return (
+                    key, None,
+                    "The tile size is larger than the selected image(s): "
+                    "no complete tile fits. Reduce the tile width/height.",
+                )
             return (key, None, "No tile data was found for the selected parameters.")
 
         grid = np.full(n_blocks, np.nan)

@@ -2,15 +2,11 @@
 
 ## Highlights
 
-- **Export — Image Export** now shows each file's **Highest dtype** and an
-  **Est. size**, plus a **Know more about data type** reference. A **Data
-  type** setting writes each file's own highest dtype or one dtype for the
-  whole batch; the log lists every channel as `source dtype → export dtype`.
-- **Segmentation** has a checkbox in the **Expose** column header that checks
-  or clears every file at once.
-- Module logs keep up to 10,000 lines, are stored as they are written and are
-  restored when a module is reopened.
-- Unmix outputs created before 0.4.3 are visible to downstream modules again.
+- **Illumination Correction** pattern recognition now accepts generated
+  **Unmix** channels: the tile calculation reads them from their saved output,
+  so a corrected unmixed channel can be estimated like any imported channel.
+- A tile size larger than the image gets a clear message and a panel hint
+  instead of "No tile data was found".
 
 ## Downloads
 

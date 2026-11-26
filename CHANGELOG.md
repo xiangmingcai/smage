@@ -6,6 +6,14 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-11-26
+
+### Fixed
+
+- **Illumination Correction**: pattern recognition now accepts generated
+  **Unmix** channels (read from their saved output) and reports a clear
+  message when the tile size is larger than the image.
+
 ## [0.5.1] — 2026-11-26
 
 ### Added

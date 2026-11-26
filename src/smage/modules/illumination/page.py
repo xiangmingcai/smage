@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from smage.core.constants import MODULE_STATE_MODIFIED
+from smage.core.pipeline import _rename_applies
 from smage.core.settings import (
     _default_palette,
     _plot_background,
@@ -800,6 +801,11 @@ def _illum_divisibility_hint(ctx, sub) -> str:
     width = int(round(geom[1] - geom[0] + 1))
     height = int(round(geom[3] - geom[2] + 1))
     messages = []
+    if width < tile_w or height < tile_h:
+        messages.append(
+            f"The image is {width}×{height}, smaller than the tile "
+            f"{tile_w}×{tile_h}: no complete tile fits. Reduce the tile size."
+        )
     if width % tile_w:
         messages.append(
             f"Width {width} is not divisible by tile width {tile_w}: "
@@ -1343,6 +1349,31 @@ def _illum_reset_plot_defaults(ctx, page, sub) -> None:
         label.setText(str(sub.get("channel") or "—"))
 
 
+def _illum_generated_column(ctx, task_id, path, channel):
+    """The stored output that holds a generated channel, or None.
+
+    Unmix channels are not columns of the source parquet: their values live
+    in a companion output that is row-aligned to the source, so the tile
+    calculation reads the channel from there.
+    """
+    if not channel or not path:
+        return None
+    source = channel
+    for stage in reversed(_data_columns._column_rename_stages(ctx, task_id)):
+        if not _rename_applies(stage, path):
+            continue
+        reverse = {v: k for k, v in stage["map"].items()}
+        source = reverse.get(source, source)
+    records = ctx._unmix_applied_columns(task_id, path) or {}
+    rec = records.get(source) or records.get(channel)
+    if not isinstance(rec, dict) or not rec.get("parquet"):
+        return None
+    return {
+        "path": str(rec["parquet"]),
+        "column": str(rec.get("channel") or source),
+    }
+
+
 def _illum_calculate(ctx, page, sub, button) -> None:
     channel = sub.get("channel")
     x_name = sub.get("x")
@@ -1390,6 +1421,13 @@ def _illum_calculate(ctx, page, sub, button) -> None:
         base_columns[path] = set(
             ctx._column_index.get(_data_files._rel_data_key(ctx, path), [])
         )
+    generated = {}
+    for path in files:
+        rec = _illum_generated_column(
+            ctx, page._illum_task_id, path, channel
+        )
+        if rec is not None:
+            generated[path] = rec
     page._illum_request_key = sub["id"]
     button.setEnabled(False)
     status = getattr(page, "_illum_calc_status", None)
@@ -1399,6 +1437,7 @@ def _illum_calculate(ctx, page, sub, button) -> None:
         sub["id"], stages, base_columns, files, channel, x_name, y_name,
         int(sub.get("tile_w", 256)), int(sub.get("tile_h", 256)),
         int(sub.get("bin", 5)), int(sub.get("resolution", 10)),
+        generated=generated,
     )
 
 
