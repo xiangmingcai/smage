@@ -6,6 +6,14 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.4] — 2026-11-26
+
+### Changed
+
+- **Illumination Correction**: **Correction parameters** are applied with an
+  **Update** button instead of on every edit; the line below the button shows
+  the method and intensity currently in use.
+
 ## [0.5.3] — 2026-11-26
 
 ### Added

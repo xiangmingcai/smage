@@ -29,7 +29,8 @@ factor = T / mask
 factor = 1 + intensity × (factor − 1)
 ```
 
-Edits to the correction method or intensity update the preview immediately.
+Edits to the correction method or intensity are applied with the **Update**
+button; the line below it shows the method and intensity currently in use.
 Downstream channels use the saved settings, so they change only after the
 module is saved.
 
@@ -62,9 +63,9 @@ corrected channel; the raw data is unchanged.
   `Module/illumination-<id>/` inside the project.
 - Duplicating a submodule also copies its recognized illumination pattern
   (and how it was computed), so the copy starts from the same profile.
-- Correction method and intensity edits apply to the preview immediately; the
-  downstream channel changes when the module is saved. Unsaved edits are
-  discarded when the module is closed.
+- Correction method and intensity edits apply to the preview when **Update**
+  is clicked; the downstream channel changes when the module is saved.
+  Unsaved edits are discarded when the module is closed.
 
 ## Related
 

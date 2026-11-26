@@ -2,15 +2,10 @@
 
 ## Highlights
 
-- **Illumination Correction** is split into **Tiles calculation** and
-  **Correction parameters**, with a new **Correction intensity** (0–100,
-  default 1). Duplicating a submodule keeps its recognized pattern, Plot
-  settings show read-only **Before** and **After** histograms, and
-  correction-parameter edits reach downstream channels only after **Save**.
-- **Feature Down**: **Background ignore** sits under **Data files** and can
-  count from a chosen subset of files. The **Data files** table has a
-  checkbox column for choosing what **Calculate** processes, and the default
-  background value is counted off the UI thread.
+- **Illumination Correction**: changes to the correction method or intensity
+  are applied with the new **Update** button in **Correction parameters**, so
+  editing a number no longer re-renders the preview on every keystroke. The
+  line below the button shows the method and intensity currently in use.
 
 ## Downloads
 

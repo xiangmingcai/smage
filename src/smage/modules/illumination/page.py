@@ -821,42 +821,57 @@ def _illum_correction_panel(ctx, page, sub) -> QWidget:
     lay.addWidget(intensity)
     lay.addWidget(_widgets_panels._param_hint(ctx,
         "Blends the correction: 0 = no correction, 0.5 = half, 1 = full "
-        "and 2 = double strength. The preview updates immediately; "
-        "downstream channels update when the module is saved."
+        "and 2 = double strength. Press Update to apply; downstream "
+        "channels update when the module is saved."
     ))
+
+    update_btn = QPushButton("Update")
+    update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    update_btn.setEnabled(editable)
+    update_btn.setToolTip(
+        "Apply the method and intensity to the illumination correction"
+    )
+    lay.addWidget(update_btn)
+    applied = QLabel("")
+    applied.setWordWrap(True)
+    applied.setStyleSheet("color: #6b7785; font-size: 8pt;")
+    lay.addWidget(applied)
     lay.addStretch(1)
+
+    method_labels = {
+        "down": "Down (darkest unchanged)",
+        "up": "Up (brightest unchanged)",
+        "median": "Median (default)",
+    }
+
+    def refresh_applied() -> None:
+        method = str(sub.get("method") or "median")
+        label = method_labels.get(method, method)
+        applied.setText(
+            f"In use: {label} · intensity {_illum_intensity(sub):.1f}"
+        )
 
     def refresh_levels():
         rebuild = getattr(page, "_illum_rebuild_levels", None)
         if rebuild is not None:
             rebuild()
 
-    def on_method():
-        sub["method"] = method_combo.currentData()
+    def on_update():
+        if page._illum_locked:
+            return
+        sub["method"] = method_combo.currentData() or "median"
+        sub["intensity"] = round(float(intensity.value()), 1)
+        refresh_applied()
         _illum_mark_dirty(ctx, page)
         _illum_render_mask(ctx, page, sub)
         _illum_render_preview(ctx, page)
         refresh_levels()
 
-    # Spin steps arrive quickly; render once the value settles.
-    intensity_timer = QTimer(intensity)
-    intensity_timer.setSingleShot(True)
-    intensity_timer.setInterval(200)
-
-    def apply_intensity():
-        _illum_render_preview(ctx, page)
-        refresh_levels()
-
-    intensity_timer.timeout.connect(apply_intensity)
-
-    def on_intensity(value):
-        sub["intensity"] = round(float(value), 1)
-        _illum_mark_dirty(ctx, page)
-        intensity_timer.start()
-
-    method_combo.currentIndexChanged.connect(lambda _=0: on_method())
-    intensity.valueChanged.connect(on_intensity)
+    update_btn.clicked.connect(on_update)
+    refresh_applied()
     return panel
+
+
 def _illum_divisibility_hint(ctx, sub) -> str:
     files = sub.get("files") or []
     tile_w = int(sub.get("tile_w", 256))

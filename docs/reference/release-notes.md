@@ -3,6 +3,15 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.5.4 — 2026-11-26
+
+- **Illumination Correction**: changes to the correction method or intensity
+  are applied with the **Update** button, so editing a number no longer
+  re-renders the preview on every keystroke. The line below the button shows
+  the method and intensity currently in use.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.5.3 — 2026-11-26
 
 - **Illumination Correction** is split into **Tiles calculation** and
