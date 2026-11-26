@@ -37,6 +37,7 @@ from smage.core.feature import (
 )
 from smage.core.formatting import _json_stable
 from smage.widgets.controls import (
+    _HeaderCheckBox,
     _NoWheelComboBox,
     _NoWheelSpinBox,
 )
@@ -108,6 +109,9 @@ def _build_feature_page(ctx, name: str, task_def: dict, locked: bool) -> QWidget
     # Feature values left out before aggregation (None = not chosen yet;
     # the most frequent value is suggested once the values are known).
     params.setdefault("ignore_values", None)
+    # Subset of the Data files used to count background values; empty means
+    # every selected file.
+    params.setdefault("ignore_files", [])
     # The first rule is always Count; it cannot be deleted.
     rules = params.get("rules") or []
     if not rules or (rules[0].get("method") != "count"):
@@ -256,7 +260,6 @@ def _feat_files_panel(ctx, page) -> QWidget:
     page._feat_ignore_thread = None
     page._feat_ignore_timer = None
     page._feat_ignore_cache = _feat_ignore_cache_load(ctx, page)
-    lay.addWidget(_feat_ignore_section(ctx, page))
 
     lay.addWidget(QLabel("Data files"))
     select_btn = QPushButton("Select files…")
@@ -265,18 +268,37 @@ def _feat_files_panel(ctx, page) -> QWidget:
     lay.addWidget(select_btn)
 
     table = QTableWidget()
-    table.setColumnCount(2)
-    table.setHorizontalHeaderLabels(["File", "Status"])
+    table.setColumnCount(3)
+    # The first column carries a checkbox; its header holds a check-all box.
+    table.setHorizontalHeaderLabels(["", "File", "Status"])
     header = table.horizontalHeader()
-    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-    header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+    table.setColumnWidth(0, 34)
     table.verticalHeader().setVisible(False)
     table.verticalHeader().setDefaultSectionSize(26)
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
     table.setStyleSheet("QTableWidget { background: #ffffff; border: none; }")
+    table.itemChanged.connect(lambda item: _feat_file_checked(ctx, page, item))
     lay.addWidget(table, 1)
     page._feat_files_table = table
+
+    check_all = _HeaderCheckBox(
+        header, 0,
+        tooltip="Check or clear every data file",
+    )
+    check_all.clicked.connect(
+        lambda checked: _feat_check_all(ctx, page, checked)
+    )
+    table.horizontalScrollBar().valueChanged.connect(check_all.place)
+    page._feat_check_all = check_all
+    QTimer.singleShot(0, check_all.place)
+
+    # Background ignore lives under the Data files table: the values are
+    # counted from a chosen subset of those files.
+    lay.addWidget(_feat_ignore_section(ctx, page))
 
     def on_column_changed(_=0):
         page._feat_params["feature"] = combo.currentData()
@@ -290,12 +312,90 @@ def _feat_files_panel(ctx, page) -> QWidget:
                 if feature in _feat_file_columns(ctx, page, p)
             ]
             page._feat_params["files"] = files
+            page._feat_params["ignore_files"] = [
+                path for path in (
+                    page._feat_params.get("ignore_files") or []
+                ) if path in files
+            ]
+            if page._feat_params.get("calc_files") is not None:
+                page._feat_params["calc_files"] = [
+                    path for path in page._feat_params["calc_files"]
+                    if path in files
+                ]
         _feat_refresh_files(ctx, page)
         _feat_mark_dirty(ctx, page)
 
     combo.currentIndexChanged.connect(on_column_changed)
     select_btn.clicked.connect(lambda _=False: _feat_select_files(ctx, page))
     return panel
+
+
+def _feat_ignore_files_from(params) -> list:
+    """The selected data files used for the background-ignore counts."""
+    files = [path for path in (params.get("files") or []) if path]
+    chosen = [
+        path for path in (params.get("ignore_files") or []) if path in files
+    ]
+    return chosen or files
+
+
+def _feat_ignore_files(page) -> list:
+    return _feat_ignore_files_from(page._feat_params)
+
+
+def _feat_ignore_files_text(page) -> str:
+    params = page._feat_params
+    files = [path for path in (params.get("files") or []) if path]
+    chosen = [
+        path for path in (params.get("ignore_files") or []) if path in files
+    ]
+    if not files:
+        return ""
+    if not chosen or len(chosen) == len(files):
+        return f"All {len(files)} selected file(s)"
+    return f"{len(chosen)} of {len(files)} selected file(s)"
+
+
+def _feat_ignore_select_files(ctx, page) -> None:
+    """Pick the subset of Data files used to count background values."""
+    params = page._feat_params
+    files = [path for path in (params.get("files") or []) if path]
+    if not files:
+        QMessageBox.information(
+            ctx.host, "Background ignore",
+            "Select the Data files first.",
+        )
+        return
+    labels = []
+    by_label = {}
+    label_by_path = {}
+    seen = {}
+    for path in files:
+        label = _data_naming._comp_file_name(ctx, path, page._feat_task_id)
+        seen[label] = seen.get(label, 0) + 1
+        if seen[label] > 1:
+            label = f"{label} [{_data_files._rel_data_key(ctx, path)}]"
+        labels.append(label)
+        by_label[label] = path
+        label_by_path[path] = label
+    current = [
+        label_by_path[path]
+        for path in _feat_ignore_files(page)
+        if path in label_by_path
+    ]
+    chosen = _widgets_picker._pick_items_dialog(ctx,
+        "Files for background ignore", labels, current, "Filter files..."
+    )
+    if chosen is None:
+        return
+    params["ignore_files"] = [
+        by_label[label] for label in chosen if label in by_label
+    ]
+    label = getattr(page, "_feat_ignore_files_label", None)
+    if label is not None:
+        label.setText(_feat_ignore_files_text(page))
+    _feat_mark_dirty(ctx, page)
+    _feat_ignore_refresh(ctx, page)
 
 
 def _feat_ignore_section(ctx, page) -> QWidget:
@@ -322,6 +422,28 @@ def _feat_ignore_section(ctx, page) -> QWidget:
     hint.setWordWrap(True)
     hint.setStyleSheet("color: #8a94a6; font-size: 8pt;")
     lay.addWidget(hint)
+
+    files_row = QHBoxLayout()
+    files_row.setContentsMargins(0, 0, 0, 0)
+    files_row.setSpacing(6)
+    files_btn = QPushButton("Select files…")
+    files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    files_btn.setEnabled(not page._feat_locked)
+    files_btn.setToolTip(
+        "Choose which of the Data files are used to count background "
+        "values; the other files are still aggregated."
+    )
+    files_btn.clicked.connect(
+        lambda _=False: _feat_ignore_select_files(ctx, page)
+    )
+    files_row.addWidget(files_btn)
+    files_label = QLabel("")
+    files_label.setWordWrap(True)
+    files_label.setStyleSheet("color: #6b7785; font-size: 8pt;")
+    files_row.addWidget(files_label, 1)
+    lay.addLayout(files_row)
+    page._feat_ignore_files_btn = files_btn
+    page._feat_ignore_files_label = files_label
 
     table = QTableWidget()
     table.setColumnCount(3)
@@ -526,7 +648,7 @@ def _feat_ignore_combine(ctx, page, only_cached: bool=False):
     """Aggregate the selected files' cached counts (None when incomplete)."""
     params = page._feat_params
     feature = params.get("feature")
-    files = list(params.get("files") or [])
+    files = _feat_ignore_files(page)
     if not feature or not files:
         return None
     totals = {}
@@ -674,8 +796,12 @@ def _feat_ignore_refresh(ctx, page) -> None:
         return
     params = page._feat_params
     feature = params.get("feature")
-    files = list(params.get("files") or [])
+    files = [path for path in (params.get("files") or []) if path]
+    count_files = _feat_ignore_files(page)
     status = getattr(page, "_feat_ignore_status", None)
+    files_label = getattr(page, "_feat_ignore_files_label", None)
+    if files_label is not None:
+        files_label.setText(_feat_ignore_files_text(page))
     if not feature or not files:
         page._feat_ignore_token = int(
             getattr(page, "_feat_ignore_token", 0)
@@ -691,7 +817,7 @@ def _feat_ignore_refresh(ctx, page) -> None:
         return
     _feat_ignore_start_worker(ctx, page)
     pending = []
-    for path in files:
+    for path in count_files:
         key = _feat_ignore_cache_key(ctx, page, feature, path)
         if key not in page._feat_ignore_cache:
             pending.append((path, key))
@@ -815,34 +941,53 @@ def _feat_ignore_toggled(ctx, page, item) -> None:
 
 
 def _feat_ignore_prepare(ctx, page) -> None:
-    """Make sure a default is chosen before a calculation starts."""
+    """Make sure a default is chosen before a calculation starts.
+
+    Only cached counts are used here: counting a large file on the UI thread
+    would freeze the window. Files without cached counts are counted by the
+    calculation's background worker.
+    """
     params = page._feat_params
     if params.get("ignore_values") is not None:
         return
-    feature = params.get("feature")
-    files = list(params.get("files") or [])
-    if not feature or not files:
+    combined = _feat_ignore_combine(ctx, page, only_cached=True)
+    if not combined:
         return
+    page._feat_ignore_default = float(combined[0][0])
+    params["ignore_values"] = [_feat_value_json(ctx, combined[0][0])]
+    _feat_ignore_fill(ctx, page, combined)
+
+
+def _feat_ignore_worker_default(ctx, page, params) -> list:
+    """Count the ignore files and return their combined ranking (worker).
+
+    Runs off the UI thread so a fresh selection of large files does not block
+    the window when Calculate is pressed.
+    """
+    feature = params.get("feature")
+    files = _feat_ignore_files_from(params)
+    if not feature or not files:
+        return []
+    totals = {}
     changed = False
     for path in files:
         key = _feat_ignore_cache_key(ctx, page, feature, path)
-        if key in page._feat_ignore_cache:
-            continue
-        try:
-            counts = _feat_ignore_file_counts(ctx, page, feature, path)
-        except Exception:  # noqa: BLE001
-            counts = []
-        page._feat_ignore_cache[key] = counts
-        changed = True
+        counts = page._feat_ignore_cache.get(key)
+        if counts is None:
+            try:
+                counts = _feat_ignore_file_counts(ctx, page, feature, path)
+            except Exception:  # noqa: BLE001
+                counts = []
+            page._feat_ignore_cache[key] = counts
+            changed = True
+        for value, count in counts or []:
+            value = float(value)
+            totals[value] = totals.get(value, 0) + int(count)
     if changed:
         _feat_ignore_cache_save(ctx, page)
-    combined = _feat_ignore_combine(ctx, page)
-    if combined:
-        page._feat_ignore_default = float(combined[0][0])
-        params["ignore_values"] = [
-            _feat_value_json(ctx, combined[0][0])
-        ]
-        _feat_ignore_fill(ctx, page, combined)
+    if not totals:
+        return []
+    return sorted(totals.items(), key=lambda item: (-item[1], item[0]))
 
 
 def _feat_select_files(ctx, page) -> None:
@@ -871,6 +1016,16 @@ def _feat_select_files(ctx, page) -> None:
         if path and path not in files:
             files.append(path)
     page._feat_params["files"] = files
+    # Keep only background-ignore files that are still selected.
+    page._feat_params["ignore_files"] = [
+        path for path in (page._feat_params.get("ignore_files") or [])
+        if path in files
+    ]
+    if page._feat_params.get("calc_files") is not None:
+        page._feat_params["calc_files"] = [
+            path for path in page._feat_params["calc_files"]
+            if path in files
+        ]
     _feat_refresh_files(ctx, page)
     _feat_mark_dirty(ctx, page)
 
@@ -891,17 +1046,117 @@ def _feat_file_status(ctx, page, parquet_path) -> str:
     return FEATURE_STATUS_DONE
 
 
+def _feat_calc_files_from(params) -> list:
+    """The checked Data files; an absent selection means every file."""
+    files = [path for path in (params.get("files") or []) if path]
+    chosen = params.get("calc_files")
+    if chosen is None:
+        return files
+    return [path for path in chosen if path in files]
+
+
+def _feat_calc_files(page) -> list:
+    return _feat_calc_files_from(page._feat_params)
+
+
+def _feat_update_check_all(ctx, page) -> None:
+    """Mirror the row check states on the header checkbox."""
+    box = getattr(page, "_feat_check_all", None)
+    table = getattr(page, "_feat_files_table", None)
+    if box is None or table is None:
+        return
+    states = []
+    for row in range(table.rowCount()):
+        item = table.item(row, 0)
+        if item is not None and (
+            item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+        ):
+            states.append(item.checkState() == Qt.CheckState.Checked)
+    if not states:
+        box.blockSignals(True)
+        box.setCheckState(Qt.CheckState.Unchecked)
+        box.blockSignals(False)
+        box.setEnabled(False)
+        return
+    checked = sum(1 for state in states if state)
+    if checked == len(states):
+        state = Qt.CheckState.Checked
+    elif checked == 0:
+        state = Qt.CheckState.Unchecked
+    else:
+        state = Qt.CheckState.PartiallyChecked
+    box.blockSignals(True)
+    box.setCheckState(state)
+    box.blockSignals(False)
+    box.setEnabled(not page._feat_locked)
+
+
+def _feat_file_checked(ctx, page, item) -> None:
+    """A row checkbox changed: store the explicit list of files to run."""
+    if page._feat_locked or item is None or item.column() != 0:
+        return
+    table = page._feat_files_table
+    params = page._feat_params
+    files = [path for path in (params.get("files") or []) if path]
+    checked = []
+    for row, path in enumerate(files):
+        row_item = table.item(row, 0)
+        if (
+            row_item is not None
+            and row_item.checkState() == Qt.CheckState.Checked
+        ):
+            checked.append(path)
+    params["calc_files"] = checked
+    _feat_update_check_all(ctx, page)
+    _feat_mark_dirty(ctx, page)
+
+
+def _feat_check_all(ctx, page, checked: bool) -> None:
+    """Check or clear every data file from the header checkbox."""
+    if page._feat_locked:
+        return
+    table = page._feat_files_table
+    params = page._feat_params
+    files = [path for path in (params.get("files") or []) if path]
+    table.blockSignals(True)
+    try:
+        for row in range(len(files)):
+            item = table.item(row, 0)
+            if item is None:
+                continue
+            item.setCheckState(
+                Qt.CheckState.Checked if checked
+                else Qt.CheckState.Unchecked
+            )
+    finally:
+        table.blockSignals(False)
+    params["calc_files"] = list(files) if checked else []
+    _feat_update_check_all(ctx, page)
+    _feat_mark_dirty(ctx, page)
+
+
 def _feat_refresh_files(ctx, page) -> None:
     """Rebuild the file status table and the rules table."""
     table = getattr(page, "_feat_files_table", None)
     if table is not None:
         files = list(page._feat_params.get("files") or [])
+        checked = set(_feat_calc_files(page))
         table.blockSignals(True)
         table.setRowCount(len(files))
         for i, path in enumerate(files):
+            chk = QTableWidgetItem()
+            chk.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            chk.setCheckState(
+                Qt.CheckState.Checked if path in checked
+                else Qt.CheckState.Unchecked
+            )
+            table.setItem(i, 0, chk)
             name_item = QTableWidgetItem(_data_naming._comp_file_name(ctx, path, page._feat_task_id))
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            table.setItem(i, 0, name_item)
+            table.setItem(i, 1, name_item)
             status = _feat_file_status(ctx, page, path)
             sitem = QTableWidgetItem(status)
             sitem.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -909,8 +1164,9 @@ def _feat_refresh_files(ctx, page) -> None:
                 QColor("#1a7f37") if status == FEATURE_STATUS_DONE
                 else QColor("#9aa0a6")
             )
-            table.setItem(i, 1, sitem)
+            table.setItem(i, 2, sitem)
         table.blockSignals(False)
+        _feat_update_check_all(ctx, page)
     _feat_rebuild_rules(ctx, page)
     _feat_ignore_refresh(ctx, page)
 
@@ -1654,7 +1910,13 @@ def _feat_calculate(ctx, page) -> None:
     _feat_ignore_prepare(ctx, page)
     params = page._feat_params
     outputs = params.get("outputs") or {}
-    selected = params.get("files") or []
+    selected = _feat_calc_files(page)
+    if not selected:
+        QMessageBox.information(
+            ctx.host, "Calculate",
+            "Check at least one data file to calculate.",
+        )
+        return
     existing = [p for p in selected if isinstance(outputs.get(p), dict)]
     if existing:
         reply = QMessageBox.question(
@@ -1679,7 +1941,7 @@ def _feat_calculate(ctx, page) -> None:
     # Snapshot the settings: edits made while the worker runs must not change
     # the meaning of the results already being computed.
     snapshot = copy.deepcopy(params)
-    selected = list(snapshot.get("files") or [])
+    selected = _feat_calc_files_from(snapshot)
     names = {
         path: _data_naming._comp_file_name(
             ctx, path, page._feat_task_id
@@ -1714,6 +1976,15 @@ def _feat_run_bg(ctx, page, q, params, selected, names) -> None:
     done = 0
     failed = []
     try:
+        # Resolve the background-ignore default here when it is not cached
+        # yet; counting the ignore files on the UI thread would freeze it.
+        if params.get("ignore_values") is None:
+            combined = _feat_ignore_worker_default(ctx, page, params)
+            if combined:
+                params["ignore_values"] = [
+                    _feat_value_json(ctx, combined[0][0])
+                ]
+                q.put(("ignore", combined))
         for index, path in enumerate(selected):
             if getattr(page, "_feat_cancel", False):
                 q.put(("log", "Calculation cancelled."))
@@ -1776,6 +2047,14 @@ def _feat_poll(ctx, page) -> None:
         elif kind == "file":
             path, record = msg[1], msg[2]
             page._feat_pending_outputs[path] = record
+        elif kind == "ignore":
+            _feat_ignore_apply(ctx, page, msg[1])
+            if page._feat_params.get("ignore_values") is None:
+                default = getattr(page, "_feat_ignore_default", None)
+                if default is not None:
+                    page._feat_params["ignore_values"] = [
+                        _feat_value_json(ctx, default)
+                    ]
         elif kind == "done":
             done, failed = msg[1], msg[2]
         elif kind == "error":

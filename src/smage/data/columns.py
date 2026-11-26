@@ -53,7 +53,19 @@ def _illumination_stage_item(sub):
         "tile_h": int(sub.get("tile_h", 256)),
         "mask": mask,
         "T": threshold,
+        "intensity": _illum_intensity_value(sub),
     }
+
+
+def _illum_intensity_value(sub) -> float:
+    """Correction strength of a submodule (0 = no correction, 1 = full)."""
+    try:
+        value = float(sub.get("intensity", 1.0))
+    except (TypeError, ValueError):
+        value = 1.0
+    if not (value >= 0.0):
+        value = 0.0
+    return min(value, 100.0)
 
 
 def _column_rename_stages(ctx, task_id) -> list:
@@ -529,10 +541,18 @@ def _map_stages(ctx, task_id, after=None, include_scale=False, parquet_path=None
                     "signature": rec.get("signature"),
                 }))
         elif task_type == "illumination":
+            # A live correction-parameter edit only reaches downstream after
+            # Save: use the page's last saved snapshot while it is open.
+            source = params
+            reg = getattr(ctx, "_module_registry", {}).get(task.get("id"))
+            if reg is not None and reg.get("task_type") == "illumination":
+                snapshot = getattr(reg["page"], "_illum_snapshot", None)
+                if isinstance(snapshot, dict):
+                    source = snapshot
             submodules = [
                 item for item in (
                     _illumination_stage_item(sub)
-                    for sub in params.get("submodules", [])
+                    for sub in source.get("submodules", [])
                 ) if item is not None
             ]
             if submodules:

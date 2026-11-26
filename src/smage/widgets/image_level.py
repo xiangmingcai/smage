@@ -14,7 +14,55 @@ from smage.core.settings import _plot_background
 from smage.widgets.plot_axes import _make_original_axis
 
 
-def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_minmax, task_id, parquet_path, extra_stages=None, configs=None) -> None:
+def _image_signal_histogram(ctx, layout, channel, task_id, parquet_path,
+                            extra_stages=None, configs=None, title=None):
+    """A read-only signal histogram for one channel.
+
+    Used where a second (for example "Before") distribution is shown next to
+    the Min/Max controls, so it has no inputs, Auto set or Reset buttons.
+    """
+    import numpy as np
+    import pyqtgraph as pg
+
+    if configs is None and channel:
+        configs = ctx._figure_axis_scale_configs(
+            task_id, parquet_path, channel
+        )
+    hist_plot = pg.PlotWidget()
+    hist_plot.setBackground(_plot_background())
+    hist_plot.showGrid(x=True, y=True, alpha=0.2)
+    hist_plot.setMinimumHeight(100)
+    hist_plot.setMaximumHeight(160)
+    hist_plot.setMouseEnabled(False, False)
+    hist_plot.setMenuEnabled(False)
+    hist_plot.hideAxis("left")
+    if configs:
+        hist_plot.getPlotItem().setAxisItems({
+            "bottom": _make_original_axis(configs),
+        })
+    layout.addWidget(hist_plot)
+    if not channel or parquet_path is None:
+        return hist_plot
+    values = ctx._figure_channel_values(
+        task_id, parquet_path, channel, extra_stages=extra_stages
+    )
+    if values is None or values.size == 0:
+        return hist_plot
+    values = _apply_scale_transforms(values, configs)
+    hist, edges = np.histogram(values, bins=200)
+    hist_plot.plot(
+        edges, hist, stepMode="center",
+        fillLevel=0, brush=(90, 140, 220, 120),
+        pen=pg.mkPen((50, 90, 160), width=1),
+    )
+    hist_plot.setTitle(
+        str(channel if title is None else title),
+        color="#5a6673", size="8pt",
+    )
+    return hist_plot
+
+
+def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_minmax, task_id, parquet_path, extra_stages=None, configs=None, hist_caption=None) -> None:
     """Min/Max inputs + signal histogram + Auto set / Reset for a channel.
 
     `on_minmax(lo, hi)` receives the bounds in PLOT units (None = auto);
@@ -61,6 +109,13 @@ def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_mi
     max_edit.setEnabled(enabled)
     h.addWidget(max_edit, 1)
     layout.addWidget(row)
+
+    if hist_caption:
+        caption = QLabel(str(hist_caption))
+        caption.setStyleSheet(
+            "color: #5a6673; font-size: 8pt; font-weight: bold;"
+        )
+        layout.addWidget(caption)
 
     hist_plot = pg.PlotWidget()
     hist_plot.setBackground(_plot_background())

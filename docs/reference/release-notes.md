@@ -3,6 +3,20 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.5.3 — 2026-11-26
+
+- **Illumination Correction** is split into **Tiles calculation** and
+  **Correction parameters**, with a new **Correction intensity** (0–100,
+  default 1). Duplicating a submodule keeps its recognized pattern, Plot
+  settings show read-only **Before** and **After** histograms, and
+  correction-parameter edits reach downstream channels only after **Save**.
+- **Feature Down**: **Background ignore** sits under **Data files** and can
+  count from a chosen subset of files. The **Data files** table has a
+  checkbox column for choosing what **Calculate** processes, and the default
+  background value is counted off the UI thread.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.5.2 — 2026-11-26
 
 - **Illumination Correction** pattern recognition accepts generated **Unmix**

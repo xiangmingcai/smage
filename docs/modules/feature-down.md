@@ -10,10 +10,11 @@ feature table that can be clustered, plotted or exported.
 | Setting | Description |
 |---|---|
 | Feature channel | The channel that defines the classes (a segmentation mask label, a sample ID, a cluster column, …). |
-| Data files | The files to aggregate. |
+| Data files | The files to aggregate. The checkbox column chooses which files **Calculate** processes; the checkbox in its header checks or clears every file. |
 | Aggregation rules | One row per output column: **Source channel**, **Method** (count, sum, min, max, mean, median, mode, percentile), **Range (% per class)** and **New column name**. |
 | Group-key row | By default a row named after the feature channel is added right below Count. It carries the class label into the output; delete it to leave the identifier column out. |
 | Background ignore | Values of the feature channel that are excluded before aggregation (for example the background label `0` of a mask). |
+| Files for background ignore | A subset of the Data files used to count the background values; the other files are still aggregated. |
 
 ### The Count row
 
@@ -57,7 +58,11 @@ downstream modules.
 - Default column names are `<source>_<method>` (for example `CD8_mean`);
   rename them in the last column of the rules table.
 - The Background ignore section lists the most frequent feature values so the
-  background can be excluded with one tick.
+  background can be excluded with one tick. It sits under **Data files**; its
+  **Select files…** button limits the count to a subset (for example only the
+  images that contain real tissue), which keeps large batches fast.
+- The default background value is counted in the background, so pressing
+  **Calculate** on many large files does not freeze the window.
 - Outputs are re-used until the settings, the source file or an upstream
   sampling change (the module signatures them).
 

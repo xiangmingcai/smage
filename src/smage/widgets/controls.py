@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QGraphicsProxyWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QGraphicsProxyWidget,
     QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QSpinBox, QToolButton,
     QVBoxLayout, QWidget,
 )
@@ -34,6 +34,56 @@ class _NoWheelDoubleSpinBox(QDoubleSpinBox):
 
     def wheelEvent(self, event) -> None:
         event.ignore()
+
+
+class _HeaderCheckBox(QCheckBox):
+    """Tristate checkbox pinned over one table header section.
+
+    Clicking it toggles between checked and unchecked; the partially checked
+    state is only used to mirror a mixed selection. The table owner connects
+    ``clicked`` and applies the change to its rows.
+    """
+
+    def __init__(self, header, section: int, text: str = "",
+                 tooltip: str = "", parent=None) -> None:
+        super().__init__(text, parent or header)
+        self._header = header
+        self._section = int(section)
+        self.setTristate(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if tooltip:
+            self.setToolTip(tooltip)
+        header.sectionResized.connect(self._place)
+        header.geometriesChanged.connect(self._place)
+        self._place()
+
+    def nextCheckState(self) -> None:  # noqa: N802 - Qt override
+        """Toggle between checked and unchecked (partial counts as checked)."""
+        if self.checkState() == Qt.CheckState.Checked:
+            self.setCheckState(Qt.CheckState.Unchecked)
+        else:
+            self.setCheckState(Qt.CheckState.Checked)
+
+    def place(self) -> None:
+        """Re-position the box over its header section."""
+        self._place()
+
+    def _place(self, *_args) -> None:
+        header = self._header
+        if (
+            self._section >= header.count()
+            or header.isSectionHidden(self._section)
+        ):
+            self.setVisible(False)
+            return
+        x = header.sectionViewportPosition(self._section)
+        width = header.sectionSize(self._section)
+        hint = self.sizeHint()
+        y = max(0, (header.height() - hint.height()) // 2)
+        self.move(x + max(0, (width - hint.width()) // 2), y)
+        self.setVisible(
+            width > 0 and x + width > 0 and x < header.width()
+        )
 
 
 class _SizeField(QWidget):

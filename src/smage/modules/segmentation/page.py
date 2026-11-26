@@ -48,6 +48,7 @@ from smage.data.image_index import (
     _image_index_dir,
 )
 from smage.widgets.controls import (
+    _HeaderCheckBox,
     _LogStepSpinBox,
     _NoWheelComboBox,
     _NoWheelDoubleSpinBox,
@@ -402,51 +403,6 @@ def _seg_any_mask(ctx, page) -> bool:
     return False
 
 
-class _SegExposeHeaderCheckBox(QCheckBox):
-    """Tristate checkbox pinned over one table header section.
-
-    Clicking it checks or clears every file at once; the partially checked
-    state mirrors a mixed selection.
-    """
-
-    def __init__(self, header, section: int, text: str = "") -> None:
-        super().__init__(text, header)
-        self._header = header
-        self._section = int(section)
-        self.setTristate(True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(
-            "Check or clear every file whose mask can be exposed"
-        )
-        header.sectionResized.connect(self._place)
-        header.geometriesChanged.connect(self._place)
-        self._place()
-
-    def nextCheckState(self) -> None:  # noqa: N802 - Qt override
-        """Toggle between checked and unchecked (partial counts as checked)."""
-        if self.checkState() == Qt.CheckState.Checked:
-            self.setCheckState(Qt.CheckState.Unchecked)
-        else:
-            self.setCheckState(Qt.CheckState.Checked)
-
-    def _place(self, *_args) -> None:
-        header = self._header
-        if (
-            self._section >= header.count()
-            or header.isSectionHidden(self._section)
-        ):
-            self.setVisible(False)
-            return
-        x = header.sectionViewportPosition(self._section)
-        width = header.sectionSize(self._section)
-        hint = self.sizeHint()
-        y = max(0, (header.height() - hint.height()) // 2)
-        self.move(x + max(0, (width - hint.width()) // 2), y)
-        self.setVisible(
-            width > 0 and x + width > 0 and x < header.width()
-        )
-
-
 def _seg_files_panel(ctx, page) -> QWidget:
     panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
@@ -509,14 +465,17 @@ def _seg_files_panel(ctx, page) -> QWidget:
     blay.addWidget(table, 1)
     page._seg_files_table = table
 
-    expose_all = _SegExposeHeaderCheckBox(header, 1, "Expose")
+    expose_all = _HeaderCheckBox(
+        header, 1, "Expose",
+        tooltip="Check or clear every file whose mask can be exposed",
+    )
     expose_all.clicked.connect(
         lambda checked: _seg_set_all_exposed(ctx, page, checked)
     )
-    table.horizontalScrollBar().valueChanged.connect(expose_all._place)
+    table.horizontalScrollBar().valueChanged.connect(expose_all.place)
     table.setColumnWidth(1, expose_all.sizeHint().width() + 14)
     page._seg_expose_all = expose_all
-    QTimer.singleShot(0, expose_all._place)
+    QTimer.singleShot(0, expose_all.place)
 
     blay.addWidget(QLabel("Mask column"))
     name_edit = QLineEdit(str(page._seg_params.get("column") or "Mask"))

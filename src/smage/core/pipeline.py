@@ -240,6 +240,11 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                     threshold / np.where(factor_map > 0, factor_map, 1.0),
                     1.0,
                 )
+                # Correction intensity: 0 = no correction, 1 = full and 2 =
+                # double strength, blended linearly around the identity.
+                intensity = float(sub.get("intensity", 1.0))
+                if intensity != 1.0:
+                    factor = 1.0 + intensity * (factor - 1.0)
                 values[channel] = values[channel] * factor
             continue
         if kind == "batch_align":

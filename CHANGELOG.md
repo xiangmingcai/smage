@@ -6,6 +6,35 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-11-26
+
+### Added
+
+- **Feature Down**: **Background ignore** now sits under **Data files** and
+  has a **Select files…** button that limits the background counting to a
+  subset of the selected files; the other files are still aggregated.
+- **Feature Down**: the **Data files** table has a checkbox column, so
+  **Calculate** only processes the checked files; the checkbox in the header
+  checks or clears every file.
+- **Illumination Correction**: the settings are split into **Tiles
+  calculation** (tile size, grid and files) and **Correction parameters**
+  (method and the new **Correction intensity**, 0–100 with 1 decimal,
+  default 1). Duplicating a submodule keeps its recognized illumination
+  pattern, and Plot settings show read-only **Before** and **After** signal
+  histograms.
+
+### Changed
+
+- **Illumination Correction**: correction method and intensity edits update
+  the preview immediately but reach downstream channels only when the module
+  is saved.
+
+### Fixed
+
+- **Feature Down**: **Calculate** no longer freezes the window while counting
+  background values for large files. The default value is resolved by the
+  calculation's background worker instead of on the UI thread.
+
 ## [0.5.2] — 2026-11-26
 
 ### Fixed

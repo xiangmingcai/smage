@@ -42,6 +42,7 @@ from smage.data.workers import _IlluminationWorker
 from smage.widgets.colormap import _figure_colormap
 from smage.widgets.controls import (
     _NoWheelComboBox,
+    _NoWheelDoubleSpinBox,
     _NoWheelSpinBox,
 )
 from smage.widgets.plot_axes import _make_sci_axis
@@ -269,6 +270,7 @@ def _illum_add_submodule(ctx, page) -> None:
         "bin": 5,
         "resolution": 10,
         "method": "median",
+        "intensity": 1.0,
         "calc_files": [],
         "mask": None,
         "mask_source": None,
@@ -336,8 +338,11 @@ def _illum_duplicate_submodule(ctx, page, sub) -> None:
     new_sub = copy.deepcopy(sub)
     new_sub["id"] = uuid4().hex[:8]
     new_sub["name"] = name
-    new_sub["mask"] = None
-    new_sub["mask_source"] = None
+    # Keep the recognized pattern (and how it was made): the duplicate starts
+    # from the same illumination profile. Saving writes its own mask file
+    # under the new id.
+    new_sub.pop("mask_file", None)
+    new_sub.setdefault("intensity", 1.0)
     page._illum_submodules.append(new_sub)
     page._illum_selected = new_sub["id"]
     _illum_refresh_list(ctx, page)
@@ -421,7 +426,13 @@ def _illum_rebuild_right(ctx, page) -> None:
     top_lay.setContentsMargins(0, 0, 0, 0)
     top_lay.setSpacing(12)
     top_lay.addWidget(_illum_channel_panel(ctx, page, sub), 1)
-    top_lay.addWidget(_illum_params_panel(ctx, page, sub), 2)
+    calc_host = QWidget()
+    calc_lay = QHBoxLayout(calc_host)
+    calc_lay.setContentsMargins(0, 0, 0, 0)
+    calc_lay.setSpacing(12)
+    calc_lay.addWidget(_illum_tiles_panel(ctx, page, sub), 1)
+    calc_lay.addWidget(_illum_correction_panel(ctx, page, sub), 1)
+    top_lay.addWidget(calc_host, 2)
     top_lay.addWidget(_illum_mask_panel(ctx, page, sub), 2)
     bottom = QWidget()
     bottom_box = QVBoxLayout(bottom)
@@ -618,12 +629,22 @@ def _illum_set_files(ctx, page, sub) -> None:
     _illum_mark_dirty(ctx, page)
 
 
-def _illum_params_panel(ctx, page, sub) -> QWidget:
+def _illum_intensity(sub) -> float:
+    """The correction strength of one submodule (0 = no correction)."""
+    try:
+        value = float(sub.get("intensity", 1.0))
+    except (TypeError, ValueError):
+        value = 1.0
+    return max(0.0, min(100.0, value))
+
+
+def _illum_tiles_panel(ctx, page, sub) -> QWidget:
+    """Tile size, grid and files used to recognize the illumination pattern."""
     panel = _widgets_panels._build_panel_frame(ctx)
     lay = QVBoxLayout(panel)
     lay.setContentsMargins(10, 10, 10, 10)
     lay.setSpacing(6)
-    lay.addWidget(QLabel("<b>Correction parameters</b>"))
+    lay.addWidget(QLabel("<b>Tiles calculation</b>"))
     editable = not page._illum_locked
 
     sizes = QHBoxLayout()
@@ -669,20 +690,6 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
     lay.addWidget(_widgets_panels._param_hint(ctx,
         "Bin = tile size of the coarse grid; Resolution = number of bins "
         "across the image. The pattern is fitted on that grid."
-    ))
-
-    lay.addWidget(QLabel("Correction method"))
-    method_combo = _NoWheelComboBox()
-    method_combo.addItem("Down (darkest unchanged)", "down")
-    method_combo.addItem("Up (brightest unchanged)", "up")
-    method_combo.addItem("Median (default)", "median")
-    idx = method_combo.findData(sub.get("method", "median"))
-    method_combo.setCurrentIndex(idx if idx >= 0 else 2)
-    method_combo.setEnabled(editable)
-    lay.addWidget(method_combo)
-    lay.addWidget(_widgets_panels._param_hint(ctx,
-        "Down keeps the darkest tile, Up the brightest; Median keeps the "
-        "median level and is the safe default."
     ))
 
     lay.addWidget(QLabel("Files for illumination pattern recognition"))
@@ -765,12 +772,6 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
             status.setText("Parameters changed — re-recognize the pattern.")
         _illum_mark_dirty(ctx, page)
 
-    def on_method():
-        sub["method"] = method_combo.currentData()
-        _illum_mark_dirty(ctx, page)
-        _illum_render_mask(ctx, page, sub)
-        _illum_render_preview(ctx, page)
-
     def on_calc_files(_item=None):
         sub["calc_files"] = [
             calc_list.item(i).data(Qt.ItemDataRole.UserRole)
@@ -783,11 +784,79 @@ def _illum_params_panel(ctx, page, sub) -> QWidget:
     tile_h.valueChanged.connect(lambda _=0: on_sizes())
     bin_spin.valueChanged.connect(on_bin)
     res_spin.valueChanged.connect(on_resolution)
-    method_combo.currentIndexChanged.connect(lambda _=0: on_method())
     calc_list.itemChanged.connect(on_calc_files)
     return panel
 
 
+def _illum_correction_panel(ctx, page, sub) -> QWidget:
+    """Method and strength applied to the recognized illumination pattern."""
+    panel = _widgets_panels._build_panel_frame(ctx)
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(6)
+    lay.addWidget(QLabel("<b>Correction parameters</b>"))
+    editable = not page._illum_locked
+
+    lay.addWidget(QLabel("Correction method"))
+    method_combo = _NoWheelComboBox()
+    method_combo.addItem("Down (darkest unchanged)", "down")
+    method_combo.addItem("Up (brightest unchanged)", "up")
+    method_combo.addItem("Median (default)", "median")
+    idx = method_combo.findData(sub.get("method", "median"))
+    method_combo.setCurrentIndex(idx if idx >= 0 else 2)
+    method_combo.setEnabled(editable)
+    lay.addWidget(method_combo)
+    lay.addWidget(_widgets_panels._param_hint(ctx,
+        "Down keeps the darkest tile, Up the brightest; Median keeps the "
+        "median level and is the safe default."
+    ))
+
+    lay.addWidget(QLabel("Correction intensity"))
+    intensity = _NoWheelDoubleSpinBox()
+    intensity.setRange(0.0, 100.0)
+    intensity.setDecimals(1)
+    intensity.setSingleStep(0.1)
+    intensity.setValue(_illum_intensity(sub))
+    intensity.setEnabled(editable)
+    lay.addWidget(intensity)
+    lay.addWidget(_widgets_panels._param_hint(ctx,
+        "Blends the correction: 0 = no correction, 0.5 = half, 1 = full "
+        "and 2 = double strength. The preview updates immediately; "
+        "downstream channels update when the module is saved."
+    ))
+    lay.addStretch(1)
+
+    def refresh_levels():
+        rebuild = getattr(page, "_illum_rebuild_levels", None)
+        if rebuild is not None:
+            rebuild()
+
+    def on_method():
+        sub["method"] = method_combo.currentData()
+        _illum_mark_dirty(ctx, page)
+        _illum_render_mask(ctx, page, sub)
+        _illum_render_preview(ctx, page)
+        refresh_levels()
+
+    # Spin steps arrive quickly; render once the value settles.
+    intensity_timer = QTimer(intensity)
+    intensity_timer.setSingleShot(True)
+    intensity_timer.setInterval(200)
+
+    def apply_intensity():
+        _illum_render_preview(ctx, page)
+        refresh_levels()
+
+    intensity_timer.timeout.connect(apply_intensity)
+
+    def on_intensity(value):
+        sub["intensity"] = round(float(value), 1)
+        _illum_mark_dirty(ctx, page)
+        intensity_timer.start()
+
+    method_combo.currentIndexChanged.connect(lambda _=0: on_method())
+    intensity.valueChanged.connect(on_intensity)
+    return panel
 def _illum_divisibility_hint(ctx, sub) -> str:
     files = sub.get("files") or []
     tile_w = int(sub.get("tile_w", 256))
@@ -1105,19 +1174,42 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
             index = page._illum_submodules.index(sub)
         except ValueError:
             index = len(page._illum_submodules)
-        stages = _illum_preview_stages(ctx,
-            page, page._illum_submodules[: index + 1]
+        channel = plot_dict.get("color_param")
+        before_stages = _illum_preview_stages(
+            ctx, page, page._illum_submodules[:index]
+        )
+        after_stages = _illum_preview_stages(
+            ctx, page, page._illum_submodules[: index + 1]
+        )
+        configs = (
+            ctx._figure_axis_scale_configs(
+                page._illum_task_id, path, channel
+            )
+            if channel else None
+        )
+        # Before on top (read-only distribution), then the shared Min/Max
+        # controls with the corrected After distribution below them.
+        before_caption = QLabel("Before")
+        before_caption.setStyleSheet(
+            "color: #5a6673; font-size: 8pt; font-weight: bold;"
+        )
+        levels_lay.addWidget(before_caption)
+        _widgets_image_level._image_signal_histogram(
+            ctx, levels_lay, channel, page._illum_task_id, path,
+            extra_stages=before_stages, configs=configs,
         )
         _widgets_image_level._image_level_controls(ctx,
             levels_lay,
-            plot_dict.get("color_param"),
+            channel,
             sub.get("plot_image_min"),
             sub.get("plot_image_max"),
             enabled,
             on_levels,
             page._illum_task_id,
             path,
-            extra_stages=stages,
+            extra_stages=after_stages,
+            configs=configs,
+            hist_caption="After",
         )
 
     page._illum_rebuild_levels = rebuild_levels
@@ -1479,6 +1571,9 @@ def _illum_on_poll(ctx, page) -> None:
         _illum_render_mask(ctx, page, sub)
         if sub.get("id") == page._illum_selected:
             _illum_render_preview(ctx, page)
+            rebuild_levels = getattr(page, "_illum_rebuild_levels", None)
+            if rebuild_levels is not None:
+                rebuild_levels()
         _illum_refresh_list(ctx, page)
         _illum_mark_dirty(ctx, page)
 

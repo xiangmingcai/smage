@@ -7,22 +7,41 @@ estimating a per-tile brightness profile and dividing it out.
 
 ## Settings
 
+The panel is split into **Tiles calculation** and **Correction parameters**.
+
 | Setting | Description |
 |---|---|
 | Channel | The channel to correct. |
 | Tile W / Tile H | Size of the tiles the image is divided into. |
 | Bin | Binning used when building the brightness profile. |
 | Resolution | Resolution of the estimated correction map. |
+| Files for illumination pattern recognition | Which files contribute to the estimate. |
 | Correction method | How tile factors are combined into the correction map. |
-| Files for illumination pattern recognition | Which files contribute to the estimate (and which files the correction is applied to). |
+| Correction intensity | Strength of the correction; 0 = none, 1 = full (default), 2 = double. |
+
+**Tiles calculation** recognizes the illumination pattern. **Correction
+parameters** apply it: the method picks the reference level (darkest,
+brightest or median tile) and the intensity blends the resulting factor
+linearly:
+
+```
+factor = T / mask
+factor = 1 + intensity × (factor − 1)
+```
+
+Edits to the correction method or intensity update the preview immediately.
+Downstream channels use the saved settings, so they change only after the
+module is saved.
 
 **Auto set** estimates the tile size and background threshold from the data.
 The preview plot shows the corrected channel, with its own display range and
-palette. Zooming or panning re-samples the image at the current magnification,
-so detail stays sharp when zoomed in. The button below the previews copies
-the zoom and position of the preview under the pointer to the other one; its
-arrow (**Sync view →** or **Sync view ←**) shows the direction that will be
-used.
+palette. In **Plot settings**, the image levels (Min/Max, Auto set, Reset) are
+shared by both previews; the **Before** histogram above them is read-only and
+shows the uncorrected distribution. Zooming or panning re-samples the image at
+the current magnification, so detail stays sharp when zoomed in. The button
+below the previews copies the zoom and position of the preview under the
+pointer to the other one; its arrow (**Sync view →** or **Sync view ←**) shows
+the direction that will be used.
 
 The channel can be an imported channel, a channel produced by an upstream map
 module, or a generated **Unmix** channel. The tile calculation reads a
@@ -41,6 +60,11 @@ corrected channel; the raw data is unchanged.
   downstream module does not re-estimate it.
 - The illumination pattern used for estimation is persisted under
   `Module/illumination-<id>/` inside the project.
+- Duplicating a submodule also copies its recognized illumination pattern
+  (and how it was computed), so the copy starts from the same profile.
+- Correction method and intensity edits apply to the preview immediately; the
+  downstream channel changes when the module is saved. Unsaved edits are
+  discarded when the module is closed.
 
 ## Related
 

@@ -2,11 +2,15 @@
 
 ## Highlights
 
-- **Illumination Correction** pattern recognition now accepts generated
-  **Unmix** channels: the tile calculation reads them from their saved output,
-  so a corrected unmixed channel can be estimated like any imported channel.
-- A tile size larger than the image gets a clear message and a panel hint
-  instead of "No tile data was found".
+- **Illumination Correction** is split into **Tiles calculation** and
+  **Correction parameters**, with a new **Correction intensity** (0–100,
+  default 1). Duplicating a submodule keeps its recognized pattern, Plot
+  settings show read-only **Before** and **After** histograms, and
+  correction-parameter edits reach downstream channels only after **Save**.
+- **Feature Down**: **Background ignore** sits under **Data files** and can
+  count from a chosen subset of files. The **Data files** table has a
+  checkbox column for choosing what **Calculate** processes, and the default
+  background value is counted off the UI thread.
 
 ## Downloads
 
