@@ -106,6 +106,13 @@ file again, so it is instant even on multi-gigabyte images. Reading is only
 needed when the file, channel or zoom changes; zooming redraws just the plot
 being zoomed.
 
+The pattern is anchored to the image origin, not to the visible view. At a
+reduced zoom the image is drawn from pyramid blocks that each hold the mean
+of many pixels; the pattern is averaged over the same block before it is
+divided out. The corrected picture therefore keeps its brightness and the
+pattern its position when the view is zoomed or panned, in this module and in
+every downstream image plot.
+
 ## Output
 
 Corrected values for the selected channel. Downstream modules see the

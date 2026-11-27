@@ -912,7 +912,9 @@ class _ImageFilterWorker:
                 values[name] = pd.to_numeric(
                     df[name], errors="coerce"
                 ).to_numpy(dtype="float64")
-        values = _evaluate_stages(stages, values, needed, parquet_path)
+        values = _evaluate_stages(
+            stages, values, needed, parquet_path, origin=origin
+        )
         try:
             mask = _compute_gate_filter_mask(
                 gates, gate_id, parquet_path, {},

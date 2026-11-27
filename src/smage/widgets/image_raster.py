@@ -125,6 +125,34 @@ def _image_raster_raw(ctx, parquet_path, manifest, bbox, channel, mask_ent=None,
     return chan, rect, frac
 
 
+def _image_cells(rect, shape):
+    """Geometry of a raster grid: cell origins and cell size in data units.
+
+    `cells` lets a position-dependent stage (Illumination correction) average
+    its pattern over every pixel a raster cell covers, instead of sampling
+    one tile position at the cell centre.  Without it the correction pattern
+    would be aliased at coarse zoom levels and change with the zoom.
+    """
+    import numpy as np
+
+    try:
+        height, width = int(shape[0]), int(shape[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if height <= 0 or width <= 0 or rect is None:
+        return None
+    if rect.width() <= 0.0 or rect.height() <= 0.0:
+        return None
+    cell_w = rect.width() / width
+    cell_h = rect.height() / height
+    return {
+        "x0": rect.x() + np.arange(width, dtype="float64") * cell_w,
+        "y0": rect.y() + np.arange(height, dtype="float64") * cell_h,
+        "w": cell_w,
+        "h": cell_h,
+    }
+
+
 def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel,
                   mask_ent=None, stages=None, force_raw=False,
                   extra_columns=(), want_coords=(), coords_out=None):
@@ -195,15 +223,16 @@ def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel,
             for name in want_coords:
                 if name in values:
                     coords[name] = values[name]
-        evaluated = _evaluate_stages(
-            stages, values, [channel], parquet_path,
-            origin=(float(manifest["xmin"]), float(manifest["ymin"])),
-        )
-        if channel not in evaluated:
-            return None, None, None
         rect = QRectF(
             xmin + i0 * b, ymin + j0 * b, (i1 - i0) * b, (j1 - j0) * b
         )
+        evaluated = _evaluate_stages(
+            stages, values, [channel], parquet_path,
+            origin=(float(manifest["xmin"]), float(manifest["ymin"])),
+            cells=_image_cells(rect, (j1 - j0, i1 - i0)),
+        )
+        if channel not in evaluated:
+            return None, None, None
         frac = None
         if mask_ent is not None:
             frac_level = mask_ent.get("levels", {}).get(b)
@@ -351,6 +380,7 @@ def _image_raster_texture(ctx, parquet_path, manifest, bbox, spacing, channel,
             origin=(
                 float(manifest["xmin"]), float(manifest["ymin"])
             ),
+            cells=_image_cells(rect, chan.shape),
         )
         chan = evaluated.get(channel, chan)
     return chan, rect, frac, cached is not None

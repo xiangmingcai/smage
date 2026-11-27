@@ -4,6 +4,22 @@ All notable changes to Smage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [0.6.2] — 2026-11-27
+
+### Fixed
+
+- **Illumination Correction** keeps the pattern's absolute position at every
+  zoom level. A reduced-resolution image is drawn from pyramid blocks, and
+  the correction used to sample one pattern cell at the block centre: the
+  pattern was aliased, changed with the zoom, and downstream Figure image
+  plots — especially generated channels such as Unmix output — could apply
+  it at a position taken from the visible crop instead of the image origin.
+  The pattern is now measured from the image origin (taken from the file
+  when a sampled or cropped read does not contain it) and averaged over the
+  pixels each raster block covers. The corrected picture now keeps its
+  brightness and pattern position when zooming or panning, and matches the
+  full-resolution correction.
+
 ## [0.6.1] — 2026-11-27
 
 ### Added

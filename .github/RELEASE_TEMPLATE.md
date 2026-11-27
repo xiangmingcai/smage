@@ -2,19 +2,13 @@
 
 ## Highlights
 
-- **Illumination Correction** handles background-subtracted channels:
-  **Shift** adds a constant to the channel at the submodule's input (the
-  pattern estimate, the Before preview and the correction all work on the
-  shifted values) and removes it again downstream, so a negative background
-  is no longer amplified by the correction. **Pattern floor** raises a
-  pattern that contains negative values, and **Paste illumination pattern** /
-  **Copy pattern** move a pattern in and out through the clipboard.
-- **Illumination Correction** responds immediately: **Update** and a
-  re-recognized pattern re-apply the correction to the cached pixels of the
-  current view, zooming redraws only the plot being zoomed, and raw-pixel
-  previews are binned to the screen resolution. The Before/After histograms
-  follow the Min/Max window, and **Correction intensity** accepts negative
-  values.
+- **Illumination Correction** keeps the pattern's absolute position at every
+  zoom level. The correction is measured from the image origin — also for
+  sampled or cropped reads and for generated channels such as Unmix output —
+  and is averaged over the pixels each reduced-resolution image block
+  covers. The corrected picture keeps its brightness and the pattern its
+  position when zooming or panning, in the module and in every downstream
+  image plot, and matches the full-resolution correction.
 
 ## Downloads
 

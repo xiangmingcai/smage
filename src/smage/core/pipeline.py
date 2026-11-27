@@ -8,6 +8,8 @@ No Qt and no project state: callers pass the stages and values in.
 """
 from __future__ import annotations
 
+import os
+
 from smage.core.calculation import (
     _apply_calculation,
     _calculation_dependencies,
@@ -137,9 +139,110 @@ def _linear_combine(sources, weights):
     return [combined[i] for i in range(combined.shape[0])]
 
 
+_ILLUM_ORIGIN_CACHE = {}
+
+
+def _illum_file_origin(path, x_name, y_name):
+    """The (xmin, ymin) of an image file, from the parquet metadata.
+
+    Position-dependent stages need the image origin, not the minimum of the
+    rows they happen to see: a sampled or spatially cropped read would
+    otherwise apply the pattern at a different phase — the correction would
+    move with the view.  Row-group statistics carry the exact minimum without
+    reading data.
+    """
+    if path is None or not x_name or not y_name:
+        return None
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    key = (
+        str(path), int(stat.st_size), float(stat.st_mtime), x_name, y_name,
+    )
+    if key in _ILLUM_ORIGIN_CACHE:
+        return _ILLUM_ORIGIN_CACHE[key]
+    origin = None
+    try:
+        from smage.data.sampling import parquet_column_stats
+
+        stats = parquet_column_stats(path, [x_name, y_name])
+        if x_name in stats and y_name in stats:
+            origin = (float(stats[x_name][0]), float(stats[y_name][0]))
+    except Exception:  # noqa: BLE001 - a missing origin falls back to the data
+        origin = None
+    if len(_ILLUM_ORIGIN_CACHE) > 256:
+        _ILLUM_ORIGIN_CACHE.clear()
+    _ILLUM_ORIGIN_CACHE[key] = origin
+    return origin
+
+
+def _illum_cell_factor(mask, tile_w, tile_h, threshold, cells, origin):
+    """Illumination factor for raster cells that hold a mean over pixels.
+
+    Each cell covers a window of the tiled pattern; the factor is taken from
+    the pattern averaged over that window (a summed-area table of the tile),
+    not from the single tile position of the cell's centre.  An image that
+    the full-resolution correction would flatten stays flat at every zoom
+    level, and the pattern keeps its absolute position because the window is
+    found from the image origin.
+    """
+    import numpy as np
+
+    try:
+        x0 = np.asarray(cells.get("x0"), dtype="float64").reshape(-1)
+        y0 = np.asarray(cells.get("y0"), dtype="float64").reshape(-1)
+        cw = int(max(1, round(float(cells.get("w", 1.0)))))
+        ch = int(max(1, round(float(cells.get("h", 1.0)))))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if x0.size == 0 or y0.size == 0:
+        return None
+    # A window covering two whole tiles averages to the tile mean; cap it so
+    # an extremely coarse zoom cannot allocate a huge support.
+    cw = min(cw, 2 * tile_w)
+    ch = min(ch, 2 * tile_h)
+    origin_x, origin_y = float(origin[0]), float(origin[1])
+    phase_x = np.mod(np.floor(x0 - origin_x).astype(np.int64), tile_w)
+    phase_y = np.mod(np.floor(y0 - origin_y).astype(np.int64), tile_h)
+    tile = np.asarray(mask, dtype="float64")[
+        np.mod(np.arange(tile_h + ch), tile_h)[:, None],
+        np.mod(np.arange(tile_w + cw), tile_w)[None, :],
+    ]
+    valid = np.isfinite(tile) & (tile > 0.0)
+    sums = np.zeros((tile_h + ch + 1, tile_w + cw + 1), dtype="float64")
+    sums[1:, 1:] = np.where(valid, tile, 0.0).cumsum(0).cumsum(1)
+    counts = np.zeros_like(sums)
+    counts[1:, 1:] = valid.astype("float64").cumsum(0).cumsum(1)
+    y_lo = phase_y[:, None]
+    x_lo = phase_x[None, :]
+    y_hi = y_lo + ch
+    x_hi = x_lo + cw
+    total = (
+        sums[y_hi, x_hi] - sums[y_lo, x_hi]
+        - sums[y_hi, x_lo] + sums[y_lo, x_lo]
+    )
+    count = (
+        counts[y_hi, x_hi] - counts[y_lo, x_hi]
+        - counts[y_hi, x_lo] + counts[y_lo, x_lo]
+    )
+    mean = np.divide(
+        total, count, out=np.full_like(total, np.nan), where=count > 0
+    )
+    return np.where(mean > 0, threshold / np.where(mean > 0, mean, 1.0), 1.0)
+
+
 def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
-                     origin=None):
-    """Apply map-module stages in order to a {column: array} mapping."""
+                     origin=None, cells=None):
+    """Apply map-module stages in order to a {column: array} mapping.
+
+    ``origin`` is the image's (xmin, ymin); position-dependent stages measure
+    the illumination pattern from it.  ``cells`` describes a raster grid whose
+    values are cell means rather than single pixels (see ``_image_cells``):
+    the illumination stage then corrects each cell by the pattern averaged
+    over the pixels the cell covers, so a zoomed-out raster does not sample
+    one tile position for a whole block of pixels.
+    """
     import numpy as np
 
     values = dict(values)
@@ -225,43 +328,67 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                 channel = sub.get("channel")
                 if channel not in values:
                     continue
-                x_values = values.get(sub.get("x"))
-                y_values = values.get(sub.get("y"))
                 mask = sub.get("mask")
-                if x_values is None or y_values is None or mask is None:
+                if mask is None:
                     continue
-                shift = float(sub.get("shift", 0.0) or 0.0)
-                if shift and sub.get("add_shift", False):
-                    values[channel] = values[channel] + shift
+                tile_w = int(sub["tile_w"])
+                tile_h = int(sub["tile_h"])
+                threshold = float(sub.get("T") or 0.0)
+                intensity = float(sub.get("intensity", 1.0))
                 if origin is not None:
                     x_origin, y_origin = origin
                 else:
-                    try:
-                        x_origin = float(np.nanmin(x_values))
-                        y_origin = float(np.nanmin(y_values))
-                    except (TypeError, ValueError):
+                    # Sampled or cropped reads do not contain the image
+                    # origin; take it from the file itself so the pattern
+                    # keeps its absolute position.
+                    file_origin = _illum_file_origin(
+                        parquet_path, sub.get("x"), sub.get("y")
+                    )
+                    if file_origin is None:
+                        x_origin = y_origin = None
+                    else:
+                        x_origin, y_origin = file_origin
+                factor = None
+                if cells is not None and x_origin is not None:
+                    # Raster cells hold the mean over many pixels: use the
+                    # pattern averaged over each cell's window.
+                    factor = _illum_cell_factor(
+                        mask, tile_w, tile_h, threshold, cells,
+                        (x_origin, y_origin),
+                    )
+                if factor is None:
+                    x_values = values.get(sub.get("x"))
+                    y_values = values.get(sub.get("y"))
+                    if x_values is None or y_values is None:
                         continue
-                xi = np.mod(
-                    np.rint(np.asarray(x_values, dtype="float64") - x_origin)
-                    .astype(np.int64),
-                    int(sub["tile_w"]),
-                )
-                yi = np.mod(
-                    np.rint(np.asarray(y_values, dtype="float64") - y_origin)
-                    .astype(np.int64),
-                    int(sub["tile_h"]),
-                )
-                factor_map = mask[yi, xi]
-                threshold = float(sub.get("T") or 0.0)
-                factor = np.where(
-                    factor_map > 0,
-                    threshold / np.where(factor_map > 0, factor_map, 1.0),
-                    1.0,
-                )
-                # Correction intensity: 0 = no correction, 1 = full and 2 =
-                # double strength, blended linearly around the identity.
-                intensity = float(sub.get("intensity", 1.0))
+                    if x_origin is None:
+                        try:
+                            x_origin = float(np.nanmin(x_values))
+                            y_origin = float(np.nanmin(y_values))
+                        except (TypeError, ValueError):
+                            continue
+                    xi = np.mod(
+                        np.rint(np.asarray(x_values, dtype="float64") - x_origin)
+                        .astype(np.int64),
+                        tile_w,
+                    )
+                    yi = np.mod(
+                        np.rint(np.asarray(y_values, dtype="float64") - y_origin)
+                        .astype(np.int64),
+                        tile_h,
+                    )
+                    factor_map = np.asarray(mask, dtype="float64")[yi, xi]
+                    factor = np.where(
+                        factor_map > 0,
+                        threshold / np.where(factor_map > 0, factor_map, 1.0),
+                        1.0,
+                    )
+                shift = float(sub.get("shift", 0.0) or 0.0)
+                if shift and sub.get("add_shift", False):
+                    values[channel] = values[channel] + shift
                 if intensity != 1.0:
+                    # Correction intensity: 0 = no correction, 1 = full and
+                    # 2 = double strength, blended linearly around identity.
                     factor = 1.0 + intensity * (factor - 1.0)
                 values[channel] = values[channel] * factor
                 if shift and sub.get("remove_shift", False):

@@ -6,7 +6,7 @@ into a common tabular representation and lets you compose analysis pipelines
 from interactive modules — gating, compensation, unmixing, segmentation,
 feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.6.1`; modules and
+> **Status:** early development. The current release is `0.6.2`; modules and
 > file formats may still change between releases.
 
 > **Intended use:** research software, not a medical device. Not for clinical
@@ -17,22 +17,15 @@ feature aggregation, clustering, dimensionality reduction and export.
 📦 **Releases:** <https://github.com/xiangmingcai/smage/releases><br>
 🐛 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
-## What's new in 0.6.1
+## What's new in 0.6.2
 
-- **Illumination Correction** handles background-subtracted channels:
-  **Shift** adds a constant to the channel at the submodule's input (the
-  pattern estimate, the Before preview and the correction all work on the
-  shifted values) and removes it again downstream, so a negative background
-  is no longer amplified by the correction. **Pattern floor** raises a
-  pattern that contains negative values, and **Paste illumination pattern** /
-  **Copy pattern** move a pattern in and out through the clipboard.
-- **Illumination Correction** responds immediately: **Update** and a
-  re-recognized pattern re-apply the correction to the cached pixels of the
-  current view instead of reading the file again; zooming redraws only the
-  plot being zoomed, and raw-pixel previews are binned to the screen
-  resolution. The Before/After histograms follow the Min/Max window, and
-  **Correction intensity** now accepts negative values (inverting the
-  correction).
+- **Illumination Correction** keeps the pattern's absolute position at every
+  zoom level. The correction is measured from the image origin — also for
+  sampled or cropped reads, and for generated channels such as Unmix output —
+  and is averaged over the pixels each reduced-resolution block covers. The
+  corrected picture now keeps its brightness and the pattern its position
+  when zooming or panning, in the module and in every downstream image plot,
+  and matches the full-resolution correction.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -75,7 +68,7 @@ Optional analysis methods run in a separate Python environment created from
 | PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
 
 The Extension Manager installs the current pip release; the versions above
-were current when Smage 0.6.1 was released. Use a **Python 3.11** environment
+were current when Smage 0.6.2 was released. Use a **Python 3.11** environment
 for these extensions, matching the Python version Smage is built with. Each
 environment may need extra packages (for example PyTorch for Cellpose or
 TensorFlow for StarDist) — see the extension's repository for its

@@ -29,7 +29,7 @@ from smage.widgets.colormap import _figure_colormap
 from smage.widgets.controls import (
     _LogStepSpinBox, _NoWheelComboBox, _NoWheelSpinBox,
 )
-from smage.widgets.image_raster import _image_raster_texture
+from smage.widgets.image_raster import _image_cells, _image_raster_texture
 from smage.widgets.plot_axes import (
     _figure_image_layers, _is_scatter_plot, _make_fit_plot_item,
     _make_original_axis, _make_sci_axis,
@@ -202,50 +202,6 @@ def _figure_axis_scale_configs(ctx, task_id, parquet_path, column, column_transf
     if not column_transforms:
         cache[cache_key] = result
     return list(result)
-
-
-def _raster_coordinate_grids(rect, shape):
-    """x/y coordinate grids for a raster's block centres.
-
-    Pipelines that depend on pixel position (Illumination correction) need
-    x/y arrays when they run on a raster that is drawn from a generated
-    channel's own pyramid, which has no x/y columns of its own.
-    """
-    import numpy as np
-
-    try:
-        height, width = int(shape[0]), int(shape[1])
-    except (TypeError, ValueError, IndexError):
-        return None, None
-    if height <= 0 or width <= 0 or rect is None:
-        return None, None
-    xs = rect.x() + (np.arange(width, dtype="float64") + 0.5) * (
-        rect.width() / width
-    )
-    ys = rect.y() + (np.arange(height, dtype="float64") + 0.5) * (
-        rect.height() / height
-    )
-    return np.meshgrid(xs, ys)
-
-
-def _raster_stage_values(values, stages, rect, shape):
-    """Add coordinate grids for the position-dependent stages of `stages`."""
-    for kind, stage in stages:
-        if kind != "illumination":
-            continue
-        for sub in stage.get("submodules") or ():
-            x_name = sub.get("x")
-            y_name = sub.get("y")
-            if not x_name or not y_name:
-                continue
-            if x_name in values and y_name in values:
-                continue
-            x_grid, y_grid = _raster_coordinate_grids(rect, shape)
-            if x_grid is None:
-                continue
-            values.setdefault(x_name, x_grid)
-            values.setdefault(y_name, y_grid)
-    return values
 
 
 def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, image_levels=None, base_stages=None, delta_stages=None, base_cache=None, base_sig=None, base_coords=()) -> None:
@@ -994,16 +950,19 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
             # The saved pyramid holds post-unmix values; apply the map stages
             # below the Unmix task (Scale in particular) so the raster and
             # the Min/Max controls share one unit system.  Position-dependent
-            # stages (Illumination) also need x/y for this raster: the
-            # generated pyramid has no coordinate columns, so derive them
-            # from the raster's rect and block grid.
+            # stages (Illumination) measure the pattern from the image origin
+            # and average it over each raster cell, so the correction keeps
+            # its absolute position at every zoom level.
             post = _stages_after(stages, "unmix", rec.get("task_id"))
             if post:
                 values = {channel: chan}
-                _raster_stage_values(values, post, rect, chan.shape)
                 evaluated = _evaluate_stages(
                     post, values, [channel],
                     parquet_path=parquet_path,
+                    origin=(
+                        float(manifest["xmin"]), float(manifest["ymin"])
+                    ),
+                    cells=_image_cells(rect, chan.shape),
                 )
                 chan = evaluated.get(channel, chan)
             lo = float(np.nanmin(chan)) if chan.size else 0.0

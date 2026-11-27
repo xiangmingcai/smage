@@ -234,11 +234,11 @@ def preview_update() -> None:
 
 @harness.case("mod.illumination.raster_coords", "L4", "illumination", tags=("fast",))
 def raster_coords() -> None:
-    """Generated-channel rasters get x/y so position stages can run."""
+    """Generated-channel rasters keep the pattern's absolute position."""
     from PySide6.QtCore import QRectF
 
     from smage.core.pipeline import _evaluate_stages
-    from smage.widgets.plot import renderer
+    from smage.widgets.image_raster import _image_cells
 
     rect = QRectF(0.0, 0.0, 4.0, 2.0)
     channel = np.full((2, 4), 10.0)
@@ -252,15 +252,28 @@ def raster_coords() -> None:
             "T": 2.0, "intensity": 1.0,
         }],
     })
-    values = renderer._raster_stage_values(
-        {"U1": channel}, [stage], rect, channel.shape
-    )
-    values = _evaluate_stages(
-        [stage], values, ["U1"], parquet_path="/data.parquet"
-    )
+
+    def corrected(x_start):
+        cells = _image_cells(
+            QRectF(x_start, 0.0, rect.width(), rect.height()), channel.shape
+        )
+        values = _evaluate_stages(
+            [stage], {"U1": channel}, ["U1"], parquet_path="/data.parquet",
+            origin=(0.0, 0.0), cells=cells,
+        )
+        return values["U1"]
+
+    values = corrected(0.0)
     harness.check(
-        not np.allclose(values["U1"], channel),
+        not np.allclose(values, channel),
         "the illumination stage ran on the raster",
+    )
+    # A crop that starts at a different x applies the same pattern column to
+    # the same absolute pixel: the phase comes from the image origin.
+    shifted = corrected(1.0)
+    harness.check(
+        np.allclose(shifted[:, :2], values[:, 1:3]),
+        "the pattern keeps its position when the view crop moves",
     )
 
 

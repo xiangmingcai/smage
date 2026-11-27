@@ -2669,6 +2669,7 @@ def _seg_raster_channel(ctx, parquet_path, channel, task_id=None):
                     {"x": x_values, "y": y_values, channel: data},
                     [channel],
                     parquet_path=parquet_path,
+                    origin=(float(man["xmin"]), float(man["ymin"])),
                 )
                 data = evaluated.get(channel, data)
             values = {"x": x_values, "y": y_values, channel: data}

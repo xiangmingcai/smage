@@ -3,6 +3,17 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.6.2 — 2026-11-27
+
+- **Illumination Correction** keeps the pattern's absolute position at every
+  zoom level: the correction is measured from the image origin — also for
+  sampled or cropped reads and for generated channels such as Unmix output —
+  and averaged over the pixels each reduced-resolution block covers. The
+  corrected picture keeps its brightness and the pattern its position when
+  zooming or panning, in the module and in every downstream image plot.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.6.1 — 2026-11-27
 
 - **Illumination Correction** handles background-subtracted channels:
