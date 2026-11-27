@@ -4,7 +4,43 @@ All notable changes to Smage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.1] — 2026-11-27
+
+### Added
+
+- **Illumination Correction**: **Shift** (default 0, any decimal) adds a
+  constant to the channel at the submodule's input — the pattern estimate,
+  the Before preview and the correction all work on the shifted values — and
+  subtracts it again in the data passed downstream. Raising a
+  background-subtracted channel above zero keeps its negative background from
+  being amplified by the correction while preserving its downstream level.
+- **Illumination Correction**: **Pattern floor** (default 100) raises a
+  pattern that contains negative values so its minimum equals the floor, so
+  every cell — including background-subtracted near-zero areas — takes part
+  in the correction instead of being left untouched or dividing by a
+  negative value.
+- **Illumination Correction**: **Paste illumination pattern** sets the
+  pattern from a clipboard matrix (validated against the tile size), and
+  **Copy pattern** writes it back as a tab-separated matrix with full
+  precision. A pasted pattern is labelled in the module.
+
+### Changed
+
+- **Illumination Correction**: **Correction intensity** accepts negative
+  values; a negative intensity inverts the correction (the factor is
+  mirrored around 1).
+- **Illumination Correction**: the Before/After histograms in **Plot
+  settings** follow the Min/Max window, so the visible distribution matches
+  the image levels.
+- **Illumination Correction**: the preview keeps the uncorrected pixels of
+  the current view, so **Update** and a re-recognized pattern re-apply the
+  correction without reading the file again; zooming redraws only the plot
+  that is being zoomed. Raw-pixel previews are binned to the screen
+  resolution instead of one cell per pixel, which removes multi-second
+  stalls on very large images.
+- **Illumination Correction**: the preview histograms use a spread sample of
+  each file instead of scanning it, so changing a parameter no longer starts
+  a full-file read in the background.
 
 ## [0.5.6] — 2026-11-27
 

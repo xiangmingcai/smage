@@ -9,14 +9,26 @@ from smage.core.pipeline import (
     _evaluate_stages, _pipeline_dependencies,
 )
 
+# Raw reads are binned to about one cell per screen pixel.  Binning at one
+# cell per data unit made an intermediate zoom (before the finest pyramid
+# level is available) allocate tens of millions of cells per plot.
+_RAW_MIN_CELLS = 1
 
-def _image_raster_raw(ctx, parquet_path, manifest, bbox, channel, mask_ent=None, stages=None):
-    """Rasterise raw pixels inside a bbox (deep zoom beyond the finest level).
+
+def _raw_cell_count(extent, spacing):
+    return max(_RAW_MIN_CELLS, int(math.ceil(extent / max(float(spacing), 1e-12))))
+
+
+def _image_raster_raw(ctx, parquet_path, manifest, bbox, channel, mask_ent=None,
+                      stages=None, spacing=1.0, want_coords=(), coords_out=None):
+    """Rasterise pixels inside a bbox (deep zoom beyond the finest level).
 
     `stages` evaluates the ordered map pipeline (Scale / Compensation /
-    Unmix) per pixel instead of reading one channel.
+    Unmix) per pixel instead of reading one channel.  Cells are about one
+    screen pixel (`spacing` in data units), so an intermediate zoom does not
+    build a full-resolution array.  `want_coords` fills `coords_out` with
+    per-cell x/y means, which position-dependent stages need.
     """
-    import math
     import numpy as np
     import pyarrow.parquet as pq
     color_cols = manifest.get("color_cols", [])
@@ -69,10 +81,15 @@ def _image_raster_raw(ctx, parquet_path, manifest, bbox, channel, mask_ent=None,
         v = df[channel].to_numpy(dtype="float64")
     else:
         v = np.ones(len(df))
-    nbx = max(1, int(math.ceil(x1 - x0)))
-    nby = max(1, int(math.ceil(y1 - y0)))
-    bi = np.clip((x - x0).astype(np.int64), 0, nbx - 1)
-    bj = np.clip((y - y0).astype(np.int64), 0, nby - 1)
+    step = max(float(spacing), 1e-12)
+    nbx = _raw_cell_count(x1 - x0, step)
+    nby = _raw_cell_count(y1 - y0, step)
+    bi = np.clip(
+        np.floor((x - x0) / step).astype(np.int64), 0, nbx - 1
+    )
+    bj = np.clip(
+        np.floor((y - y0) / step).astype(np.int64), 0, nby - 1
+    )
     bidx = bj * nbx + bi
     cnt = np.bincount(bidx, minlength=nbx * nby).reshape(nby, nbx)
     frac = None
@@ -90,11 +107,27 @@ def _image_raster_raw(ctx, parquet_path, manifest, bbox, channel, mask_ent=None,
     else:
         ssum = np.bincount(bidx, weights=v, minlength=nbx * nby).reshape(nby, nbx)
         chan = np.divide(ssum, cnt, out=np.zeros_like(ssum), where=cnt > 0)
+    if coords_out is not None and want_coords:
+        for name in want_coords:
+            if name == "x":
+                source = x
+            elif name == "y":
+                source = y
+            else:
+                continue
+            total = np.bincount(
+                bidx, weights=source, minlength=nbx * nby
+            ).reshape(nby, nbx)
+            coords_out[name] = np.divide(
+                total, cnt, out=np.zeros_like(total), where=cnt > 0
+            )
     rect = QRectF(x0, y0, x1 - x0, y1 - y0)
     return chan, rect, frac
 
 
-def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel, mask_ent=None, stages=None, force_raw=False):
+def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel,
+                  mask_ent=None, stages=None, force_raw=False,
+                  extra_columns=(), want_coords=(), coords_out=None):
     """Return (channel_2d_array, data_rect, mask_fraction) for the visible bbox.
 
     `stages` evaluates the ordered map pipeline (Scale / Compensation /
@@ -102,29 +135,39 @@ def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel, mask_ent=
     applied to the aggregated values. With `force_raw` (used by gate subset
     views) the pixels are read at full resolution: block means would blend
     masked and unmasked pixels and make the selection look inaccurate.
+
+    `extra_columns` adds source columns (for example the x/y coordinates a
+    later position-dependent stage needs) to the extraction, and
+    `want_coords`/`coords_out` return those coordinates on the same grid as
+    the channel.
     """
-    import math
     import numpy as np
+    extra = tuple(extra_columns or ())
+    coords = {} if coords_out is None else coords_out
     if force_raw:
         return ctx._image_raster_raw(
-            parquet_path, manifest, bbox, channel, mask_ent, stages
+            parquet_path, manifest, bbox, channel, mask_ent, stages,
+            spacing=spacing, want_coords=want_coords, coords_out=coords,
         )
     color_cols = manifest.get("color_cols", [])
     if not color_cols:
         return None, None, None
     if stages is not None:
         needed = _pipeline_dependencies(stages, [channel], parquet_path)
+        needed = set(needed) | set(extra)
         if not all(c in color_cols for c in needed):
             # Not all inputs are indexed; fall back to raw pixels.
             return ctx._image_raster_raw(
-                parquet_path, manifest, bbox, channel, mask_ent, stages
+                parquet_path, manifest, bbox, channel, mask_ent, stages,
+                spacing=spacing, want_coords=want_coords, coords_out=coords,
             )
         levels = manifest.get("levels", [])
         if not levels or (
             spacing < levels[0]["block"] and levels[0]["block"] > 1
         ):
             return ctx._image_raster_raw(
-                parquet_path, manifest, bbox, channel, mask_ent, stages
+                parquet_path, manifest, bbox, channel, mask_ent, stages,
+                spacing=spacing, want_coords=want_coords, coords_out=coords,
             )
         chosen = levels[-1]
         for info in levels:
@@ -148,6 +191,10 @@ def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel, mask_ent=
             name: arr[j0:j1, i0:i1, color_cols.index(name)]
             for name in needed if name in color_cols
         }
+        if want_coords:
+            for name in want_coords:
+                if name in values:
+                    coords[name] = values[name]
         evaluated = _evaluate_stages(
             stages, values, [channel], parquet_path,
             origin=(float(manifest["xmin"]), float(manifest["ymin"])),
@@ -178,7 +225,8 @@ def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel, mask_ent=
         return None, None, None
     if spacing < levels[0]["block"] and levels[0]["block"] > 1:
         return ctx._image_raster_raw(
-            parquet_path, manifest, bbox, channel, mask_ent, None
+            parquet_path, manifest, bbox, channel, mask_ent, None,
+            spacing=spacing, want_coords=want_coords, coords_out=coords,
         )
     chosen = levels[-1]
     for info in levels:
@@ -196,6 +244,10 @@ def _image_raster(ctx, parquet_path, manifest, bbox, spacing, channel, mask_ent=
     if i1 <= i0 or j1 <= j0:
         return None, None, None
     crop = arr[j0:j1, i0:i1, cidx]
+    if want_coords:
+        for name in want_coords:
+            if name in color_cols:
+                coords[name] = arr[j0:j1, i0:i1, color_cols.index(name)]
     rect = QRectF(xmin + i0 * b, ymin + j0 * b, (i1 - i0) * b, (j1 - j0) * b)
     frac = None
     if mask_ent is not None:
@@ -236,3 +288,69 @@ def _image_mask_crop(ctx, manifest, bbox, spacing, mask_ent):
     return frac, rect
 
 
+def _image_raster_texture(ctx, parquet_path, manifest, bbox, spacing, channel,
+                          mask_ent=None, stages=None, force_raw=False,
+                          stages_after=None, base_cache=None, base_sig=None,
+                          base_coords=(), cache_limit=6):
+    """Like :func:`_image_raster`, with a cached pre-correction base.
+
+    The channel is first computed with `stages` only ("base"), and that base
+    is cached per (file, channel, view, spacing, base signature).  A second
+    stage list (`stages_after`) is then applied on top without reading or
+    recomputing anything — this is what lets the Illumination preview redraw
+    the corrected image when only its correction parameters change.
+
+    `base_coords` names the coordinates the caller will need for
+    `stages_after`; they are extracted into the base as well, so the plain
+    (no correction) and corrected renders share one cache entry.
+
+    Returns (channel, rect, frac, from_cache).
+    """
+    import numpy as np
+    names = list(base_coords or ())
+    for kind, stage in stages_after or ():
+        if kind != "illumination":
+            continue
+        for sub in stage.get("submodules") or ():
+            for name in (sub.get("x"), sub.get("y")):
+                if name and name not in names:
+                    names.append(name)
+    needed_coords = tuple(names)
+    key = None
+    cached = None
+    if base_cache is not None and base_sig is not None:
+        key = (
+            str(parquet_path), str(channel),
+            tuple(round(float(v), 6) for v in bbox),
+            round(float(spacing), 6), bool(force_raw),
+            tuple(needed_coords), tuple(base_sig),
+        )
+        cached = base_cache.get(key)
+    if cached is not None:
+        chan, rect, frac, coords = cached
+    else:
+        coords = {}
+        chan, rect, frac = _image_raster(
+            ctx, parquet_path, manifest, bbox, spacing, channel,
+            mask_ent=mask_ent, stages=stages, force_raw=force_raw,
+            extra_columns=needed_coords, want_coords=needed_coords,
+            coords_out=coords,
+        )
+        if key is not None and chan is not None:
+            if len(base_cache) >= cache_limit:
+                base_cache.pop(next(iter(base_cache)))
+            base_cache[key] = (chan, rect, frac, dict(coords))
+    if chan is None:
+        return None, None, None, False
+    if stages_after:
+        values = {channel: np.array(chan, dtype="float64", copy=True)}
+        for name, array in coords.items():
+            values[name] = np.asarray(array, dtype="float64")
+        evaluated = _evaluate_stages(
+            stages_after, values, [channel], parquet_path=parquet_path,
+            origin=(
+                float(manifest["xmin"]), float(manifest["ymin"])
+            ),
+        )
+        chan = evaluated.get(channel, chan)
+    return chan, rect, frac, cached is not None

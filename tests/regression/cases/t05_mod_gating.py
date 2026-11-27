@@ -500,9 +500,26 @@ def image_polygon_not() -> None:
 
         image = page._gating_plot_widget._img_item.image
         harness.check(image is not None, "the subset image is rendered")
-        harness.eq(int(image[12, 12, 3]), 0,
+        # The raster is binned to screen resolution, so array indices are
+        # not data coordinates: map the two probe points through the item's
+        # rect and shape.
+        rect = page._gating_plot_widget._img_item.mapRectToView(
+            page._gating_plot_widget._img_item.boundingRect()
+        )
+        height, width = image.shape[0], image.shape[1]
+
+        def cell(dx: float, dy: float):
+            col = int((dx - rect.x()) / rect.width() * width)
+            row = int((dy - rect.y()) / rect.height() * height)
+            col = max(0, min(width - 1, col))
+            row = max(0, min(height - 1, row))
+            return row, col
+
+        inside = cell(16.0, 16.0)
+        outside = cell(2.0, 2.0)
+        harness.eq(int(image[inside[0], inside[1], 3]), 0,
                    "a pixel inside the polygon is hidden")
-        harness.eq(int(image[2, 2, 3]), 255,
+        harness.eq(int(image[outside[0], outside[1], 3]), 255,
                    "a pixel outside the polygon is shown")
     finally:
         _close(window)

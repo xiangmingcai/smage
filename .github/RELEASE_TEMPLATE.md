@@ -2,15 +2,19 @@
 
 ## Highlights
 
-- **Illumination Correction**: the pattern estimate no longer leaves stripes
-  in the mask. The sample is now two-dimensional and stratified on the
-  estimator's own blocks, so every block of every tile is covered in both x
-  and y, with a per-tile phase offset that prevents aliasing. The sample is
-  deterministic: the same file and settings give the same pattern.
-- Includes the 0.5.5 large-file improvements: sampled pattern estimation
-  with progress and **Cancel**, background histograms, one shared display
-  range for the previews, and the correction applied to generated **Unmix**
-  channels in the After preview.
+- **Illumination Correction** handles background-subtracted channels:
+  **Shift** adds a constant to the channel at the submodule's input (the
+  pattern estimate, the Before preview and the correction all work on the
+  shifted values) and removes it again downstream, so a negative background
+  is no longer amplified by the correction. **Pattern floor** raises a
+  pattern that contains negative values, and **Paste illumination pattern** /
+  **Copy pattern** move a pattern in and out through the clipboard.
+- **Illumination Correction** responds immediately: **Update** and a
+  re-recognized pattern re-apply the correction to the cached pixels of the
+  current view, zooming redraws only the plot being zoomed, and raw-pixel
+  previews are binned to the screen resolution. The Before/After histograms
+  follow the Min/Max window, and **Correction intensity** accepts negative
+  values.
 
 ## Downloads
 

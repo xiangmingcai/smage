@@ -16,13 +16,14 @@ from smage.widgets.plot_axes import _make_original_axis
 
 def _image_signal_histogram(ctx, layout, channel, task_id, parquet_path,
                             extra_stages=None, configs=None, title=None,
-                            values=None):
+                            values=None, hist_range=None):
     """A read-only signal histogram for one channel.
 
     Used where a second (for example "Before") distribution is shown next to
     the Min/Max controls, so it has no inputs, Auto set or Reset buttons.
     ``values`` may hold an already loaded (sampled) distribution; otherwise
-    the channel is read through the context.
+    the channel is read through the context.  ``hist_range`` restricts the
+    histogram (and so its x axis) to the current Min/Max display window.
     """
     import numpy as np
     import pyqtgraph as pg
@@ -53,7 +54,16 @@ def _image_signal_histogram(ctx, layout, channel, task_id, parquet_path,
     if values is None or values.size == 0:
         return hist_plot
     values = _apply_scale_transforms(values, configs)
-    hist, edges = np.histogram(values, bins=200)
+    if (
+        hist_range is not None and len(hist_range) == 2
+        and float(hist_range[1]) > float(hist_range[0])
+    ):
+        hist, edges = np.histogram(
+            values, bins=200,
+            range=(float(hist_range[0]), float(hist_range[1])),
+        )
+    else:
+        hist, edges = np.histogram(values, bins=200)
     hist_plot.plot(
         edges, hist, stepMode="center",
         fillLevel=0, brush=(90, 140, 220, 120),
@@ -169,7 +179,18 @@ def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_mi
         # which only affect how the data is shown.
         values_display = _apply_scale_transforms(loaded, configs)
         state["values"] = values_display
-        hist, edges = np.histogram(values_display, bins=200)
+        # The histogram follows the Min/Max display window when both are
+        # set, so the visible distribution matches the image levels.
+        if (
+            min_val is not None and max_val is not None
+            and float(max_val) > float(min_val)
+        ):
+            hist, edges = np.histogram(
+                values_display, bins=200,
+                range=(float(min_val), float(max_val)),
+            )
+        else:
+            hist, edges = np.histogram(values_display, bins=200)
         hist_plot.clear()
         hist_plot.plot(
             edges, hist, stepMode="center",

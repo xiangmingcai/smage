@@ -37,7 +37,11 @@ from smage.core.settings import (
     _default_palette,
     _plot_background,
 )
-from smage.data.columns import _illumination_stage_item
+from smage.data.columns import (
+    _illum_pattern_floor,
+    _illum_shift_value,
+    _illumination_stage_item,
+)
 from smage.data.image_index import _image_geometry
 from smage.data.workers import _ColumnSampleWorker, _IlluminationWorker
 from smage.widgets.colormap import _figure_colormap
@@ -50,6 +54,7 @@ from smage.widgets.plot_axes import _make_sci_axis
 from smage.widgets.resources import _lock_pixmap
 from uuid import uuid4
 import copy
+import math
 import pyqtgraph as pg
 from smage.data import columns as _data_columns
 from smage.data import files as _data_files
@@ -116,6 +121,8 @@ def _build_illumination_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     page._illum_hist_pending = {}
     page._illum_shared_levels = None
     page._illum_params_version = 0
+    page._illum_base_cache = {}
+    page._illum_lod_target = None
     page._illum_poll_timer = QTimer(ctx.host)
     page._illum_poll_timer.setInterval(120)
     page._illum_poll_timer.timeout.connect(
@@ -278,6 +285,8 @@ def _illum_add_submodule(ctx, page) -> None:
         "resolution": 10,
         "method": "median",
         "intensity": 1.0,
+        "pattern_floor": 100.0,
+        "shift": 0.0,
         "calc_files": [],
         "mask": None,
         "mask_source": None,
@@ -350,6 +359,8 @@ def _illum_duplicate_submodule(ctx, page, sub) -> None:
     # under the new id.
     new_sub.pop("mask_file", None)
     new_sub.setdefault("intensity", 1.0)
+    new_sub.setdefault("pattern_floor", 100.0)
+    new_sub.setdefault("shift", 0.0)
     page._illum_submodules.append(new_sub)
     page._illum_selected = new_sub["id"]
     _illum_refresh_list(ctx, page)
@@ -365,6 +376,145 @@ def _illum_drop_mask_file(ctx, task_id, sub) -> None:
         ctx.project._mask_path(str(task_id), str(sub["id"])).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _illum_parse_pattern_text(text, tile_w, tile_h):
+    """Parse a pasted matrix; returns ``(array, error)``.
+
+    Accepts TSV (as written by Copy pattern), comma or whitespace separated
+    values, one matrix row per line.
+    """
+    import math
+
+    import numpy as np
+
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = raw.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        return None, "There is nothing on the clipboard."
+    rows = []
+    width = None
+    for number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            return None, f"Row {number} is empty."
+        if "\t" in line:
+            cells = line.split("\t")
+        elif "," in line:
+            cells = line.split(",")
+        else:
+            cells = stripped.split()
+        if width is None:
+            width = len(cells)
+        elif len(cells) != width:
+            return None, (
+                f"Row {number} has {len(cells)} value(s); expected {width}."
+            )
+        values = []
+        for column, cell in enumerate(cells, start=1):
+            text_value = cell.strip()
+            try:
+                value = float(text_value)
+            except ValueError:
+                return None, (
+                    f'Row {number}, column {column} is not a number: '
+                    f'"{text_value}".'
+                )
+            if not math.isfinite(value):
+                return None, (
+                    f"Row {number}, column {column} is not a finite number."
+                )
+            values.append(value)
+        rows.append(values)
+    return np.asarray(rows, dtype="float64"), ""
+
+
+def _illum_paste_pattern(ctx, page, sub) -> None:
+    """Replace the pattern with a tile_h × tile_w matrix from the clipboard."""
+    if page._illum_locked:
+        return
+    from PySide6.QtWidgets import QApplication
+
+    tile_w = int(sub.get("tile_w", 0) or 0)
+    tile_h = int(sub.get("tile_h", 0) or 0)
+    if tile_w <= 0 or tile_h <= 0:
+        QMessageBox.warning(
+            ctx.host, "Paste illumination pattern",
+            "Set the tile width and height first.",
+        )
+        return
+    matrix, error = _illum_parse_pattern_text(
+        QApplication.clipboard().text(), tile_w, tile_h
+    )
+    if error:
+        QMessageBox.warning(ctx.host, "Paste illumination pattern", error)
+        return
+    if matrix.shape != (tile_h, tile_w):
+        QMessageBox.warning(
+            ctx.host, "Paste illumination pattern",
+            f"The pasted pattern is {matrix.shape[0]} × {matrix.shape[1]}; "
+            f"the current tile is {tile_h} × {tile_w}. Change the tile "
+            "size or paste a matching pattern.",
+        )
+        return
+    sub["mask"] = matrix.tolist()
+    sub["mask_source"] = {
+        "source": "pasted",
+        "tile_w": tile_w,
+        "tile_h": tile_h,
+        "channel": sub.get("channel"),
+        "x": sub.get("x"),
+        "y": sub.get("y"),
+        "files": list(sub.get("files") or []),
+    }
+    # The previous pattern's saved file no longer applies.
+    _illum_drop_mask_file(ctx, page._illum_task_id, sub)
+    status = getattr(page, "_illum_calc_status", None)
+    if status is not None:
+        status.setText(
+            f"Pattern pasted from the clipboard ({tile_h} × {tile_w})."
+        )
+    _illum_render_mask(ctx, page, sub)
+    _illum_mark_dirty(ctx, page)
+    rebuild_levels = getattr(page, "_illum_rebuild_levels", None)
+    if rebuild_levels is not None:
+        rebuild_levels()
+    _illum_schedule_preview(ctx, page)
+
+
+def _illum_copy_pattern(ctx, page, sub) -> None:
+    """Copy the pattern as a TSV matrix with full precision."""
+    import numpy as np
+    from PySide6.QtWidgets import QApplication
+
+    mask = sub.get("mask")
+    if not mask:
+        QMessageBox.information(
+            ctx.host, "Copy pattern", "There is no pattern to copy."
+        )
+        return
+    try:
+        array = np.asarray(mask, dtype="float64")
+    except (TypeError, ValueError):
+        QMessageBox.warning(
+            ctx.host, "Copy pattern", "The pattern is not numeric."
+        )
+        return
+    if array.ndim != 2 or array.size == 0:
+        QMessageBox.warning(
+            ctx.host, "Copy pattern", "The pattern is not a matrix."
+        )
+        return
+    lines = [
+        "\t".join(format(float(value), ".17g") for value in row)
+        for row in array
+    ]
+    QApplication.clipboard().setText("\n".join(lines))
+    ctx.statusBar().showMessage("Pattern copied to clipboard")
 
 
 def _illum_delete_submodule(ctx, page, sub) -> None:
@@ -502,6 +652,23 @@ def _illum_channel_panel(ctx, page, sub) -> QWidget:
     channel_combo.setEnabled(editable)
     top_lay.addWidget(QLabel("Channel"))
     top_lay.addWidget(channel_combo)
+
+    top_lay.addWidget(QLabel("Shift"))
+    shift_spin = _NoWheelDoubleSpinBox()
+    shift_spin.setRange(-1e9, 1e9)
+    shift_spin.setDecimals(3)
+    shift_spin.setSingleStep(1.0)
+    shift_spin.setValue(_illum_shift_value(sub))
+    shift_spin.setEnabled(editable)
+    shift_spin.setToolTip(
+        "Added to the channel before recognition and preview; removed again "
+        "in the data passed downstream."
+    )
+    top_lay.addWidget(shift_spin)
+    top_lay.addWidget(_widgets_panels._param_hint(ctx,
+        "Added to the channel before recognition and preview; removed again "
+        "in the data passed downstream."
+    ))
     axes_row = QHBoxLayout()
     x_combo = _NoWheelComboBox()
     y_combo = _NoWheelComboBox()
@@ -583,7 +750,32 @@ def _illum_channel_panel(ctx, page, sub) -> QWidget:
             _illum_mark_dirty(ctx, page)
         return handler
 
+    def on_shift(value):
+        if page._illum_locked:
+            return
+        new = float(value)
+        if abs(_illum_shift_value(sub) - new) < 1e-12:
+            return
+        sub["shift"] = new
+        cleared = False
+        if sub.get("mask"):
+            # The pattern was estimated in a different shifted domain.
+            sub["mask"] = None
+            sub["mask_source"] = None
+            _illum_drop_mask_file(ctx, page._illum_task_id, sub)
+            status = getattr(page, "_illum_calc_status", None)
+            if status is not None:
+                status.setText(
+                    "Shift changed — re-recognize or paste the pattern."
+                )
+            cleared = True
+        _illum_mark_dirty(ctx, page)
+        if cleared:
+            _illum_render_mask(ctx, page, sub)
+            _illum_render_preview(ctx, page)
+
     channel_combo.currentIndexChanged.connect(lambda _=0: on_channel())
+    shift_spin.valueChanged.connect(on_shift)
     x_combo.currentIndexChanged.connect(lambda _=0: on_axis("x", x_combo)())
     y_combo.currentIndexChanged.connect(lambda _=0: on_axis("y", y_combo)())
     return panel
@@ -637,12 +829,50 @@ def _illum_set_files(ctx, page, sub) -> None:
 
 
 def _illum_intensity(sub) -> float:
-    """The correction strength of one submodule (0 = no correction)."""
+    """The correction strength of one submodule (0 = no correction).
+
+    Negative values invert the correction.
+    """
     try:
         value = float(sub.get("intensity", 1.0))
     except (TypeError, ValueError):
         value = 1.0
-    return max(0.0, min(100.0, value))
+    if not math.isfinite(value):
+        value = 1.0
+    return max(-100.0, min(100.0, value))
+
+
+def _illum_mask_source(sub) -> str:
+    """How the pattern was obtained: "recognized", "pasted" or ""."""
+    return str((sub.get("mask_source") or {}).get("source") or "")
+
+
+def _illum_floor_applied(sub) -> bool:
+    """Whether the pattern holds negative values (the floor is in effect)."""
+    import numpy as np
+
+    mask = sub.get("mask")
+    if not mask:
+        return False
+    try:
+        array = np.asarray(mask, dtype="float64")
+    except (TypeError, ValueError):
+        return False
+    finite = array[np.isfinite(array)]
+    return bool(finite.size and (finite < 0.0).any())
+
+
+def _illum_floor_text(sub) -> str:
+    """` · floor 100` when a negative pattern is raised, else nothing."""
+    if not _illum_floor_applied(sub):
+        return ""
+    return f" · floor {_illum_pattern_floor(sub):g}"
+
+
+def _illum_shift_text(sub) -> str:
+    """` · shift 200` when the channel is shifted, else nothing."""
+    shift = _illum_shift_value(sub)
+    return "" if not shift else f" · shift {shift:g}"
 
 
 def _illum_tiles_panel(ctx, page, sub) -> QWidget:
@@ -736,10 +966,31 @@ def _illum_tiles_panel(ctx, page, sub) -> QWidget:
     page._illum_calc_btn = calc_btn
     page._illum_calc_status = status
 
+    paste_row = QHBoxLayout()
+    paste_btn = QPushButton("Paste illumination pattern")
+    paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    paste_btn.setEnabled(editable)
+    paste_btn.setToolTip(
+        f"Paste a {int(sub.get('tile_h', 256))} × "
+        f"{int(sub.get('tile_w', 256))} matrix from the clipboard"
+    )
+    paste_btn.clicked.connect(
+        lambda _=False: _illum_paste_pattern(ctx, page, sub)
+    )
+    paste_row.addWidget(paste_btn)
+    paste_row.addStretch(1)
+    lay.addLayout(paste_row)
+    if sub.get("mask") and _illum_mask_source(sub) == "pasted":
+        status.setText("Current pattern: pasted from the clipboard.")
+
     def on_sizes():
         sub["tile_w"] = int(tile_w.value())
         sub["tile_h"] = int(tile_h.value())
         hint.setText(_illum_divisibility_hint(ctx, sub))
+        paste_btn.setToolTip(
+            f"Paste a {sub['tile_h']} × {sub['tile_w']} matrix from the "
+            "clipboard"
+        )
         cleared = False
         if sub.get("mask"):
             sub["mask"] = None
@@ -763,7 +1014,8 @@ def _illum_tiles_panel(ctx, page, sub) -> QWidget:
         if res_spin.value() < int(value):
             res_spin.setValue(int(value))
         sub["resolution"] = int(res_spin.value())
-        if sub.get("mask"):
+        # A pasted pattern does not depend on the bin/resolution grid.
+        if sub.get("mask") and _illum_mask_source(sub) != "pasted":
             sub["mask"] = None
             sub["mask_source"] = None
             _illum_drop_mask_file(ctx, page._illum_task_id, sub)
@@ -772,7 +1024,7 @@ def _illum_tiles_panel(ctx, page, sub) -> QWidget:
 
     def on_resolution(value):
         sub["resolution"] = int(value)
-        if sub.get("mask"):
+        if sub.get("mask") and _illum_mask_source(sub) != "pasted":
             sub["mask"] = None
             sub["mask_source"] = None
             _illum_drop_mask_file(ctx, page._illum_task_id, sub)
@@ -820,7 +1072,7 @@ def _illum_correction_panel(ctx, page, sub) -> QWidget:
 
     lay.addWidget(QLabel("Correction intensity"))
     intensity = _NoWheelDoubleSpinBox()
-    intensity.setRange(0.0, 100.0)
+    intensity.setRange(-100.0, 100.0)
     intensity.setDecimals(1)
     intensity.setSingleStep(0.1)
     intensity.setValue(_illum_intensity(sub))
@@ -828,15 +1080,30 @@ def _illum_correction_panel(ctx, page, sub) -> QWidget:
     lay.addWidget(intensity)
     lay.addWidget(_widgets_panels._param_hint(ctx,
         "Blends the correction: 0 = no correction, 0.5 = half, 1 = full "
-        "and 2 = double strength. Press Update to apply; downstream "
-        "channels update when the module is saved."
+        "and 2 = double strength. Negative values invert the correction. "
+        "Press Update to apply; downstream channels update when the module "
+        "is saved."
+    ))
+
+    lay.addWidget(QLabel("Pattern floor"))
+    floor = _NoWheelDoubleSpinBox()
+    floor.setRange(0.001, 1e9)
+    floor.setDecimals(3)
+    floor.setSingleStep(1.0)
+    floor.setValue(_illum_pattern_floor(sub))
+    floor.setEnabled(editable)
+    lay.addWidget(floor)
+    lay.addWidget(_widgets_panels._param_hint(ctx,
+        "When the pattern contains negative values it is raised so its "
+        "lowest value is this. Larger values make the correction gentler."
     ))
 
     update_btn = QPushButton("Update")
     update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     update_btn.setEnabled(editable)
     update_btn.setToolTip(
-        "Apply the method and intensity to the illumination correction"
+        "Apply the method, intensity and pattern floor to the illumination "
+        "correction"
     )
     lay.addWidget(update_btn)
     applied = QLabel("")
@@ -856,6 +1123,8 @@ def _illum_correction_panel(ctx, page, sub) -> QWidget:
         label = method_labels.get(method, method)
         applied.setText(
             f"In use: {label} · intensity {_illum_intensity(sub):.1f}"
+            + _illum_floor_text(sub)
+            + _illum_shift_text(sub)
         )
 
     def refresh_levels():
@@ -868,6 +1137,7 @@ def _illum_correction_panel(ctx, page, sub) -> QWidget:
             return
         sub["method"] = method_combo.currentData() or "median"
         sub["intensity"] = round(float(intensity.value()), 1)
+        sub["pattern_floor"] = float(floor.value())
         refresh_applied()
         _illum_mark_dirty(ctx, page)
         _illum_render_mask(ctx, page, sub)
@@ -927,6 +1197,18 @@ def _illum_mask_panel(ctx, page, sub) -> QWidget:
     source.setWordWrap(True)
     source.setStyleSheet("color: #6b7785;")
     lay.addWidget(source)
+    copy_row = QHBoxLayout()
+    copy_row.addStretch(1)
+    copy_btn = QPushButton("Copy pattern")
+    copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    copy_btn.setToolTip(
+        "Copy the pattern matrix to the clipboard (full precision)"
+    )
+    copy_btn.clicked.connect(
+        lambda _=False: _illum_copy_pattern(ctx, page, sub)
+    )
+    copy_row.addWidget(copy_btn)
+    lay.addLayout(copy_row)
     page._illum_mask_plot = plot
     page._illum_mask_image = image_item
     page._illum_mask_source = source
@@ -960,12 +1242,27 @@ def _illum_render_mask(ctx, page, sub) -> None:
     image_item.setRect(QRectF(0, 0, mask.shape[1], mask.shape[0]))
     source_params = sub.get("mask_source") or {}
     if source is not None:
+        if str(source_params.get("source") or "") == "pasted":
+            header = (
+                f"pasted · {source_params.get('tile_h', mask.shape[0])}"
+                f" × {source_params.get('tile_w', mask.shape[1])}"
+            )
+        else:
+            header = (
+                f"tile {source_params.get('tile_w', sub.get('tile_w'))}"
+                f" × {source_params.get('tile_h', sub.get('tile_h'))}"
+                f" · bin {source_params.get('bin', sub.get('bin'))}"
+                f" · resolution "
+                f"{source_params.get('resolution', sub.get('resolution'))}"
+            )
+        floor_note = (
+            f" · floor {_illum_pattern_floor(sub):g} applied"
+            if _illum_floor_applied(sub) else ""
+        )
         source.setText(
-            f"tile {source_params.get('tile_w', sub.get('tile_w'))}"
-            f" × {source_params.get('tile_h', sub.get('tile_h'))}"
-            f" · bin {source_params.get('bin', sub.get('bin'))}"
-            f" · resolution {source_params.get('resolution', sub.get('resolution'))}\n"
-            f"channel {sub.get('channel')} · method {sub.get('method')}\n"
+            f"{header}\n"
+            f"channel {sub.get('channel')} · method "
+            f"{sub.get('method')}{floor_note}{_illum_shift_text(sub)}\n"
             f"pattern range {lo:.4g} – {hi:.4g}"
         )
 
@@ -1052,8 +1349,14 @@ def _illum_plot_panel(ctx, page, sub, title: str) -> QWidget:
     if lod is None:
         lod = QTimer(ctx.host)
         lod.setSingleShot(True)
-        lod.setInterval(80)
-        lod.timeout.connect(lambda: _illum_render_preview(ctx, page))
+        lod.setInterval(120)
+
+        def _lod_render() -> None:
+            target = getattr(page, "_illum_lod_target", None)
+            page._illum_lod_target = None
+            _illum_render_preview(ctx, page, only=target)
+
+        lod.timeout.connect(_lod_render)
         page._illum_lod_timer = lod
 
     def on_range(*_args) -> None:
@@ -1065,6 +1368,9 @@ def _illum_plot_panel(ctx, page, sub, title: str) -> QWidget:
             page, "_illum_ignore_range_until", 0.0
         ):
             return
+        # Remember which plot the user is zooming: the other one keeps its
+        # raster and is not redrawn.
+        page._illum_lod_target = "before" if title == "Before" else "after"
         lod.start()
 
     plot.getPlotItem().getViewBox().sigRangeChanged.connect(on_range)
@@ -1181,6 +1487,11 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
         plot_dict["image_max"] = hi
         _illum_mark_dirty(ctx, page)
         _illum_render_preview(ctx, page)
+        # The histograms follow the Min/Max window; rebuild them from the
+        # cached distributions (no file read).
+        rebuild = getattr(page, "_illum_rebuild_levels", None)
+        if rebuild is not None:
+            rebuild()
 
     def rebuild_levels() -> None:
         import numpy as np
@@ -1199,11 +1510,18 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
         channel = plot_dict.get("color_param")
         if not path or not channel:
             return
-        before_stages = _illum_preview_stages(
-            ctx, page, page._illum_submodules[:index]
+        earlier = page._illum_submodules[:index]
+        before_stages = (
+            (_illum_preview_stages(ctx, page, earlier) or [])
+            + _illum_shift_stages(sub)
         )
-        after_stages = _illum_preview_stages(
-            ctx, page, page._illum_submodules[: index + 1]
+        delta_item = _illum_sub_stage(ctx, sub, mode="display")
+        after_stages = before_stages + (
+            [("illumination", {
+                "task_id": page._illum_task_id,
+                "submodules": [delta_item],
+            })]
+            if delta_item is not None else []
         )
         configs = (
             ctx._figure_axis_scale_configs(
@@ -1265,10 +1583,19 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
             "color: #5a6673; font-size: 8pt; font-weight: bold;"
         )
         levels_lay.addWidget(before_caption)
+        plot_range = None
+        if (
+            sub.get("plot_image_min") is not None
+            and sub.get("plot_image_max") is not None
+        ):
+            lo = float(sub["plot_image_min"])
+            hi = float(sub["plot_image_max"])
+            if hi > lo:
+                plot_range = (lo, hi)
         _widgets_image_level._image_signal_histogram(
             ctx, levels_lay, channel, page._illum_task_id, path,
             extra_stages=before_stages, configs=configs,
-            values=before_values,
+            values=before_values, hist_range=plot_range,
         )
         _widgets_image_level._image_level_controls(ctx,
             levels_lay,
@@ -1358,13 +1685,13 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
     return panel
 
 
-def _illum_sub_stage(ctx, sub):
-    return _illumination_stage_item(sub)
+def _illum_sub_stage(ctx, sub, mode="data"):
+    return _illumination_stage_item(sub, mode=mode)
 
 
-def _illum_preview_stages(ctx, page, subs):
+def _illum_preview_stages(ctx, page, subs, mode="data"):
     items = [
-        item for item in (_illum_sub_stage(ctx, s) for s in subs)
+        item for item in (_illum_sub_stage(ctx, s, mode) for s in subs)
         if item is not None
     ]
     if not items:
@@ -1375,7 +1702,19 @@ def _illum_preview_stages(ctx, page, subs):
     })]
 
 
-_ILLUM_HIST_ROWS = 200_000
+def _illum_shift_stages(sub):
+    """Offset stage adding the submodule's channel shift (empty when 0)."""
+    channel = sub.get("channel")
+    shift = _illum_shift_value(sub)
+    if not channel or not shift:
+        return []
+    return [("offset", {
+        "columns": {channel: shift},
+        "files": set(sub.get("files") or []),
+    })]
+
+
+_ILLUM_HIST_ROWS = 512_000
 
 
 def _illum_hist_cache_key(page, path, channel, side, index):
@@ -1447,15 +1786,25 @@ def _illum_hist_request(ctx, page, key, path, channel, stages) -> bool:
             return False
         read_path, columns, names = source
         page._illum_hist_pending[key] = names[0]
-        # A corrected (After) distribution depends on the position inside a
-        # tile, so it needs the strided sample; the raw one is fine with the
-        # cheaper spread sample.
-        method = "stride" if any(
-            kind == "illumination" for kind, _stage in (stages or [])
-        ) else "spread"
+        # A banded sample is enough for a distribution and costs a few
+        # milliseconds even on a multi-gigabyte file; the band is widened to
+        # the image row so every x is represented.
+        min_batch = 1
+        try:
+            entry = ctx._ensure_image_index(path)
+            manifest = (entry or {}).get("manifest") or {}
+            width = (
+                float(manifest.get("xmax", 0))
+                - float(manifest.get("xmin", 0)) + 1.0
+            )
+            if width > 0:
+                min_batch = int(width)
+        except Exception:  # noqa: BLE001
+            min_batch = 1
         worker.request(
             key, read_path, columns, list(stages or []), names, path,
-            max_rows=_ILLUM_HIST_ROWS, method=method,
+            max_rows=_ILLUM_HIST_ROWS, method="spread",
+            max_groups=16, min_batch=min_batch,
         )
         return False
     # Fallback: the values cannot be read from a sample (an unusual stored
@@ -1494,6 +1843,19 @@ def _illum_hist_poll(ctx, page) -> bool:
     return changed
 
 
+def _illum_base_signature(ctx, page, earlier, shift=0.0) -> tuple:
+    """Inputs that change the cached pre-correction raster of a preview."""
+    return (
+        page._illum_task_id,
+        tuple(sub.get("id") for sub in earlier),
+        tuple(str(sub.get("method") or "median") for sub in earlier),
+        tuple(_illum_intensity(sub) for sub in earlier),
+        tuple(id(sub.get("mask")) for sub in earlier),
+        float(shift),
+        int(getattr(ctx, "_stages_revision", 0)),
+    )
+
+
 def _illum_schedule_preview(ctx, page, delay: int = 40) -> None:
     """Coalesce preview redraws triggered by several UI handlers at once."""
     timer = getattr(page, "_illum_render_timer", None)
@@ -1505,13 +1867,13 @@ def _illum_schedule_preview(ctx, page, delay: int = 40) -> None:
     timer.start(delay)
 
 
-def _illum_render_preview(ctx, page) -> None:
-    """Render both previews without letting their own range changes loop."""
+def _illum_render_preview(ctx, page, only=None) -> None:
+    """Render both previews (or just the one the user is zooming)."""
     import time
 
     page._illum_rendering = True
     try:
-        _illum_render_preview_now(ctx, page)
+        _illum_render_preview_now(ctx, page, only=only)
     finally:
         page._illum_rendering = False
         # Ignore the layout/range signals emitted while the render settled;
@@ -1519,7 +1881,7 @@ def _illum_render_preview(ctx, page) -> None:
         page._illum_ignore_range_until = time.monotonic() + 0.05
 
 
-def _illum_render_preview_now(ctx, page) -> None:
+def _illum_render_preview_now(ctx, page, only=None) -> None:
     sub = _illum_selected_sub(ctx, page)
     plot_dict = getattr(page, "_illum_plot", None)
     before = getattr(page, "_illum_before_plot", None)
@@ -1531,13 +1893,37 @@ def _illum_render_preview_now(ctx, page) -> None:
     except ValueError:
         return
     earlier = page._illum_submodules[:index]
-    before_stages = _illum_preview_stages(ctx, page, earlier)
-    after_stages = _illum_preview_stages(ctx, page, earlier + [sub])
+    shift = _illum_shift_value(sub)
+    # The preview works in the shifted channel domain: earlier submodules
+    # (already returned to the original level) get the current shift added,
+    # and the current submodule applies only its factor.
+    before_stages = (
+        (_illum_preview_stages(ctx, page, earlier) or [])
+        + _illum_shift_stages(sub)
+    )
+    delta_item = _illum_sub_stage(ctx, sub, mode="display")
+    delta_stages = (
+        [("illumination", {
+            "task_id": page._illum_task_id,
+            "submodules": [delta_item],
+        })]
+        if delta_item is not None else None
+    )
+    after_stages = before_stages + (delta_stages or [])
+    base_sig = _illum_base_signature(ctx, page, earlier, shift)
+    base_coords = tuple(
+        name for name in (sub.get("x"), sub.get("y")) if name
+    )
     runlog.action(
         "illum.preview", type=str(plot_dict.get("type")),
         file=str(plot_dict.get("file")), channel=str(plot_dict.get("color_param")),
     )
-    for plot_widget in (before, after):
+    targets = []
+    if only != "after":
+        targets.append((before, before_stages, None))
+    if only != "before":
+        targets.append((after, after_stages, delta_stages))
+    for plot_widget, _extra, _delta in targets:
         _illum_clear_tile_grid(ctx, plot_widget)
     # Both previews use one display range so the correction is visible
     # instead of being normalized away by two independent auto ranges.
@@ -1548,21 +1934,19 @@ def _illum_render_preview_now(ctx, page) -> None:
         and plot_dict.get("image_max") is None
     ):
         shared_levels = getattr(page, "_illum_shared_levels", None)
-    _widgets_plot_renderer._figure_render(ctx,
-        plot_dict, before, task_id=page._illum_task_id,
-        extra_stages=before_stages, image_levels=shared_levels,
-    )
-    _widgets_plot_renderer._figure_render(ctx,
-        plot_dict, after, task_id=page._illum_task_id,
-        extra_stages=after_stages, image_levels=shared_levels,
-    )
+    cache = getattr(page, "_illum_base_cache", None)
+    for plot_widget, extra, delta in targets:
+        _widgets_plot_renderer._figure_render(ctx,
+            plot_dict, plot_widget, task_id=page._illum_task_id,
+            extra_stages=extra, image_levels=shared_levels,
+            base_stages=before_stages, delta_stages=delta,
+            base_cache=cache, base_sig=base_sig, base_coords=base_coords,
+        )
     if plot_dict.get("show_tile_grid"):
-        before._illum_grid_item = _illum_draw_tile_grid(ctx,
-            before, plot_dict, sub
-        )
-        after._illum_grid_item = _illum_draw_tile_grid(ctx,
-            after, plot_dict, sub
-        )
+        for plot_widget, _extra, _delta in targets:
+            plot_widget._illum_grid_item = _illum_draw_tile_grid(ctx,
+                plot_widget, plot_dict, sub
+            )
 
 
 def _illum_clear_tile_grid(ctx, plot_widget) -> None:
@@ -1720,6 +2104,9 @@ def _illum_calculate(ctx, page, sub, button) -> None:
             "task_id": page._illum_task_id,
             "submodules": earlier_items,
         }))
+    # The pattern is estimated on the shifted channel: the submodule's input
+    # adds the shift before the tile statistics run.
+    stages.extend(_illum_shift_stages(sub))
     base_columns = {}
     for path in files:
         base_columns[path] = set(
@@ -1814,6 +2201,7 @@ def _illum_on_poll(ctx, page) -> None:
             continue
         sub["mask"] = result["mask"]
         sub["mask_source"] = {
+            "source": "recognized",
             "tile_w": result["tile_w"],
             "tile_h": result["tile_h"],
             "bin": result["bin"],

@@ -25,7 +25,7 @@ import numpy as np
 
 from smage.data import project_paths as _project_paths
 
-PROJECT_VERSION = "0.5.6"
+PROJECT_VERSION = "0.6.1"
 DATA_DIRNAME = "data"
 MANIFEST_FILENAME = "project.json"
 # Window/UI preferences (tree expansion, …), kept out of the manifest so they

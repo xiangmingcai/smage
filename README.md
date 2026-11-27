@@ -6,7 +6,7 @@ into a common tabular representation and lets you compose analysis pipelines
 from interactive modules — gating, compensation, unmixing, segmentation,
 feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.5.6`; modules and
+> **Status:** early development. The current release is `0.6.1`; modules and
 > file formats may still change between releases.
 
 > **Intended use:** research software, not a medical device. Not for clinical
@@ -17,14 +17,22 @@ feature aggregation, clustering, dimensionality reduction and export.
 📦 **Releases:** <https://github.com/xiangmingcai/smage/releases><br>
 🐛 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
-## What's new in 0.5.6
+## What's new in 0.6.1
 
-- **Illumination Correction**: the pattern estimate no longer leaves stripes
-  in the mask. The sample is now two-dimensional and stratified on the
-  estimator's own blocks, so every block of every tile is covered in both x
-  and y, with a per-tile phase offset that prevents aliasing. The sample is
-  deterministic: the same file and settings give the same pattern. This
-  builds on the 0.5.5 large-file sampling, progress and **Cancel**.
+- **Illumination Correction** handles background-subtracted channels:
+  **Shift** adds a constant to the channel at the submodule's input (the
+  pattern estimate, the Before preview and the correction all work on the
+  shifted values) and removes it again downstream, so a negative background
+  is no longer amplified by the correction. **Pattern floor** raises a
+  pattern that contains negative values, and **Paste illumination pattern** /
+  **Copy pattern** move a pattern in and out through the clipboard.
+- **Illumination Correction** responds immediately: **Update** and a
+  re-recognized pattern re-apply the correction to the cached pixels of the
+  current view instead of reading the file again; zooming redraws only the
+  plot being zoomed, and raw-pixel previews are binned to the screen
+  resolution. The Before/After histograms follow the Min/Max window, and
+  **Correction intensity** now accepts negative values (inverting the
+  correction).
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -67,7 +75,7 @@ Optional analysis methods run in a separate Python environment created from
 | PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
 
 The Extension Manager installs the current pip release; the versions above
-were current when Smage 0.5.6 was released. Use a **Python 3.11** environment
+were current when Smage 0.6.1 was released. Use a **Python 3.11** environment
 for these extensions, matching the Python version Smage is built with. Each
 environment may need extra packages (for example PyTorch for Cellpose or
 TensorFlow for StarDist) — see the extension's repository for its

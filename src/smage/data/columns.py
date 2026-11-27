@@ -20,13 +20,52 @@ from smage.core.pipeline import (
 )
 
 
-def _illumination_stage_item(sub):
-    """Convert one Illumination submodule into a pipeline stage entry."""
+def _illum_pattern_floor(sub) -> float:
+    """Value the pattern is raised to when it contains negative values.
+
+    A pattern estimated from a background-subtracted channel can hold
+    negative brightness values; dividing the reference level by them is
+    meaningless.  Raising the whole pattern so its minimum equals this floor
+    makes every cell positive and the ratio bounded.
+    """
+    import math
+
+    try:
+        value = float(sub.get("pattern_floor", 100.0))
+    except (TypeError, ValueError):
+        value = 100.0
+    if not math.isfinite(value) or value <= 0.0:
+        value = 100.0
+    return value
+
+
+def _illum_shift_value(sub) -> float:
+    """The constant added to the channel before the correction (0 = none)."""
+    import math
+
+    try:
+        value = float(sub.get("shift", 0.0))
+    except (TypeError, ValueError):
+        value = 0.0
+    if not math.isfinite(value):
+        value = 0.0
+    return value
+
+
+def _illumination_stage_item(sub, mode="data"):
+    """Convert one Illumination submodule into a pipeline stage entry.
+
+    ``mode="data"`` (the default, used downstream) adds the channel shift,
+    applies the correction and removes the shift again, so the data leaving
+    the module keeps its original level.  ``mode="display"`` applies only the
+    correction: the preview has already added the shift at its input and
+    shows the shifted values.
+    """
     import numpy as np
 
     channel = sub.get("channel")
     mask_data = sub.get("mask")
-    if not channel or not mask_data:
+    if not channel or mask_data is None:
         return None
     try:
         mask = np.asarray(mask_data, dtype="float64")
@@ -37,6 +76,13 @@ def _illumination_stage_item(sub):
     finite = mask[np.isfinite(mask)]
     if finite.size == 0:
         return None
+    if bool((finite < 0.0).any()):
+        # Raise the pattern so its minimum is the user's floor; only then is
+        # the reference level divided by a positive per-cell brightness.
+        shift = _illum_pattern_floor(sub) - float(finite.min())
+        if shift > 0.0:
+            mask = mask + shift
+            finite = finite + shift
     method = sub.get("method", "median")
     if method == "down":
         threshold = float(finite.min())
@@ -44,6 +90,7 @@ def _illumination_stage_item(sub):
         threshold = float(finite.max())
     else:
         threshold = float(np.median(finite))
+    data_mode = mode != "display"
     return {
         "channel": channel,
         "x": sub.get("x"),
@@ -54,18 +101,27 @@ def _illumination_stage_item(sub):
         "mask": mask,
         "T": threshold,
         "intensity": _illum_intensity_value(sub),
+        "shift": _illum_shift_value(sub),
+        "add_shift": data_mode,
+        "remove_shift": data_mode,
     }
 
 
 def _illum_intensity_value(sub) -> float:
-    """Correction strength of a submodule (0 = no correction, 1 = full)."""
+    """Correction strength of a submodule (0 = no correction, 1 = full).
+
+    Negative values invert the correction (the pattern is applied the other
+    way round).
+    """
+    import math
+
     try:
         value = float(sub.get("intensity", 1.0))
     except (TypeError, ValueError):
         value = 1.0
-    if not (value >= 0.0):
-        value = 0.0
-    return min(value, 100.0)
+    if not math.isfinite(value):
+        value = 1.0
+    return max(-100.0, min(100.0, value))
 
 
 def _column_rename_stages(ctx, task_id) -> list:

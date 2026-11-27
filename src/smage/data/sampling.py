@@ -755,18 +755,23 @@ def parquet_column_stats(path, columns):
     return out
 
 
-def _sample_spread(pf, columns, total, max_rows, max_groups):
+def _sample_spread(pf, columns, total, max_rows, max_groups, min_batch=1):
     """One small batch from each of several evenly spread row groups."""
     import numpy as np
 
     meta = pf.metadata
     groups = int(meta.num_row_groups or 0)
-    count = max(1, min(groups, int(max_groups), max(1, int(max_rows) // 65536)))
+    count = max(1, min(groups, int(max_groups)))
     positions = np.unique(
         np.linspace(0, groups - 1, count).round().astype(int)
     )
     first_rows = int(meta.row_group(0).num_rows)
-    per_group = max(1, min(int(max_rows) // max(1, len(positions)), first_rows))
+    # A batch shorter than one image row would cover only part of x; the
+    # caller passes the image width as `min_batch` so each band spans it.
+    per_group = max(
+        int(min_batch), int(max_rows) // max(1, len(positions))
+    )
+    per_group = max(1, min(per_group, first_rows))
     parts = []
     for index in positions:
         iterator = pf.iter_batches(
@@ -918,19 +923,19 @@ def sample_image_blocks(path, columns, x_name, y_name, origin, tile_w,
 
 
 def sample_parquet_rows(path, columns, max_rows=400_000, max_groups=32,
-                        method="spread"):
+                        method="spread", min_batch=1):
     """Sample up to ``max_rows`` rows of ``columns`` from one parquet file.
 
     ``method="spread"`` reads one batch from each of several evenly spread
     row groups: cheap, and fine for a distribution (a histogram), but a
     batch covers only a contiguous slice of the rows, so it must not be used
-    to estimate anything that varies inside an image tile.
+    to estimate anything that varies inside an image tile.  ``min_batch``
+    keeps each batch at least that many rows — pass the image width so a
+    band spans every x.
 
     ``method="stride"`` scans the whole file and keeps every k-th row.  I/O
     is the complete column chunks, but memory stays bounded and every part
-    of the file — every row of an image tile — is represented.  Used for the
-    illumination pattern estimate, where a missing band of rows becomes a
-    visible stripe in the mask.
+    of the file — every row of an image tile — is represented.
 
     Values keep their stored dtypes; the caller decides which ones need to
     be converted.
@@ -960,5 +965,7 @@ def sample_parquet_rows(path, columns, max_rows=400_000, max_groups=32,
     if method == "stride":
         return _sample_strided(pf, present, total, max_rows)
     if int(meta.num_row_groups or 0) >= 4:
-        return _sample_spread(pf, present, total, max_rows, max_groups)
+        return _sample_spread(
+            pf, present, total, max_rows, max_groups, min_batch
+        )
     return _sample_strided(pf, present, total, max_rows)

@@ -29,6 +29,7 @@ from smage.widgets.colormap import _figure_colormap
 from smage.widgets.controls import (
     _LogStepSpinBox, _NoWheelComboBox, _NoWheelSpinBox,
 )
+from smage.widgets.image_raster import _image_raster_texture
 from smage.widgets.plot_axes import (
     _figure_image_layers, _is_scatter_plot, _make_fit_plot_item,
     _make_original_axis, _make_sci_axis,
@@ -247,12 +248,20 @@ def _raster_stage_values(values, stages, rect, shape):
     return values
 
 
-def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, image_levels=None) -> None:
-    """(Re)draw a plot widget from its plot_dict."""
+def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, image_levels=None, base_stages=None, delta_stages=None, base_cache=None, base_sig=None, base_coords=()) -> None:
+    """(Re)draw a plot widget from its plot_dict.
+
+    `base_stages`/`delta_stages` split the pipeline for the image renderer:
+    the base is cached per view and only the delta (the module's own
+    correction) is recomputed on a redraw. See `_image_raster_texture`.
+    """
     if plot_dict.get("type") == "image":
         ctx._figure_render_image(
             plot_dict, plot_widget, column_transforms, task_id, extra_stages,
             image_levels=image_levels,
+            base_stages=base_stages, delta_stages=delta_stages,
+            base_cache=base_cache, base_sig=base_sig,
+            base_coords=base_coords,
         )
         return
     mask, error = ctx._figure_filter_mask(plot_dict, task_id)
@@ -645,7 +654,7 @@ def _image_filter_fraction_for_rect(mask_ent, manifest, rect, shape):
     return mask2d[np.ix_(qj, qi)].astype("float64")
 
 
-def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, row_mask=None, image_levels=None) -> None:
+def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, row_mask=None, image_levels=None, base_stages=None, delta_stages=None, base_cache=None, base_sig=None, base_coords=()) -> None:
     """Render an Image plot as a raster (LOD pyramid), ImageJ-style.
 
     `row_mask` is an optional boolean/uint8 array aligned to the image's
@@ -655,6 +664,11 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
     `image_levels` is an optional (lo, hi) display range shared by several
     plots of the same channel (the Illumination previews). It is used for
     layers without their own Min/Max, in display (post-Scale) units.
+
+    `base_stages`/`delta_stages` split the pipeline: the channel after
+    `base_stages` is cached per view, and `delta_stages` (the module's own
+    correction) is applied on top on each redraw without re-reading the
+    file. Both may be None for the normal path.
     """
     import numpy as np
     ctx._figure_bump_render_token(plot_widget)
@@ -1047,16 +1061,30 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                     unavailable.append(channel)
                     continue
             raster_stages = stages if _pipeline_touches(stages, channel) else None
-            chan, rect, frac = ctx._image_raster(
-                parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
-                mask_ent, raster_stages,
-                # A gate subset must be pixel-exact: pooled block means mix
-                # masked and unmasked pixels and look like the wrong region.
-                force_raw=row_mask is not None,
-            )
+            if base_stages is not None:
+                # The base (everything above this module) is cached per
+                # view; only the module's own correction is recomputed, so
+                # changing a correction parameter does not read the file.
+                chan, rect, frac, _cached = _image_raster_texture(
+                    ctx, parquet_path, manifest, (x0, x1, y0, y1), spacing,
+                    channel, mask_ent=mask_ent, stages=base_stages,
+                    force_raw=row_mask is not None,
+                    stages_after=delta_stages, base_cache=base_cache,
+                    base_sig=base_sig, base_coords=base_coords,
+                )
+                cname = None
+            else:
+                chan, rect, frac = ctx._image_raster(
+                    parquet_path, manifest, (x0, x1, y0, y1), spacing, channel,
+                    mask_ent, raster_stages,
+                    # A gate subset must be pixel-exact: pooled block means
+                    # mix masked and unmasked pixels and look like the wrong
+                    # region.
+                    force_raw=row_mask is not None,
+                )
+                cname = channel if raster_stages is None else None
             if chan is None:
                 continue
-            cname = channel if raster_stages is None else None
             ranges = manifest.get("color_ranges", {}) or {}
             lo, hi = ranges.get(cname, (None, None))
             if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:

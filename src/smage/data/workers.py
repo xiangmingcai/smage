@@ -762,10 +762,12 @@ class _ColumnSampleWorker:
         self._thread.start()
 
     def request(self, key, read_path, columns, stages, names, parquet_path,
-                max_rows=400_000, method="spread"):
+                max_rows=400_000, method="spread", max_groups=32,
+                min_batch=1):
         self._req_q.put((
             key, str(read_path), list(columns), list(stages or []),
             list(names), parquet_path, int(max_rows), str(method),
+            int(max_groups), int(min_batch),
         ))
 
     def poll(self):
@@ -793,14 +795,15 @@ class _ColumnSampleWorker:
             self._res_q.put(res)
 
     def _compute(self, key, read_path, columns, stages, names, parquet_path,
-                 max_rows, method="spread"):
+                 max_rows, method="spread", max_groups=32, min_batch=1):
         import numpy as np
 
         from smage.core.pipeline import _evaluate_stages
         from smage.data.sampling import sample_parquet_rows
 
         sample = sample_parquet_rows(
-            read_path, columns, max_rows=max_rows, method=method
+            read_path, columns, max_rows=max_rows, method=method,
+            max_groups=max_groups, min_batch=min_batch,
         )
         if not sample or any(name not in sample for name in columns):
             return (key, None, "Could not read the sampled values.")

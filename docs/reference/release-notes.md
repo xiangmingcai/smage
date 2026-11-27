@@ -3,6 +3,24 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.6.1 — 2026-11-27
+
+- **Illumination Correction** handles background-subtracted channels:
+  **Shift** adds a constant to the channel at the submodule's input (pattern
+  estimate, Before preview and correction all work on the shifted values) and
+  removes it again downstream, so a negative background is no longer
+  amplified. **Pattern floor** raises a pattern that contains negative
+  values, and **Paste illumination pattern** / **Copy pattern** move a
+  pattern in and out through the clipboard.
+- **Illumination Correction** responds immediately: **Update** and a
+  re-recognized pattern re-apply the correction to the cached pixels of the
+  current view, zooming redraws only the plot being zoomed, and raw-pixel
+  previews are binned to the screen resolution. The histograms follow the
+  Min/Max window, and **Correction intensity** accepts negative values
+  (inverting the correction).
+
+See CHANGELOG.md for the complete list.
+
 ## 0.5.6 — 2026-11-27
 
 - **Illumination Correction**: the pattern estimate no longer leaves stripes

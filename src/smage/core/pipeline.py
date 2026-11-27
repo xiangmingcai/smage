@@ -50,6 +50,8 @@ def _pipeline_touches(stages, name) -> bool:
             return True
         if kind in ("compensation", "unmix") and name in stage["names"]:
             return True
+        if kind == "offset" and name in (stage.get("columns") or {}):
+            return True
         if kind == "illumination":
             for sub in stage.get("submodules", []):
                 if sub.get("channel") == name:
@@ -203,6 +205,19 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                     cache[key] = out
             values.update(out)
             continue
+        if kind == "offset":
+            # A constant added to the named columns (the illumination
+            # module's channel shift). Applied only to the module's files.
+            files = stage.get("files")
+            if (
+                files is not None and parquet_path is not None
+                and parquet_path not in files
+            ):
+                continue
+            for name, value in (stage.get("columns") or {}).items():
+                if name in values:
+                    values[name] = values[name] + value
+            continue
         if kind == "illumination":
             for sub in stage.get("submodules", []):
                 if parquet_path is not None and parquet_path not in sub["files"]:
@@ -215,6 +230,9 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                 mask = sub.get("mask")
                 if x_values is None or y_values is None or mask is None:
                     continue
+                shift = float(sub.get("shift", 0.0) or 0.0)
+                if shift and sub.get("add_shift", False):
+                    values[channel] = values[channel] + shift
                 if origin is not None:
                     x_origin, y_origin = origin
                 else:
@@ -246,6 +264,10 @@ def _evaluate_stages(stages, values, names, parquet_path=None, cache=None,
                 if intensity != 1.0:
                     factor = 1.0 + intensity * (factor - 1.0)
                 values[channel] = values[channel] * factor
+                if shift and sub.get("remove_shift", False):
+                    # The data passed downstream is returned to the original
+                    # level; the previews keep the shifted values.
+                    values[channel] = values[channel] - shift
             continue
         if kind == "batch_align":
             aligned = list(stage.get("columns") or [])
