@@ -6,6 +6,18 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.6] — 2026-11-27
+
+### Fixed
+
+- **Illumination Correction**: the sampled pattern estimation could leave
+  stripes in the mask, because the sample read only the first rows of each
+  row group and covered part of a tile. The pattern is now estimated from a
+  two-dimensional stratified sample: the estimator's blocks are sampled in
+  both x and y, with a per-tile phase offset so no block is empty and a
+  periodic pattern cannot alias. The sample is deterministic — the same file
+  and settings reproduce the same pattern.
+
 ## [0.5.5] — 2026-11-27
 
 ### Added

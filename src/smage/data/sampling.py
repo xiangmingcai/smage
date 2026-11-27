@@ -816,13 +816,124 @@ def _sample_strided(pf, columns, total, max_rows):
     }
 
 
-def sample_parquet_rows(path, columns, max_rows=400_000, max_groups=32):
+def lattice_strides(width, height, block_w, block_h, budget,
+                    max_per_axis=16):
+    """Pixel strides that give every block ``k × k`` samples on a budget.
+
+    ``block_w``/``block_h`` is the estimator's block size in pixels (the
+    tile divided by the bin count).  Both axes are sampled: a stride above
+    the block size would leave whole blocks without data, and a fixed
+    lattice could alias a periodic pattern — the caller adds a per-tile
+    phase offset for that reason.
+    """
+    import math
+
+    total = max(1.0, float(width) * float(height))
+    block_w = max(1.0, float(block_w))
+    block_h = max(1.0, float(block_h))
+    k = int(math.sqrt(
+        max(1.0, float(budget)) * block_w * block_h / total
+    ))
+    k = max(1, min(k, int(min(block_w, block_h)), int(max_per_axis)))
+    sx = max(1, int(round(block_w / k)))
+    sy = max(1, int(round(block_h / k)))
+    return sx, sy
+
+
+def sample_image_blocks(path, columns, x_name, y_name, origin, tile_w,
+                        tile_h, sx, sy):
+    """Stratified pixel sample: every tile block gets x *and* y samples.
+
+    The file is streamed once (the columns are read in full), and pixels are
+    kept on a two-dimensional lattice with a per-tile phase offset::
+
+        keep = (x - x0 - phase_x) % sx == 0 and (y - y0 - phase_y) % sy == 0
+
+    where the phases come from a hash of the tile row/column, so consecutive
+    tiles sample different positions inside their blocks instead of one
+    global grid.  ``sx``/``sy`` below the block size guarantee that no block
+    of a tile is empty; this is what prevents the stripes a banded row
+    sample leaves in the illumination mask.
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    columns = list(columns)
+    try:
+        pf = pq.ParquetFile(str(path))
+    except Exception:  # noqa: BLE001
+        return {}
+    if x_name not in columns or y_name not in columns:
+        return {}
+    x0 = int(round(float(origin[0])))
+    y0 = int(round(float(origin[1])))
+    step_x = max(1, int(sx))
+    step_y = max(1, int(sy))
+    tile_w = max(1, int(tile_w))
+    tile_h = max(1, int(tile_h))
+    gx = np.uint64(0x9E3779B97F4A7C15)
+    gy = np.uint64(0xC2B2AE3D27D4EB4F)
+    parts = {column: [] for column in columns}
+    for batch in pf.iter_batches(batch_size=1_000_000, columns=columns):
+        x = np.asarray(
+            batch.column(x_name).to_numpy(zero_copy_only=False)
+        )
+        y = np.asarray(
+            batch.column(y_name).to_numpy(zero_copy_only=False)
+        )
+        if not np.issubdtype(x.dtype, np.integer) or not (
+            np.issubdtype(y.dtype, np.integer)
+        ):
+            # Non-integer coordinates: no lattice, keep the batch as is.
+            indices = np.arange(batch.num_rows)
+        else:
+            xi = x.astype(np.int64) - x0
+            yi = y.astype(np.int64) - y0
+            ti = np.floor_divide(xi, tile_w).astype(np.uint64)
+            tj = np.floor_divide(yi, tile_h).astype(np.uint64)
+            hashed = ti * gx ^ tj * gy
+            phase_x = (hashed % np.uint64(step_x)).astype(np.int64)
+            phase_y = (
+                (hashed >> np.uint64(32)) % np.uint64(step_y)
+            ).astype(np.int64)
+            keep = (
+                np.remainder(xi - phase_x, step_x) == 0
+            ) & (
+                np.remainder(yi - phase_y, step_y) == 0
+            )
+            indices = np.flatnonzero(keep)
+        if indices.size == 0:
+            continue
+        selection = pa.array(indices)
+        for column in columns:
+            parts[column].append(
+                batch.column(column).take(selection)
+                .to_numpy(zero_copy_only=False)
+            )
+    return {
+        column: (np.concatenate(chunks) if chunks else np.empty(0))
+        for column, chunks in parts.items()
+    }
+
+
+def sample_parquet_rows(path, columns, max_rows=400_000, max_groups=32,
+                        method="spread"):
     """Sample up to ``max_rows`` rows of ``columns`` from one parquet file.
 
-    The sample is spread over the file (one batch from each of several row
-    groups), so a histogram or a tile estimate built from it is not limited
-    to one part of the image.  Values keep their stored dtypes; the caller
-    decides which ones need to be converted.
+    ``method="spread"`` reads one batch from each of several evenly spread
+    row groups: cheap, and fine for a distribution (a histogram), but a
+    batch covers only a contiguous slice of the rows, so it must not be used
+    to estimate anything that varies inside an image tile.
+
+    ``method="stride"`` scans the whole file and keeps every k-th row.  I/O
+    is the complete column chunks, but memory stays bounded and every part
+    of the file — every row of an image tile — is represented.  Used for the
+    illumination pattern estimate, where a missing band of rows becomes a
+    visible stripe in the mask.
+
+    Values keep their stored dtypes; the caller decides which ones need to
+    be converted.
     """
     import pyarrow.parquet as pq
 
@@ -846,6 +957,8 @@ def sample_parquet_rows(path, columns, max_rows=400_000, max_groups=32):
             column: table.column(column).to_numpy(zero_copy_only=False)
             for column in present
         }
+    if method == "stride":
+        return _sample_strided(pf, present, total, max_rows)
     if int(meta.num_row_groups or 0) >= 4:
         return _sample_spread(pf, present, total, max_rows, max_groups)
     return _sample_strided(pf, present, total, max_rows)

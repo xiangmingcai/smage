@@ -261,5 +261,85 @@ def raster_coords() -> None:
     )
 
 
+@harness.case("mod.illumination.pattern_sampling", "L4", "illumination", tags=("fast",))
+def pattern_sampling() -> None:
+    """The tile estimate samples every block in x and y, not one row band."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import smage.data.workers as workers
+    from smage.data import sampling
+
+    window, project, _page, _parquet = _open("illum_sampling")
+    try:
+        path = str(project.data_dir / "sampling.parquet")
+        rows = np.arange(400_000, dtype=np.int64)
+        x = (rows % 200).astype("int32")
+        y = (rows // 200).astype("int32")
+        base = np.random.default_rng(3).normal(1000, 30, rows.size)
+        # The pattern changes inside one 32 px tile.
+        pattern = 1.0 + 0.4 * np.cos(2 * np.pi * y / 32) + 0.2 * np.sin(
+            2 * np.pi * x / 32
+        )
+        pq.write_table(
+            pa.table({
+                "x": x, "y": y,
+                "c0": (base * pattern).astype("float32"),
+            }),
+            path, row_group_size=50_000,
+        )
+        names = {"x", "y", "c0"}
+        original_budget = workers._ILLUM_SAMPLE_ROWS
+        try:
+            workers._ILLUM_SAMPLE_ROWS = 10_000_000
+            worker = workers._IlluminationWorker()
+            full = worker._file_stats(
+                path, [], {path: names}, "c0", "x", "y", 32, 32, 4, {}
+            )
+            worker.stop()
+            workers._ILLUM_SAMPLE_ROWS = 40_000
+            worker = workers._IlluminationWorker()
+            sampled = worker._file_stats(
+                path, [], {path: names}, "c0", "x", "y", 32, 32, 4, {}
+            )
+            worker.stop()
+        finally:
+            workers._ILLUM_SAMPLE_ROWS = original_budget
+        harness.check(
+            bool((sampled["counts"] > 0).all()),
+            "every tile block keeps samples",
+        )
+        grid_full = full["sums"] / np.maximum(full["counts"], 1)
+        grid_sampled = sampled["sums"] / np.maximum(sampled["counts"], 1)
+        error = np.abs(grid_sampled - grid_full) / np.abs(grid_full)
+        harness.check(
+            float(error.max()) < 0.05,
+            f"the sampled grid stays close: {error.max():.4f}",
+        )
+
+        # The worker must sample the image blocks, not a row band.
+        calls = []
+        original_blocks = sampling.sample_image_blocks
+
+        def recorder(*args, **kwargs):
+            calls.append(True)
+            return original_blocks(*args, **kwargs)
+
+        sampling.sample_image_blocks = recorder
+        workers._ILLUM_SAMPLE_ROWS = 40_000
+        try:
+            worker = workers._IlluminationWorker()
+            worker._file_stats(
+                path, [], {path: names}, "c0", "x", "y", 32, 32, 4, {}
+            )
+            worker.stop()
+        finally:
+            sampling.sample_image_blocks = original_blocks
+            workers._ILLUM_SAMPLE_ROWS = original_budget
+        harness.check(bool(calls), "the tile estimate samples the image blocks")
+    finally:
+        _close(window)
+
+
 if __name__ == "__main__":
     raise SystemExit(harness.main())

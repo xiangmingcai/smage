@@ -1447,9 +1447,15 @@ def _illum_hist_request(ctx, page, key, path, channel, stages) -> bool:
             return False
         read_path, columns, names = source
         page._illum_hist_pending[key] = names[0]
+        # A corrected (After) distribution depends on the position inside a
+        # tile, so it needs the strided sample; the raw one is fine with the
+        # cheaper spread sample.
+        method = "stride" if any(
+            kind == "illumination" for kind, _stage in (stages or [])
+        ) else "spread"
         worker.request(
             key, read_path, columns, list(stages or []), names, path,
-            max_rows=_ILLUM_HIST_ROWS,
+            max_rows=_ILLUM_HIST_ROWS, method=method,
         )
         return False
     # Fallback: the values cannot be read from a sample (an unusual stored

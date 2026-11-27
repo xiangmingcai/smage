@@ -50,12 +50,16 @@ generated channel from its saved output. The tile width and height must fit
 inside the image: an image smaller than one tile produces no data to estimate
 the pattern from, and the panel shows a hint in that case.
 
-**Recognize Illumination Pattern** reads a spread sample of each selected file
-(up to about two million pixels, taken from batches across the file) instead
-of loading the whole file, so large files are processed in seconds with
-bounded memory. The progress line next to the button shows the current file,
-and the button turns into **Cancel** while the calculation runs; cancelling
-keeps the previous pattern. Each file's time is recorded in the run log.
+**Recognize Illumination Pattern** reads a two-dimensional sample of each
+selected file (up to about two million pixels) instead of loading it whole,
+so large files are processed in seconds with bounded memory. The sample is
+stratified on the estimator's own blocks — the tile divided by the bin count
+— with a per-tile phase offset, so every block of every tile is covered in
+both x and y. A banded or single-stride sample would leave some blocks empty
+and show up as stripes in the mask. The progress line next to the button
+shows the current file, and the button turns into **Cancel** while the
+calculation runs; cancelling keeps the previous pattern. Each file's time is
+recorded in the run log.
 
 The **Before** and **After** image previews always share one display range, so
 a change of correction method, intensity or pattern is visible instead of

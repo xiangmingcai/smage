@@ -478,7 +478,10 @@ class _IlluminationWorker:
         from smage.core.pipeline import (
             _evaluate_stages, _pipeline_dependencies,
         )
-        from smage.data.sampling import parquet_column_stats, sample_parquet_rows
+        from smage.data.sampling import (
+            lattice_strides, parquet_column_stats, sample_image_blocks,
+            sample_parquet_rows,
+        )
 
         gen = generated.get(path)
         needed = {x_name, y_name} if gen else {x_name, y_name, channel}
@@ -508,9 +511,45 @@ class _IlluminationWorker:
             stored if name == channel else name
             for name in dependencies
         } if stored else set(dependencies)
-        sample = sample_parquet_rows(
-            read_path, sorted(read_names), max_rows=_ILLUM_SAMPLE_ROWS
+        stats = (
+            parquet_column_stats(read_path, [x_name, y_name])
+            if x_name and y_name else {}
         )
+        origin = None
+        if x_name in stats and y_name in stats:
+            origin = (stats[x_name][0], stats[y_name][0])
+        total_rows = 0
+        try:
+            import pyarrow.parquet as pq
+            total_rows = int(pq.ParquetFile(read_path).metadata.num_rows or 0)
+        except Exception:  # noqa: BLE001
+            total_rows = 0
+        if (
+            origin is not None
+            and total_rows > _ILLUM_SAMPLE_ROWS
+        ):
+            # The pattern is estimated per position inside a tile, so the
+            # sample must cover every tile in both x and y; a row band (or a
+            # row stride) leaves stripes.  Sample a 2D lattice through the
+            # tile blocks instead.
+            x0, y0 = float(origin[0]), float(origin[1])
+            width = float(stats[x_name][1]) - x0 + 1.0
+            height = float(stats[y_name][1]) - y0 + 1.0
+            sx, sy = lattice_strides(
+                width, height,
+                max(1.0, tile_w / max(1, bins)),
+                max(1.0, tile_h / max(1, bins)),
+                _ILLUM_SAMPLE_ROWS,
+            )
+            sample = sample_image_blocks(
+                read_path, sorted(read_names), x_name, y_name,
+                (x0, y0), tile_w, tile_h, sx, sy,
+            )
+        else:
+            sample = sample_parquet_rows(
+                read_path, sorted(read_names), max_rows=_ILLUM_SAMPLE_ROWS,
+                method="stride",
+            )
         if not sample or any(name not in sample for name in read_names):
             return "skip"
         if stored is not None:
@@ -520,13 +559,6 @@ class _IlluminationWorker:
             if not np.issubdtype(np.asarray(array).dtype, np.number):
                 return "skip"
             values[name] = array
-        stats = (
-            parquet_column_stats(read_path, [x_name, y_name])
-            if x_name and y_name else {}
-        )
-        origin = None
-        if x_name in stats and y_name in stats:
-            origin = (stats[x_name][0], stats[y_name][0])
         evaluated = _evaluate_stages(
             stages, values, sorted(needed), parquet_path=path,
             origin=origin,
@@ -730,10 +762,10 @@ class _ColumnSampleWorker:
         self._thread.start()
 
     def request(self, key, read_path, columns, stages, names, parquet_path,
-                max_rows=400_000):
+                max_rows=400_000, method="spread"):
         self._req_q.put((
             key, str(read_path), list(columns), list(stages or []),
-            list(names), parquet_path, int(max_rows),
+            list(names), parquet_path, int(max_rows), str(method),
         ))
 
     def poll(self):
@@ -761,13 +793,15 @@ class _ColumnSampleWorker:
             self._res_q.put(res)
 
     def _compute(self, key, read_path, columns, stages, names, parquet_path,
-                 max_rows):
+                 max_rows, method="spread"):
         import numpy as np
 
         from smage.core.pipeline import _evaluate_stages
         from smage.data.sampling import sample_parquet_rows
 
-        sample = sample_parquet_rows(read_path, columns, max_rows=max_rows)
+        sample = sample_parquet_rows(
+            read_path, columns, max_rows=max_rows, method=method
+        )
         if not sample or any(name not in sample for name in columns):
             return (key, None, "Could not read the sampled values.")
         values = {}

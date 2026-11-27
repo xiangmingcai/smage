@@ -6,7 +6,7 @@ into a common tabular representation and lets you compose analysis pipelines
 from interactive modules — gating, compensation, unmixing, segmentation,
 feature aggregation, clustering, dimensionality reduction and export.
 
-> **Status:** early development. The current release is `0.5.5`; modules and
+> **Status:** early development. The current release is `0.5.6`; modules and
 > file formats may still change between releases.
 
 > **Intended use:** research software, not a medical device. Not for clinical
@@ -17,17 +17,14 @@ feature aggregation, clustering, dimensionality reduction and export.
 📦 **Releases:** <https://github.com/xiangmingcai/smage/releases><br>
 🐛 **Issues:** <https://github.com/xiangmingcai/smage/issues>
 
-## What's new in 0.5.5
+## What's new in 0.5.6
 
-- **Illumination Correction** handles large files: **Recognize Illumination
-  Pattern** estimates the pattern from a spread pixel sample of each file
-  instead of loading it whole, so a multi-gigabyte file takes seconds and
-  memory stays bounded. The status line shows the current file and the button
-  becomes **Cancel** while it runs. The Before/After histograms are read in
-  the background from a sample, so opening the module or switching file,
-  channel or parameters no longer freezes the window.
-- The Before and After image previews share one display range, and the After
-  preview applies the correction to generated **Unmix** channels.
+- **Illumination Correction**: the pattern estimate no longer leaves stripes
+  in the mask. The sample is now two-dimensional and stratified on the
+  estimator's own blocks, so every block of every tile is covered in both x
+  and y, with a per-tile phase offset that prevents aliasing. The sample is
+  deterministic: the same file and settings give the same pattern. This
+  builds on the 0.5.5 large-file sampling, progress and **Cancel**.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -70,7 +67,7 @@ Optional analysis methods run in a separate Python environment created from
 | PARC | Cluster | 0.40 | [ShobiStassen/PARC](https://github.com/ShobiStassen/PARC) |
 
 The Extension Manager installs the current pip release; the versions above
-were current when Smage 0.5.5 was released. Use a **Python 3.11** environment
+were current when Smage 0.5.6 was released. Use a **Python 3.11** environment
 for these extensions, matching the Python version Smage is built with. Each
 environment may need extra packages (for example PyTorch for Cellpose or
 TensorFlow for StarDist) — see the extension's repository for its

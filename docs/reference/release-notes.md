@@ -3,6 +3,16 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.5.6 — 2026-11-27
+
+- **Illumination Correction**: the pattern estimate no longer leaves stripes
+  in the mask. The sample is now two-dimensional and stratified on the
+  estimator's own blocks, so every block of every tile is covered in both x
+  and y, with a per-tile phase offset that prevents aliasing. The sample is
+  deterministic: the same file and settings give the same pattern.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.5.5 — 2026-11-27
 
 - **Illumination Correction** handles large files: **Recognize Illumination

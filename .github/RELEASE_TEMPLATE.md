@@ -2,15 +2,15 @@
 
 ## Highlights
 
-- **Illumination Correction** handles large files: **Recognize Illumination
-  Pattern** estimates the pattern from a spread pixel sample of each file
-  instead of loading it whole, so a multi-gigabyte file takes seconds and
-  memory stays bounded. The status line shows the current file, the button
-  becomes **Cancel** while it runs, and each file's time is logged.
-- The Before/After histograms are read in the background from a sample, so
-  opening the module or switching file, channel or parameters no longer
-  freezes the window. The two image previews share one display range, and the
-  After preview applies the correction to generated **Unmix** channels.
+- **Illumination Correction**: the pattern estimate no longer leaves stripes
+  in the mask. The sample is now two-dimensional and stratified on the
+  estimator's own blocks, so every block of every tile is covered in both x
+  and y, with a per-tile phase offset that prevents aliasing. The sample is
+  deterministic: the same file and settings give the same pattern.
+- Includes the 0.5.5 large-file improvements: sampled pattern estimation
+  with progress and **Cancel**, background histograms, one shared display
+  range for the previews, and the correction applied to generated **Unmix**
+  channels in the After preview.
 
 ## Downloads
 
