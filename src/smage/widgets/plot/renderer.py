@@ -203,11 +203,56 @@ def _figure_axis_scale_configs(ctx, task_id, parquet_path, column, column_transf
     return list(result)
 
 
-def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None) -> None:
+def _raster_coordinate_grids(rect, shape):
+    """x/y coordinate grids for a raster's block centres.
+
+    Pipelines that depend on pixel position (Illumination correction) need
+    x/y arrays when they run on a raster that is drawn from a generated
+    channel's own pyramid, which has no x/y columns of its own.
+    """
+    import numpy as np
+
+    try:
+        height, width = int(shape[0]), int(shape[1])
+    except (TypeError, ValueError, IndexError):
+        return None, None
+    if height <= 0 or width <= 0 or rect is None:
+        return None, None
+    xs = rect.x() + (np.arange(width, dtype="float64") + 0.5) * (
+        rect.width() / width
+    )
+    ys = rect.y() + (np.arange(height, dtype="float64") + 0.5) * (
+        rect.height() / height
+    )
+    return np.meshgrid(xs, ys)
+
+
+def _raster_stage_values(values, stages, rect, shape):
+    """Add coordinate grids for the position-dependent stages of `stages`."""
+    for kind, stage in stages:
+        if kind != "illumination":
+            continue
+        for sub in stage.get("submodules") or ():
+            x_name = sub.get("x")
+            y_name = sub.get("y")
+            if not x_name or not y_name:
+                continue
+            if x_name in values and y_name in values:
+                continue
+            x_grid, y_grid = _raster_coordinate_grids(rect, shape)
+            if x_grid is None:
+                continue
+            values.setdefault(x_name, x_grid)
+            values.setdefault(y_name, y_grid)
+    return values
+
+
+def _figure_render(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, image_levels=None) -> None:
     """(Re)draw a plot widget from its plot_dict."""
     if plot_dict.get("type") == "image":
         ctx._figure_render_image(
-            plot_dict, plot_widget, column_transforms, task_id, extra_stages
+            plot_dict, plot_widget, column_transforms, task_id, extra_stages,
+            image_levels=image_levels,
         )
         return
     mask, error = ctx._figure_filter_mask(plot_dict, task_id)
@@ -600,12 +645,16 @@ def _image_filter_fraction_for_rect(mask_ent, manifest, rect, shape):
     return mask2d[np.ix_(qj, qi)].astype("float64")
 
 
-def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, row_mask=None) -> None:
+def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=None, task_id=None, extra_stages=None, row_mask=None, image_levels=None) -> None:
     """Render an Image plot as a raster (LOD pyramid), ImageJ-style.
 
     `row_mask` is an optional boolean/uint8 array aligned to the image's
     pixel rows; pixels it marks False are hidden (used by Gating's subset
     view to show only the points inside the active gate).
+
+    `image_levels` is an optional (lo, hi) display range shared by several
+    plots of the same channel (the Illumination previews). It is used for
+    layers without their own Min/Max, in display (post-Scale) units.
     """
     import numpy as np
     ctx._figure_bump_render_token(plot_widget)
@@ -930,11 +979,16 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                 continue
             # The saved pyramid holds post-unmix values; apply the map stages
             # below the Unmix task (Scale in particular) so the raster and
-            # the Min/Max controls share one unit system.
+            # the Min/Max controls share one unit system.  Position-dependent
+            # stages (Illumination) also need x/y for this raster: the
+            # generated pyramid has no coordinate columns, so derive them
+            # from the raster's rect and block grid.
             post = _stages_after(stages, "unmix", rec.get("task_id"))
             if post:
+                values = {channel: chan}
+                _raster_stage_values(values, post, rect, chan.shape)
                 evaluated = _evaluate_stages(
-                    post, {channel: chan}, [channel],
+                    post, values, [channel],
                     parquet_path=parquet_path,
                 )
                 chan = evaluated.get(channel, chan)
@@ -1029,6 +1083,24 @@ def _figure_render_image(ctx, plot_dict: dict, plot_widget, column_transforms=No
                 hi = float(np.nanmax(chan)) if chan.size else 1.0
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = 0.0, 1.0
+        # A caller-supplied shared range (the Illumination module shows the
+        # same Before/After image on one scale) replaces the per-view auto
+        # range; an explicit layer min/max still wins below.
+        if (
+            image_levels is not None
+            and layer.get("min") is None
+            and layer.get("max") is None
+        ):
+            try:
+                level_lo, level_hi = float(image_levels[0]), float(image_levels[1])
+            except (TypeError, ValueError, IndexError):
+                level_lo = level_hi = None
+            if (
+                level_lo is not None and level_hi is not None
+                and np.isfinite(level_lo) and np.isfinite(level_hi)
+                and level_hi > level_lo
+            ):
+                lo, hi = level_lo, level_hi
         # Per-channel brightness/contrast: a user-set min/max overrides the
         # automatic range for this layer. Either bound may be set alone.
         user_min = layer.get("min")

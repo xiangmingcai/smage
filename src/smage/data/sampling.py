@@ -708,3 +708,144 @@ def _subsample_mask_meta(ctx, task, parquet_path, manifest) -> dict:
         meta["unit"] = "percent"
         meta["percent"] = params.get("percent")
     return meta
+
+
+# ---------------------------------------------------------------------------
+# Sampled parquet reads
+#
+# A parquet table is stored as a sequence of row groups.  Reading a small
+# batch from a few evenly spread row groups gives a representative sample of
+# the file with a fraction of the I/O and, more importantly, without a
+# full-file in-memory copy.  Used by the tile statistics of the Illumination
+# module and by the plot histograms next to its previews.
+# ---------------------------------------------------------------------------
+
+
+def parquet_column_stats(path, columns):
+    """Exact ``(min, max)`` per column from the parquet metadata.
+
+    Statistics are written by the importer and by the generate modules, so
+    the range of a column is available without reading any row.  Columns
+    without complete statistics are omitted.
+    """
+    import pyarrow.parquet as pq
+
+    try:
+        meta = pq.ParquetFile(str(path)).metadata
+    except Exception:  # noqa: BLE001
+        return {}
+    names = list(meta.schema.names)
+    out = {}
+    for column in columns:
+        if column not in names:
+            continue
+        index = names.index(column)
+        lo = None
+        hi = None
+        complete = True
+        for i in range(int(meta.num_row_groups or 0)):
+            stats = meta.row_group(i).column(index).statistics
+            if stats is None or not stats.has_min_max:
+                complete = False
+                break
+            lo = stats.min if lo is None else min(lo, stats.min)
+            hi = stats.max if hi is None else max(hi, stats.max)
+        if complete and lo is not None:
+            out[column] = (lo, hi)
+    return out
+
+
+def _sample_spread(pf, columns, total, max_rows, max_groups):
+    """One small batch from each of several evenly spread row groups."""
+    import numpy as np
+
+    meta = pf.metadata
+    groups = int(meta.num_row_groups or 0)
+    count = max(1, min(groups, int(max_groups), max(1, int(max_rows) // 65536)))
+    positions = np.unique(
+        np.linspace(0, groups - 1, count).round().astype(int)
+    )
+    first_rows = int(meta.row_group(0).num_rows)
+    per_group = max(1, min(int(max_rows) // max(1, len(positions)), first_rows))
+    parts = []
+    for index in positions:
+        iterator = pf.iter_batches(
+            batch_size=per_group, columns=columns,
+            row_groups=[int(index)],
+        )
+        try:
+            parts.append(next(iterator))
+        except StopIteration:
+            continue
+        finally:
+            iterator.close()
+    if not parts:
+        return {}
+    return {
+        column: np.concatenate([
+            part.column(column).to_numpy(zero_copy_only=False)
+            for part in parts
+        ])
+        for column in columns
+    }
+
+
+def _sample_strided(pf, columns, total, max_rows):
+    """Every stride-th row, for files with too few row groups to spread."""
+    import numpy as np
+    import pyarrow as pa
+
+    stride = max(1, int(total) // max(1, int(max_rows)))
+    parts = {column: [] for column in columns}
+    start = 0
+    for batch in pf.iter_batches(batch_size=1_000_000, columns=columns):
+        rows = batch.num_rows
+        offset = (-start) % stride
+        selection = np.arange(offset, rows, stride)
+        if selection.size:
+            indices = pa.array(selection)
+            for column in columns:
+                parts[column].append(
+                    batch.column(column).take(indices)
+                    .to_numpy(zero_copy_only=False)
+                )
+        start += rows
+    return {
+        column: (np.concatenate(chunks) if chunks else np.empty(0))
+        for column, chunks in parts.items()
+    }
+
+
+def sample_parquet_rows(path, columns, max_rows=400_000, max_groups=32):
+    """Sample up to ``max_rows`` rows of ``columns`` from one parquet file.
+
+    The sample is spread over the file (one batch from each of several row
+    groups), so a histogram or a tile estimate built from it is not limited
+    to one part of the image.  Values keep their stored dtypes; the caller
+    decides which ones need to be converted.
+    """
+    import pyarrow.parquet as pq
+
+    columns = list(dict.fromkeys(columns))
+    if not columns:
+        return {}
+    try:
+        pf = pq.ParquetFile(str(path))
+    except Exception:  # noqa: BLE001
+        return {}
+    meta = pf.metadata
+    total = int(meta.num_rows or 0)
+    if total <= 0:
+        return {}
+    present = [c for c in columns if c in set(meta.schema.names)]
+    if not present:
+        return {}
+    if total <= int(max_rows):
+        table = pf.read(columns=present)
+        return {
+            column: table.column(column).to_numpy(zero_copy_only=False)
+            for column in present
+        }
+    if int(meta.num_row_groups or 0) >= 4:
+        return _sample_spread(pf, present, total, max_rows, max_groups)
+    return _sample_strided(pf, present, total, max_rows)

@@ -32,13 +32,14 @@ from PySide6.QtWidgets import (
 )
 from smage.core.constants import MODULE_STATE_MODIFIED
 from smage.core.pipeline import _rename_applies
+from smage.core.scale_math import _apply_scale_transforms
 from smage.core.settings import (
     _default_palette,
     _plot_background,
 )
 from smage.data.columns import _illumination_stage_item
 from smage.data.image_index import _image_geometry
-from smage.data.workers import _IlluminationWorker
+from smage.data.workers import _ColumnSampleWorker, _IlluminationWorker
 from smage.widgets.colormap import _figure_colormap
 from smage.widgets.controls import (
     _NoWheelComboBox,
@@ -109,6 +110,12 @@ def _build_illumination_page(ctx, name: str, task_def: dict, locked: bool) -> QW
     page._illum_snapshot = copy.deepcopy(params)
     page._illum_worker = _IlluminationWorker()
     page._illum_request_key = None
+    page._illum_calc_running = False
+    page._illum_hist_worker = _ColumnSampleWorker()
+    page._illum_hist_cache = {}
+    page._illum_hist_pending = {}
+    page._illum_shared_levels = None
+    page._illum_params_version = 0
     page._illum_poll_timer = QTimer(ctx.host)
     page._illum_poll_timer.setInterval(120)
     page._illum_poll_timer.timeout.connect(
@@ -719,7 +726,7 @@ def _illum_tiles_panel(ctx, page, sub) -> QWidget:
     calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
     calc_btn.setEnabled(editable and bool(sub.get("channel")))
     calc_btn.clicked.connect(
-        lambda _=False: _illum_calculate(ctx, page, sub, calc_btn)
+        lambda _=False: _illum_calc_clicked(ctx, page, sub, calc_btn)
     )
     calc_row.addWidget(calc_btn)
     status = QLabel("")
@@ -1176,7 +1183,7 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
         _illum_render_preview(ctx, page)
 
     def rebuild_levels() -> None:
-        import numpy as np  # noqa: F401
+        import numpy as np
 
         clear_levels()
         is_image = plot_dict.get("type") == "image"
@@ -1190,6 +1197,8 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
         except ValueError:
             index = len(page._illum_submodules)
         channel = plot_dict.get("color_param")
+        if not path or not channel:
+            return
         before_stages = _illum_preview_stages(
             ctx, page, page._illum_submodules[:index]
         )
@@ -1202,6 +1211,53 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
             )
             if channel else None
         )
+        cache = page._illum_hist_cache
+        before_key = _illum_hist_cache_key(
+            page, path, channel, "before", index
+        )
+        after_key = _illum_hist_cache_key(
+            page, path, channel, "after", index
+        )
+        if channel:
+            _illum_hist_request(
+                ctx, page, before_key, path, channel, before_stages
+            )
+            _illum_hist_request(
+                ctx, page, after_key, path, channel, after_stages
+            )
+        before_values = cache.get(before_key)
+        after_values = cache.get(after_key)
+        if before_values is None or after_values is None:
+            # The distributions are read in the background: show both
+            # sections with a placeholder instead of reading the whole
+            # channel on the UI thread.
+            for caption in ("Before", "After"):
+                cap = QLabel(caption)
+                cap.setStyleSheet(
+                    "color: #5a6673; font-size: 8pt; font-weight: bold;"
+                )
+                levels_lay.addWidget(cap)
+                note = QLabel("Computing…")
+                note.setStyleSheet("color: #6b7785; font-size: 8pt;")
+                levels_lay.addWidget(note)
+            return
+        # One display range shared by the Before and After images, so a
+        # correction (including a constant gain from the method) shows up
+        # instead of being normalized away by two independent auto ranges.
+        if before_values.size and after_values.size:
+            before_display = _apply_scale_transforms(before_values, configs)
+            after_display = _apply_scale_transforms(after_values, configs)
+            lo = min(
+                float(np.percentile(before_display, 0.5)),
+                float(np.percentile(after_display, 0.5)),
+            )
+            hi = max(
+                float(np.percentile(before_display, 99.5)),
+                float(np.percentile(after_display, 99.5)),
+            )
+            page._illum_shared_levels = (lo, hi) if hi > lo else None
+        else:
+            page._illum_shared_levels = None
         # Before on top (read-only distribution), then the shared Min/Max
         # controls with the corrected After distribution below them.
         before_caption = QLabel("Before")
@@ -1212,6 +1268,7 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
         _widgets_image_level._image_signal_histogram(
             ctx, levels_lay, channel, page._illum_task_id, path,
             extra_stages=before_stages, configs=configs,
+            values=before_values,
         )
         _widgets_image_level._image_level_controls(ctx,
             levels_lay,
@@ -1225,6 +1282,7 @@ def _illum_plot_settings(ctx, page, sub) -> QWidget:
             extra_stages=after_stages,
             configs=configs,
             hist_caption="After",
+            values=after_values,
         )
 
     page._illum_rebuild_levels = rebuild_levels
@@ -1317,6 +1375,130 @@ def _illum_preview_stages(ctx, page, subs):
     })]
 
 
+_ILLUM_HIST_ROWS = 200_000
+
+
+def _illum_hist_cache_key(page, path, channel, side, index):
+    """Cache key for one sampled distribution.
+
+    The parameter version drops every entry when a submodule changes; the
+    index keeps two submodules of the same channel apart while nothing is
+    dirty.
+    """
+    return (
+        str(path), str(channel), side, int(index),
+        int(getattr(page, "_illum_params_version", 0)),
+    )
+
+
+def _illum_hist_source(ctx, page, path, channel, stages):
+    """(read path, columns, names) for a sampled histogram, or None."""
+    if not path or not channel:
+        return None
+    needed = _data_columns._pipeline_dependencies(
+        list(stages or []), [channel], path
+    )
+    generated = _illum_generated_column(
+        ctx, page._illum_task_id, path, channel
+    )
+    try:
+        import pyarrow.parquet as pq
+    except Exception:  # noqa: BLE001
+        return None
+    if generated is not None:
+        # A generated channel lives in its own row-aligned output; sample
+        # that file (it carries x/y for image data).
+        if generated["column"] != channel:
+            return None
+        read_path = generated["path"]
+        try:
+            available = set(pq.ParquetFile(read_path).schema.names)
+        except Exception:  # noqa: BLE001
+            return None
+        if not all(name in available for name in needed):
+            return None
+        return read_path, sorted(needed), [channel]
+    base = set(
+        ctx._column_index.get(_data_files._rel_data_key(ctx, path), [])
+    )
+    if not base:
+        try:
+            base = set(pq.ParquetFile(path).schema.names)
+        except Exception:  # noqa: BLE001
+            base = set()
+    columns = [name for name in needed if name in base]
+    if not all(name in columns for name in needed):
+        return None
+    return path, columns, [channel]
+
+
+def _illum_hist_request(ctx, page, key, path, channel, stages) -> bool:
+    """Ask the worker for one distribution; False when it is already cached."""
+    cache = page._illum_hist_cache
+    if key in cache:
+        return True
+    worker = getattr(page, "_illum_hist_worker", None)
+    source = (
+        _illum_hist_source(ctx, page, path, channel, stages)
+        if worker is not None else None
+    )
+    if source is not None:
+        if key in page._illum_hist_pending:
+            return False
+        read_path, columns, names = source
+        page._illum_hist_pending[key] = names[0]
+        worker.request(
+            key, read_path, columns, list(stages or []), names, path,
+            max_rows=_ILLUM_HIST_ROWS,
+        )
+        return False
+    # Fallback: the values cannot be read from a sample (an unusual stored
+    # column); read them the old way, once, and cache the result.
+    try:
+        values = ctx._figure_channel_values(
+            page._illum_task_id, path, channel, extra_stages=stages
+        )
+    except Exception:  # noqa: BLE001
+        values = None
+    import numpy as np
+    cache[key] = (
+        np.asarray(values, dtype="float64")
+        if values is not None and values.size
+        else np.empty(0, dtype="float64")
+    )
+    return True
+
+
+def _illum_hist_poll(ctx, page) -> bool:
+    """Collect finished histogram reads; True when a redraw is due."""
+    worker = getattr(page, "_illum_hist_worker", None)
+    if worker is None:
+        return False
+    import numpy as np
+
+    changed = False
+    for key, values, _error in worker.poll():
+        channel = page._illum_hist_pending.pop(key, None)
+        page._illum_hist_cache[key] = (
+            np.asarray(values.get(channel), dtype="float64")
+            if values is not None and channel in values
+            else np.empty(0, dtype="float64")
+        )
+        changed = True
+    return changed
+
+
+def _illum_schedule_preview(ctx, page, delay: int = 40) -> None:
+    """Coalesce preview redraws triggered by several UI handlers at once."""
+    timer = getattr(page, "_illum_render_timer", None)
+    if timer is None:
+        timer = QTimer(ctx.host)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: _illum_render_preview(ctx, page))
+        page._illum_render_timer = timer
+    timer.start(delay)
+
+
 def _illum_render_preview(ctx, page) -> None:
     """Render both previews without letting their own range changes loop."""
     import time
@@ -1351,13 +1533,22 @@ def _illum_render_preview_now(ctx, page) -> None:
     )
     for plot_widget in (before, after):
         _illum_clear_tile_grid(ctx, plot_widget)
+    # Both previews use one display range so the correction is visible
+    # instead of being normalized away by two independent auto ranges.
+    shared_levels = None
+    if (
+        plot_dict.get("type") == "image"
+        and plot_dict.get("image_min") is None
+        and plot_dict.get("image_max") is None
+    ):
+        shared_levels = getattr(page, "_illum_shared_levels", None)
     _widgets_plot_renderer._figure_render(ctx,
         plot_dict, before, task_id=page._illum_task_id,
-        extra_stages=before_stages,
+        extra_stages=before_stages, image_levels=shared_levels,
     )
     _widgets_plot_renderer._figure_render(ctx,
         plot_dict, after, task_id=page._illum_task_id,
-        extra_stages=after_stages,
+        extra_stages=after_stages, image_levels=shared_levels,
     )
     if plot_dict.get("show_tile_grid"):
         before._illum_grid_item = _illum_draw_tile_grid(ctx,
@@ -1536,10 +1727,11 @@ def _illum_calculate(ctx, page, sub, button) -> None:
         if rec is not None:
             generated[path] = rec
     page._illum_request_key = sub["id"]
-    button.setEnabled(False)
+    page._illum_calc_running = True
+    button.setText("Cancel")
     status = getattr(page, "_illum_calc_status", None)
     if status is not None:
-        status.setText("Calculating…")
+        status.setText(f"Recognizing pattern: 0/{len(files)} files")
     page._illum_worker.request(
         sub["id"], stages, base_columns, files, channel, x_name, y_name,
         int(sub.get("tile_w", 256)), int(sub.get("tile_h", 256)),
@@ -1548,18 +1740,62 @@ def _illum_calculate(ctx, page, sub, button) -> None:
     )
 
 
+def _illum_calc_clicked(ctx, page, sub, button) -> None:
+    """Start the calculation, or cancel the one that is running."""
+    if getattr(page, "_illum_calc_running", False):
+        key = page._illum_request_key
+        if key:
+            page._illum_worker.cancel(key)
+            status = getattr(page, "_illum_calc_status", None)
+            if status is not None:
+                status.setText("Cancelling…")
+        return
+    _illum_calculate(ctx, page, sub, button)
+
+
 def _illum_on_poll(ctx, page) -> None:
     worker = getattr(page, "_illum_worker", None)
     if worker is None:
         return
-    for key, result, error in worker.poll():
+    if _illum_hist_poll(ctx, page):
+        previous = getattr(page, "_illum_shared_levels", None)
+        rebuild_levels = getattr(page, "_illum_rebuild_levels", None)
+        if rebuild_levels is not None:
+            rebuild_levels()
+        if getattr(page, "_illum_shared_levels", None) != previous:
+            # The shared display range moved: redraw both previews on it.
+            _illum_schedule_preview(ctx, page)
+    status = getattr(page, "_illum_calc_status", None)
+    for message in worker.poll():
+        if message and message[0] == "progress":
+            _, key, done, total, name = message
+            if key == page._illum_request_key and status is not None:
+                status.setText(
+                    f"Recognizing pattern: {done}/{total} files · {name}"
+                )
+            continue
+        if message and message[0] == "cancelled":
+            _, key, _ = message
+            if key != page._illum_request_key:
+                continue
+            page._illum_request_key = None
+            page._illum_calc_running = False
+            button = getattr(page, "_illum_calc_btn", None)
+            if button is not None:
+                button.setText("Recognize Illumination Pattern")
+                button.setEnabled(not page._illum_locked)
+            if status is not None:
+                status.setText("Cancelled; the previous pattern was kept.")
+            continue
+        key, result, error = message
         if key != page._illum_request_key:
             continue
         page._illum_request_key = None
+        page._illum_calc_running = False
         button = getattr(page, "_illum_calc_btn", None)
         if button is not None:
+            button.setText("Recognize Illumination Pattern")
             button.setEnabled(not page._illum_locked)
-        status = getattr(page, "_illum_calc_status", None)
         if error:
             if status is not None:
                 status.setText(error)
@@ -1581,20 +1817,39 @@ def _illum_on_poll(ctx, page) -> None:
             "x": sub.get("x"),
             "y": sub.get("y"),
         }
+        for entry in result.get("timing") or []:
+            runlog.action(
+                "illum.recognize",
+                file=str(entry.get("file")),
+                rows=int(entry.get("rows") or 0),
+                seconds=float(entry.get("seconds") or 0.0),
+            )
         if status is not None:
-            status.setText("Mask calculated.")
+            count = len(result.get("timing") or [])
+            status.setText(
+                f"Mask calculated from {count} file(s) in "
+                f"{float(result.get('seconds') or 0.0):.1f} s."
+            )
         _illum_render_mask(ctx, page, sub)
+        _illum_refresh_list(ctx, page)
+        # Bump the parameter version before the histograms are rebuilt so the
+        # After distribution is re-read from the new mask, then redraw.
+        _illum_mark_dirty(ctx, page)
         if sub.get("id") == page._illum_selected:
-            _illum_render_preview(ctx, page)
             rebuild_levels = getattr(page, "_illum_rebuild_levels", None)
             if rebuild_levels is not None:
                 rebuild_levels()
-        _illum_refresh_list(ctx, page)
-        _illum_mark_dirty(ctx, page)
+            _illum_schedule_preview(ctx, page)
 
 
 def _illum_mark_dirty(ctx, page) -> None:
     page._illum_dirty = True
+    # Histogram samples depend on the parameters and on the masks; bumping
+    # the version drops the cached distributions of every submodule.
+    page._illum_params_version = getattr(page, "_illum_params_version", 0) + 1
+    cache = getattr(page, "_illum_hist_cache", None)
+    if cache is not None and len(cache) > 16:
+        cache.clear()
     _illum_update_save_btn(ctx, page)
     ctx._module_set_state(page, MODULE_STATE_MODIFIED)
 
@@ -1627,11 +1882,13 @@ def _illum_close(ctx, page) -> None:
         page._illum_task_def["params"] = page._illum_snapshot
     for name in (
         "_illum_poll_timer", "_illum_order_timer", "_illum_lod_timer",
+        "_illum_render_timer",
     ):
         timer = getattr(page, name, None)
         if timer is not None:
             timer.stop()
-    worker = getattr(page, "_illum_worker", None)
-    if worker is not None:
-        worker.stop()
+    for name in ("_illum_worker", "_illum_hist_worker"):
+        worker = getattr(page, name, None)
+        if worker is not None:
+            worker.stop()
     ctx._close_module_page(page)

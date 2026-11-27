@@ -342,23 +342,107 @@ class _GatingStatsWorker:
         return (generation, result)
 
 
+_ILLUM_SAMPLE_ROWS = 2_000_000
+
+
+def _tile_index(values, origin, tile):
+    """Per-value tile index along one axis.
+
+    Integer pixel coordinates keep integer arithmetic: the stored dtype is
+    exact, so subtracting the origin and dividing cannot round.
+    """
+    import numpy as np
+
+    arr = np.asarray(values)
+    step = int(tile)
+    origin_f = float(origin)
+    if np.issubdtype(arr.dtype, np.integer) and origin_f.is_integer():
+        base = arr.astype(np.int64) - int(origin_f)
+        return np.floor_divide(base, step)
+    return np.floor(
+        (arr.astype(np.float64) - origin_f) / step
+    ).astype(np.int64)
+
+
+def _tile_offset(values, origin, tile, index):
+    """Distance inside the tile for coordinates already turned into indices."""
+    import numpy as np
+
+    arr = np.asarray(values)
+    step = int(tile)
+    origin_f = float(origin)
+    if np.issubdtype(arr.dtype, np.integer) and origin_f.is_integer():
+        return arr.astype(np.int64) - int(origin_f) - index * step
+    return arr.astype(np.float64) - origin_f - index * step
+
+
+def _group_bounds(sorted_keys):
+    """(starts, ends) of equal-key runs in a sorted key array."""
+    import numpy as np
+
+    split = np.flatnonzero(np.diff(sorted_keys)) + 1
+    starts = np.concatenate(([0], split))
+    ends = np.concatenate((split, [sorted_keys.size]))
+    return starts, ends
+
+
+def _group_quantile(sorted_values, starts, ends, q):
+    """Quantile per run of `sorted_values`, with linear interpolation."""
+    import numpy as np
+
+    values = np.asarray(sorted_values, dtype=np.float64)
+    count = ends - starts
+    position = float(q) * np.maximum(count - 1, 0)
+    below = np.floor(position).astype(np.int64)
+    above = np.ceil(position).astype(np.int64)
+    frac = position - below
+    return (
+        values[starts + below] * (1.0 - frac)
+        + values[starts + above] * frac
+    )
+
+
+def _group_median(sorted_values, starts, ends):
+    """Median per run of `sorted_values` (no per-group Python loop)."""
+    import numpy as np
+
+    values = np.asarray(sorted_values, dtype=np.float64)
+    count = ends - starts
+    low = starts + (count - 1) // 2
+    high = starts + count // 2
+    return 0.5 * (values[low] + values[high])
+
+
 class _IlluminationWorker:
-    """Background worker that estimates an illumination mask from tiles."""
+    """Background worker that estimates an illumination mask from tiles.
+
+    Each file is read as a spread sample (up to ``_ILLUM_SAMPLE_ROWS`` rows,
+    one batch from each of several row groups) instead of a full in-memory
+    copy, and the per-tile statistics are computed with numpy.  A 30 M row
+    file takes about a second and well under 1 GB of memory, where the old
+    full pandas read took tens of seconds and many gigabytes.
+    """
 
     def __init__(self):
         self._req_q = queue.Queue()
         self._res_q = queue.Queue()
         self._stop = threading.Event()
+        self._cancel = {}
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def request(self, key, stages, base_columns, files, channel, x_name,
                 y_name, tile_w, tile_h, bins, resolution, generated=None):
+        self._cancel.pop(key, None)
         self._req_q.put((
             key, stages, base_columns, list(files), channel, x_name, y_name,
             int(tile_w), int(tile_h), int(bins), int(resolution),
             dict(generated or {}),
         ))
+
+    def cancel(self, key):
+        """Stop after the file being read; the partial result is discarded."""
+        self._cancel[key] = True
 
     def poll(self):
         out = []
@@ -384,10 +468,161 @@ class _IlluminationWorker:
                 res = (req[0], None, f"Could not calculate the mask: {exc}")
             self._res_q.put(res)
 
+    def _file_stats(self, path, stages, base_columns, channel, x_name, y_name,
+                    tile_w, tile_h, bins, generated):
+        """Per-tile block medians of one file, or a reason string."""
+        import os
+
+        import numpy as np
+
+        from smage.core.pipeline import (
+            _evaluate_stages, _pipeline_dependencies,
+        )
+        from smage.data.sampling import parquet_column_stats, sample_parquet_rows
+
+        gen = generated.get(path)
+        needed = {x_name, y_name} if gen else {x_name, y_name, channel}
+        dependencies = _pipeline_dependencies(stages, needed, path)
+        read_path = str(path)
+        needed = set(needed) | {channel}
+        stored = None
+        if gen:
+            read_path = str(gen["path"])
+            dependencies = set(dependencies) | {channel}
+            # A Rename module between Unmix and this one changes the channel
+            # name; the companion output still holds the stored column.
+            if gen.get("column") and gen["column"] != channel:
+                stored = gen["column"]
+        else:
+            base = base_columns.get(path) or set()
+            if not base:
+                try:
+                    import pyarrow.parquet as pq
+                    base = set(pq.ParquetFile(path).schema.names)
+                except Exception:  # noqa: BLE001
+                    return "skip"
+            dependencies = {c for c in dependencies if c in base}
+        if not dependencies:
+            return "skip"
+        read_names = {
+            stored if name == channel else name
+            for name in dependencies
+        } if stored else set(dependencies)
+        sample = sample_parquet_rows(
+            read_path, sorted(read_names), max_rows=_ILLUM_SAMPLE_ROWS
+        )
+        if not sample or any(name not in sample for name in read_names):
+            return "skip"
+        if stored is not None:
+            sample[channel] = sample.pop(stored)
+        values = {}
+        for name, array in sample.items():
+            if not np.issubdtype(np.asarray(array).dtype, np.number):
+                return "skip"
+            values[name] = array
+        stats = (
+            parquet_column_stats(read_path, [x_name, y_name])
+            if x_name and y_name else {}
+        )
+        origin = None
+        if x_name in stats and y_name in stats:
+            origin = (stats[x_name][0], stats[y_name][0])
+        evaluated = _evaluate_stages(
+            stages, values, sorted(needed), parquet_path=path,
+            origin=origin,
+        )
+        if not all(name in evaluated for name in needed):
+            return "skip"
+        x = np.asarray(evaluated[x_name])
+        y = np.asarray(evaluated[y_name])
+        values_channel = np.asarray(evaluated[channel])
+        if not (
+            np.issubdtype(values_channel.dtype, np.number)
+            and np.issubdtype(x.dtype, np.number)
+            and np.issubdtype(y.dtype, np.number)
+        ):
+            return "skip"
+        # Integer channels and coordinates cannot hold NaN; skipping the
+        # finite checks keeps the integer path cheap.
+        good = None
+        for array in (x, y, values_channel):
+            if np.issubdtype(array.dtype, np.floating):
+                finite = np.isfinite(array)
+                good = finite if good is None else (good & finite)
+        if good is not None:
+            x, y, values_channel = x[good], y[good], values_channel[good]
+        if values_channel.size == 0:
+            return "skip"
+        if origin is not None:
+            x0, y0 = float(origin[0]), float(origin[1])
+            width = float(stats[x_name][1]) - x0 + 1.0
+            height = float(stats[y_name][1]) - y0 + 1.0
+        else:
+            x0 = float(np.min(x))
+            y0 = float(np.min(y))
+            width = float(np.max(x)) - x0 + 1.0
+            height = float(np.max(y)) - y0 + 1.0
+        ntx = int(width // tile_w)
+        nty = int(height // tile_h)
+        if ntx < 1 or nty < 1:
+            return "small"
+        ti = _tile_index(x, x0, tile_w)
+        tj = _tile_index(y, y0, tile_h)
+        keep = (ti >= 0) & (ti < ntx) & (tj >= 0) & (tj < nty)
+        if not keep.any():
+            return "skip"
+        x, y = x[keep], y[keep]
+        values_channel = values_channel[keep]
+        ti, tj = ti[keep], tj[keep]
+        wx = _tile_offset(x, x0, tile_w, ti)
+        wy = _tile_offset(y, y0, tile_h, tj)
+        bx = np.clip(
+            np.floor_divide(wx * bins, int(tile_w)).astype(np.int64),
+            0, bins - 1,
+        )
+        by = np.clip(
+            np.floor_divide(wy * bins, int(tile_h)).astype(np.int64),
+            0, bins - 1,
+        )
+        tile_id = tj * ntx + ti
+        block = by * bins + bx
+        # 10th percentile per tile; darker points are background.
+        order = np.lexsort((values_channel, tile_id))
+        tile_sorted = tile_id[order]
+        value_sorted = np.asarray(values_channel[order], dtype=np.float64)
+        starts, ends = _group_bounds(tile_sorted)
+        threshold = _group_quantile(value_sorted, starts, ends, 0.1)
+        per_tile = np.full(int(ntx * nty), np.nan)
+        per_tile[tile_sorted[starts]] = threshold
+        kept = values_channel >= per_tile[tile_id]
+        if not kept.any():
+            return "skip"
+        # Median per (tile, block), then mean over tiles per block.
+        key = tile_id[kept] * (bins * bins) + block[kept]
+        value_kept = values_channel[kept]
+        order2 = np.lexsort((value_kept, key))
+        key_sorted = key[order2]
+        value_kept = np.asarray(value_kept[order2], dtype=np.float64)
+        starts2, ends2 = _group_bounds(key_sorted)
+        medians = _group_median(value_kept, starts2, ends2)
+        block_index = key_sorted[starts2] % (bins * bins)
+        sums = np.zeros(bins * bins, dtype=np.float64)
+        counts = np.zeros(bins * bins, dtype=np.float64)
+        np.add.at(sums, block_index, medians)
+        np.add.at(counts, block_index, 1.0)
+        return {
+            "sums": sums,
+            "counts": counts,
+            "rows": int(values_channel.size),
+            "path": os.path.basename(str(path)),
+        }
+
     def _compute(self, key, stages, base_columns, files, channel, x_name,
                  y_name, tile_w, tile_h, bins, resolution, generated=None):
+        import os
+        import time as _time
+
         import numpy as np
-        import pandas as pd
         from scipy.interpolate import RectBivariateSpline, griddata
 
         generated = generated or {}
@@ -398,89 +633,36 @@ class _IlluminationWorker:
         counts = np.zeros(n_blocks, dtype="float64")
         used_files = 0
         small_files = 0
-        for path in files:
-            gen = generated.get(path)
-            # A generated channel (for example a saved Unmix output) lives in
-            # its own row-aligned parquet; only x/y come from the source.
-            needed = {x_name, y_name} if gen else {x_name, y_name, channel}
-            dependencies = _pipeline_dependencies(stages, needed, path)
-            base = base_columns.get(path) or set()
-            if not base:
-                try:
-                    import pyarrow.parquet as pq
-                    base = set(pq.ParquetFile(path).schema.names)
-                except Exception:  # noqa: BLE001
-                    continue
-            base = [c for c in dependencies if c in base]
-            values = {}
-            if base:
-                try:
-                    df = pd.read_parquet(path, columns=base)
-                except Exception:  # noqa: BLE001
-                    continue
-                for name in base:
-                    values[name] = pd.to_numeric(
-                        df[name], errors="coerce"
-                    ).to_numpy(dtype="float64")
-            values = _evaluate_stages(stages, values, needed, path)
-            if not all(name in values for name in needed):
-                continue
-            x = np.asarray(values[x_name], dtype="float64")
-            y = np.asarray(values[y_name], dtype="float64")
-            if gen:
-                try:
-                    gdf = pd.read_parquet(
-                        gen["path"], columns=[gen["column"]]
-                    )
-                except Exception:  # noqa: BLE001
-                    continue
-                v = pd.to_numeric(
-                    gdf[gen["column"]], errors="coerce"
-                ).to_numpy(dtype="float64")
-                if v.size != x.size:
-                    continue
-            else:
-                v = np.asarray(values[channel], dtype="float64")
-            finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
-            x, y, v = x[finite], y[finite], v[finite]
-            if v.size == 0:
-                continue
-            x0 = float(x.min())
-            y0 = float(y.min())
-            width = float(x.max() - x0) + 1.0
-            height = float(y.max() - y0) + 1.0
-            ntx = int(width // tile_w)
-            nty = int(height // tile_h)
-            if ntx < 1 or nty < 1:
+        timing = []
+        started = _time.perf_counter()
+        for index, path in enumerate(files):
+            if self._cancel.get(key):
+                self._cancel.pop(key, None)
+                return ("cancelled", key, None)
+            file_started = _time.perf_counter()
+            file_stats = self._file_stats(
+                path, stages, base_columns, channel, x_name, y_name,
+                tile_w, tile_h, bins, generated,
+            )
+            if file_stats == "small":
                 small_files += 1
-                continue
-            ti = np.floor((x - x0) / tile_w).astype(np.int64)
-            tj = np.floor((y - y0) / tile_h).astype(np.int64)
-            keep = (ti >= 0) & (ti < ntx) & (tj >= 0) & (tj < nty)
-            if not keep.any():
-                continue
-            x, y, v = x[keep], y[keep], v[keep]
-            ti, tj = ti[keep], tj[keep]
-            tile_id = tj * ntx + ti
-            wx = (x - x0) - ti * tile_w
-            wy = (y - y0) - tj * tile_h
-            bx = np.clip((wx * bins / tile_w).astype(np.int64), 0, bins - 1)
-            by = np.clip((wy * bins / tile_h).astype(np.int64), 0, bins - 1)
-            block = by * bins + bx
-            frame = pd.DataFrame({"tile": tile_id, "block": block, "v": v})
-            # 10th percentile threshold per tile; darker points are background.
-            thresholds = frame.groupby("tile")["v"].quantile(0.1)
-            frame["thr"] = frame["tile"].map(thresholds)
-            frame = frame[frame["v"] >= frame["thr"]]
-            if frame.empty:
-                continue
-            # Median per block within each tile, then mean over tiles.
-            medians = frame.groupby(["tile", "block"])["v"].median()
-            per_block = medians.groupby(level="block").mean()
-            indices = per_block.index.to_numpy(dtype=np.int64)
-            sums[indices] += per_block.to_numpy()
-            counts[indices] += 1.0
-            used_files += 1
+            elif isinstance(file_stats, dict):
+                sums += file_stats["sums"]
+                counts += file_stats["counts"]
+                used_files += 1
+                timing.append({
+                    "file": file_stats["path"],
+                    "rows": file_stats["rows"],
+                    "seconds": round(_time.perf_counter() - file_started, 2),
+                })
+            self._res_q.put((
+                "progress", key, index + 1, len(files),
+                os.path.basename(str(path)),
+            ))
+
+        if self._cancel.get(key):
+            self._cancel.pop(key, None)
+            return ("cancelled", key, None)
 
         if used_files == 0 or not (counts > 0).any():
             if small_files and small_files == len(files):
@@ -527,7 +709,83 @@ class _IlluminationWorker:
             "bin": int(bins),
             "resolution": int(resolution),
             "files": list(files),
+            "timing": timing,
+            "seconds": round(_time.perf_counter() - started, 2),
         }, None)
+
+
+class _ColumnSampleWorker:
+    """Background worker that reads a sampled column for display histograms.
+
+    The caller resolves the map stages and the columns to read; the worker
+    only performs the I/O and the stage evaluation, so no context caches are
+    touched from this thread.
+    """
+
+    def __init__(self):
+        self._req_q = queue.Queue()
+        self._res_q = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def request(self, key, read_path, columns, stages, names, parquet_path,
+                max_rows=400_000):
+        self._req_q.put((
+            key, str(read_path), list(columns), list(stages or []),
+            list(names), parquet_path, int(max_rows),
+        ))
+
+    def poll(self):
+        out = []
+        while True:
+            try:
+                out.append(self._res_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                req = self._req_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                res = self._compute(*req)
+            except Exception as exc:  # noqa: BLE001
+                res = (req[0], None, f"Could not read the values: {exc}")
+            self._res_q.put(res)
+
+    def _compute(self, key, read_path, columns, stages, names, parquet_path,
+                 max_rows):
+        import numpy as np
+
+        from smage.core.pipeline import _evaluate_stages
+        from smage.data.sampling import sample_parquet_rows
+
+        sample = sample_parquet_rows(read_path, columns, max_rows=max_rows)
+        if not sample or any(name not in sample for name in columns):
+            return (key, None, "Could not read the sampled values.")
+        values = {}
+        for name, array in sample.items():
+            array = np.asarray(array)
+            if not np.issubdtype(array.dtype, np.number):
+                return (key, None, "The values are not numeric.")
+            values[name] = array
+        evaluated = _evaluate_stages(
+            stages, values, names, parquet_path=parquet_path
+        )
+        out = {
+            name: np.asarray(evaluated[name], dtype=np.float64)
+            for name in names if name in evaluated
+        }
+        if not out:
+            return (key, None, "Could not read the sampled values.")
+        return (key, out, None)
 
 
 class _ImageFilterWorker:

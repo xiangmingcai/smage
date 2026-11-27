@@ -15,11 +15,14 @@ from smage.widgets.plot_axes import _make_original_axis
 
 
 def _image_signal_histogram(ctx, layout, channel, task_id, parquet_path,
-                            extra_stages=None, configs=None, title=None):
+                            extra_stages=None, configs=None, title=None,
+                            values=None):
     """A read-only signal histogram for one channel.
 
     Used where a second (for example "Before") distribution is shown next to
     the Min/Max controls, so it has no inputs, Auto set or Reset buttons.
+    ``values`` may hold an already loaded (sampled) distribution; otherwise
+    the channel is read through the context.
     """
     import numpy as np
     import pyqtgraph as pg
@@ -43,9 +46,10 @@ def _image_signal_histogram(ctx, layout, channel, task_id, parquet_path,
     layout.addWidget(hist_plot)
     if not channel or parquet_path is None:
         return hist_plot
-    values = ctx._figure_channel_values(
-        task_id, parquet_path, channel, extra_stages=extra_stages
-    )
+    if values is None:
+        values = ctx._figure_channel_values(
+            task_id, parquet_path, channel, extra_stages=extra_stages
+        )
     if values is None or values.size == 0:
         return hist_plot
     values = _apply_scale_transforms(values, configs)
@@ -62,12 +66,15 @@ def _image_signal_histogram(ctx, layout, channel, task_id, parquet_path,
     return hist_plot
 
 
-def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_minmax, task_id, parquet_path, extra_stages=None, configs=None, hist_caption=None) -> None:
+def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_minmax, task_id, parquet_path, extra_stages=None, configs=None, hist_caption=None, values=None) -> None:
     """Min/Max inputs + signal histogram + Auto set / Reset for a channel.
 
     `on_minmax(lo, hi)` receives the bounds in PLOT units (None = auto);
     the inputs and the histogram labels show ORIGINAL (pre-Scale) values,
     converted through `configs`.
+
+    ``values`` may hold an already loaded (sampled) distribution; Auto set
+    and Reset then use it instead of reading the whole channel.
     """
     import numpy as np
     import pyqtgraph as pg
@@ -150,17 +157,19 @@ def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_mi
         if not channel or parquet_path is None:
             hist_plot.clear()
             return
-        values = ctx._figure_channel_values(
-            task_id, parquet_path, channel, extra_stages=extra_stages
-        )
-        if values is None or values.size == 0:
+        loaded = values
+        if loaded is None:
+            loaded = ctx._figure_channel_values(
+                task_id, parquet_path, channel, extra_stages=extra_stages
+            )
+        if loaded is None or loaded.size == 0:
             hist_plot.clear()
             return
         # Levels are in display units: apply the Scale (log/arcsinh) configs,
         # which only affect how the data is shown.
-        values = _apply_scale_transforms(values, configs)
-        state["values"] = values
-        hist, edges = np.histogram(values, bins=200)
+        values_display = _apply_scale_transforms(loaded, configs)
+        state["values"] = values_display
+        hist, edges = np.histogram(values_display, bins=200)
         hist_plot.clear()
         hist_plot.plot(
             edges, hist, stepMode="center",
@@ -213,19 +222,28 @@ def _image_level_controls(ctx, layout, channel, min_val, max_val, enabled, on_mi
         on_minmax(lo, hi)
 
     def on_reset(_=False) -> None:
-        bounds = ctx._channel_full_range(
-            task_id, parquet_path, channel, extra_stages=extra_stages
-        )
-        if bounds is None:
-            min_edit.setText("")
-            max_edit.setText("")
-            on_minmax(None, None)
-            ctx.statusBar().showMessage(
-                "This channel has no finite values", 3000
+        if values is not None and state["values"] is not None:
+            # A sampled distribution is already in display units; use it
+            # instead of reading the whole channel just to find its range.
+            sampled = state["values"]
+            if sampled.size == 0:
+                return
+            lo = float(np.min(sampled))
+            hi = float(np.max(sampled))
+        else:
+            bounds = ctx._channel_full_range(
+                task_id, parquet_path, channel, extra_stages=extra_stages
             )
-            return
-        lo = _forward_scale_value(_round_level(bounds[0]), configs)
-        hi = _forward_scale_value(_round_level(bounds[1]), configs)
+            if bounds is None:
+                min_edit.setText("")
+                max_edit.setText("")
+                on_minmax(None, None)
+                ctx.statusBar().showMessage(
+                    "This channel has no finite values", 3000
+                )
+                return
+            lo = _forward_scale_value(_round_level(bounds[0]), configs)
+            hi = _forward_scale_value(_round_level(bounds[1]), configs)
         min_edit.setText(
             _format_level(_inverse_scale_value(lo, configs))
         )

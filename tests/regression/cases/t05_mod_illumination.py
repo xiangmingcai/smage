@@ -138,5 +138,128 @@ def names() -> None:
         _close(window)
 
 
+def _image_preview(case_id: str):
+    """Open the module on an image project and show the Image preview."""
+    from smage.data.image_index import _build_image_index_files
+
+    task = harness.task_def("illumination", task_id="i-1", name="Illumination")
+    project = harness.new_project(case_id, rows=2500, tasks=[task])
+    parquet = str(project.data_dir / "case.parquet")
+    # The import path builds a display pyramid; do it here since the test
+    # project is written directly.
+    _build_image_index_files(parquet)
+    window = harness.new_window()
+    harness.open_project(window, project)
+    window._open_module("i-1", "illumination", "Illumination")
+    harness.pump(300)
+    page = window.tabs.currentWidget()
+    ctx = window._ctx
+    illum_page._illum_add_submodule(ctx, page)
+    sub = page._illum_submodules[0]
+    sub.update(files=[parquet], channel="FL1-A", x="x", y="y",
+               tile_w=10, tile_h=10, plot_type="image",
+               method="median", intensity=1.0)
+    sub["mask"] = np.tile(
+        np.linspace(0.5, 2.0, 10)[None, :], (10, 1)
+    ).tolist()
+    sub["mask_source"] = {
+        "tile_w": 10, "tile_h": 10, "bin": 5, "resolution": 10,
+        "files": [parquet], "channel": "FL1-A", "x": "x", "y": "y",
+    }
+    illum_page._illum_rebuild_right(ctx, page)
+    harness.pump(900)
+    illum_page._illum_render_preview(ctx, page)
+    harness.pump(200)
+    return window, page, ctx, sub
+
+
+@harness.case("mod.illumination.preview", "L4", "illumination", tags=("fast",))
+def preview() -> None:
+    """After applies the mask, intensity 0 is the identity, levels are shared."""
+    window, page, ctx, sub = _image_preview("illum_preview")
+    try:
+        before = page._illum_before_plot._img_data
+        after = page._illum_after_plot._img_data
+        harness.check(before is not None, "the Before image rendered")
+        harness.check(after is not None, "the After image rendered")
+        harness.check(
+            not np.array_equal(before, after),
+            "the After image applies the correction",
+        )
+        harness.check(
+            page._illum_shared_levels is not None,
+            "the sampled histograms set one display range",
+        )
+        sub["intensity"] = 0.0
+        illum_page._illum_render_preview(ctx, page)
+        harness.pump(200)
+        harness.check(
+            np.array_equal(page._illum_after_plot._img_data, before),
+            "intensity 0 leaves the image unchanged",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.illumination.preview_update", "L4", "illumination", tags=("fast",))
+def preview_update() -> None:
+    """A method change through Update redraws the After image."""
+    from PySide6.QtWidgets import QComboBox, QPushButton
+
+    window, page, ctx, sub = _image_preview("illum_preview_update")
+    try:
+        combo = next(
+            c for c in page.findChildren(QComboBox) if c.findData("down") >= 0
+        )
+        combo.setCurrentIndex(combo.findData("down"))
+        harness.pump(100)
+        update = next(
+            b for b in page.findChildren(QPushButton) if b.text() == "Update"
+        )
+        before_pixels = page._illum_after_plot._img_data.copy()
+        update.click()
+        harness.pump(900)
+        after_pixels = page._illum_after_plot._img_data
+        harness.eq(sub.get("method"), "down")
+        harness.check(
+            not np.array_equal(before_pixels, after_pixels),
+            "the After image reflects the new method",
+        )
+    finally:
+        _close(window)
+
+
+@harness.case("mod.illumination.raster_coords", "L4", "illumination", tags=("fast",))
+def raster_coords() -> None:
+    """Generated-channel rasters get x/y so position stages can run."""
+    from PySide6.QtCore import QRectF
+
+    from smage.core.pipeline import _evaluate_stages
+    from smage.widgets.plot import renderer
+
+    rect = QRectF(0.0, 0.0, 4.0, 2.0)
+    channel = np.full((2, 4), 10.0)
+    stage = ("illumination", {
+        "task_id": "t",
+        "submodules": [{
+            "channel": "U1", "x": "x", "y": "y",
+            "files": {"/data.parquet"},
+            "tile_w": 2, "tile_h": 2,
+            "mask": np.array([[1.0, 2.0], [4.0, 4.0]]),
+            "T": 2.0, "intensity": 1.0,
+        }],
+    })
+    values = renderer._raster_stage_values(
+        {"U1": channel}, [stage], rect, channel.shape
+    )
+    values = _evaluate_stages(
+        [stage], values, ["U1"], parquet_path="/data.parquet"
+    )
+    harness.check(
+        not np.allclose(values["U1"], channel),
+        "the illumination stage ran on the raster",
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(harness.main())

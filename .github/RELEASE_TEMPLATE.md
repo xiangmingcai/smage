@@ -2,10 +2,15 @@
 
 ## Highlights
 
-- **Illumination Correction**: changes to the correction method or intensity
-  are applied with the new **Update** button in **Correction parameters**, so
-  editing a number no longer re-renders the preview on every keystroke. The
-  line below the button shows the method and intensity currently in use.
+- **Illumination Correction** handles large files: **Recognize Illumination
+  Pattern** estimates the pattern from a spread pixel sample of each file
+  instead of loading it whole, so a multi-gigabyte file takes seconds and
+  memory stays bounded. The status line shows the current file, the button
+  becomes **Cancel** while it runs, and each file's time is logged.
+- The Before/After histograms are read in the background from a sample, so
+  opening the module or switching file, channel or parameters no longer
+  freezes the window. The two image previews share one display range, and the
+  After preview applies the correction to generated **Unmix** channels.
 
 ## Downloads
 

@@ -3,6 +3,19 @@
 The authoritative changelog lives in
 [CHANGELOG.md](https://github.com/xiangmingcai/smage/blob/main/CHANGELOG.md).
 
+## 0.5.5 — 2026-11-27
+
+- **Illumination Correction** handles large files: **Recognize Illumination
+  Pattern** estimates the pattern from a spread pixel sample of each file
+  instead of loading it whole (seconds per multi-gigabyte file, bounded
+  memory), shows the current file, and can be cancelled. The Before/After
+  histograms are read in the background from a sample, so switching file,
+  channel or parameters no longer blocks the window. The two image previews
+  share one display range, and the After preview applies the correction to
+  generated **Unmix** channels.
+
+See CHANGELOG.md for the complete list.
+
 ## 0.5.4 — 2026-11-26
 
 - **Illumination Correction**: changes to the correction method or intensity

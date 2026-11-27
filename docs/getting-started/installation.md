@@ -14,7 +14,7 @@
 3. Verify the download (optional but recommended):
 
     ```bat
-    certutil -hashfile Smage-v0.5.4-win64.zip SHA256
+    certutil -hashfile Smage-v0.5.5-win64.zip SHA256
     ```
 
     The value must match the line in `SHA256SUMS.txt`.

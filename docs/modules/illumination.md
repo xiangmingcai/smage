@@ -50,6 +50,18 @@ generated channel from its saved output. The tile width and height must fit
 inside the image: an image smaller than one tile produces no data to estimate
 the pattern from, and the panel shows a hint in that case.
 
+**Recognize Illumination Pattern** reads a spread sample of each selected file
+(up to about two million pixels, taken from batches across the file) instead
+of loading the whole file, so large files are processed in seconds with
+bounded memory. The progress line next to the button shows the current file,
+and the button turns into **Cancel** while the calculation runs; cancelling
+keeps the previous pattern. Each file's time is recorded in the run log.
+
+The **Before** and **After** image previews always share one display range, so
+a change of correction method, intensity or pattern is visible instead of
+being normalized away by two independent automatic ranges. The range comes
+from the sampled signal distributions; the Min/Max fields override it.
+
 ## Output
 
 Corrected values for the selected channel. Downstream modules see the
@@ -59,6 +71,9 @@ corrected channel; the raw data is unchanged.
 
 - The correction map is estimated once per channel and cached; changing a
   downstream module does not re-estimate it.
+- The signal histograms in **Plot settings** are read in the background from
+  a sample of the channel, so switching file, channel or parameters never
+  blocks the window. **Auto set** and **Reset** use the same sample.
 - The illumination pattern used for estimation is persisted under
   `Module/illumination-<id>/` inside the project.
 - Duplicating a submodule also copies its recognized illumination pattern

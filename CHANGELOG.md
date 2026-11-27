@@ -6,6 +6,33 @@ All notable changes to Smage are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.5] — 2026-11-27
+
+### Added
+
+- **Illumination Correction**: **Recognize Illumination Pattern** shows the
+  file being processed, logs each file's time, and can be cancelled. The
+  pattern is estimated from a spread pixel sample of each file instead of a
+  full read, so large files finish in seconds and memory stays bounded.
+- **Illumination Correction**: the Before/After histograms are read in the
+  background from a sample of the channel, so opening the module or switching
+  file, channel or parameters no longer blocks the window.
+
+### Changed
+
+- **Illumination Correction**: correction method and intensity are applied
+  with an **Update** button instead of on every edit; the line below the
+  button shows the method and intensity currently in use.
+- **Illumination Correction**: the Before and After image previews share one
+  display range, so a method change or a mild correction is visible instead
+  of being normalized away.
+
+### Fixed
+
+- **Illumination Correction**: the After preview now applies the correction
+  to generated **Unmix** channels; the raster had no x/y, so the illumination
+  stage was skipped.
+
 ## [0.5.4] — 2026-11-26
 
 ### Changed
